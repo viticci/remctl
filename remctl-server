@@ -402,13 +402,13 @@ def resolve_ck_id(pk):
     try:
         db = open_db()
         r = db.execute(
-            "SELECT ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDREMINDER r "
+            "SELECT r.ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDREMINDER r "
             "LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
             "WHERE r.Z_PK = ?", (pk,)
         ).fetchone()
         db.close()
         if r and r["ZCKIDENTIFIER"]:
-            return f"x-apple-reminder://{r['ZCKIDENTIFIER']}", r["list_name"]
+            return r["ZCKIDENTIFIER"], r["list_name"]
     except Exception:
         pass
     return None, None
