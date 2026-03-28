@@ -297,9 +297,11 @@ def q_stats(db):
         "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1"
     ).fetchone()[0]
     overdue = db.execute(
-        f"SELECT COUNT(*) FROM ZREMCDREMINDER "
-        f"WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 "
-        f"AND ZDUEDATE IS NOT NULL AND ZDUEDATE < {to_ts(datetime.now())}"
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL "
+        f"AND r.ZDUEDATE IS NOT NULL AND r.ZDUEDATE < {to_ts(datetime.now())}"
     ).fetchone()[0]
     lists = len(q_lists(db))
     sections = len(q_sections(db))
