@@ -105,7 +105,7 @@ def to_ts(dt):
 
 def q_lists(db):
     return db.execute(
-        "SELECT Z_PK, ZNAME FROM ZREMCDBASELIST "
+        "SELECT Z_PK, ZNAME, ZBADGEEMBLEM FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
         "AND ZNAME IS NOT NULL AND ZNAME != '' ORDER BY ZNAME"
     ).fetchall()
@@ -852,12 +852,22 @@ class RemctlHandler(BaseHTTPRequestHandler):
                     "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0",
                     (r["Z_PK"],),
                 ).fetchone()[0]
-                data.append({
+                entry = {
                     "id": r["Z_PK"],
                     "name": r["ZNAME"],
                     "activeCount": count,
                     "sectionCount": len(secs),
-                })
+                }
+                # Parse emoji icon from ZBADGEEMBLEM JSON
+                emblem = r["ZBADGEEMBLEM"]
+                if emblem:
+                    try:
+                        emblem_data = json.loads(emblem)
+                        if "Emoji" in emblem_data:
+                            entry["icon"] = emblem_data["Emoji"]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                data.append(entry)
             self._ok(data)
             self._log_timing("GET", path, 200, t0)
             db.close()
