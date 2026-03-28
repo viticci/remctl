@@ -488,14 +488,15 @@ def sync_after_bridge_write(pk):
         sys.stderr.write(f"[sync_after_bridge_write] Warning: {e}\n")
 
 
-def nudge_remindd(pk):
-    """Trigger remindd to properly sync a reminder to iCloud.
+def sync_to_icloud_via_applescript(pk, action_data):
+    """Fire an AppleScript write in the background to trigger proper iCloud sync.
 
-    EventKit writes update CoreData but remindd doesn't push them to
-    CloudKit because it didn't initiate the change. A trivial AppleScript
-    edit (set name to itself) forces remindd to process the record through
-    its proper CloudKit sync pipeline, which pushes ALL pending changes
-    including our bridge's date/completion updates.
+    EventKit writes update CoreData locally but remindd won't push them
+    to CloudKit. The ONLY reliable way to get iCloud sync is to have
+    remindd make the change itself, which happens through AppleScript.
+
+    This runs in a background thread (Popen, no wait) so the API response
+    is instant. The iCloud sync happens 30-60s later when AppleScript completes.
     """
     try:
         db_path = find_main_db()
@@ -514,21 +515,54 @@ def nudge_remindd(pk):
 
         ck_id = r["ZCKIDENTIFIER"]
         list_name = r["list_name"] or "Reminders"
-        esc_list = list_name.replace('"', '\\"')
+        esc_list = list_name.replace('"', '\\"').replace("'", "'")
 
+        # Build AppleScript commands based on what was changed
+        commands = []
+        if action_data.get("due"):
+            # Parse the due date and format for AppleScript
+            due_str = action_data["due"]
+            try:
+                from datetime import datetime as _dt
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+                    try:
+                        dt = _dt.strptime(due_str, fmt)
+                        as_date = dt.strftime('%A, %B %d, %Y at %I:%M:%S %p')
+                        commands.append(f'set due date of r to date "{as_date}"')
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+
+        action = action_data.get("action", "")
+        if action == "complete":
+            commands.append("set completed of r to true")
+        elif action == "uncomplete":
+            commands.append("set completed of r to false")
+
+        if not commands:
+            # Fallback: touch name to force sync
+            commands.append("set name of r to name of r")
+
+        cmd_str = "\n".join(commands)
         script = (
             f'tell application "Reminders"\n'
             f'tell list "{esc_list}"\n'
             f'set r to (first reminder whose id is "x-apple-reminder://{ck_id}")\n'
-            f'set name of r to name of r\n'
+            f'{cmd_str}\n'
             f'end tell\nend tell'
         )
-        subprocess.run(
+
+        # Fire and forget — don't wait for completion (takes 30-60s)
+        subprocess.Popen(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=15
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+        sys.stderr.write(f"[icloud_sync] Background AppleScript fired for #{pk}\n")
     except Exception as e:
-        sys.stderr.write(f"[nudge_remindd] Warning: {e}\n")
+        sys.stderr.write(f"[icloud_sync] Warning: {e}\n")
 
 
 def bridge_call(action_data, original_pk=None):
@@ -565,8 +599,8 @@ def bridge_call(action_data, original_pk=None):
                     time.sleep(0.3)  # Let EventKit commit to CoreData
                     # Fix ZDISPLAYDATEDATE for local Reminders.app UI
                     sync_after_bridge_write(pk)
-                    # Nudge remindd via AppleScript to trigger proper iCloud sync
-                    nudge_remindd(pk)
+                    # Fire background AppleScript for reliable iCloud sync
+                    sync_to_icloud_via_applescript(pk, action_data)
                 return parsed
             # Bridge failed, try remctl CLI fallback
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
