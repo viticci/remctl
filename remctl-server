@@ -414,19 +414,52 @@ def resolve_ck_id(pk):
     return None, None
 
 
-def bridge_call(action_data):
+def sync_display_date(pk):
+    """After EventKit updates ZDUEDATE, sync ZDISPLAYDATEDATE to match.
+
+    Reminders.app uses ZDISPLAYDATEDATE (not ZDUEDATE) for its UI views.
+    EventKit only updates ZDUEDATE, leaving ZDISPLAYDATEDATE stale.
+    This causes reminders to appear under the wrong date and become
+    uneditable in Reminders.app.
+    """
+    try:
+        db_path = find_main_db()
+        if not db_path:
+            return
+        conn = sqlite3.connect(str(db_path))
+        r = conn.execute(
+            "SELECT ZDUEDATE FROM ZREMCDREMINDER WHERE Z_PK = ?", (pk,)
+        ).fetchone()
+        if r and r[0] is not None:
+            conn.execute(
+                "UPDATE ZREMCDREMINDER SET ZDISPLAYDATEDATE = ? WHERE Z_PK = ?",
+                (r[0], pk)
+            )
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        sys.stderr.write(f"[sync_display_date] Warning: {e}\n")
+
+
+def bridge_call(action_data, original_pk=None):
     """Call remctl-bridge (Swift EventKit helper) for write operations.
 
     Automatically resolves integer IDs to calendarItemIdentifiers.
+    If the operation changes a due date, also syncs ZDISPLAYDATEDATE.
     """
+    resolved_pk = None
+
     # If action_data has an integer 'id', resolve it to calendarItemIdentifier
     if "id" in action_data and isinstance(action_data["id"], int):
+        resolved_pk = action_data["id"]
         ck_id, list_name = resolve_ck_id(action_data["id"])
         if ck_id:
             action_data = dict(action_data)
             action_data["id"] = ck_id
         else:
             return {"ok": False, "error": f"Could not resolve reminder #{action_data['id']}"}
+
+    pk = original_pk or resolved_pk
 
     if BRIDGE_PATH.exists():
         try:
@@ -436,7 +469,13 @@ def bridge_call(action_data):
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
+                parsed = json.loads(result.stdout)
+                # After successful bridge write, sync display date if due was changed
+                if pk and action_data.get("due") is not None:
+                    import time
+                    time.sleep(0.3)  # Let EventKit commit to CoreData
+                    sync_display_date(pk)
+                return parsed
             # Bridge failed, try remctl CLI fallback
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
             pass
