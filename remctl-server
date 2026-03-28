@@ -565,25 +565,137 @@ def sync_to_icloud_via_applescript(pk, action_data):
         sys.stderr.write(f"[icloud_sync] Warning: {e}\n")
 
 
-def bridge_call(action_data, original_pk=None):
-    """Call remctl-bridge (Swift EventKit helper) for write operations.
+def applescript_write(pk, action_data):
+    """Write via AppleScript (goes through remindd → reliable iCloud sync).
 
-    Automatically resolves integer IDs to calendarItemIdentifiers.
-    If the operation changes a due date, also syncs ZDISPLAYDATEDATE.
+    AppleScript is slow (~30s) but it's the ONLY reliable way to sync
+    changes to iCloud. EventKit writes update CoreData locally but
+    remindd won't push them to CloudKit.
+
+    Returns dict with status on success, None on failure/timeout.
+    """
+    try:
+        db = open_db()
+        r = db.execute(
+            "SELECT r.ZCKIDENTIFIER, r.ZTITLE, l.ZNAME as list_name "
+            "FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+            "WHERE r.Z_PK = ?", (pk,)
+        ).fetchone()
+        db.close()
+        if not r or not r["ZCKIDENTIFIER"]:
+            return None
+
+        ck_id = r["ZCKIDENTIFIER"]
+        list_name = r["list_name"] or "Reminders"
+        title = r["ZTITLE"] or ""
+
+        def esc(s):
+            return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+        action = action_data.get("action", "")
+        commands = []
+
+        if action == "update":
+            if action_data.get("title"):
+                commands.append(f'set name of r to "{esc(action_data["title"])}"')
+            if action_data.get("notes"):
+                commands.append(f'set body of r to "{esc(action_data["notes"])}"')
+            if action_data.get("due"):
+                due_str = action_data["due"]
+                try:
+                    from datetime import datetime as _dt
+                    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+                        try:
+                            dt = _dt.strptime(due_str, fmt)
+                            as_date = dt.strftime('%A, %B %d, %Y at %I:%M:%S %p')
+                            commands.append(f'set due date of r to date "{as_date}"')
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+            pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+            if action_data.get("priority") is not None:
+                pri = action_data["priority"]
+                if isinstance(pri, str):
+                    pri = pm.get(pri, 0)
+                commands.append(f"set priority of r to {pri}")
+            if action_data.get("flagged") is not None:
+                val = "true" if action_data["flagged"] else "false"
+                commands.append(f"set flagged of r to {val}")
+
+        elif action == "complete":
+            commands.append("set completed of r to true")
+
+        elif action == "uncomplete":
+            commands.append("set completed of r to false")
+
+        elif action == "delete":
+            commands.append("delete r")
+
+        if not commands:
+            return None
+
+        cmd_str = "\n".join(commands)
+        script = (
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(list_name)}"\n'
+            f'set r to (first reminder whose id is "x-apple-reminder://{ck_id}")\n'
+            f'{cmd_str}\n'
+            f'end tell\nend tell'
+        )
+
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode == 0:
+            sys.stderr.write(f"[applescript_write] OK for #{pk} ({action})\n")
+            return {"status": action_data.get("action", "updated"), "id": str(pk), "title": title}
+        else:
+            sys.stderr.write(f"[applescript_write] Error for #{pk}: {result.stderr[:100]}\n")
+            return None
+
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[applescript_write] Timeout for #{pk}\n")
+        return None
+    except Exception as e:
+        sys.stderr.write(f"[applescript_write] Exception for #{pk}: {e}\n")
+        return None
+
+
+def bridge_call(action_data, original_pk=None):
+    """Write to Reminders with reliable iCloud sync.
+
+    Strategy:
+    1. For update/complete/uncomplete/delete: use AppleScript (reliable iCloud sync)
+    2. For create/list operations: use EventKit bridge (AppleScript can't do these well)
+    3. Fall back to bridge if AppleScript fails
     """
     resolved_pk = None
 
-    # If action_data has an integer 'id', resolve it to calendarItemIdentifier
+    # Resolve integer IDs
     if "id" in action_data and isinstance(action_data["id"], int):
         resolved_pk = action_data["id"]
+
+    pk = original_pk or resolved_pk
+    action = action_data.get("action", "")
+
+    # AppleScript-first for operations that need iCloud sync
+    if pk and action in ("update", "complete", "uncomplete", "delete"):
+        result = applescript_write(pk, action_data)
+        if result:
+            return result
+        sys.stderr.write(f"[bridge_call] AppleScript failed for #{pk}, falling back to bridge\n")
+
+    # Bridge path (for creates, list ops, or AppleScript fallback)
+    if "id" in action_data and isinstance(action_data["id"], int):
         ck_id, list_name = resolve_ck_id(action_data["id"])
         if ck_id:
             action_data = dict(action_data)
             action_data["id"] = ck_id
         else:
             return {"ok": False, "error": f"Could not resolve reminder #{action_data['id']}"}
-
-    pk = original_pk or resolved_pk
 
     if BRIDGE_PATH.exists():
         try:
@@ -593,20 +705,11 @@ def bridge_call(action_data, original_pk=None):
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and result.stdout.strip():
-                parsed = json.loads(result.stdout)
-                if pk:
-                    import time
-                    time.sleep(0.3)  # Let EventKit commit to CoreData
-                    # Fix ZDISPLAYDATEDATE for local Reminders.app UI
-                    sync_after_bridge_write(pk)
-                    # Fire background AppleScript for reliable iCloud sync
-                    sync_to_icloud_via_applescript(pk, action_data)
-                return parsed
-            # Bridge failed, try remctl CLI fallback
+                return json.loads(result.stdout)
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
             pass
 
-    # Fallback: use remctl CLI
+    # Last resort: remctl CLI fallback
     return remctl_cli_fallback(action_data)
 
 
