@@ -1,0 +1,23 @@
+# Compiled Swift binary
+remctl-bridge
+*.o
+*.dSYM/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+._*
+
+# Config (contains API token)
+.config/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

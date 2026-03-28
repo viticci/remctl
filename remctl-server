@@ -1,0 +1,1258 @@
+#!/usr/bin/env python3
+"""remctl-server — REST API for iCloud Reminders.
+
+Exposes all remctl features as JSON endpoints over HTTP. Designed for
+Tailscale-only access with Bearer token authentication.
+
+Reads directly from the iCloud Reminders CoreData SQLite database.
+Writes via remctl-bridge (Swift EventKit) or falls back to remctl CLI.
+
+Zero external dependencies — stdlib only.
+"""
+
+import argparse
+import json
+import os
+import secrets
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+VERSION = "1.0.0"
+DEFAULT_PORT = 19876
+APPLE_EPOCH = 978307200
+HOME = Path.home()
+STORE_DIR = HOME / "Library/Group Containers/group.com.apple.reminders/Container_v1/Stores"
+BRIDGE_PATH = HOME / "bin" / "remctl-bridge"
+REMCTL_PATH = HOME / "bin" / "remctl"
+TOKEN_DIR = HOME / ".config" / "remctl"
+TOKEN_FILE = TOKEN_DIR / "api-token"
+
+PRI_NAME = {0: "none", 1: "high", 5: "medium", 9: "low"}
+PRI_FROM_NAME = {"none": 0, "high": 1, "medium": 5, "low": 9}
+
+_REM_COLS = """r.Z_PK, r.ZTITLE, r.ZNOTES, r.ZCOMPLETED, r.ZFLAGGED, r.ZPRIORITY,
+    r.ZDUEDATE, r.ZALLDAY, r.ZCOMPLETIONDATE, r.ZCREATIONDATE,
+    r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name"""
+
+# ── Token Management ─────────────────────────────────────────────────────────
+
+def load_or_create_token(cli_token=None):
+    """Load API token from CLI arg, env var, or file. Generate if missing."""
+    if cli_token:
+        return cli_token, "CLI argument"
+
+    env_token = os.environ.get("REMCTL_API_TOKEN")
+    if env_token:
+        return env_token, "REMCTL_API_TOKEN env"
+
+    if TOKEN_FILE.exists():
+        token = TOKEN_FILE.read_text().strip()
+        if token:
+            return token, str(TOKEN_FILE)
+
+    # Generate new token
+    token = secrets.token_urlsafe(32)
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+    return token, f"{TOKEN_FILE} (generated)"
+
+
+# ── Database ─────────────────────────────────────────────────────────────────
+
+def find_main_db():
+    candidates = sorted(
+        STORE_DIR.glob("Data-*.sqlite"),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def open_db():
+    db_path = find_main_db()
+    if not db_path:
+        raise RuntimeError("No Reminders database found. Is iCloud Reminders enabled?")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ts(v):
+    """CoreData timestamp → Python datetime."""
+    if not v:
+        return None
+    return datetime.fromtimestamp(v + APPLE_EPOCH)
+
+
+def to_ts(dt):
+    """Python datetime → CoreData timestamp."""
+    return dt.timestamp() - APPLE_EPOCH
+
+
+# ── Queries ──────────────────────────────────────────────────────────────────
+
+def q_lists(db):
+    return db.execute(
+        "SELECT Z_PK, ZNAME FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
+        "AND ZNAME IS NOT NULL AND ZNAME != '' ORDER BY ZNAME"
+    ).fetchall()
+
+
+def q_list_pk(db, name):
+    r = db.execute(
+        "SELECT Z_PK FROM ZREMCDBASELIST "
+        "WHERE ZNAME = ? COLLATE NOCASE AND ZMARKEDFORDELETION = 0 LIMIT 1",
+        (name,),
+    ).fetchone()
+    return r[0] if r else None
+
+
+def q_reminders(db, list_pk=None, completed=False, parent_pk=None,
+                top_level=False, limit=500):
+    conds, params = ["r.ZMARKEDFORDELETION = 0"], []
+    if not completed:
+        conds.append("r.ZCOMPLETED = 0")
+    if list_pk is not None:
+        conds.append("r.ZLIST = ?")
+        params.append(list_pk)
+    if parent_pk is not None:
+        conds.append("r.ZPARENTREMINDER = ?")
+        params.append(parent_pk)
+    elif top_level:
+        conds.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE {' AND '.join(conds)} ORDER BY r.Z_PK LIMIT ?",
+        params + [limit],
+    ).fetchall()
+
+
+def q_reminder(db, pk):
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.Z_PK = ?",
+        (pk,),
+    ).fetchone()
+
+
+def q_subtask_count(db, pk):
+    return db.execute(
+        "SELECT COUNT(*) FROM ZREMCDREMINDER "
+        "WHERE ZPARENTREMINDER = ? AND ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0",
+        (pk,),
+    ).fetchone()[0]
+
+
+def q_sections(db, list_pk=None):
+    if list_pk:
+        return db.execute(
+            "SELECT Z_PK, ZDISPLAYNAME, ZLIST FROM ZREMCDBASESECTION "
+            "WHERE ZMARKEDFORDELETION = 0 AND ZLIST = ? ORDER BY Z_PK",
+            (list_pk,),
+        ).fetchall()
+    return db.execute(
+        "SELECT s.Z_PK, s.ZDISPLAYNAME, s.ZLIST, l.ZNAME as list_name "
+        "FROM ZREMCDBASESECTION s "
+        "LEFT JOIN ZREMCDBASELIST l ON s.ZLIST = l.Z_PK "
+        "WHERE s.ZMARKEDFORDELETION = 0 ORDER BY l.ZNAME, s.Z_PK"
+    ).fetchall()
+
+
+def q_section_memberships(db, list_pk):
+    row = db.execute(
+        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA "
+        "FROM ZREMCDBASELIST WHERE Z_PK = ?",
+        (list_pk,),
+    ).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    sections = db.execute(
+        "SELECT ZCKIDENTIFIER, ZDISPLAYNAME FROM ZREMCDBASESECTION "
+        "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0",
+        (list_pk,),
+    ).fetchall()
+    g2n = {s["ZCKIDENTIFIER"]: s["ZDISPLAYNAME"] for s in sections}
+    return {
+        m["memberID"]: g2n[m["groupID"]]
+        for m in data.get("memberships", [])
+        if m.get("groupID") in g2n and m.get("memberID")
+    }
+
+
+def q_hashtags(db, pk):
+    return db.execute(
+        "SELECT h.ZNAME FROM ZREMCDOBJECT o "
+        "JOIN ZREMCDHASHTAGLABEL h ON o.ZHASHTAGLABEL = h.Z_PK "
+        "WHERE o.ZREMINDER3 = ?",
+        (pk,),
+    ).fetchall()
+
+
+def q_search(db, query, completed=False):
+    conds = [
+        "r.ZMARKEDFORDELETION = 0",
+        "l.Z_PK IS NOT NULL",
+        "(r.ZTITLE LIKE ? OR r.ZNOTES LIKE ?)",
+    ]
+    if not completed:
+        conds.append("r.ZCOMPLETED = 0")
+    pat = f"%{query}%"
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE {' AND '.join(conds)} ORDER BY r.Z_PK DESC LIMIT 100",
+        (pat, pat),
+    ).fetchall()
+
+
+def q_due_today(db, include_overdue=True):
+    sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    eod = sod + timedelta(days=1)
+    if include_overdue:
+        where = f"r.ZDUEDATE < {to_ts(eod)} AND r.ZDUEDATE IS NOT NULL"
+    else:
+        where = (
+            f"r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(eod)}"
+        )
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND {where} ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+
+def q_upcoming(db, days=7):
+    now = datetime.now()
+    end = now + timedelta(days=days)
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
+        f"AND r.ZDUEDATE >= {to_ts(now)} AND r.ZDUEDATE < {to_ts(end)} "
+        f"ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+
+def q_overdue(db):
+    now = datetime.now()
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
+        f"AND r.ZDUEDATE < {to_ts(now)} ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+
+def q_flagged(db):
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
+        f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZFLAGGED = 1 "
+        f"ORDER BY r.ZDUEDATE NULLS LAST"
+    ).fetchall()
+
+
+def q_tags(db):
+    return db.execute(
+        "SELECT ZNAME FROM ZREMCDHASHTAGLABEL "
+        "WHERE ZNAME IS NOT NULL ORDER BY ZNAME"
+    ).fetchall()
+
+
+def q_stats(db):
+    total = db.execute(
+        "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0"
+    ).fetchone()[0]
+    active = db.execute(
+        "SELECT COUNT(*) FROM ZREMCDREMINDER "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0"
+    ).fetchone()[0]
+    flagged = db.execute(
+        "SELECT COUNT(*) FROM ZREMCDREMINDER "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1"
+    ).fetchone()[0]
+    overdue = db.execute(
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER "
+        f"WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 "
+        f"AND ZDUEDATE IS NOT NULL AND ZDUEDATE < {to_ts(datetime.now())}"
+    ).fetchone()[0]
+    lists = len(q_lists(db))
+    sections = len(q_sections(db))
+    return {
+        "total": total,
+        "active": active,
+        "completed": total - active,
+        "overdue": overdue,
+        "flagged": flagged,
+        "lists": lists,
+        "sections": sections,
+    }
+
+
+def preload_extras(db, pks):
+    """Batch-load subtask counts and hashtags to avoid N+1 queries."""
+    if not pks:
+        return {}, {}
+    ph = ",".join("?" * len(pks))
+    sc_rows = db.execute(
+        f"SELECT ZPARENTREMINDER, COUNT(*) FROM ZREMCDREMINDER "
+        f"WHERE ZPARENTREMINDER IN ({ph}) AND ZMARKEDFORDELETION = 0 "
+        f"AND ZCOMPLETED = 0 GROUP BY ZPARENTREMINDER",
+        pks,
+    ).fetchall()
+    sc = {r[0]: r[1] for r in sc_rows}
+    ht_rows = db.execute(
+        f"SELECT o.ZREMINDER3, h.ZNAME FROM ZREMCDOBJECT o "
+        f"JOIN ZREMCDHASHTAGLABEL h ON o.ZHASHTAGLABEL = h.Z_PK "
+        f"WHERE o.ZREMINDER3 IN ({ph})",
+        pks,
+    ).fetchall()
+    ht = {}
+    for r in ht_rows:
+        ht.setdefault(r[0], []).append(r[1])
+    return sc, ht
+
+
+# ── Serialization ────────────────────────────────────────────────────────────
+
+def reminder_to_dict(r, db=None, section=None, _sc=None, _ht=None):
+    """Convert a reminder row to JSON-serializable dict."""
+    sc = (_sc or {}).get(r["Z_PK"], q_subtask_count(db, r["Z_PK"]) if db else 0)
+    tags = (_ht or {}).get(
+        r["Z_PK"],
+        [t["ZNAME"] for t in q_hashtags(db, r["Z_PK"])] if db else [],
+    )
+    d = {
+        "id": r["Z_PK"],
+        "title": r["ZTITLE"],
+        "list": r["list_name"],
+        "completed": bool(r["ZCOMPLETED"]),
+        "flagged": bool(r["ZFLAGGED"]),
+        "priority": PRI_NAME.get(r["ZPRIORITY"] or 0, "none"),
+        "subtaskCount": sc,
+        "isSubtask": bool(r["ZPARENTREMINDER"]),
+    }
+    if section:
+        d["section"] = section
+    if r["ZNOTES"]:
+        d["notes"] = r["ZNOTES"]
+    if r["ZICSURL"]:
+        d["url"] = r["ZICSURL"]
+    if r["ZDUEDATE"]:
+        d["dueDate"] = ts(r["ZDUEDATE"]).isoformat()
+    if r["ZCREATIONDATE"]:
+        d["createdDate"] = ts(r["ZCREATIONDATE"]).isoformat()
+    if r["ZCOMPLETIONDATE"]:
+        d["completionDate"] = ts(r["ZCOMPLETIONDATE"]).isoformat()
+    if r["ZPARENTREMINDER"]:
+        d["parentID"] = r["ZPARENTREMINDER"]
+    if tags:
+        d["tags"] = tags
+    if r["ZCKIDENTIFIER"]:
+        d["deepLink"] = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
+    return d
+
+
+def reminders_to_list(db, rows, with_sections_for_list_pk=None):
+    """Convert multiple reminder rows, optionally resolving section membership."""
+    pks = [r["Z_PK"] for r in rows]
+    sc, ht = preload_extras(db, pks)
+    memberships = {}
+    if with_sections_for_list_pk is not None:
+        memberships = q_section_memberships(db, with_sections_for_list_pk)
+    return [
+        reminder_to_dict(
+            r, db,
+            section=memberships.get(r["ZCKIDENTIFIER"]),
+            _sc=sc, _ht=ht,
+        )
+        for r in rows
+    ]
+
+
+# ── Write Operations ─────────────────────────────────────────────────────────
+
+def resolve_ck_id(pk):
+    """Resolve a SQLite Z_PK to a calendarItemIdentifier for the bridge.
+
+    The bridge uses EventKit calendarItemIdentifiers, but the API exposes
+    integer Z_PK IDs. This function maps between them via ZCKIDENTIFIER.
+    """
+    try:
+        db = open_db()
+        r = db.execute(
+            "SELECT ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDREMINDER r "
+            "LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+            "WHERE r.Z_PK = ?", (pk,)
+        ).fetchone()
+        db.close()
+        if r and r["ZCKIDENTIFIER"]:
+            return f"x-apple-reminder://{r['ZCKIDENTIFIER']}", r["list_name"]
+    except Exception:
+        pass
+    return None, None
+
+
+def bridge_call(action_data):
+    """Call remctl-bridge (Swift EventKit helper) for write operations.
+
+    Automatically resolves integer IDs to calendarItemIdentifiers.
+    """
+    # If action_data has an integer 'id', resolve it to calendarItemIdentifier
+    if "id" in action_data and isinstance(action_data["id"], int):
+        ck_id, list_name = resolve_ck_id(action_data["id"])
+        if ck_id:
+            action_data = dict(action_data)
+            action_data["id"] = ck_id
+        else:
+            return {"ok": False, "error": f"Could not resolve reminder #{action_data['id']}"}
+
+    if BRIDGE_PATH.exists():
+        try:
+            result = subprocess.run(
+                [str(BRIDGE_PATH)],
+                input=json.dumps(action_data),
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+            # Bridge failed, try remctl CLI fallback
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+
+    # Fallback: use remctl CLI
+    return remctl_cli_fallback(action_data)
+
+
+def remctl_cli_fallback(action_data):
+    """Fall back to calling remctl CLI for write operations."""
+    action = action_data.get("action", "")
+    args = [str(REMCTL_PATH), "--json"]
+
+    if action == "create":
+        args.append("add")
+        args.append(action_data.get("title", "Untitled"))
+        if action_data.get("list"):
+            args.extend(["-l", action_data["list"]])
+        if action_data.get("notes"):
+            args.extend(["-n", action_data["notes"]])
+        if action_data.get("due"):
+            args.extend(["-d", action_data["due"]])
+        if action_data.get("priority"):
+            pri = PRI_NAME.get(action_data["priority"], "") if isinstance(
+                action_data["priority"], int
+            ) else action_data["priority"]
+            if pri and pri != "none":
+                args.extend(["-p", pri])
+        if action_data.get("flagged"):
+            args.append("-f")
+
+    elif action == "complete":
+        args.extend(["done", str(action_data["id"])])
+
+    elif action == "uncomplete":
+        args.extend(["undone", str(action_data["id"])])
+
+    elif action == "update":
+        args.extend(["edit", str(action_data["id"])])
+        if action_data.get("title"):
+            args.extend(["--title", action_data["title"]])
+        if action_data.get("notes"):
+            args.extend(["-n", action_data["notes"]])
+        if action_data.get("due"):
+            args.extend(["-d", action_data["due"]])
+        if action_data.get("priority") is not None:
+            pri = action_data["priority"]
+            if isinstance(pri, int):
+                pri = PRI_NAME.get(pri, "none")
+            args.extend(["-p", pri])
+
+    elif action == "delete":
+        args.extend(["delete", str(action_data["id"]), "--force"])
+
+    elif action == "flag":
+        # No direct flag command in remctl CLI — use bridge or skip
+        return {"ok": False, "error": "Flag operation requires remctl-bridge"}
+
+    elif action == "unflag":
+        return {"ok": False, "error": "Unflag operation requires remctl-bridge"}
+
+    elif action == "create_list":
+        # remctl CLI doesn't support list creation
+        return {"ok": False, "error": "List creation requires remctl-bridge"}
+
+    elif action == "rename_list":
+        return {"ok": False, "error": "List rename requires remctl-bridge"}
+
+    elif action == "delete_list":
+        return {"ok": False, "error": "List deletion requires remctl-bridge"}
+
+    else:
+        return {"ok": False, "error": f"Unknown action: {action}"}
+
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            try:
+                return {"ok": True, "data": json.loads(result.stdout)}
+            except json.JSONDecodeError:
+                return {"ok": True, "data": {"message": result.stdout.strip()}}
+        return {"ok": False, "error": result.stderr.strip() or "Command failed"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Command timed out"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "remctl not found"}
+
+
+# ── HTTP Handler ─────────────────────────────────────────────────────────────
+
+class RemctlHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the remctl API."""
+
+    server_version = f"RemCTL/{VERSION}"
+
+    def log_message(self, format, *args):
+        """Override default logging with timestamped format."""
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        client = self.client_address[0]
+        sys.stderr.write(f"[{ts_str}] {client} {format % args}\n")
+
+    # ── Response helpers ─────────────────────────────────────────────────
+
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers", "Authorization, Content-Type"
+        )
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _ok(self, data):
+        self._send_json({"ok": True, "data": data})
+
+    def _error(self, message, status=400):
+        self._send_json({"ok": False, "error": message}, status)
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    # ── Auth ─────────────────────────────────────────────────────────────
+
+    def _check_auth(self):
+        """Validate Bearer token. Returns True if authorized."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            self._error("Missing Authorization: Bearer <token> header", 401)
+            return False
+        token = auth[7:].strip()
+        if token != self.server.api_token:
+            self._error("Invalid token", 401)
+            return False
+        return True
+
+    # ── Route matching ───────────────────────────────────────────────────
+
+    def _parse_path(self):
+        """Parse URL path and query string."""
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path).rstrip("/") or "/"
+        qs = parse_qs(parsed.query)
+        return path, qs
+
+    def _match(self, path, pattern):
+        """Simple pattern matching. Returns dict of captures or None.
+
+        Pattern examples:
+          /api/v1/lists             → {}
+          /api/v1/lists/:name       → {"name": "Shopping"}
+          /api/v1/reminders/:id     → {"id": "42"}
+        """
+        p_parts = pattern.rstrip("/").split("/")
+        u_parts = path.split("/")
+        if len(p_parts) != len(u_parts):
+            return None
+        captures = {}
+        for pp, up in zip(p_parts, u_parts):
+            if pp.startswith(":"):
+                captures[pp[1:]] = up
+            elif pp != up:
+                return None
+        return captures
+
+    # ── HTTP methods ─────────────────────────────────────────────────────
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        t0 = time.monotonic()
+        path, qs = self._parse_path()
+
+        # Health check — no auth required
+        if path == "/health":
+            db_ok = find_main_db() is not None
+            self._ok({
+                "status": "healthy" if db_ok else "degraded",
+                "version": VERSION,
+                "database": "connected" if db_ok else "not found",
+                "timestamp": datetime.now().isoformat(),
+            })
+            self._log_timing("GET", path, 200, t0)
+            return
+
+        if not self._check_auth():
+            self._log_timing("GET", path, 401, t0)
+            return
+
+        try:
+            self._route_get(path, qs, t0)
+        except RuntimeError as e:
+            self._error(str(e), 503)
+            self._log_timing("GET", path, 503, t0)
+        except Exception as e:
+            self._error(f"Internal error: {e}", 500)
+            self._log_timing("GET", path, 500, t0)
+
+    def do_POST(self):
+        t0 = time.monotonic()
+        path, qs = self._parse_path()
+
+        if not self._check_auth():
+            self._log_timing("POST", path, 401, t0)
+            return
+
+        body = self._read_body()
+        if body is None:
+            self._error("Invalid JSON body", 400)
+            self._log_timing("POST", path, 400, t0)
+            return
+
+        try:
+            self._route_post(path, qs, body, t0)
+        except RuntimeError as e:
+            self._error(str(e), 503)
+            self._log_timing("POST", path, 503, t0)
+        except Exception as e:
+            self._error(f"Internal error: {e}", 500)
+            self._log_timing("POST", path, 500, t0)
+
+    def do_PATCH(self):
+        t0 = time.monotonic()
+        path, qs = self._parse_path()
+
+        if not self._check_auth():
+            self._log_timing("PATCH", path, 401, t0)
+            return
+
+        body = self._read_body()
+        if body is None:
+            self._error("Invalid JSON body", 400)
+            self._log_timing("PATCH", path, 400, t0)
+            return
+
+        try:
+            self._route_patch(path, qs, body, t0)
+        except RuntimeError as e:
+            self._error(str(e), 503)
+            self._log_timing("PATCH", path, 503, t0)
+        except Exception as e:
+            self._error(f"Internal error: {e}", 500)
+            self._log_timing("PATCH", path, 500, t0)
+
+    def do_DELETE(self):
+        t0 = time.monotonic()
+        path, qs = self._parse_path()
+
+        if not self._check_auth():
+            self._log_timing("DELETE", path, 401, t0)
+            return
+
+        try:
+            self._route_delete(path, qs, t0)
+        except RuntimeError as e:
+            self._error(str(e), 503)
+            self._log_timing("DELETE", path, 503, t0)
+        except Exception as e:
+            self._error(f"Internal error: {e}", 500)
+            self._log_timing("DELETE", path, 500, t0)
+
+    def _log_timing(self, method, path, status, t0):
+        ms = (time.monotonic() - t0) * 1000
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sys.stderr.write(f"[{ts_str}] {method} {path} {status} ({ms:.0f}ms)\n")
+
+    # ── GET routes ───────────────────────────────────────────────────────
+
+    def _route_get(self, path, qs, t0):
+        db = open_db()
+
+        # GET /api/v1/lists
+        if path == "/api/v1/lists":
+            rows = q_lists(db)
+            data = []
+            for r in rows:
+                secs = q_sections(db, r["Z_PK"])
+                count = db.execute(
+                    "SELECT COUNT(*) FROM ZREMCDREMINDER "
+                    "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0",
+                    (r["Z_PK"],),
+                ).fetchone()[0]
+                data.append({
+                    "id": r["Z_PK"],
+                    "name": r["ZNAME"],
+                    "activeCount": count,
+                    "sectionCount": len(secs),
+                })
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/lists/:name/sections
+        m = self._match(path, "/api/v1/lists/:name/sections")
+        if m:
+            name = unquote(m["name"])
+            pk = q_list_pk(db, name)
+            if pk is None:
+                self._error(f"List '{name}' not found", 404)
+                self._log_timing("GET", path, 404, t0)
+                db.close()
+                return
+            secs = q_sections(db, pk)
+            data = [{"id": s["Z_PK"], "name": s["ZDISPLAYNAME"]} for s in secs]
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/lists/:name
+        m = self._match(path, "/api/v1/lists/:name")
+        if m:
+            name = unquote(m["name"])
+            pk = q_list_pk(db, name)
+            if pk is None:
+                self._error(f"List '{name}' not found", 404)
+                self._log_timing("GET", path, 404, t0)
+                db.close()
+                return
+            items = q_reminders(db, list_pk=pk, top_level=True)
+            data = reminders_to_list(db, items, with_sections_for_list_pk=pk)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/reminders/:id/subtasks
+        m = self._match(path, "/api/v1/reminders/:id/subtasks")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("GET", path, 400, t0)
+                db.close()
+                return
+            parent = q_reminder(db, rid)
+            if not parent:
+                self._error(f"Reminder #{rid} not found", 404)
+                self._log_timing("GET", path, 404, t0)
+                db.close()
+                return
+            subs = q_reminders(db, parent_pk=rid, completed=True)
+            data = reminders_to_list(db, subs)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/reminders/:id
+        m = self._match(path, "/api/v1/reminders/:id")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("GET", path, 400, t0)
+                db.close()
+                return
+            r = q_reminder(db, rid)
+            if not r:
+                self._error(f"Reminder #{rid} not found", 404)
+                self._log_timing("GET", path, 404, t0)
+                db.close()
+                return
+            # Resolve section
+            sec = None
+            if r["ZLIST"]:
+                memberships = q_section_memberships(db, r["ZLIST"])
+                sec = memberships.get(r["ZCKIDENTIFIER"])
+            d = reminder_to_dict(r, db, section=sec)
+            # Include subtasks and attachments in detail view
+            subs = q_reminders(db, parent_pk=rid, completed=True)
+            if subs:
+                d["subtasks"] = reminders_to_list(db, subs)
+            self._ok(d)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/today
+        if path == "/api/v1/today":
+            items = q_due_today(db, include_overdue=True)
+            sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            data = reminders_to_list(db, items)
+            # Tag overdue items
+            for d, r in zip(data, items):
+                due_dt = ts(r["ZDUEDATE"])
+                if due_dt and due_dt < sod:
+                    d["overdue"] = True
+                    d["overdueDays"] = (sod - due_dt).days
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/upcoming
+        if path == "/api/v1/upcoming":
+            days = int(qs.get("days", ["7"])[0])
+            days = max(1, min(days, 90))
+            items = q_upcoming(db, days=days)
+            data = reminders_to_list(db, items)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/overdue
+        if path == "/api/v1/overdue":
+            items = q_overdue(db)
+            data = reminders_to_list(db, items)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/flagged
+        if path == "/api/v1/flagged":
+            items = q_flagged(db)
+            data = reminders_to_list(db, items)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/search
+        if path == "/api/v1/search":
+            query = qs.get("q", [""])[0]
+            if not query:
+                self._error("Missing 'q' query parameter", 400)
+                self._log_timing("GET", path, 400, t0)
+                db.close()
+                return
+            items = q_search(db, query)
+            data = reminders_to_list(db, items)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/tags
+        if path == "/api/v1/tags":
+            rows = q_tags(db)
+            data = [{"name": r["ZNAME"]} for r in rows]
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/sections
+        if path == "/api/v1/sections":
+            rows = q_sections(db)
+            grouped = {}
+            for r in rows:
+                ln = r["list_name"] or "?"
+                grouped.setdefault(ln, []).append({
+                    "id": r["Z_PK"],
+                    "name": r["ZDISPLAYNAME"],
+                })
+            self._ok(grouped)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        # GET /api/v1/stats
+        if path == "/api/v1/stats":
+            data = q_stats(db)
+            self._ok(data)
+            self._log_timing("GET", path, 200, t0)
+            db.close()
+            return
+
+        db.close()
+        self._error(f"Not found: {path}", 404)
+        self._log_timing("GET", path, 404, t0)
+
+    # ── POST routes ──────────────────────────────────────────────────────
+
+    def _route_post(self, path, qs, body, t0):
+
+        # POST /api/v1/reminders/:id/complete
+        m = self._match(path, "/api/v1/reminders/:id/complete")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            result = bridge_call({"action": "complete", "id": rid})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("POST", path, 200, t0)
+            return
+
+        # POST /api/v1/reminders/:id/uncomplete
+        m = self._match(path, "/api/v1/reminders/:id/uncomplete")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            result = bridge_call({"action": "uncomplete", "id": rid})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("POST", path, 200, t0)
+            return
+
+        # POST /api/v1/reminders/:id/flag
+        m = self._match(path, "/api/v1/reminders/:id/flag")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            result = bridge_call({"action": "flag", "id": rid, "flagged": True})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("POST", path, 200, t0)
+            return
+
+        # POST /api/v1/reminders/:id/unflag
+        m = self._match(path, "/api/v1/reminders/:id/unflag")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            result = bridge_call({"action": "unflag", "id": rid, "flagged": False})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("POST", path, 200, t0)
+            return
+
+        # POST /api/v1/reminders — create reminder
+        if path == "/api/v1/reminders":
+            title = body.get("title")
+            if not title:
+                self._error("Missing 'title' field", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            action_data = {"action": "create", "title": title}
+            if body.get("list"):
+                action_data["list"] = body["list"]
+            if body.get("notes"):
+                action_data["notes"] = body["notes"]
+            if body.get("due") or body.get("dueDate"):
+                action_data["due"] = body.get("due") or body.get("dueDate")
+            if body.get("priority"):
+                action_data["priority"] = body["priority"]
+            if body.get("flagged"):
+                action_data["flagged"] = body["flagged"]
+            if body.get("url"):
+                action_data["url"] = body["url"]
+            result = bridge_call(action_data)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                status = 201
+                self._send_json(
+                    {"ok": True, "data": result.get("data", result) if isinstance(result, dict) else result},
+                    status,
+                )
+                self._log_timing("POST", path, status, t0)
+            return
+
+        # POST /api/v1/lists — create list
+        if path == "/api/v1/lists":
+            name = body.get("name")
+            if not name:
+                self._error("Missing 'name' field", 400)
+                self._log_timing("POST", path, 400, t0)
+                return
+            action_data = {"action": "create_list", "title": name}
+            if body.get("color"):
+                action_data["color"] = body["color"]
+            result = bridge_call(action_data)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("POST", path, 500, t0)
+            else:
+                status = 201
+                self._send_json(
+                    {"ok": True, "data": result.get("data", result) if isinstance(result, dict) else result},
+                    status,
+                )
+                self._log_timing("POST", path, status, t0)
+            return
+
+        self._error(f"Not found: {path}", 404)
+        self._log_timing("POST", path, 404, t0)
+
+    # ── PATCH routes ─────────────────────────────────────────────────────
+
+    def _route_patch(self, path, qs, body, t0):
+
+        # PATCH /api/v1/reminders/:id
+        m = self._match(path, "/api/v1/reminders/:id")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("PATCH", path, 400, t0)
+                return
+            action_data = {"action": "update", "id": rid}
+            if "title" in body:
+                action_data["title"] = body["title"]
+            if "notes" in body:
+                action_data["notes"] = body["notes"]
+            if "due" in body or "dueDate" in body:
+                action_data["due"] = body.get("due") or body.get("dueDate")
+            if "priority" in body:
+                action_data["priority"] = body["priority"]
+            if "flagged" in body:
+                action_data["flagged"] = body["flagged"]
+            if "url" in body:
+                action_data["url"] = body["url"]
+            result = bridge_call(action_data)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("PATCH", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("PATCH", path, 200, t0)
+            return
+
+        # PATCH /api/v1/lists/:name
+        m = self._match(path, "/api/v1/lists/:name")
+        if m:
+            name = unquote(m["name"])
+            new_name = body.get("name")
+            if not new_name:
+                self._error("Missing 'name' field for rename", 400)
+                self._log_timing("PATCH", path, 400, t0)
+                return
+            action_data = {
+                "action": "rename_list",
+                "title": name,
+                "newTitle": new_name,
+            }
+            result = bridge_call(action_data)
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("PATCH", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("PATCH", path, 200, t0)
+            return
+
+        self._error(f"Not found: {path}", 404)
+        self._log_timing("PATCH", path, 404, t0)
+
+    # ── DELETE routes ────────────────────────────────────────────────────
+
+    def _route_delete(self, path, qs, t0):
+
+        # DELETE /api/v1/reminders/:id
+        m = self._match(path, "/api/v1/reminders/:id")
+        if m:
+            try:
+                rid = int(m["id"])
+            except ValueError:
+                self._error("Invalid reminder ID", 400)
+                self._log_timing("DELETE", path, 400, t0)
+                return
+            result = bridge_call({"action": "delete", "id": rid})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("DELETE", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("DELETE", path, 200, t0)
+            return
+
+        # DELETE /api/v1/lists/:name
+        m = self._match(path, "/api/v1/lists/:name")
+        if m:
+            name = unquote(m["name"])
+            result = bridge_call({"action": "delete_list", "title": name})
+            if isinstance(result, dict) and result.get("ok") is False:
+                self._error(result.get("error", "Failed"), 500)
+                self._log_timing("DELETE", path, 500, t0)
+            else:
+                self._ok(result.get("data", result) if isinstance(result, dict) else result)
+                self._log_timing("DELETE", path, 200, t0)
+            return
+
+        self._error(f"Not found: {path}", 404)
+        self._log_timing("DELETE", path, 404, t0)
+
+
+# ── Server ───────────────────────────────────────────────────────────────────
+
+class RemctlServer(HTTPServer):
+    """HTTPServer subclass that holds the API token."""
+
+    def __init__(self, addr, handler, api_token):
+        self.api_token = api_token
+        super().__init__(addr, handler)
+
+
+def run_server(port, token, token_source):
+    """Start the HTTP server with graceful shutdown."""
+    server = RemctlServer(("0.0.0.0", port), RemctlHandler, token)
+
+    # Mask middle of token for display
+    if len(token) > 8:
+        masked = token[:4] + "..." + token[-4:]
+    else:
+        masked = "****"
+
+    print(f"""
+RemCTL API Server v{VERSION}
+Listening on http://0.0.0.0:{port}
+Auth: Bearer token required
+Token: {masked}  (from {token_source})
+
+Database: {find_main_db() or 'NOT FOUND'}
+Bridge:   {BRIDGE_PATH} ({'available' if BRIDGE_PATH.exists() else 'not found, using remctl CLI fallback'})
+""", flush=True)
+
+    # Graceful shutdown
+    def _shutdown(signum, frame):
+        signame = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+        sys.stderr.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {signame} received, shutting down...\n")
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Server stopped.\n")
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="remctl-server",
+        description="REST API server for iCloud Reminders (via remctl)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"Server port (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--token",
+        help="Override API token (otherwise loaded from env/file)",
+    )
+    parser.add_argument(
+        "--generate-token", action="store_true",
+        help="Generate a new token, save it, and start server",
+    )
+
+    args = parser.parse_args()
+
+    if args.generate_token:
+        token = secrets.token_urlsafe(32)
+        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(token + "\n")
+        TOKEN_FILE.chmod(0o600)
+        print(f"Generated token: {token}")
+        print(f"Saved to: {TOKEN_FILE}")
+        token_source = f"{TOKEN_FILE} (generated)"
+    else:
+        token, token_source = load_or_create_token(args.token)
+
+    if args.generate_token:
+        run_server(args.port, token, token_source)
+    else:
+        run_server(args.port, token, token_source)
+
+
+if __name__ == "__main__":
+    main()

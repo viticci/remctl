@@ -1,0 +1,1797 @@
+#!/usr/bin/env python3
+"""remctl — Power-user Reminders CLI v3.0.0
+
+Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
+attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
+with AppleScript fallback. Single file, zero dependencies, no build step.
+"""
+
+import argparse, csv, io, json, os, plistlib, re, shutil, sqlite3, subprocess, sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import parsedatetime as _pdt
+    _cal = _pdt.Calendar()
+except ImportError:
+    _cal = None
+
+VERSION = "3.0.0"
+
+APPLE_EPOCH = 978307200
+HOME = Path.home()
+STORE_DIR = HOME / "Library/Group Containers/group.com.apple.reminders/Container_v1/Stores"
+BRIDGE_PATH = HOME / "bin" / "remctl-bridge"
+
+# ── Color System ─────────────────────────────────────────────────────────────
+
+class C:
+    """ANSI color helpers. Respects NO_COLOR env and --no-color flag."""
+    enabled = True
+
+    @staticmethod
+    def _c(code, text):
+        return f"\033[{code}m{text}\033[0m" if C.enabled else str(text)
+
+    @staticmethod
+    def red(t): return C._c("31", t)
+    @staticmethod
+    def green(t): return C._c("32", t)
+    @staticmethod
+    def yellow(t): return C._c("33", t)
+    @staticmethod
+    def blue(t): return C._c("34", t)
+    @staticmethod
+    def magenta(t): return C._c("35", t)
+    @staticmethod
+    def cyan(t): return C._c("36", t)
+    @staticmethod
+    def dim(t): return C._c("2", t)
+    @staticmethod
+    def bold(t): return C._c("1", t)
+    @staticmethod
+    def strikethrough(t): return C._c("9", t)
+    @staticmethod
+    def rgb(r, g, b, t):
+        return f"\033[38;2;{r};{g};{b}m{t}\033[0m" if C.enabled else str(t)
+
+# ── Splash Screen ────────────────────────────────────────────────────────────
+
+LOGO_LINES = [
+    r"██████  ███████ ███    ███  ██████ ████████ ██      ",
+    r"██   ██ ██      ████  ████ ██        ██    ██      ",
+    r"██████  █████   ██ ████ ██ ██        ██    ██      ",
+    r"██   ██ ██      ██  ██  ██ ██        ██    ██      ",
+    r"██   ██ ███████ ██      ██  ██████   ██    ███████ ",
+    r"▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀      ▀▀  ▀▀▀▀▀▀  ▀▀    ▀▀▀▀▀▀▀",
+]
+
+LOGO_COLORS = [
+    (97, 187, 70),    # Green  #61BB46
+    (253, 181, 21),   # Yellow #FDB515
+    (245, 132, 31),   # Orange #F5841F
+    (224, 47, 55),    # Red    #E02F37
+    (150, 61, 151),   # Purple #963D97
+    (0, 157, 220),    # Blue   #009DDC
+]
+
+def show_splash():
+    """Display colored ASCII art splash screen."""
+    print()
+    for line, (r, g, b) in zip(LOGO_LINES, LOGO_COLORS):
+        print(f"  {C.rgb(r, g, b, line)}")
+    print()
+    print(C.dim(f"  v{VERSION} — Power-user Reminders CLI"))
+    print()
+    print(C.dim("  Commands:"))
+    print(C.dim("    today       Due today + overdue          search      Search reminders"))
+    print(C.dim("    show <list> Show list (by section)       add \"title\" Create reminder"))
+    print(C.dim("    info <id>   Full detail view             done <id>   Complete reminder"))
+    print(C.dim("    upcoming    Next 7 days                  flagged     Flagged reminders"))
+    print(C.dim("    stats       Statistics                   lists       All lists"))
+    print()
+    print(C.dim("  remctl --help for full command reference"))
+    print()
+
+# ── Database ─────────────────────────────────────────────────────────────────
+
+def find_main_db():
+    candidates = sorted(STORE_DIR.glob("Data-*.sqlite"), key=lambda p: p.stat().st_size, reverse=True)
+    if not candidates:
+        print("Error: No Reminders database found. Is iCloud Reminders enabled?", file=sys.stderr)
+        sys.exit(1)
+    return candidates[0]
+
+def open_db():
+    conn = sqlite3.connect(f"file:{find_main_db()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def ts(v):
+    if not v: return None
+    return datetime.fromtimestamp(v + APPLE_EPOCH)
+
+def to_ts(dt):
+    return dt.timestamp() - APPLE_EPOCH
+
+PRI = {0: "", 1: "!!!", 5: "!!", 9: "!"}
+PRI_NAME = {0: "none", 1: "high", 5: "medium", 9: "low"}
+
+# ── List Color Parsing ───────────────────────────────────────────────────────
+
+LIST_COLOR_MAP = {
+    "red": (255, 41, 104),
+    "orange": (255, 149, 0),
+    "yellow": (255, 204, 0),
+    "green": (99, 218, 56),
+    "blue": (0, 122, 255),
+    "purple": (204, 115, 225),
+    "brown": (162, 132, 94),
+    "cyan": (90, 200, 250),
+    "teal": (48, 176, 199),
+}
+
+def parse_list_color(blob):
+    """Extract color info from ZCOLOR binary plist (NSKeyedArchiver)."""
+    if not blob:
+        return {"name": "blue", "hex": "#007AFF"}
+    try:
+        data = plistlib.loads(bytes(blob))
+        objects = data.get("$objects", [])
+        for obj in objects:
+            if isinstance(obj, dict) and "ckSymbolicColorName" in obj:
+                name_uid = obj["ckSymbolicColorName"]
+                hex_uid = obj.get("daHexString")
+                name = objects[name_uid.data] if hasattr(name_uid, 'data') else str(name_uid)
+                hex_str = objects[hex_uid.data] if hex_uid and hasattr(hex_uid, 'data') else ""
+                return {"name": name, "hex": hex_str}
+    except Exception:
+        pass
+    return {"name": "blue", "hex": "#007AFF"}
+
+def load_list_colors(db):
+    """Load all list colors into a dict {list_name: (r, g, b)}."""
+    colors = {}
+    try:
+        rows = db.execute(
+            "SELECT ZNAME, ZCOLOR FROM ZREMCDBASELIST "
+            "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            info = parse_list_color(r["ZCOLOR"])
+            rgb = LIST_COLOR_MAP.get(info["name"], (0, 122, 255))
+            colors[r["ZNAME"]] = rgb
+    except Exception:
+        pass
+    return colors
+
+# Global list color cache — populated on demand
+_list_colors = None
+
+def get_list_colors(db):
+    global _list_colors
+    if _list_colors is None:
+        _list_colors = load_list_colors(db)
+    return _list_colors
+
+def color_list_name(name, db=None):
+    """Return the list name colored by its Reminders color."""
+    if not name or not C.enabled:
+        return name or "(none)"
+    if db:
+        colors = get_list_colors(db)
+        if name in colors:
+            r, g, b = colors[name]
+            return C.rgb(r, g, b, name)
+    return C.cyan(name)
+
+# ── Queries ──────────────────────────────────────────────────────────────────
+
+def q_lists(db):
+    return db.execute(
+        "SELECT Z_PK, ZNAME FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL AND ZNAME != '' "
+        "ORDER BY ZNAME"
+    ).fetchall()
+
+def q_list_pk(db, name):
+    r = db.execute(
+        "SELECT Z_PK FROM ZREMCDBASELIST WHERE ZNAME = ? COLLATE NOCASE AND ZMARKEDFORDELETION = 0 LIMIT 1", (name,)
+    ).fetchone()
+    return r[0] if r else None
+
+_REM_COLS = """r.Z_PK, r.ZTITLE, r.ZNOTES, r.ZCOMPLETED, r.ZFLAGGED, r.ZPRIORITY,
+    r.ZDUEDATE, r.ZALLDAY, r.ZCOMPLETIONDATE, r.ZCREATIONDATE,
+    r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name"""
+
+def q_reminders(db, list_pk=None, completed=False, parent_pk=None, top_level=False, limit=500):
+    c, params = ["r.ZMARKEDFORDELETION = 0"], []
+    if not completed: c.append("r.ZCOMPLETED = 0")
+    if list_pk is not None: c.append("r.ZLIST = ?"); params.append(list_pk)
+    if parent_pk is not None: c.append("r.ZPARENTREMINDER = ?"); params.append(parent_pk)
+    elif top_level: c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} ORDER BY r.Z_PK LIMIT ?",
+        params + [limit]
+    ).fetchall()
+
+def q_reminder(db, pk):
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.Z_PK = ?", (pk,)
+    ).fetchone()
+
+def q_subtask_count(db, pk):
+    return db.execute(
+        "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZPARENTREMINDER = ? "
+        "AND ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0", (pk,)
+    ).fetchone()[0]
+
+def q_sections(db, list_pk=None):
+    if list_pk:
+        return db.execute(
+            "SELECT Z_PK, ZDISPLAYNAME, ZLIST FROM ZREMCDBASESECTION "
+            "WHERE ZMARKEDFORDELETION = 0 AND ZLIST = ? ORDER BY Z_PK", (list_pk,)
+        ).fetchall()
+    return db.execute(
+        "SELECT s.Z_PK, s.ZDISPLAYNAME, s.ZLIST, l.ZNAME as list_name FROM ZREMCDBASESECTION s "
+        "LEFT JOIN ZREMCDBASELIST l ON s.ZLIST = l.Z_PK "
+        "WHERE s.ZMARKEDFORDELETION = 0 ORDER BY l.ZNAME, s.Z_PK"
+    ).fetchall()
+
+def q_section_memberships(db, list_pk):
+    row = db.execute(
+        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
+        (list_pk,)
+    ).fetchone()
+    if not row or not row[0]: return {}
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    sections = db.execute(
+        "SELECT ZCKIDENTIFIER, ZDISPLAYNAME FROM ZREMCDBASESECTION "
+        "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0", (list_pk,)
+    ).fetchall()
+    g2n = {s["ZCKIDENTIFIER"]: s["ZDISPLAYNAME"] for s in sections}
+    return {
+        m["memberID"]: g2n[m["groupID"]]
+        for m in data.get("memberships", [])
+        if m.get("groupID") in g2n and m.get("memberID")
+    }
+
+def q_attachments(db, pk):
+    return db.execute(
+        "SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
+        "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0", (pk,)
+    ).fetchall()
+
+def q_hashtags(db, pk):
+    return db.execute(
+        "SELECT h.ZNAME FROM ZREMCDOBJECT o JOIN ZREMCDHASHTAGLABEL h "
+        "ON o.ZHASHTAGLABEL = h.Z_PK WHERE o.ZREMINDER3 = ?", (pk,)
+    ).fetchall()
+
+def q_search(db, query, completed=False):
+    c = ["r.ZMARKEDFORDELETION = 0", "l.Z_PK IS NOT NULL", "(r.ZTITLE LIKE ? OR r.ZNOTES LIKE ?)"]
+    if not completed: c.append("r.ZCOMPLETED = 0")
+    pat = f"%{query}%"
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} ORDER BY r.Z_PK DESC LIMIT 100",
+        (pat, pat)
+    ).fetchall()
+
+def q_due_today(db, include_overdue=True):
+    now = datetime.now()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    eod = sod + timedelta(days=1)
+    if include_overdue:
+        w = f"r.ZDUEDATE < {to_ts(eod)} AND r.ZDUEDATE IS NOT NULL"
+    else:
+        w = f"r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(eod)}"
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND {w} ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+def q_flagged(db):
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZFLAGGED = 1 ORDER BY r.ZDUEDATE NULLS LAST"
+    ).fetchall()
+
+def q_upcoming(db, days=7):
+    """Reminders due within the next N days (not overdue)."""
+    now = datetime.now()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    future = sod + timedelta(days=days + 1)
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
+        f"AND r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(future)} "
+        f"ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+def q_overdue(db):
+    """All overdue incomplete reminders."""
+    now = datetime.now()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return db.execute(
+        f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
+        f"AND r.ZDUEDATE < {to_ts(sod)} ORDER BY r.ZDUEDATE"
+    ).fetchall()
+
+# ── Format ───────────────────────────────────────────────────────────────────
+
+def fmt_due(v, colored=True):
+    if not v: return ""
+    dt, now = ts(v), datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if dt.date() == today.date():
+        label = f" (today {dt.strftime('%H:%M')})" if dt.hour or dt.minute else " (today)"
+        return label
+    if dt.date() == (today + timedelta(days=1)).date():
+        return " (tomorrow)"
+    if dt < now:
+        label = f" (overdue {(now - dt).days}d)"
+        return C.red(label) if colored else label
+    return f" ({dt.strftime('%Y-%m-%d')})"
+
+def preload_extras(db, pks):
+    """Batch-load subtask counts and hashtags to avoid N+1 queries."""
+    if not pks: return {}, {}
+    ph = ",".join("?" * len(pks))
+    sc_rows = db.execute(
+        f"SELECT ZPARENTREMINDER, COUNT(*) FROM ZREMCDREMINDER "
+        f"WHERE ZPARENTREMINDER IN ({ph}) AND ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 "
+        f"GROUP BY ZPARENTREMINDER", pks
+    ).fetchall()
+    sc = {r[0]: r[1] for r in sc_rows}
+    ht_rows = db.execute(
+        f"SELECT o.ZREMINDER3, h.ZNAME FROM ZREMCDOBJECT o JOIN ZREMCDHASHTAGLABEL h "
+        f"ON o.ZHASHTAGLABEL = h.Z_PK WHERE o.ZREMINDER3 IN ({ph})", pks
+    ).fetchall()
+    ht = {}
+    for r in ht_rows:
+        ht.setdefault(r[0], []).append(r[1])
+    return sc, ht
+
+def _color_priority(pri_val):
+    """Color a priority marker based on level."""
+    p = PRI.get(pri_val or 0, "")
+    if not p: return ""
+    if pri_val == 1: return C.red(p)
+    if pri_val == 5: return C.yellow(p)
+    if pri_val == 9: return C.green(p)
+    return p
+
+def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
+    completed = r["ZCOMPLETED"]
+    if completed:
+        status = C.green("[x]")
+    else:
+        status = C.dim("[ ]")
+    flag = C.yellow(" *") if r["ZFLAGGED"] else ""
+    pri_val = r["ZPRIORITY"] or 0
+    sc = (_sc or {}).get(r["Z_PK"], q_subtask_count(db, r["Z_PK"]) if db else 0)
+    tags = (_ht or {}).get(r["Z_PK"], [t["ZNAME"] for t in q_hashtags(db, r["Z_PK"])] if db else [])
+    tag_str = " " + " ".join(f"#{t}" for t in tags) if tags else ""
+    sub_str = f" [{sc} subtask{'s' if sc != 1 else ''}]" if sc > 0 else ""
+    pri_str = f" {_color_priority(pri_val)}" if PRI.get(pri_val, "") else ""
+    id_str = C.dim(f"#{r['Z_PK']}")
+    title = r["ZTITLE"] or "(untitled)"
+    due_str = fmt_due(r["ZDUEDATE"])
+    if completed:
+        title = C.dim(C.strikethrough(title))
+        due_str = C.dim(due_str)
+        tag_str = C.dim(tag_str)
+        sub_str = C.dim(sub_str)
+    parts = [f"{indent}{status} {id_str}{pri_str}{flag} {title}{due_str}{tag_str}{sub_str}"]
+    if verbose:
+        if r["list_name"]:
+            parts.append(f"{indent}    List: {color_list_name(r['list_name'], db)}")
+        if r["ZNOTES"]:
+            parts.append(f"{indent}    Notes: {C.dim(str(r['ZNOTES'])[:200])}")
+        if r["ZICSURL"]:
+            parts.append(f"{indent}    URL: {C.dim(r['ZICSURL'])}")
+    return "\n".join(parts)
+
+def to_dict(r, db=None, section=None, _sc=None, _ht=None):
+    sc = (_sc or {}).get(r["Z_PK"], q_subtask_count(db, r["Z_PK"]) if db else 0)
+    tags = (_ht or {}).get(r["Z_PK"], [t["ZNAME"] for t in q_hashtags(db, r["Z_PK"])] if db else [])
+    d = {
+        "id": r["Z_PK"], "title": r["ZTITLE"], "list": r["list_name"],
+        "completed": bool(r["ZCOMPLETED"]), "flagged": bool(r["ZFLAGGED"]),
+        "priority": PRI_NAME.get(r["ZPRIORITY"] or 0, "none"),
+        "subtaskCount": sc, "isSubtask": bool(r["ZPARENTREMINDER"])
+    }
+    if section: d["section"] = section
+    if r["ZNOTES"]: d["notes"] = r["ZNOTES"]
+    if r["ZICSURL"]: d["url"] = r["ZICSURL"]
+    if r["ZDUEDATE"]: d["dueDate"] = ts(r["ZDUEDATE"]).isoformat()
+    if r["ZCREATIONDATE"]: d["createdDate"] = ts(r["ZCREATIONDATE"]).isoformat()
+    if r["ZCOMPLETIONDATE"]: d["completionDate"] = ts(r["ZCOMPLETIONDATE"]).isoformat()
+    if r["ZPARENTREMINDER"]: d["parentID"] = r["ZPARENTREMINDER"]
+    if tags: d["tags"] = tags
+    if r["ZCKIDENTIFIER"]:
+        d["deepLink"] = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
+    return d
+
+# ── Table Format ─────────────────────────────────────────────────────────────
+
+def _strip_ansi(s):
+    """Remove ANSI escape codes for width calculation."""
+    return re.sub(r'\033\[[0-9;]*m', '', s)
+
+def _visible_len(s):
+    """Length of string as displayed (without ANSI codes)."""
+    return len(_strip_ansi(s))
+
+def _pad(s, width):
+    """Pad string to width, accounting for ANSI codes."""
+    visible = _visible_len(s)
+    return s + " " * max(0, width - visible)
+
+def fmt_table(rows_data, max_width=None):
+    """Format data as a Unicode box-drawing table.
+
+    rows_data: list of dicts with keys: id, title, list, due, pri
+    """
+    if not rows_data:
+        return ""
+    if max_width is None:
+        try:
+            max_width = os.get_terminal_size().columns
+        except (ValueError, OSError):
+            max_width = 80
+
+    headers = ["ID", "Title", "List", "Due", "Pri"]
+    # Calculate column widths
+    col_widths = [len(h) for h in headers]
+    for row in rows_data:
+        vals = [str(row.get("id", "")), row.get("title", ""), row.get("list", ""),
+                row.get("due", ""), row.get("pri", "")]
+        for i, v in enumerate(vals):
+            col_widths[i] = max(col_widths[i], _visible_len(str(v)))
+
+    # Cap title column so table fits terminal
+    fixed = col_widths[0] + col_widths[2] + col_widths[3] + col_widths[4] + 16  # borders + padding
+    max_title = max(10, max_width - fixed)
+    col_widths[1] = min(col_widths[1], max_title)
+
+    def hline(left, mid, right, fill="─"):
+        parts = [left]
+        for i, w in enumerate(col_widths):
+            parts.append(fill * (w + 2))
+            parts.append(mid if i < len(col_widths) - 1 else "")
+        parts.append(right)
+        return "".join(parts)
+
+    def row_line(vals):
+        cells = []
+        for i, v in enumerate(vals):
+            s = str(v)
+            # Truncate if needed (by visible length)
+            if _visible_len(s) > col_widths[i]:
+                plain = _strip_ansi(s)
+                s = plain[:col_widths[i] - 1] + "…"
+            cells.append(f" {_pad(s, col_widths[i])} ")
+        return "│" + "│".join(cells) + "│"
+
+    lines = []
+    lines.append(hline("┌", "┬", "┐"))
+    lines.append(row_line([C.bold(h) for h in headers]))
+    lines.append(hline("├", "┼", "┤"))
+    for row in rows_data:
+        vals = [
+            C.dim(str(row.get("id", ""))),
+            row.get("title", ""),
+            row.get("list", ""),
+            row.get("due", ""),
+            row.get("pri", "")
+        ]
+        lines.append(row_line(vals))
+    lines.append(hline("└", "┴", "┘"))
+    return "\n".join(lines)
+
+def reminders_to_table_data(items, db=None):
+    """Convert reminder rows to table-friendly dicts."""
+    data = []
+    now = datetime.now()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for r in items:
+        due_str = ""
+        if r["ZDUEDATE"]:
+            dt = ts(r["ZDUEDATE"])
+            if dt.date() == sod.date():
+                due_str = "Today"
+                if dt.hour or dt.minute:
+                    due_str += f" {dt.strftime('%H:%M')}"
+            elif dt.date() == (sod + timedelta(days=1)).date():
+                due_str = "Tomorrow"
+            elif dt < now:
+                due_str = C.red(f"Overdue {(now - dt).days}d")
+            else:
+                due_str = dt.strftime("%Y-%m-%d")
+        pri_val = r["ZPRIORITY"] or 0
+        pri_str = _color_priority(pri_val) if PRI.get(pri_val, "") else ""
+        title = r["ZTITLE"] or "(untitled)"
+        if r["ZFLAGGED"]:
+            title = C.yellow("* ") + title
+        list_name = r["list_name"] or ""
+        if db and C.enabled:
+            list_name = color_list_name(list_name, db)
+        data.append({
+            "id": r["Z_PK"],
+            "title": title,
+            "list": list_name,
+            "due": due_str,
+            "pri": pri_str,
+        })
+    return data
+
+# ── Bridge Integration ───────────────────────────────────────────────────────
+
+def bridge_available():
+    """Check if remctl-bridge (Swift EventKit binary) is available."""
+    return BRIDGE_PATH.exists() and BRIDGE_PATH.stat().st_mode & 0o111
+
+def bridge_call(data):
+    """Call remctl-bridge with JSON data. Returns parsed JSON response."""
+    try:
+        r = subprocess.run(
+            [str(BRIDGE_PATH)], input=json.dumps(data),
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        return None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        return None
+
+# ── AppleScript ──────────────────────────────────────────────────────────────
+
+def osa(script):
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print("Error: AppleScript timed out (Reminders.app may be unresponsive)", file=sys.stderr)
+        sys.exit(1)
+    if r.returncode != 0:
+        print(f"AppleScript error: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return r.stdout.strip()
+
+def osa_by_id(list_name, rem_id, action):
+    """Run AppleScript action on a reminder matched by its x-apple-reminder ID."""
+    return osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(list_name)}"\n'
+        f'set r to (first reminder whose id is "{esc(rem_id)}")\n'
+        f'{action}\n'
+        f'end tell\n'
+        f'end tell'
+    )
+
+def esc(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", "")
+
+def as_date(dt):
+    return dt.strftime("%A, %B %d, %Y at %I:%M:%S %p")
+
+# ── Natural Language Date Parser ─────────────────────────────────────────────
+
+def parse_due(s):
+    """Parse due date. Accepts:
+      - ISO: 2026-04-15, 2026-04-15 14:00, 2026-04-15T14:00
+      - Shortcuts: today, tomorrow, eod, eow, +3d, +1w, +2h, +1m
+      - Relative: "in 3 days", "in 2 weeks"
+      - Named days: "next monday", "next friday at 3pm"
+      - Natural language (if parsedatetime installed): "march 30 2pm"
+    """
+    if not s: return None
+    sl = s.lower().strip()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now()
+
+    # Exact shortcuts
+    if sl == "today": return today
+    if sl == "tomorrow": return today + timedelta(days=1)
+    if sl == "eod": return today.replace(hour=17, minute=0)
+    if sl == "eow":
+        days_ahead = 4 - today.weekday()  # Friday = 4
+        if days_ahead <= 0: days_ahead += 7
+        return today + timedelta(days=days_ahead)
+
+    # Relative: +3d, +1w, +2m, +2h
+    m = re.match(r'^[+]?(\d+)([dwmh])$', sl)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit == 'd': return today + timedelta(days=n)
+        if unit == 'w': return today + timedelta(weeks=n)
+        if unit == 'h': return now + timedelta(hours=n)
+        if unit == 'm': return today + timedelta(days=n * 30)
+
+    # "next monday", "next friday at 3pm"
+    days_map = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+        "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6
+    }
+    m = re.match(r'^next\s+(\w+)(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$', sl)
+    if m:
+        day_name, hour, minute, ampm = m.groups()
+        if day_name in days_map:
+            target = days_map[day_name]
+            days_ahead = (target - today.weekday()) % 7
+            if days_ahead == 0: days_ahead = 7
+            dt = today + timedelta(days=days_ahead)
+            if hour:
+                h = int(hour)
+                if ampm == "pm" and h < 12: h += 12
+                if ampm == "am" and h == 12: h = 0
+                dt = dt.replace(hour=h, minute=int(minute or 0))
+            return dt
+
+    # "in N days/weeks/hours/months"
+    m = re.match(r'^in\s+(\d+)\s+(day|days|week|weeks|hour|hours|month|months)$', sl)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if "day" in unit: return today + timedelta(days=n)
+        if "week" in unit: return today + timedelta(weeks=n)
+        if "hour" in unit: return now + timedelta(hours=n)
+        if "month" in unit: return today + timedelta(days=n * 30)
+
+    # ISO formats
+    for f in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s.strip(), f)
+        except ValueError:
+            pass
+
+    # Fallback to parsedatetime if available
+    if _cal:
+        result, status = _cal.parseDT(s)
+        if status > 0: return result
+
+    return None
+
+# ── Recurrence / Alarm Parsing ───────────────────────────────────────────────
+
+def parse_recurrence(spec):
+    """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15'."""
+    parts = spec.lower().split()
+    freq = parts[0]
+    result = {"frequency": freq, "interval": 1}
+    if freq == "weekly" and len(parts) > 1:
+        day_map = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
+        days = [day_map[d.strip()] for d in parts[1].split(",") if d.strip() in day_map]
+        if days: result["daysOfWeek"] = days
+    elif freq == "monthly" and len(parts) > 1:
+        days = [int(d) for d in parts[1].split(",") if d.strip().isdigit()]
+        if days: result["daysOfMonth"] = days
+    return result
+
+def parse_alarm(spec):
+    """Parse alarm spec like '15m', '1h', '1d', or ISO datetime."""
+    if not spec: return None
+    sl = spec.lower().strip()
+    m = re.match(r'^(\d+)(m|min|h|hr|d)$', sl)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit in ("m", "min"): return {"minutes_before": n}
+        if unit in ("h", "hr"): return {"minutes_before": n * 60}
+        if unit == "d": return {"minutes_before": n * 1440}
+    # Try ISO datetime
+    for f in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(spec.strip(), f)
+            return {"absolute": dt.isoformat()}
+        except ValueError:
+            pass
+    return None
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_lists(a):
+    db = open_db()
+    rows = q_lists(db)
+    if a.json:
+        print(json.dumps([{"id": r["Z_PK"], "title": r["ZNAME"]} for r in rows], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        data = [{"id": r["Z_PK"], "title": r["ZNAME"],
+                 "list": "", "due": "", "pri": ""} for r in rows]
+        print(fmt_table(data))
+        return
+    print(C.bold("Reminder Lists:"))
+    for r in rows:
+        secs = q_sections(db, r["Z_PK"])
+        list_name = color_list_name(r["ZNAME"], db)
+        sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
+        id_dim = C.dim(f"(id: {r['Z_PK']})")
+        print(f"  {list_name} {id_dim}{sec_info}")
+    print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
+
+def cmd_show(a):
+    db = open_db()
+    pk = q_list_pk(db, a.list)
+    if pk is None:
+        print(f"Error: List '{a.list}' not found", file=sys.stderr)
+        sys.exit(1)
+    items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
+    pks = [i["Z_PK"] for i in items]
+    sc, ht = preload_extras(db, pks)
+    secs = q_sections(db, pk)
+    memberships = q_section_memberships(db, pk) if secs else {}
+    if a.json:
+        print(json.dumps(
+            [to_dict(i, db, section=memberships.get(i["ZCKIDENTIFIER"]), _sc=sc, _ht=ht) for i in items],
+            indent=2
+        ))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print(f"No {'active ' if not a.completed else ''}reminders in '{a.list}'")
+        return
+    print(f"{C.bold(color_list_name(a.list, db))}:")
+    if secs:
+        sec_items, unsectioned = {}, []
+        for item in items:
+            sn = memberships.get(item["ZCKIDENTIFIER"])
+            if sn:
+                sec_items.setdefault(sn, []).append(item)
+            else:
+                unsectioned.append(item)
+        for item in unsectioned:
+            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
+        for sn in [s["ZDISPLAYNAME"] for s in secs]:
+            if sn in sec_items:
+                print(f"\n  {C.bold(f'[{sn}]')}")
+                for item in sec_items[sn]:
+                    print(fmt(item, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+    else:
+        for item in items:
+            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
+    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
+
+def cmd_add(a):
+    title = a.title
+    if a.tags:
+        for t in a.tags.split(","):
+            t = t.strip()
+            h = t if t.startswith("#") else f"#{t}"
+            if h not in title:
+                title += f" {h}"
+    pm = {"high": 1, "h": 1, "medium": 5, "med": 5, "m": 5, "low": 9, "l": 9}
+    dt = parse_due(a.due)
+    if a.due and not dt:
+        print(f"Warning: Could not parse due date '{a.due}'. Creating reminder without due date.", file=sys.stderr)
+
+    # Try bridge first
+    if bridge_available():
+        data = {"action": "create", "title": title}
+        if a.list: data["list"] = a.list
+        if a.notes: data["notes"] = a.notes
+        if dt: data["due"] = dt.isoformat()
+        if a.priority and a.priority.lower() in pm:
+            data["priority"] = pm[a.priority.lower()]
+        if a.flag: data["flagged"] = True
+        if hasattr(a, 'url') and a.url: data["url"] = a.url
+        if hasattr(a, 'recurrence') and a.recurrence:
+            data["recurrence"] = parse_recurrence(a.recurrence)
+        if hasattr(a, 'alarm') and a.alarm:
+            data["alarm"] = parse_alarm(a.alarm)
+        result = bridge_call(data)
+        if result and result.get("status") == "created":
+            if a.json:
+                print(json.dumps({"status": "created", "id": result.get("id", ""), "title": title}))
+            else:
+                print(f"Created: {title}")
+            return
+
+    # Fall back to AppleScript
+    lst = f'tell list "{esc(a.list)}"' if a.list else "tell default list"
+    s = f'tell application "Reminders"\n{lst}\nset r to make new reminder with properties {{name:"{esc(title)}"}}\n'
+    if a.notes: s += f'set body of r to "{esc(a.notes)}"\n'
+    if a.priority and a.priority.lower() in pm:
+        s += f"set priority of r to {pm[a.priority.lower()]}\n"
+    if a.flag: s += "set flagged of r to true\n"
+    if dt: s += f'set due date of r to date "{as_date(dt)}"\n'
+    s += "return id of r\nend tell\nend tell"
+    rid = osa(s)
+    if a.json:
+        print(json.dumps({"status": "created", "id": rid, "title": title}))
+    else:
+        print(f"Created: {title}")
+
+def _rem_id(r):
+    """Build the x-apple-reminder:// ID that AppleScript uses for matching."""
+    return f"x-apple-reminder://{r['ZCKIDENTIFIER']}" if r["ZCKIDENTIFIER"] else None
+
+def _bridge_write(action, pk, db, extra=None):
+    """Attempt a bridge write operation. Returns True on success."""
+    if not bridge_available():
+        return False
+    r = q_reminder(db, pk)
+    if not r or not r["ZCKIDENTIFIER"]:
+        return False
+    data = {"action": action, "id": r["ZCKIDENTIFIER"]}
+    if extra:
+        data.update(extra)
+    result = bridge_call(data)
+    return result is not None and result.get("status") in ("completed", "uncompleted", "deleted", "updated", "flagged", "unflagged")
+
+def cmd_done(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
+        result = bridge_call(data)
+        if result and result.get("status") == "completed":
+            if a.json:
+                print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+            else:
+                print(f"Completed: {r['ZTITLE']}")
+            return
+
+    # Fall back to AppleScript
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, "set completed of r to true")
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is false)\n'
+            f'if (count of rs) > 0 then\n'
+            f'set completed of item 1 of rs to true\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Completed: {r['ZTITLE']}")
+
+def cmd_undone(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "uncomplete", "id": r["ZCKIDENTIFIER"]}
+        result = bridge_call(data)
+        if result and result.get("status") == "uncompleted":
+            if a.json:
+                print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
+            else:
+                print(f"Uncompleted: {r['ZTITLE']}")
+            return
+
+    # Fall back to AppleScript
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, "set completed of r to false")
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is true)\n'
+            f'if (count of rs) > 0 then\n'
+            f'set completed of item 1 of rs to false\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Uncompleted: {r['ZTITLE']}")
+
+def cmd_delete(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+    if not a.force:
+        ans = input(f"Delete '{r['ZTITLE']}' from {r['list_name']}? [y/N] ")
+        if not ans.lower().startswith("y"):
+            print("Cancelled.")
+            return
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "delete", "id": r["ZCKIDENTIFIER"]}
+        result = bridge_call(data)
+        if result and result.get("status") == "deleted":
+            if a.json:
+                print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
+            else:
+                print(f"Deleted: {r['ZTITLE']}")
+            return
+
+    # Fall back to AppleScript
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, "delete r")
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+            f'if (count of rs) > 0 then\n'
+            f'delete item 1 of rs\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Deleted: {r['ZTITLE']}")
+
+def cmd_edit(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
+        has_changes = False
+        if a.title: data["title"] = a.title; has_changes = True
+        if a.notes: data["notes"] = a.notes; has_changes = True
+        pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+        if a.priority and a.priority.lower() in pm:
+            data["priority"] = pm[a.priority.lower()]; has_changes = True
+        if a.due == "clear":
+            data["due"] = None; has_changes = True
+        elif a.due:
+            dt = parse_due(a.due)
+            if dt: data["due"] = dt.isoformat(); has_changes = True
+        if hasattr(a, 'url') and a.url:
+            data["url"] = a.url; has_changes = True
+        if hasattr(a, 'recurrence') and a.recurrence:
+            data["recurrence"] = parse_recurrence(a.recurrence); has_changes = True
+        if hasattr(a, 'alarm') and a.alarm:
+            data["alarm"] = parse_alarm(a.alarm); has_changes = True
+        if has_changes:
+            result = bridge_call(data)
+            if result and result.get("status") == "updated":
+                if a.json:
+                    print(json.dumps({"status": "updated", "id": a.id}))
+                else:
+                    print(f"Updated #{a.id}")
+                return
+
+    # Fall back to AppleScript
+    parts = []
+    if a.title: parts.append(f'set name of r to "{esc(a.title)}"')
+    if a.notes: parts.append(f'set body of r to "{esc(a.notes)}"')
+    pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+    if a.priority and a.priority.lower() in pm:
+        parts.append(f"set priority of r to {pm[a.priority.lower()]}")
+    if a.due == "clear":
+        parts.append("set due date of r to missing value")
+    elif a.due:
+        dt = parse_due(a.due)
+        if dt: parts.append(f'set due date of r to date "{as_date(dt)}"')
+    if not parts:
+        print("Nothing to update.")
+        return
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, chr(10).join(parts))
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+            f'if (count of rs) > 0 then\n'
+            f'set r to item 1 of rs\n'
+            f'{chr(10).join(parts)}\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "updated", "id": a.id}))
+    else:
+        print(f"Updated #{a.id}")
+
+def cmd_search(a):
+    db = open_db()
+    items = q_search(db, a.query, completed=a.completed)
+    if a.json:
+        print(json.dumps([to_dict(i, db) for i in items], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print(f"No reminders matching '{a.query}'")
+        return
+    print(f"Search: {C.bold(a.query)}")
+    for i in items:
+        print(fmt(i, db, verbose=a.verbose))
+    print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
+
+def cmd_today(a):
+    db = open_db()
+    items = q_due_today(db, include_overdue=not a.no_overdue)
+    if a.json:
+        print(json.dumps([to_dict(i, db) for i in items], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
+        return
+    sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    overdue = [i for i in items if ts(i["ZDUEDATE"]) < sod]
+    overdue_pks = {i["Z_PK"] for i in overdue}
+    due = [i for i in items if i["Z_PK"] not in overdue_pks]
+    if overdue:
+        print(C.red(f"Overdue ({len(overdue)}):"))
+        for i in overdue:
+            print(fmt(i, db, indent="  "))
+        print()
+    if due:
+        print(C.bold(f"Due Today ({len(due)}):"))
+        for i in due:
+            print(fmt(i, db, indent="  "))
+    print(f"\n{len(items)} total")
+
+def cmd_flagged(a):
+    db = open_db()
+    items = q_flagged(db)
+    if a.json:
+        print(json.dumps([to_dict(i, db) for i in items], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print("No flagged reminders")
+        return
+    print(C.bold("Flagged:"))
+    for i in items:
+        print(fmt(i, db, verbose=a.verbose, indent="  "))
+    print(f"\n{len(items)} flagged")
+
+def cmd_tags(a):
+    db = open_db()
+    rows = db.execute(
+        "SELECT ZNAME FROM ZREMCDHASHTAGLABEL WHERE ZNAME IS NOT NULL ORDER BY ZNAME"
+    ).fetchall()
+    if a.json:
+        print(json.dumps([{"name": r["ZNAME"]} for r in rows], indent=2))
+        return
+    if not rows:
+        print("No tags found")
+        return
+    print(C.bold("Tags:"))
+    for r in rows:
+        print(f"  {C.magenta('#' + r['ZNAME'])}")
+    print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
+
+def cmd_subtasks(a):
+    db = open_db()
+    parent = q_reminder(db, a.id)
+    if not parent:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+    subs = q_reminders(db, parent_pk=a.id, completed=True)
+    if a.json:
+        d = to_dict(parent, db)
+        d["subtasks"] = [to_dict(s, db) for s in subs]
+        print(json.dumps(d, indent=2))
+        return
+    print(f"Parent: {parent['ZTITLE']}")
+    if not subs:
+        print("  No subtasks")
+    else:
+        for s in subs:
+            print(fmt(s, db, indent="  "))
+        print(f"\n{len(subs)} subtask{'s' if len(subs) != 1 else ''}")
+
+def cmd_info(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+    subs = q_reminders(db, parent_pk=a.id, completed=True)
+    atts = q_attachments(db, a.id)
+    tags = q_hashtags(db, a.id)
+    sec = None
+    if r["ZLIST"]:
+        memberships = q_section_memberships(db, r["ZLIST"])
+        sec = memberships.get(r["ZCKIDENTIFIER"])
+    if a.json:
+        d = to_dict(r, db, section=sec)
+        if subs: d["subtasks"] = [to_dict(s, db) for s in subs]
+        if atts: d["attachments"] = [{"filename": a2["ZFILENAME"], "type": a2["ZATTACHMENTTYPERAWVALUE"]} for a2 in atts]
+        print(json.dumps(d, indent=2))
+        return
+    print(C.bold(f"Reminder #{r['Z_PK']}"))
+    print(f"  Title:     {r['ZTITLE']}")
+    print(f"  List:      {color_list_name(r['list_name'], db)}")
+    if sec: print(f"  Section:   {C.bold(sec)}")
+    status_str = C.green("Completed") if r["ZCOMPLETED"] else C.yellow("Active")
+    print(f"  Status:    {status_str}")
+    pri_val = r["ZPRIORITY"] or 0
+    pri_display = PRI_NAME.get(pri_val, "none")
+    if pri_val == 1: pri_display = C.red(pri_display)
+    elif pri_val == 5: pri_display = C.yellow(pri_display)
+    elif pri_val == 9: pri_display = C.green(pri_display)
+    print(f"  Priority:  {pri_display}")
+    flagged_str = C.yellow("Yes") if r["ZFLAGGED"] else "No"
+    print(f"  Flagged:   {flagged_str}")
+    if r["ZDUEDATE"]:
+        print(f"  Due:       {ts(r['ZDUEDATE']).strftime('%b %d, %Y at %I:%M %p')}")
+    if r["ZCREATIONDATE"]:
+        print(f"  Created:   {ts(r['ZCREATIONDATE']).strftime('%b %d, %Y at %I:%M %p')}")
+    if r["ZCOMPLETIONDATE"]:
+        print(f"  Completed: {ts(r['ZCOMPLETIONDATE']).strftime('%b %d, %Y at %I:%M %p')}")
+    if r["ZNOTES"]: print(f"  Notes:     {r['ZNOTES']}")
+    if r["ZICSURL"]: print(f"  URL:       {r['ZICSURL']}")
+    if tags:
+        tag_str = ", ".join(C.magenta('#' + t['ZNAME']) for t in tags)
+        print(f"  Tags:      {tag_str}")
+    pp = r["ZPARENTREMINDER"]
+    if pp:
+        p = q_reminder(db, pp)
+        print(f"  Parent:    #{pp}" + (f" ({p['ZTITLE']})" if p else ""))
+    if subs:
+        print(f"  Subtasks ({len(subs)}):")
+        for s in subs:
+            print(fmt(s, db, indent="    "))
+    if atts:
+        print(f"  Attachments ({len(atts)}):")
+        for a2 in atts:
+            print(f"    - {a2['ZFILENAME'] or 'untitled'} ({a2['ZATTACHMENTTYPERAWVALUE'] or '?'})")
+    if r["ZCKIDENTIFIER"]:
+        link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
+        print(f"  Deep link: {C.dim(link)}")
+
+def cmd_sections(a):
+    db = open_db()
+    rows = q_sections(db)
+    if a.json:
+        out = {}
+        for r in rows:
+            out.setdefault(r["list_name"] or "?", []).append(r["ZDISPLAYNAME"])
+        print(json.dumps(out, indent=2))
+        return
+    if not rows:
+        print("No sections found")
+        return
+    cur = None
+    for r in rows:
+        ln = r["list_name"] or "?"
+        if ln != cur:
+            if cur: print()
+            print(f"{C.bold(color_list_name(ln, db))}:")
+            cur = ln
+        print(f"  - {r['ZDISPLAYNAME']}")
+    print(f"\n{len(rows)} section{'s' if len(rows) != 1 else ''}")
+
+def cmd_stats(a):
+    db = open_db()
+    total = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0").fetchone()[0]
+    active = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0").fetchone()[0]
+    flagged = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1").fetchone()[0]
+    overdue = db.execute(
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 "
+        f"AND ZDUEDATE IS NOT NULL AND ZDUEDATE < {to_ts(datetime.now())}"
+    ).fetchone()[0]
+    lists_count = len(q_lists(db))
+    sections_count = len(q_sections(db))
+    if a.json:
+        print(json.dumps({
+            "total": total, "active": active, "completed": total - active,
+            "overdue": overdue, "flagged": flagged,
+            "lists": lists_count, "sections": sections_count
+        }, indent=2))
+        return
+    print(C.bold("Reminders Stats"))
+    print(f"  Total:      {total}")
+    print(f"  Active:     {C.green(str(active))}")
+    print(f"  Completed:  {C.dim(str(total - active))}")
+    print(f"  Overdue:    {C.red(str(overdue)) if overdue else '0'}")
+    print(f"  Flagged:    {C.yellow(str(flagged)) if flagged else '0'}")
+    print(f"  Lists:      {lists_count}")
+    print(f"  Sections:   {sections_count}")
+
+def cmd_link(a):
+    db = open_db()
+    ids = a.ids
+    if a.list:
+        pk = q_list_pk(db, a.list)
+        if pk is None:
+            print(f"Error: List '{a.list}' not found", file=sys.stderr)
+            sys.exit(1)
+        items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
+        ids = [i["Z_PK"] for i in items]
+    if not ids:
+        print("No reminders specified.", file=sys.stderr)
+        sys.exit(1)
+    results = []
+    for rid in ids:
+        r = q_reminder(db, rid)
+        if not r:
+            print(f"Warning: #{rid} not found", file=sys.stderr)
+            continue
+        if r["ZCKIDENTIFIER"]:
+            link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
+            results.append({"id": rid, "title": r["ZTITLE"], "link": link})
+    if a.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for item in results:
+            print(f"#{item['id']} {item['title']}")
+            print(f"  {C.dim(item['link'])}")
+
+def cmd_open(a):
+    if hasattr(a, 'id') and a.id:
+        db = open_db()
+        r = q_reminder(db, a.id)
+        if not r:
+            print(f"Error: #{a.id} not found", file=sys.stderr)
+            sys.exit(1)
+        if r["ZCKIDENTIFIER"]:
+            link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
+            subprocess.run(["open", link])
+            print(f"Opened #{a.id} in Reminders.app")
+        else:
+            subprocess.run(["open", "-a", "Reminders"])
+            print("Opened Reminders.app (no deep link available)")
+    else:
+        subprocess.run(["open", "-a", "Reminders"])
+        print("Opened Reminders.app")
+
+# ── New Commands ─────────────────────────────────────────────────────────────
+
+def cmd_flag(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "flag", "id": r["ZCKIDENTIFIER"]}
+        result = bridge_call(data)
+        if result and result.get("status") == "flagged":
+            if a.json:
+                print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
+            else:
+                print(f"Flagged: {r['ZTITLE']}")
+            return
+
+    # Fall back to AppleScript
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, "set flagged of r to true")
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+            f'if (count of rs) > 0 then\n'
+            f'set flagged of item 1 of rs to true\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Flagged: {r['ZTITLE']}")
+
+def cmd_unflag(a):
+    db = open_db()
+    r = q_reminder(db, a.id)
+    if not r:
+        print(f"Error: #{a.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Try bridge first
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": "unflag", "id": r["ZCKIDENTIFIER"]}
+        result = bridge_call(data)
+        if result and result.get("status") == "unflagged":
+            if a.json:
+                print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
+            else:
+                print(f"Unflagged: {r['ZTITLE']}")
+            return
+
+    # Fall back to AppleScript
+    rid = _rem_id(r)
+    if rid:
+        osa_by_id(r["list_name"], rid, "set flagged of r to false")
+    else:
+        osa(
+            f'tell application "Reminders"\n'
+            f'tell list "{esc(r["list_name"])}"\n'
+            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+            f'if (count of rs) > 0 then\n'
+            f'set flagged of item 1 of rs to false\n'
+            f'end if\nend tell\nend tell'
+        )
+    if a.json:
+        print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Unflagged: {r['ZTITLE']}")
+
+def cmd_upcoming(a):
+    db = open_db()
+    days = a.days if hasattr(a, 'days') and a.days else 7
+    items = q_upcoming(db, days=days)
+    if a.json:
+        print(json.dumps([to_dict(i, db) for i in items], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print(f"Nothing due in the next {days} days")
+        return
+    print(C.bold(f"Upcoming ({days} days):"))
+    # Group by day
+    groups = {}
+    for i in items:
+        dt = ts(i["ZDUEDATE"])
+        day_key = dt.strftime("%Y-%m-%d")
+        day_label = dt.strftime("%A, %b %d")
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if dt.date() == today.date():
+            day_label = "Today"
+        elif dt.date() == (today + timedelta(days=1)).date():
+            day_label = "Tomorrow"
+        groups.setdefault((day_key, day_label), []).append(i)
+    for (day_key, day_label), day_items in sorted(groups.items()):
+        print(f"\n  {C.bold(day_label)}:")
+        for i in day_items:
+            print(fmt(i, db, indent="    "))
+    print(f"\n{len(items)} upcoming")
+
+def cmd_overdue(a):
+    db = open_db()
+    items = q_overdue(db)
+    if a.json:
+        print(json.dumps([to_dict(i, db) for i in items], indent=2))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print(fmt_table(reminders_to_table_data(items, db)))
+        return
+    if not items:
+        print("No overdue reminders")
+        return
+    print(C.red(C.bold(f"Overdue ({len(items)}):")))
+    for i in items:
+        print(fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  "))
+    print(f"\n{len(items)} overdue")
+
+def cmd_list_create(a):
+    if not bridge_available():
+        print("Error: remctl-bridge required for list management", file=sys.stderr)
+        sys.exit(1)
+    data = {"action": "create_list", "name": a.name}
+    if hasattr(a, 'color') and a.color:
+        data["color"] = a.color
+    result = bridge_call(data)
+    if result and result.get("status") == "created":
+        if a.json:
+            print(json.dumps({"status": "created", "name": a.name}))
+        else:
+            print(f"Created list: {a.name}")
+    else:
+        print(f"Error: Failed to create list '{a.name}'", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_list_rename(a):
+    if not bridge_available():
+        print("Error: remctl-bridge required for list management", file=sys.stderr)
+        sys.exit(1)
+    data = {"action": "rename_list", "name": a.name, "new_name": a.new_name}
+    result = bridge_call(data)
+    if result and result.get("status") == "renamed":
+        if a.json:
+            print(json.dumps({"status": "renamed", "old_name": a.name, "new_name": a.new_name}))
+        else:
+            print(f"Renamed: {a.name} -> {a.new_name}")
+    else:
+        print(f"Error: Failed to rename list '{a.name}'", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_list_delete(a):
+    if not bridge_available():
+        print("Error: remctl-bridge required for list management", file=sys.stderr)
+        sys.exit(1)
+    if not a.force:
+        ans = input(f"Delete list '{a.name}'? This cannot be undone. [y/N] ")
+        if not ans.lower().startswith("y"):
+            print("Cancelled.")
+            return
+    data = {"action": "delete_list", "name": a.name}
+    result = bridge_call(data)
+    if result and result.get("status") == "deleted":
+        if a.json:
+            print(json.dumps({"status": "deleted", "name": a.name}))
+        else:
+            print(f"Deleted list: {a.name}")
+    else:
+        print(f"Error: Failed to delete list '{a.name}'", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_export(a):
+    db = open_db()
+    if a.list:
+        pk = q_list_pk(db, a.list)
+        if pk is None:
+            print(f"Error: List '{a.list}' not found", file=sys.stderr)
+            sys.exit(1)
+        items = q_reminders(db, list_pk=pk, completed=True, top_level=False, limit=10000)
+    else:
+        items = q_reminders(db, completed=True, top_level=False, limit=10000)
+
+    export_format = a.export_format if hasattr(a, 'export_format') and a.export_format else "json"
+
+    if export_format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "title", "list", "completed", "flagged", "priority", "due_date", "notes", "url", "tags"])
+        for item in items:
+            d = to_dict(item, db)
+            writer.writerow([
+                d["id"], d["title"], d.get("list", ""),
+                d["completed"], d["flagged"], d["priority"],
+                d.get("dueDate", ""), d.get("notes", ""),
+                d.get("url", ""), ",".join(d.get("tags", []))
+            ])
+        print(output.getvalue(), end="")
+    else:
+        data = [to_dict(item, db) for item in items]
+        print(json.dumps(data, indent=2))
+
+def cmd_import(a):
+    filepath = Path(a.file)
+    if not filepath.exists():
+        print(f"Error: File '{a.file}' not found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Error: Failed to read JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, list):
+        print("Error: JSON must be an array of reminder objects", file=sys.stderr)
+        sys.exit(1)
+
+    created = 0
+    errors = 0
+    for item in data:
+        title = item.get("title")
+        if not title:
+            print("Warning: Skipping item without title", file=sys.stderr)
+            errors += 1
+            continue
+
+        # Build a namespace that looks like cmd_add's args
+        class AddArgs:
+            pass
+        aa = AddArgs()
+        aa.title = title
+        aa.list = item.get("list")
+        aa.notes = item.get("notes")
+        aa.due = item.get("due")
+        aa.priority = item.get("priority")
+        aa.flag = item.get("flagged", False)
+        aa.tags = None
+        aa.url = item.get("url")
+        aa.recurrence = item.get("recurrence")
+        aa.alarm = item.get("alarm")
+        aa.json = False
+
+        try:
+            cmd_add(aa)
+            created += 1
+        except SystemExit:
+            errors += 1
+
+    summary = {"created": created, "errors": errors, "total": len(data)}
+    if getattr(a, 'json', False):
+        print(json.dumps(summary))
+    else:
+        print(f"\nImported {created}/{len(data)} reminders ({errors} errors)")
+
+# ── Shell Completions ────────────────────────────────────────────────────────
+
+ZSH_COMPLETION = '''#compdef remctl
+_remctl() {
+    local -a commands=(
+        'lists:List all iCloud reminder lists'
+        'show:Show reminders in a list'
+        'add:Add a reminder'
+        'done:Complete a reminder'
+        'undone:Uncomplete a reminder'
+        'edit:Edit a reminder'
+        'delete:Delete a reminder'
+        'search:Search reminders'
+        'today:Due today + overdue'
+        'upcoming:Next N days'
+        'overdue:All overdue reminders'
+        'flagged:Flagged reminders'
+        'flag:Flag a reminder'
+        'unflag:Unflag a reminder'
+        'tags:List all tags'
+        'subtasks:Show subtasks'
+        'info:Full detail view'
+        'sections:Show sections'
+        'stats:Statistics'
+        'link:Get deep links'
+        'open:Open in Reminders.app'
+        'export:Export reminders'
+        'import:Import reminders'
+        'list-create:Create a new list'
+        'list-rename:Rename a list'
+        'list-delete:Delete a list'
+        'completion:Generate shell completions'
+    )
+    _describe 'command' commands
+}
+compdef _remctl remctl
+'''
+
+BASH_COMPLETION = '''_remctl() {
+    local cur prev commands
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="lists show add done undone edit delete search today upcoming overdue flagged flag unflag tags subtasks info sections stats link open export import list-create list-rename list-delete completion"
+
+    if [ $COMP_CWORD -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    fi
+}
+complete -F _remctl remctl
+'''
+
+FISH_COMPLETION = '''# Fish completion for remctl
+complete -c remctl -n "__fish_use_subcommand" -a lists -d "List all iCloud reminder lists"
+complete -c remctl -n "__fish_use_subcommand" -a show -d "Show reminders in a list"
+complete -c remctl -n "__fish_use_subcommand" -a add -d "Add a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a undone -d "Uncomplete a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a edit -d "Edit a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a delete -d "Delete a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a search -d "Search reminders"
+complete -c remctl -n "__fish_use_subcommand" -a today -d "Due today + overdue"
+complete -c remctl -n "__fish_use_subcommand" -a upcoming -d "Next N days"
+complete -c remctl -n "__fish_use_subcommand" -a overdue -d "All overdue reminders"
+complete -c remctl -n "__fish_use_subcommand" -a flagged -d "Flagged reminders"
+complete -c remctl -n "__fish_use_subcommand" -a flag -d "Flag a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a unflag -d "Unflag a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a tags -d "List all tags"
+complete -c remctl -n "__fish_use_subcommand" -a subtasks -d "Show subtasks"
+complete -c remctl -n "__fish_use_subcommand" -a info -d "Full detail view"
+complete -c remctl -n "__fish_use_subcommand" -a sections -d "Show sections"
+complete -c remctl -n "__fish_use_subcommand" -a stats -d "Statistics"
+complete -c remctl -n "__fish_use_subcommand" -a link -d "Get deep links"
+complete -c remctl -n "__fish_use_subcommand" -a open -d "Open in Reminders.app"
+complete -c remctl -n "__fish_use_subcommand" -a export -d "Export reminders"
+complete -c remctl -n "__fish_use_subcommand" -a import -d "Import reminders"
+complete -c remctl -n "__fish_use_subcommand" -a list-create -d "Create a new list"
+complete -c remctl -n "__fish_use_subcommand" -a list-rename -d "Rename a list"
+complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
+complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
+'''
+
+def cmd_completion(a):
+    shell = a.shell if hasattr(a, 'shell') and a.shell else "zsh"
+    if shell == "zsh":
+        print(ZSH_COMPLETION)
+    elif shell == "bash":
+        print(BASH_COMPLETION)
+    elif shell == "fish":
+        print(FISH_COMPLETION)
+    else:
+        print(f"Error: Unsupported shell '{shell}'. Use bash, zsh, or fish.", file=sys.stderr)
+        sys.exit(1)
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="remctl",
+        description="Power-user Reminders CLI — reads sections/subtasks/tags/attachments/colors, "
+                    "writes via remctl-bridge (EventKit) with AppleScript fallback."
+    )
+    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("--no-color", action="store_true", help="Disable color output")
+    p.add_argument("--format", choices=["plain", "table", "json"], default="plain",
+                   help="Output format (default: plain)")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    def js(c): c.add_argument("--json", action="store_true")
+    def vb(c): c.add_argument("-v", "--verbose", action="store_true")
+
+    # --- Existing commands ---
+    c = sub.add_parser("lists", help="List all iCloud reminder lists"); js(c)
+
+    c = sub.add_parser("show", help="Show reminders in a list (grouped by section)")
+    c.add_argument("list"); c.add_argument("--completed", action="store_true", help="Include completed")
+    vb(c); js(c)
+
+    c = sub.add_parser("add", help="Add a reminder (syncs via bridge/AppleScript)")
+    c.add_argument("title"); c.add_argument("-l", "--list")
+    c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD, today, tomorrow, +3d, eod, eow, 'next friday at 3pm'")
+    c.add_argument("-p", "--priority", help="high, medium, low")
+    c.add_argument("-f", "--flag", action="store_true")
+    c.add_argument("-t", "--tags", help="Comma-separated (inline #hashtags)")
+    c.add_argument("--url", help="Set URL field")
+    c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', yearly (bridge only)")
+    c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
+    js(c)
+
+    c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
+
+    c = sub.add_parser("edit", help="Edit a reminder")
+    c.add_argument("id", type=int); c.add_argument("--title")
+    c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD or 'clear'")
+    c.add_argument("-p", "--priority")
+    c.add_argument("--url", help="Set URL field")
+    c.add_argument("--recurrence", help="Recurrence (bridge only)")
+    c.add_argument("--alarm", help="Alarm (bridge only)")
+    js(c)
+
+    c = sub.add_parser("delete", help="Delete a reminder")
+    c.add_argument("id", type=int); c.add_argument("--force", action="store_true"); js(c)
+
+    c = sub.add_parser("search", help="Search reminders")
+    c.add_argument("query"); c.add_argument("--completed", action="store_true"); vb(c); js(c)
+
+    c = sub.add_parser("today", help="Due today + overdue")
+    c.add_argument("--no-overdue", action="store_true"); vb(c); js(c)
+
+    c = sub.add_parser("flagged", help="Flagged reminders"); vb(c); js(c)
+
+    c = sub.add_parser("tags", help="List all hashtag labels"); js(c)
+
+    c = sub.add_parser("subtasks", help="Show subtasks of a reminder")
+    c.add_argument("id", type=int); vb(c); js(c)
+
+    c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c)
+
+    c = sub.add_parser("sections", help="Show sections across lists"); js(c)
+
+    c = sub.add_parser("stats", help="Statistics"); js(c)
+
+    c = sub.add_parser("link", help="Get deep link(s) for reminders")
+    c.add_argument("ids", type=int, nargs="*", help="Reminder IDs")
+    c.add_argument("-l", "--list", help="Get links for all active reminders in a list")
+    c.add_argument("--completed", action="store_true"); js(c)
+
+    c = sub.add_parser("open", help="Open reminder in Reminders.app (or just open the app)")
+    c.add_argument("id", type=int, nargs="?", default=None, help="Reminder ID (opens specific reminder via deep link)")
+
+    # --- New commands ---
+    c = sub.add_parser("flag", help="Flag a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("unflag", help="Unflag a reminder"); c.add_argument("id", type=int); js(c)
+
+    c = sub.add_parser("upcoming", help="Show reminders due in next N days (default 7)")
+    c.add_argument("days", type=int, nargs="?", default=7, help="Number of days to look ahead")
+    vb(c); js(c)
+
+    c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c)
+
+    c = sub.add_parser("list-create", help="Create a new list (bridge only)")
+    c.add_argument("name"); c.add_argument("--color", help="List color name"); js(c)
+
+    c = sub.add_parser("list-rename", help="Rename a list (bridge only)")
+    c.add_argument("name"); c.add_argument("new_name"); js(c)
+
+    c = sub.add_parser("list-delete", help="Delete a list (bridge only)")
+    c.add_argument("name"); c.add_argument("--force", action="store_true"); js(c)
+
+    c = sub.add_parser("export", help="Export reminders")
+    c.add_argument("-l", "--list", help="Export only this list")
+    c.add_argument("--format", dest="export_format", choices=["json", "csv"], default="json", help="Export format")
+    js(c)
+
+    c = sub.add_parser("import", help="Import reminders from JSON file")
+    c.add_argument("file", help="Path to JSON file"); js(c)
+
+    c = sub.add_parser("completion", help="Generate shell completion script")
+    c.add_argument("shell", nargs="?", default="zsh", choices=["bash", "zsh", "fish"], help="Shell type")
+
+    # --- Parse ---
+    a = p.parse_args()
+
+    # Set up color
+    if a.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        C.enabled = False
+
+    # Propagate global --format to json flag where needed
+    if a.format == "json" and not hasattr(a, 'json'):
+        a.json = True
+    elif a.format == "json" and hasattr(a, 'json'):
+        a.json = True
+
+    # No command: splash screen + today
+    if not a.cmd:
+        a.no_overdue = False
+        a.verbose = False
+        if a.format == "json":
+            a.json = True
+            cmd_today(a)
+        else:
+            a.json = False
+            show_splash()
+            cmd_today(a)
+        return
+
+    # Propagate --format table to subcommand
+    if a.format == "table" and not hasattr(a, 'format_override'):
+        pass  # format is already on the namespace
+
+    # Route to command handler
+    cmds = {
+        "lists": cmd_lists,
+        "show": cmd_show,
+        "add": cmd_add,
+        "done": cmd_done,
+        "undone": cmd_undone,
+        "edit": cmd_edit,
+        "delete": cmd_delete,
+        "search": cmd_search,
+        "today": cmd_today,
+        "flagged": cmd_flagged,
+        "tags": cmd_tags,
+        "subtasks": cmd_subtasks,
+        "info": cmd_info,
+        "sections": cmd_sections,
+        "stats": cmd_stats,
+        "link": cmd_link,
+        "open": cmd_open,
+        "flag": cmd_flag,
+        "unflag": cmd_unflag,
+        "upcoming": cmd_upcoming,
+        "overdue": cmd_overdue,
+        "list-create": cmd_list_create,
+        "list-rename": cmd_list_rename,
+        "list-delete": cmd_list_delete,
+        "export": cmd_export,
+        "import": cmd_import,
+        "completion": cmd_completion,
+    }
+
+    handler = cmds.get(a.cmd)
+    if handler:
+        handler(a)
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":
+    main()

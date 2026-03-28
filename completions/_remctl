@@ -1,0 +1,129 @@
+#compdef remctl
+
+_remctl_lists() {
+    local -a lists
+    lists=(${(f)"$(remctl lists --json 2>/dev/null | python3 -c 'import json,sys; [print(l["title"]) for l in json.load(sys.stdin)]' 2>/dev/null)"})
+    _describe 'list' lists
+}
+
+_remctl() {
+    local -a commands
+    commands=(
+        'lists:List all iCloud reminder lists'
+        'show:Show reminders in a list (grouped by section)'
+        'add:Add a reminder (syncs via EventKit or AppleScript)'
+        'done:Complete a reminder'
+        'undone:Uncomplete a reminder'
+        'edit:Edit a reminder'
+        'delete:Delete a reminder'
+        'search:Search reminders'
+        'today:Due today + overdue'
+        'upcoming:Reminders due in the next N days'
+        'overdue:All overdue reminders'
+        'flagged:Flagged reminders'
+        'flag:Flag a reminder'
+        'unflag:Unflag a reminder'
+        'tags:List all hashtag labels'
+        'subtasks:Show subtasks of a reminder'
+        'info:Full detail view of a reminder'
+        'sections:Show sections across lists'
+        'stats:Statistics'
+        'link:Get deep link(s) for reminders'
+        'open:Open reminder in Reminders.app'
+        'export:Export reminders to JSON or CSV'
+        'import:Import reminders from JSON file'
+        'list-create:Create a new reminder list'
+        'list-rename:Rename a reminder list'
+        'list-delete:Delete a reminder list'
+        'completion:Generate shell completions'
+        'server:Start the REST API server'
+    )
+
+    _arguments -C \
+        '--json[Output JSON]' \
+        '--no-color[Disable color output]' \
+        '--format[Output format]:format:(plain table json)' \
+        '--version[Show version]' \
+        '-h[Show help]' \
+        '--help[Show help]' \
+        '1:command:->command' \
+        '*::arg:->args'
+
+    case "$state" in
+        command)
+            _describe 'command' commands
+            ;;
+        args)
+            case "$words[1]" in
+                show)
+                    _arguments '1:list:_remctl_lists' '--completed[Include completed]' '-v[Verbose]' '--json[JSON output]'
+                    ;;
+                add)
+                    _arguments \
+                        '1:title:' \
+                        '-l[List]:list:_remctl_lists' \
+                        '-n[Notes]:notes:' \
+                        '-d[Due date]:due:' \
+                        '-p[Priority]:priority:(high medium low)' \
+                        '-f[Flag]' \
+                        '-t[Tags]:tags:' \
+                        '--url[URL]:url:' \
+                        '--recurrence[Recurrence]:recurrence:(daily weekly monthly yearly)' \
+                        '--alarm[Alarm]:alarm:' \
+                        '--json[JSON output]'
+                    ;;
+                done|undone|flag|unflag|info|subtasks)
+                    _arguments '1:id:'
+                    ;;
+                edit)
+                    _arguments \
+                        '1:id:' \
+                        '--title[New title]:title:' \
+                        '-n[Notes]:notes:' \
+                        '-d[Due date]:due:' \
+                        '-p[Priority]:priority:(high medium low none)' \
+                        '--url[URL]:url:' \
+                        '--json[JSON output]'
+                    ;;
+                delete)
+                    _arguments '1:id:' '--force[Skip confirmation]' '--json[JSON output]'
+                    ;;
+                search)
+                    _arguments '1:query:' '--completed[Include completed]' '-v[Verbose]' '--json[JSON output]'
+                    ;;
+                upcoming)
+                    _arguments '1:days:'
+                    ;;
+                export)
+                    _arguments '-l[List]:list:_remctl_lists' '--format[Format]:format:(json csv)'
+                    ;;
+                import)
+                    _arguments '1:file:_files -g "*.json"'
+                    ;;
+                link)
+                    _arguments '*:id:' '-l[List]:list:_remctl_lists' '--json[JSON output]'
+                    ;;
+                open)
+                    _arguments '1:id:'
+                    ;;
+                list-create)
+                    _arguments '1:name:' '--color[Color]:color:(red orange yellow green blue purple brown cyan)'
+                    ;;
+                list-rename)
+                    _arguments '1:current name:_remctl_lists' '2:new name:'
+                    ;;
+                list-delete)
+                    _arguments '1:name:_remctl_lists' '--force[Skip confirmation]'
+                    ;;
+                completion)
+                    _arguments '1:shell:(bash zsh fish)'
+                    ;;
+                server)
+                    _arguments '--port[Port]:port:' '--token[API token]:token:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_remctl "$@"
