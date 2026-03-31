@@ -118,7 +118,7 @@ remctl add "Deploy" -d +3d -p high                  # In 3 days, high priority
 remctl add "Pay rent" -d "2026-04-01" -f            # Flagged
 remctl add "Weekly report" --recurrence weekly       # Recurring
 remctl add "Standup" --recurrence "weekly mon,wed,fri" --alarm 15m
-remctl add "Check app" --url "https://example.com"  # With URL
+remctl add "Check app" --url "https://example.com"  # URL (appended to notes)
 remctl add "Groceries #shopping #weekly" -t errands  # With tags
 ```
 
@@ -240,7 +240,7 @@ This gives access to **everything** — sections, subtasks, tags, attachments, c
 
 RemCTL uses a hybrid write path:
 
-1. **remctl-bridge** (preferred): A pre-compiled Swift binary that writes via EventKit. ~70ms per operation. Supports recurrence, alarms, URLs, and list management.
+1. **remctl-bridge** (preferred): A pre-compiled Swift binary that writes via EventKit. ~70ms per operation. Supports recurrence, alarms, URLs (appended to notes — the Reminders URL field is a private ReminderKit property, not writable via EventKit), and list management.
 2. **AppleScript fallback**: If the bridge isn't available, remctl falls back to AppleScript. Slower (~8.7s) and more limited, but works without compilation.
 
 The bridge is detected automatically at `~/bin/remctl-bridge`.
