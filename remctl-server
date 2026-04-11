@@ -91,6 +91,16 @@ def open_db():
     return conn
 
 
+def open_db_rw():
+    """Open the Reminders DB in read-write mode for direct writes."""
+    db_path = find_main_db()
+    if not db_path:
+        raise RuntimeError("No Reminders database found.")
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def ts(v):
     """CoreData timestamp → Python datetime."""
     if not v:
@@ -124,7 +134,7 @@ def q_list_pk(db, name):
 
 def q_reminders(db, list_pk=None, completed=False, parent_pk=None,
                 top_level=False, limit=500):
-    conds, params = ["r.ZMARKEDFORDELETION = 0"], []
+    conds, params = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL"], []
     if not completed:
         conds.append("r.ZCOMPLETED = 0")
     if list_pk is not None:
@@ -212,6 +222,7 @@ def q_hashtags(db, pk):
 def q_search(db, query, completed=False):
     conds = [
         "r.ZMARKEDFORDELETION = 0",
+        "r.ZACCOUNT IS NOT NULL",
         "l.Z_PK IS NOT NULL",
         "(r.ZTITLE LIKE ? OR r.ZNOTES LIKE ?)",
     ]
@@ -238,7 +249,7 @@ def q_due_today(db, include_overdue=True):
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND {where} ORDER BY r.ZDUEDATE"
     ).fetchall()
 
@@ -249,7 +260,7 @@ def q_upcoming(db, days=7):
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
         f"AND r.ZDUEDATE >= {to_ts(now)} AND r.ZDUEDATE < {to_ts(end)} "
         f"ORDER BY r.ZDUEDATE"
@@ -261,7 +272,7 @@ def q_overdue(db):
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
         f"AND r.ZDUEDATE < {to_ts(now)} ORDER BY r.ZDUEDATE"
     ).fetchall()
@@ -271,7 +282,7 @@ def q_flagged(db):
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZFLAGGED = 1 "
         f"ORDER BY r.ZDUEDATE NULLS LAST"
     ).fetchall()
@@ -286,20 +297,20 @@ def q_tags(db):
 
 def q_stats(db):
     total = db.execute(
-        "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0"
+        "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZACCOUNT IS NOT NULL"
     ).fetchone()[0]
     active = db.execute(
         "SELECT COUNT(*) FROM ZREMCDREMINDER "
-        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0"
+        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL"
     ).fetchone()[0]
     flagged = db.execute(
         "SELECT COUNT(*) FROM ZREMCDREMINDER "
-        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1"
+        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1 AND ZACCOUNT IS NOT NULL"
     ).fetchone()[0]
     overdue = db.execute(
         f"SELECT COUNT(*) FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL "
         f"AND r.ZDUEDATE IS NOT NULL AND r.ZDUEDATE < {to_ts(datetime.now())}"
     ).fetchone()[0]
@@ -541,6 +552,117 @@ def applescript_write(pk, action_data):
         return None
 
 
+import uuid as _uuid
+
+
+def sqlite_create_reminder(action_data):
+    """Create a reminder by writing directly to the CoreData SQLite DB.
+
+    Last-resort fallback when both EventKit bridge and AppleScript are broken.
+    Uses the same DB the server reads from; iCloud daemon picks up changes.
+    """
+    try:
+        db = open_db_rw()
+        title = action_data.get("title", "Untitled")
+        notes = action_data.get("notes")
+        list_name = action_data.get("list", "Reminders")
+        priority_raw = action_data.get("priority", 0)
+        due_str = action_data.get("due")
+
+        # Resolve priority
+        if isinstance(priority_raw, str):
+            priority = PRI_FROM_NAME.get(priority_raw, 0)
+        else:
+            priority = priority_raw
+
+        # Resolve list PK
+        list_pk = db.execute(
+            "SELECT Z_PK FROM ZREMCDBASELIST "
+            "WHERE ZNAME = ? COLLATE NOCASE AND ZMARKEDFORDELETION = 0 LIMIT 1",
+            (list_name,),
+        ).fetchone()
+        if not list_pk:
+            db.close()
+            return {"ok": False, "error": f"List not found: {list_name}"}
+        list_pk = list_pk[0]
+
+        # Resolve Z_ENT for reminders
+        ent_row = db.execute(
+            "SELECT Z_ENT FROM ZREMCDREMINDER LIMIT 1"
+        ).fetchone()
+        z_ent = ent_row[0] if ent_row else 14
+
+        # Get next Z_PK
+        pk_row = db.execute(
+            "SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_ENT = ?", (z_ent,)
+        ).fetchone()
+        if pk_row:
+            next_pk = pk_row[0] + 1
+        else:
+            max_row = db.execute(
+                "SELECT MAX(Z_PK) FROM ZREMCDREMINDER"
+            ).fetchone()
+            next_pk = (max_row[0] or 0) + 1
+
+        # Parse due date
+        due_ts = None
+        all_day = 1
+        now = datetime.now()
+        if due_str:
+            if due_str == "today":
+                dt = now.replace(hour=12, minute=0, second=0, microsecond=0)
+            elif due_str == "tomorrow":
+                dt = (now + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+            elif due_str.startswith("+") and due_str.endswith("d"):
+                days = int(due_str[1:-1])
+                dt = (now + timedelta(days=days)).replace(hour=12, minute=0, second=0, microsecond=0)
+            else:
+                try:
+                    dt = datetime.strptime(due_str, "%Y-%m-%d")
+                    dt = dt.replace(hour=12, minute=0, second=0)
+                except ValueError:
+                    try:
+                        dt = datetime.strptime(due_str, "%Y-%m-%d %H:%M")
+                        all_day = 0
+                    except ValueError:
+                        dt = None
+            if dt:
+                due_ts = to_ts(dt)
+
+        creation_ts = to_ts(now)
+        ck_id = str(_uuid.uuid4()).upper()
+
+        # Insert the reminder
+        db.execute(
+            "INSERT INTO ZREMCDREMINDER "
+            "(Z_PK, Z_ENT, Z_OPT, ZTITLE, ZNOTES, ZCOMPLETED, ZFLAGGED, "
+            "ZPRIORITY, ZDUEDATE, ZALLDAY, ZCREATIONDATE, ZLIST, "
+            "ZMARKEDFORDELETION, ZCKIDENTIFIER, ZPARENTREMINDER) "
+            "VALUES (?, ?, 1, ?, ?, 0, 0, ?, ?, ?, ?, ?, 0, ?, NULL)",
+            (next_pk, z_ent, title, notes, priority, due_ts, all_day,
+             creation_ts, list_pk, ck_id),
+        )
+
+        # Update Z_PRIMARYKEY counter
+        db.execute(
+            "UPDATE Z_PRIMARYKEY SET Z_MAX = ? WHERE Z_ENT = ?",
+            (next_pk, z_ent),
+        )
+
+        db.commit()
+        db.close()
+
+        deep_link = f"x-apple-reminderkit://REMCDReminder/{ck_id}"
+        sys.stderr.write(f"[sqlite_create] Created reminder #{next_pk} '{title}' in {list_name}\n")
+        return {
+            "ok": True,
+            "data": {"id": next_pk, "title": title, "deepLink": deep_link},
+        }
+    except Exception as e:
+        sys.stderr.write(f"[sqlite_create] Error: {e}\n")
+        return {"ok": False, "error": str(e)}
+
+
 def bridge_call(action_data, original_pk=None):
     """Write to Reminders.
 
@@ -548,6 +670,7 @@ def bridge_call(action_data, original_pk=None):
     1. update/complete/uncomplete/delete: AppleScript first (reliable iCloud sync)
     2. create/list ops: EventKit bridge (AppleScript can't create well)
     3. AppleScript failure or no bridge: remctl CLI fallback
+    4. Direct SQLite write as last resort for creates
     """
     resolved_pk = None
 
@@ -579,12 +702,40 @@ def bridge_call(action_data, original_pk=None):
             result = subprocess.run(
                 [str(BRIDGE_PATH)],
                 input=json.dumps(action_data),
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=8,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
+                bridge_result = json.loads(result.stdout)
+                # Post-write verification for creates: check ZACCOUNT is set
+                if action == "create" and bridge_result.get("ok"):
+                    created_id = bridge_result.get("data", {}).get("id")
+                    if created_id:
+                        time.sleep(0.5)  # give remindd a moment to finalize
+                        try:
+                            vdb = open_db()
+                            row = vdb.execute(
+                                "SELECT ZACCOUNT FROM ZREMCDREMINDER WHERE Z_PK = ?",
+                                (created_id,)
+                            ).fetchone()
+                            vdb.close()
+                            if row and row[0] is None:
+                                sys.stderr.write(
+                                    f"[bridge_call] WARNING: Reminder #{created_id} created with ZACCOUNT=NULL "
+                                    f"(remindd may be unhealthy). Item will be invisible to Reminders.app.\n"
+                                )
+                                bridge_result["warning"] = "Reminder created but may not sync — remindd appears unhealthy"
+                        except Exception as ve:
+                            sys.stderr.write(f"[bridge_call] Verification check failed: {ve}\n")
+                return bridge_result
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
-            pass
+            sys.stderr.write("[bridge_call] Bridge timed out or bad JSON, trying fallbacks\n")
+
+    # Direct SQLite write for creates (bypasses broken bridge/AppleScript)
+    if action == "create":
+        result = sqlite_create_reminder(action_data)
+        if isinstance(result, dict) and result.get("ok"):
+            return result
+        sys.stderr.write(f"[bridge_call] SQLite create failed: {result}\n")
 
     # Last resort: remctl CLI fallback
     return remctl_cli_fallback(action_data)
@@ -593,7 +744,7 @@ def bridge_call(action_data, original_pk=None):
 def remctl_cli_fallback(action_data):
     """Fall back to calling remctl CLI for write operations."""
     action = action_data.get("action", "")
-    args = [str(REMCTL_PATH), "--json"]
+    args = [str(REMCTL_PATH), "--format", "json"]
 
     if action == "create":
         args.append("add")

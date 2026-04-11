@@ -203,7 +203,7 @@ _REM_COLS = """r.Z_PK, r.ZTITLE, r.ZNOTES, r.ZCOMPLETED, r.ZFLAGGED, r.ZPRIORITY
     r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name"""
 
 def q_reminders(db, list_pk=None, completed=False, parent_pk=None, top_level=False, limit=500):
-    c, params = ["r.ZMARKEDFORDELETION = 0"], []
+    c, params = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL"], []
     if not completed: c.append("r.ZCOMPLETED = 0")
     if list_pk is not None: c.append("r.ZLIST = ?"); params.append(list_pk)
     if parent_pk is not None: c.append("r.ZPARENTREMINDER = ?"); params.append(parent_pk)
@@ -272,7 +272,7 @@ def q_hashtags(db, pk):
     ).fetchall()
 
 def q_search(db, query, completed=False):
-    c = ["r.ZMARKEDFORDELETION = 0", "l.Z_PK IS NOT NULL", "(r.ZTITLE LIKE ? OR r.ZNOTES LIKE ?)"]
+    c = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL", "l.Z_PK IS NOT NULL", "(r.ZTITLE LIKE ? OR r.ZNOTES LIKE ?)"]
     if not completed: c.append("r.ZCOMPLETED = 0")
     pat = f"%{query}%"
     return db.execute(
@@ -291,14 +291,14 @@ def q_due_today(db, include_overdue=True):
         w = f"r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(eod)}"
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
-        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND {w} ORDER BY r.ZDUEDATE"
     ).fetchall()
 
 def q_flagged(db):
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
-        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZFLAGGED = 1 ORDER BY r.ZDUEDATE NULLS LAST"
     ).fetchall()
 
@@ -309,7 +309,7 @@ def q_upcoming(db, days=7):
     future = sod + timedelta(days=days + 1)
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
-        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
         f"AND r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(future)} "
         f"ORDER BY r.ZDUEDATE"
@@ -321,7 +321,7 @@ def q_overdue(db):
     sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
-        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
         f"AND r.ZDUEDATE < {to_ts(sod)} ORDER BY r.ZDUEDATE"
     ).fetchall()
@@ -1192,11 +1192,11 @@ def cmd_sections(a):
 
 def cmd_stats(a):
     db = open_db()
-    total = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0").fetchone()[0]
-    active = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0").fetchone()[0]
-    flagged = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1").fetchone()[0]
+    total = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZACCOUNT IS NOT NULL").fetchone()[0]
+    active = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL").fetchone()[0]
+    flagged = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1 AND ZACCOUNT IS NOT NULL").fetchone()[0]
     overdue = db.execute(
-        f"SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 "
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL "
         f"AND ZDUEDATE IS NOT NULL AND ZDUEDATE < {to_ts(datetime.now())}"
     ).fetchone()[0]
     lists_count = len(q_lists(db))
