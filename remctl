@@ -38,6 +38,10 @@ DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 19876
 LAUNCH_AGENT_LABEL = "com.remctl.server"
 
+
+class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    pass
+
 # ── Color System ─────────────────────────────────────────────────────────────
 
 class C:
@@ -2353,16 +2357,28 @@ def main():
     p = argparse.ArgumentParser(
         prog="remctl",
         description="Power-user Reminders CLI — reads sections/subtasks/tags/attachments/colors, "
-                    "writes via remctl-bridge (EventKit) with AppleScript fallback."
+                    "writes via remctl-bridge (EventKit) with AppleScript fallback.",
+        epilog=(
+            "Examples:\n"
+            "  remctl today\n"
+            "  remctl add \"Buy milk\" -d tomorrow\n"
+            "  remctl setup --shell auto --doctor\n"
+            "  remctl service install\n"
+            "  remctl service status\n"
+            "\n"
+            "Use `remctl setup --help`, `remctl doctor --help`, and `remctl service --help`\n"
+            "for onboarding and service-management details."
+        ),
+        formatter_class=HelpFormatter,
     )
     p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--no-color", action="store_true", help="Disable color output")
     p.add_argument("--format", choices=["plain", "table", "json"], default="plain",
-                   help="Output format (default: plain)")
+                   help="Output format")
 
     sub = p.add_subparsers(dest="cmd")
 
-    def js(c): c.add_argument("--json", action="store_true")
+    def js(c): c.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     def vb(c): c.add_argument("-v", "--verbose", action="store_true")
 
     # --- Existing commands ---
@@ -2452,9 +2468,44 @@ def main():
     c = sub.add_parser("import", help="Import reminders from JSON file")
     c.add_argument("file", help="Path to JSON file"); js(c)
 
-    c = sub.add_parser("doctor", help="Diagnose setup and runtime issues"); js(c)
+    c = sub.add_parser(
+        "doctor",
+        help="Diagnose setup and runtime issues",
+        description=(
+            "Run environment and runtime checks for the CLI and optional local API service.\n"
+            "This is the first troubleshooting step after install."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl doctor\n"
+            "  remctl doctor --json\n"
+            "\n"
+            "If `local_api` reports `degraded (database: not found)` while the CLI itself works,\n"
+            "grant Full Disk Access to the Python interpreter used by `remctl-server`, then run\n"
+            "`remctl service restart` and `remctl doctor` again."
+        ),
+        formatter_class=HelpFormatter,
+    ); js(c)
 
-    c = sub.add_parser("setup", help="Install completions and optional launch agent")
+    c = sub.add_parser(
+        "setup",
+        help="Install completions and optional launch agent",
+        description=(
+            "Create the RemCTL config directory and API token, install shell completions,\n"
+            "and optionally install/start the background remctl-server launch agent."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl setup --shell auto --doctor\n"
+            "  remctl setup --service install\n"
+            "  remctl setup --service install --port 8080\n"
+            "\n"
+            "The service is optional. Use it only if you need the local REST API or Android sync,\n"
+            "and expect to grant Full Disk Access to the Python interpreter if doctor reports a\n"
+            "degraded API with `database: not found`."
+        ),
+        formatter_class=HelpFormatter,
+    )
     c.add_argument("--shell", choices=["auto", "bash", "zsh", "fish", "skip"], default="auto", help="Shell completion to install")
     c.add_argument("--service", choices=["skip", "install"], default="skip", help="Whether to install and start the launch agent")
     c.add_argument("--host", default=DEFAULT_SERVER_HOST, help="Host for the launch agent's remctl-server process")
@@ -2465,8 +2516,28 @@ def main():
     c.add_argument("--doctor", action="store_true", help="Run remctl doctor after setup")
     js(c)
 
-    c = sub.add_parser("service", help="Manage the remctl launch agent")
-    c.add_argument("action", choices=["install", "start", "stop", "restart", "status", "uninstall"])
+    c = sub.add_parser(
+        "service",
+        help="Manage the remctl launch agent",
+        description=(
+            "Manage the background remctl-server launch agent stored at\n"
+            "~/Library/LaunchAgents/com.remctl.server.plist."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl service install\n"
+            "  remctl service status\n"
+            "  remctl service restart\n"
+            "  remctl service uninstall\n"
+            "\n"
+            "Only `install` uses --host, --port, --allow-origin, --enable-opengraph,\n"
+            "and --allow-unsafe-sqlite-writes. If `doctor` reports a degraded API with\n"
+            "`database: not found`, grant Full Disk Access to the Python interpreter shown\n"
+            "by `remctl service status`, then restart the service."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("action", choices=["install", "start", "stop", "restart", "status", "uninstall"], help="Service action to run")
     c.add_argument("--host", default=DEFAULT_SERVER_HOST, help="Host for the launch agent's remctl-server process")
     c.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help="Port for the launch agent's remctl-server process")
     c.add_argument("--allow-origin", help="Optional Access-Control-Allow-Origin for the launch agent")
@@ -2476,7 +2547,18 @@ def main():
     c.add_argument("--keep-file", action="store_true", help="Keep the plist file when uninstalling")
     js(c)
 
-    c = sub.add_parser("completion", help="Generate shell completion script")
+    c = sub.add_parser(
+        "completion",
+        help="Generate shell completion script",
+        description="Print a shell completion script for remctl.",
+        epilog=(
+            "Examples:\n"
+            "  remctl completion zsh\n"
+            "  remctl completion bash\n"
+            "  remctl completion fish"
+        ),
+        formatter_class=HelpFormatter,
+    )
     c.add_argument("shell", nargs="?", default="zsh", choices=["bash", "zsh", "fish"], help="Shell type")
 
     # --- Parse ---

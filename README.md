@@ -54,6 +54,8 @@ If you also want the background API server:
 ./install.sh --bootstrap --with-service
 ```
 
+That service is optional. It is only needed for the local REST API and Android sync.
+
 If you only want the binaries first:
 
 ```bash
@@ -133,6 +135,18 @@ remctl service status
 ```
 
 `remctl doctor` is the first troubleshooting step. It checks the macOS prerequisites, Reminders database, CLI and bridge install, API token, shell completion, launch agent, and local API health.
+
+### Help And Discovery
+
+```bash
+remctl --help
+remctl setup --help
+remctl doctor --help
+remctl service --help
+remctl completion --help
+```
+
+The top-level help lists every command. The onboarding and service subcommands include more detailed examples in their own `--help` output.
 
 ## Usage
 
