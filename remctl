@@ -589,6 +589,27 @@ def osa_by_id(list_name, rem_id, action):
         f'end tell'
     )
 
+def osa_by_id_try(list_name, rem_id, action, timeout=120):
+    """Non-fatal variant: returns True on success, False on failure.
+    Used for AppleScript-first write paths that want to fall back to bridge.
+
+    Reminders.app AppleScript dispatch can be slow (30–90s) on busy stores,
+    especially after a remindd restart. Use a generous timeout — slow sync
+    beats silent data loss."""
+    script = (
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(list_name)}"\n'
+        f'set r to (first reminder whose id is "{esc(rem_id)}")\n'
+        f'{action}\n'
+        f'end tell\n'
+        f'end tell'
+    )
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
 def esc(s):
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", "")
 
@@ -851,7 +872,17 @@ def cmd_done(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Try bridge first
+    # AppleScript-first: bridge writes update CoreData but don't reliably
+    # propagate to CloudKit (verified for dueDate edits 2026-04-17).
+    rid = _rem_id(r)
+    if rid and osa_by_id_try(r["list_name"], rid, "set completed of r to true"):
+        if a.json:
+            print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+        else:
+            print(f"Completed: {r['ZTITLE']}")
+        return
+
+    # Bridge fallback
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
         result = bridge_call(data)
@@ -862,19 +893,15 @@ def cmd_done(a):
                 print(f"Completed: {r['ZTITLE']}")
             return
 
-    # Fall back to AppleScript
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, "set completed of r to true")
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is false)\n'
-            f'if (count of rs) > 0 then\n'
-            f'set completed of item 1 of rs to true\n'
-            f'end if\nend tell\nend tell'
-        )
+    # Last resort: AppleScript by-name
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is false)\n'
+        f'if (count of rs) > 0 then\n'
+        f'set completed of item 1 of rs to true\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
     else:
@@ -887,7 +914,14 @@ def cmd_undone(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Try bridge first
+    rid = _rem_id(r)
+    if rid and osa_by_id_try(r["list_name"], rid, "set completed of r to false"):
+        if a.json:
+            print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
+        else:
+            print(f"Uncompleted: {r['ZTITLE']}")
+        return
+
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "uncomplete", "id": r["ZCKIDENTIFIER"]}
         result = bridge_call(data)
@@ -898,19 +932,14 @@ def cmd_undone(a):
                 print(f"Uncompleted: {r['ZTITLE']}")
             return
 
-    # Fall back to AppleScript
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, "set completed of r to false")
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is true)\n'
-            f'if (count of rs) > 0 then\n'
-            f'set completed of item 1 of rs to false\n'
-            f'end if\nend tell\nend tell'
-        )
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is true)\n'
+        f'if (count of rs) > 0 then\n'
+        f'set completed of item 1 of rs to false\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
     else:
@@ -928,7 +957,14 @@ def cmd_delete(a):
             print("Cancelled.")
             return
 
-    # Try bridge first
+    rid = _rem_id(r)
+    if rid and osa_by_id_try(r["list_name"], rid, "delete r"):
+        if a.json:
+            print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
+        else:
+            print(f"Deleted: {r['ZTITLE']}")
+        return
+
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "delete", "id": r["ZCKIDENTIFIER"]}
         result = bridge_call(data)
@@ -939,19 +975,14 @@ def cmd_delete(a):
                 print(f"Deleted: {r['ZTITLE']}")
             return
 
-    # Fall back to AppleScript
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, "delete r")
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-            f'if (count of rs) > 0 then\n'
-            f'delete item 1 of rs\n'
-            f'end if\nend tell\nend tell'
-        )
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+        f'if (count of rs) > 0 then\n'
+        f'delete item 1 of rs\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
     else:
@@ -964,13 +995,55 @@ def cmd_edit(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Try bridge first
+    pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+
+    # AppleScript-first for reliable iCloud sync.
+    # EKEventStore.save() from a short-lived CLI process updates CoreData locally
+    # but the dueDateComponents change does not propagate to CloudKit — verified
+    # 2026-04-17 with side-by-side AppleScript/bridge edits on the same zone.
+    # AppleScript goes through Reminders.app which correctly syncs via remindd.
+    has_bridge_only = (
+        (hasattr(a, 'recurrence') and a.recurrence) or
+        (hasattr(a, 'alarm') and a.alarm)
+    )
+    has_applescript_fields = bool(
+        a.title or a.notes or a.due or a.priority
+        or (hasattr(a, 'url') and a.url)
+    )
+
+    if r["ZCKIDENTIFIER"] and has_applescript_fields and not has_bridge_only:
+        parts = []
+        if a.title:
+            parts.append(f'set name of r to "{esc(a.title)}"')
+        # URL has no public AppleScript property; append to notes as a tappable link
+        notes_body = a.notes
+        if hasattr(a, 'url') and a.url:
+            notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
+        if notes_body:
+            parts.append(f'set body of r to "{esc(notes_body)}"')
+        if a.priority and a.priority.lower() in pm:
+            parts.append(f"set priority of r to {pm[a.priority.lower()]}")
+        if a.due == "clear":
+            parts.append("set due date of r to missing value")
+        elif a.due:
+            dt = parse_due(a.due)
+            if dt:
+                parts.append(f'set due date of r to date "{as_date(dt)}"')
+        if parts and osa_by_id_try(r["list_name"], _rem_id(r), chr(10).join(parts)):
+            if a.json:
+                print(json.dumps({"status": "updated", "id": a.id}))
+            else:
+                print(f"Updated #{a.id}")
+            return
+
+    # Bridge fallback — used when AppleScript failed OR when the edit touches a
+    # bridge-only field (recurrence, alarm). Bridge writes for these fields DO
+    # sync reliably; only dueDateComponents-only writes are the known-broken case.
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
         if a.notes: data["notes"] = a.notes; has_changes = True
-        pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
         if a.priority and a.priority.lower() in pm:
             data["priority"] = pm[a.priority.lower()]; has_changes = True
         if a.due == "clear":
@@ -993,11 +1066,10 @@ def cmd_edit(a):
                     print(f"Updated #{a.id}")
                 return
 
-    # Fall back to AppleScript
+    # Last resort: AppleScript by-name (used when ZCKIDENTIFIER is missing).
     parts = []
     if a.title: parts.append(f'set name of r to "{esc(a.title)}"')
     if a.notes: parts.append(f'set body of r to "{esc(a.notes)}"')
-    pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
     if a.priority and a.priority.lower() in pm:
         parts.append(f"set priority of r to {pm[a.priority.lower()]}")
     if a.due == "clear":
@@ -1008,19 +1080,15 @@ def cmd_edit(a):
     if not parts:
         print("Nothing to update.")
         return
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, chr(10).join(parts))
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-            f'if (count of rs) > 0 then\n'
-            f'set r to item 1 of rs\n'
-            f'{chr(10).join(parts)}\n'
-            f'end if\nend tell\nend tell'
-        )
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+        f'if (count of rs) > 0 then\n'
+        f'set r to item 1 of rs\n'
+        f'{chr(10).join(parts)}\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "updated", "id": a.id}))
     else:
@@ -1299,7 +1367,14 @@ def cmd_flag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Try bridge first
+    rid = _rem_id(r)
+    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to true"):
+        if a.json:
+            print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
+        else:
+            print(f"Flagged: {r['ZTITLE']}")
+        return
+
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "flag", "id": r["ZCKIDENTIFIER"]}
         result = bridge_call(data)
@@ -1310,19 +1385,14 @@ def cmd_flag(a):
                 print(f"Flagged: {r['ZTITLE']}")
             return
 
-    # Fall back to AppleScript
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, "set flagged of r to true")
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-            f'if (count of rs) > 0 then\n'
-            f'set flagged of item 1 of rs to true\n'
-            f'end if\nend tell\nend tell'
-        )
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+        f'if (count of rs) > 0 then\n'
+        f'set flagged of item 1 of rs to true\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
     else:
@@ -1335,7 +1405,14 @@ def cmd_unflag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Try bridge first
+    rid = _rem_id(r)
+    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to false"):
+        if a.json:
+            print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
+        else:
+            print(f"Unflagged: {r['ZTITLE']}")
+        return
+
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "unflag", "id": r["ZCKIDENTIFIER"]}
         result = bridge_call(data)
@@ -1346,19 +1423,14 @@ def cmd_unflag(a):
                 print(f"Unflagged: {r['ZTITLE']}")
             return
 
-    # Fall back to AppleScript
-    rid = _rem_id(r)
-    if rid:
-        osa_by_id(r["list_name"], rid, "set flagged of r to false")
-    else:
-        osa(
-            f'tell application "Reminders"\n'
-            f'tell list "{esc(r["list_name"])}"\n'
-            f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-            f'if (count of rs) > 0 then\n'
-            f'set flagged of item 1 of rs to false\n'
-            f'end if\nend tell\nend tell'
-        )
+    osa(
+        f'tell application "Reminders"\n'
+        f'tell list "{esc(r["list_name"])}"\n'
+        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
+        f'if (count of rs) > 0 then\n'
+        f'set flagged of item 1 of rs to false\n'
+        f'end if\nend tell\nend tell'
+    )
     if a.json:
         print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
     else:

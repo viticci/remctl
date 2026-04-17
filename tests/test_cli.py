@@ -188,6 +188,124 @@ class CliTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"SHELL": "/bin/zsh"}, clear=False):
             self.assertEqual(self.remctl.resolve_setup_shell("auto"), "zsh")
 
+    # --- Regression: AppleScript-first for mutating ops (iCloud sync) ---
+    # 2026-04-17: EKEventStore.save() from a short-lived CLI process updates
+    # CoreData locally but the resulting CKRecord push omits dueDateComponents,
+    # so iOS Reminders never sees the new date. AppleScript writes via
+    # Reminders.app include the surrounding state and sync correctly. All
+    # mutating CLI commands must try osa_by_id_try BEFORE bridge_call.
+    _FAKE_REMINDER = {
+        "ZCKIDENTIFIER": "DEAD-BEEF-0000-0000-0000-000000000000",
+        "ZTITLE": "test",
+        "list_name": "Emails",
+    }
+
+    def _assert_applescript_first(self, cmd_name, args, script_contains):
+        reminder = self._FAKE_REMINDER
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            getattr(self.remctl, cmd_name)(args)
+        osa_try.assert_called_once()
+        # Ensure the actual AppleScript body matches what we expect for this op
+        action = osa_try.call_args.args[2]
+        self.assertIn(script_contains, action)
+        bridge_call.assert_not_called()
+
+    def test_cmd_done_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_done",
+            SimpleNamespace(id=1, json=True),
+            "set completed of r to true",
+        )
+
+    def test_cmd_undone_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_undone",
+            SimpleNamespace(id=1, json=True),
+            "set completed of r to false",
+        )
+
+    def test_cmd_flag_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_flag",
+            SimpleNamespace(id=1, json=True),
+            "set flagged of r to true",
+        )
+
+    def test_cmd_unflag_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_unflag",
+            SimpleNamespace(id=1, json=True),
+            "set flagged of r to false",
+        )
+
+    def test_cmd_delete_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_delete",
+            SimpleNamespace(id=1, json=True, force=True),
+            "delete r",
+        )
+
+    def test_cmd_edit_due_date_tries_applescript_before_bridge(self):
+        self._assert_applescript_first(
+            "cmd_edit",
+            SimpleNamespace(
+                id=1, json=True, title=None, notes=None, priority=None,
+                due="2026-04-20 09:00", url=None, recurrence=None, alarm=None,
+            ),
+            "set due date of r to date",
+        )
+
+    def test_cmd_edit_with_bridge_only_field_skips_applescript(self):
+        """alarm/recurrence can't be set via AppleScript — bridge must be used."""
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due=None, url=None, recurrence=None, alarm="15m",
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        osa_try.assert_not_called()
+        bridge_call.assert_called_once()
+        self.assertEqual(bridge_call.call_args.args[0]["alarm"], "-15m")
+
+    def test_cmd_edit_falls_back_to_bridge_when_applescript_fails(self):
+        """If osa_by_id_try returns False (timeout/error), bridge must still run."""
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-04-20 09:00", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=False),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        bridge_call.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
