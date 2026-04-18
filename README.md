@@ -117,13 +117,15 @@ What `remctl onboard` does:
 2. Triggers the native Reminders permission prompt through EventKit.
 3. Triggers the AppleScript Automation prompt used by fallback writes and real flagged-state writes.
 4. Verifies whether direct database reads are available.
-5. Tells you exactly what is still missing.
+5. If Full Disk Access is missing, opens the correct System Settings pane and tells you exactly what to add.
 
-Important: macOS does not provide a native Full Disk Access prompt. If onboarding reports that direct SQLite reads are blocked, grant Full Disk Access to the Python interpreter shown by `remctl doctor`, then rerun:
+Important: macOS does not provide a native Full Disk Access prompt. If onboarding reports that direct SQLite reads are blocked, grant Full Disk Access to the terminal app running `remctl` or to the Python interpreter shown by `remctl doctor`, then rerun:
 
 ```bash
 remctl doctor
 ```
+
+If onboarding says the local `remctl` service fallback is already healthy, you can keep using `remctl` immediately and come back to Full Disk Access later. The warning only affects direct SQLite reads in that shell.
 
 ### Verify What You Are Actually Running
 

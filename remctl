@@ -48,6 +48,24 @@ LAUNCH_AGENT_LABEL = "com.remctl.server"
 ONBOARD_STATE_FILE = CONFIG_DIR / "onboard-state.json"
 AUTO_ONBOARD_SKIP_ENV = "REMCTL_SKIP_ONBOARD"
 AUTO_ONBOARD_SKIP_COMMANDS = {"completion", "doctor", "onboard", "service", "setup"}
+FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+KNOWN_TERMINAL_APPS = {
+    "alacritty": "Alacritty.app",
+    "apple_terminal": "Terminal.app",
+    "code": "Visual Studio Code.app",
+    "cursor": "Cursor.app",
+    "ghostty": "Ghostty.app",
+    "hyper": "Hyper.app",
+    "iterm.app": "iTerm.app",
+    "iterm2": "iTerm.app",
+    "kitty": "kitty.app",
+    "terminal": "Terminal.app",
+    "visual studio code": "Visual Studio Code.app",
+    "warp": "Warp.app",
+    "warpterminal": "Warp.app",
+    "wezterm-gui": "WezTerm.app",
+    "zed": "Zed.app",
+}
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -138,8 +156,9 @@ def show_splash():
 def reminders_store_access_error():
     if STORE_DIR.exists() and not os.access(STORE_DIR, os.R_OK):
         return (
-            f"Reminders store at {STORE_DIR} is not readable from {sys.executable}. "
-            "Grant Full Disk Access to this Python interpreter or use the local remctl service."
+            f"Direct SQLite reads are blocked because the Reminders store at {STORE_DIR} "
+            f"is not readable from {sys.executable}. Grant Full Disk Access to the terminal "
+            "app or this Python interpreter, or use the local remctl service."
         )
     return None
 
@@ -724,6 +743,112 @@ def print_check_report(title, checks):
     return warn_count, fail_count
 
 
+def _normalize_terminal_app_name(value):
+    if not value:
+        return None
+    return KNOWN_TERMINAL_APPS.get(value.strip().lower())
+
+
+def detect_terminal_app_name():
+    env_name = _normalize_terminal_app_name(os.environ.get("TERM_PROGRAM"))
+    if env_name:
+        return env_name
+
+    pid = os.getppid()
+    for _ in range(6):
+        if not pid or pid <= 1:
+            break
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        if proc.returncode != 0:
+            break
+        line = proc.stdout.strip()
+        if not line:
+            break
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            break
+        next_pid, command = parts
+        label = _normalize_terminal_app_name(Path(command).name)
+        if label:
+            return label
+        try:
+            pid = int(next_pid)
+        except ValueError:
+            break
+    return None
+
+
+def full_disk_access_targets():
+    terminal_name = detect_terminal_app_name()
+    targets = []
+    if terminal_name:
+        targets.append(f"{terminal_name} (recommended for CLI use)")
+    else:
+        targets.append("the terminal app that is running remctl (recommended for CLI use)")
+    targets.append(str(sys.executable))
+    return targets
+
+
+def full_disk_access_fix_text(*, api_healthy=False, rerun_command="remctl doctor", mention_onboard=False):
+    targets = full_disk_access_targets()
+    target_text = " or ".join(targets)
+    parts = [
+        "macOS does not provide a native Full Disk Access prompt.",
+        f"Open System Settings > Privacy & Security > Full Disk Access and add {target_text}.",
+        f"Then relaunch the terminal and rerun `{rerun_command}`.",
+    ]
+    if mention_onboard:
+        parts.insert(1, "`remctl onboard` will open the correct System Settings pane for you.")
+    if api_healthy:
+        parts.append(
+            "If you are happy using the healthy local remctl service fallback, you can ignore this warning."
+        )
+    return " ".join(parts)
+
+
+def open_full_disk_access_settings():
+    try:
+        proc = subprocess.run(
+            ["open", FULL_DISK_ACCESS_SETTINGS_URL],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def print_full_disk_access_guidance(*, api_healthy=False, settings_opened=False, rerun_command="remctl doctor"):
+    print()
+    print(C.bold("Full Disk Access"))
+    if settings_opened:
+        print(C.dim("  Opened System Settings > Privacy & Security > Full Disk Access."))
+    else:
+        print(C.dim("  Open System Settings > Privacy & Security > Full Disk Access."))
+    for target in full_disk_access_targets():
+        print(C.dim(f"  Add: {target}"))
+    print(C.dim(f"  Then relaunch the terminal and rerun `{rerun_command}`."))
+    if api_healthy:
+        print(C.dim("  Direct SQLite reads are optional here because the local remctl service fallback is already healthy."))
+
+
+def needs_full_disk_access_guidance(check):
+    if not check:
+        return False
+    fix = check.get("fix") or ""
+    detail = check.get("detail") or ""
+    return "Full Disk Access" in fix or "Full Disk Access" in detail
+
+
 def load_onboard_state():
     if not ONBOARD_STATE_FILE.exists():
         return None
@@ -882,33 +1007,31 @@ def local_api_check_for_onboarding():
 def database_access_check_for_onboarding(api_check=None):
     access_error = reminders_store_access_error()
     db_path = find_main_db_path()
+    api_healthy = bool(api_check and api_check["status"] == "ok")
     if access_error:
-        if api_check and api_check["status"] == "ok":
+        if api_healthy:
             return check_result(
                 "database",
                 "warn",
-                f"{access_error} Local remctl service fallback is healthy.",
                 (
-                    f"Grant Full Disk Access to {sys.executable} if you want direct SQLite reads. "
-                    "macOS does not provide a native prompt for this."
+                    f"{access_error} Direct SQLite reads are blocked in this shell, "
+                    "but the local remctl service fallback is healthy."
                 ),
+                full_disk_access_fix_text(api_healthy=True, rerun_command="remctl doctor"),
             )
         return check_result(
             "database",
             "fail",
             access_error,
-            (
-                f"Grant Full Disk Access to {sys.executable}. "
-                "macOS does not provide a native prompt for this."
-            ),
+            full_disk_access_fix_text(api_healthy=False, rerun_command="remctl doctor"),
         )
     if db_path:
         return check_result("database", "ok", str(db_path))
-    if api_check and api_check["status"] == "ok":
+    if api_healthy:
         return check_result(
             "database",
             "warn",
-            "No local Reminders database found. Local remctl service fallback is healthy.",
+            "No local Reminders database found. The local remctl service fallback is healthy.",
             "Enable iCloud Reminders and open Reminders.app once if you want direct SQLite reads.",
         )
     return check_result(
@@ -971,6 +1094,14 @@ def maybe_run_first_launch_onboarding(args):
     print()
     result = run_onboarding(auto=True)
     print_check_report("RemCTL onboard", result["checks"])
+    database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
+    api_check = next((check for check in result["checks"] if check["name"] == "local_api"), None)
+    if needs_full_disk_access_guidance(database_check):
+        print_full_disk_access_guidance(
+            api_healthy=bool(api_check and api_check["status"] == "ok"),
+            settings_opened=False,
+            rerun_command="remctl doctor",
+        )
     print()
     return result
 
@@ -3224,10 +3355,10 @@ def gather_doctor_checks():
             "database",
             "fail",
             db_access_error,
-            (
-                f"Run remctl onboard to prompt Reminders and Automation access. "
-                f"For direct SQLite reads, also grant Full Disk Access to {sys.executable} "
-                "or rely on remctl service fallback."
+            full_disk_access_fix_text(
+                api_healthy=False,
+                rerun_command="remctl doctor",
+                mention_onboard=True,
             ),
         )
     else:
@@ -3316,11 +3447,13 @@ def gather_doctor_checks():
                 if check["name"] == "database" and check["status"] == "fail":
                     check["status"] = "warn"
                     check["detail"] = (
-                        f"{check['detail']} Local remctl service fallback is healthy."
+                        f"{check['detail']} Direct SQLite reads are blocked in this shell, "
+                        "but the local remctl service fallback is healthy."
                     )
-                    check["fix"] = (
-                        f"Grant Full Disk Access to {sys.executable} if you want direct "
-                        "database reads; otherwise the local remctl service fallback is working."
+                    check["fix"] = full_disk_access_fix_text(
+                        api_healthy=True,
+                        rerun_command="remctl doctor",
+                        mention_onboard=True,
                     )
                     break
     else:
@@ -3356,6 +3489,14 @@ def cmd_onboard(a):
         print(C.dim("Approve any macOS prompts for Reminders or Automation access."))
         print()
         print_check_report(None, result["checks"])
+        database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
+        api_check = next((check for check in result["checks"] if check["name"] == "local_api"), None)
+        if needs_full_disk_access_guidance(database_check):
+            print_full_disk_access_guidance(
+                api_healthy=bool(api_check and api_check["status"] == "ok"),
+                settings_opened=open_full_disk_access_settings(),
+                rerun_command="remctl doctor",
+            )
     if result["failures"]:
         sys.exit(1)
 
@@ -3542,7 +3683,9 @@ def main():
         help="Prompt for macOS Reminders permissions and verify readiness",
         description=(
             "Open Reminders.app, trigger the native EventKit and AppleScript permission prompts,\n"
-            "then verify whether direct database reads and optional local API fallback are ready."
+            "then verify whether direct database reads and optional local API fallback are ready.\n"
+            "If Full Disk Access is still missing, remctl opens the correct System Settings pane\n"
+            "and tells you exactly what to add."
         ),
         epilog=(
             "Examples:\n"
@@ -3551,7 +3694,8 @@ def main():
             "\n"
             "macOS will not show a native Full Disk Access prompt. If onboarding reports that\n"
             "direct SQLite reads are blocked, grant Full Disk Access to the Python interpreter\n"
-            "shown in `remctl doctor`."
+            "or terminal app shown in `remctl doctor`. If the local API fallback is already\n"
+            "healthy, you can keep using remctl and ignore the warning."
         ),
         formatter_class=HelpFormatter,
     ); js(c)

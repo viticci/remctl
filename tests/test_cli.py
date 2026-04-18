@@ -231,12 +231,69 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch.object(self.remctl, "reminders_store_access_error", return_value="db blocked"),
             mock.patch.object(self.remctl, "find_main_db_path", return_value=None),
+            mock.patch.object(self.remctl, "full_disk_access_targets", return_value=["Terminal.app", "/tmp/python3"]),
         ):
             check = self.remctl.database_access_check_for_onboarding(
                 api_check={"status": "ok", "detail": "healthy", "fix": None}
             )
         self.assertEqual(check["status"], "warn")
-        self.assertIn("Local remctl service fallback is healthy", check["detail"])
+        self.assertIn("local remctl service fallback is healthy", check["detail"])
+        self.assertIn("Terminal.app", check["fix"])
+        self.assertIn("ignore this warning", check["fix"])
+
+    def test_detect_terminal_app_name_prefers_term_program(self):
+        with mock.patch.dict("os.environ", {"TERM_PROGRAM": "Apple_Terminal"}, clear=False):
+            self.assertEqual(self.remctl.detect_terminal_app_name(), "Terminal.app")
+
+    def test_full_disk_access_fix_text_mentions_targets_and_fallback(self):
+        with mock.patch.object(
+            self.remctl,
+            "full_disk_access_targets",
+            return_value=["Terminal.app (recommended for CLI use)", "/tmp/python3"],
+        ):
+            text = self.remctl.full_disk_access_fix_text(
+                api_healthy=True,
+                rerun_command="remctl doctor",
+                mention_onboard=True,
+            )
+        self.assertIn("Terminal.app", text)
+        self.assertIn("/tmp/python3", text)
+        self.assertIn("remctl onboard", text)
+        self.assertIn("ignore this warning", text)
+
+    def test_cmd_onboard_opens_full_disk_access_settings_when_database_not_ready(self):
+        result = {
+            "ok": True,
+            "warnings": 1,
+            "failures": 0,
+            "checks": [
+                {"name": "database", "status": "warn", "detail": "db blocked", "fix": "Grant Full Disk Access to Terminal.app"},
+                {"name": "local_api", "status": "ok", "detail": "healthy", "fix": None},
+            ],
+        }
+        with (
+            mock.patch.object(self.remctl, "run_onboarding", return_value=result),
+            mock.patch.object(self.remctl, "print_check_report"),
+            mock.patch.object(self.remctl, "open_full_disk_access_settings", return_value=True) as open_settings,
+            mock.patch.object(self.remctl, "print_full_disk_access_guidance") as guidance,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_onboard(SimpleNamespace(json=False))
+        open_settings.assert_called_once_with()
+        guidance.assert_called_once_with(
+            api_healthy=True,
+            settings_opened=True,
+            rerun_command="remctl doctor",
+        )
+
+    def test_needs_full_disk_access_guidance_false_for_missing_database(self):
+        check = {
+            "name": "database",
+            "status": "warn",
+            "detail": "No local Reminders database found.",
+            "fix": "Enable iCloud Reminders and open Reminders.app once.",
+        }
+        self.assertFalse(self.remctl.needs_full_disk_access_guidance(check))
 
     def test_maybe_run_first_launch_onboarding_runs_once_for_interactive_commands(self):
         args = SimpleNamespace(cmd="today", json=False, format="plain")
@@ -633,7 +690,7 @@ class CliTests(unittest.TestCase):
             checks = self.remctl.gather_doctor_checks()
         database = next(check for check in checks if check["name"] == "database")
         self.assertEqual(database["status"], "warn")
-        self.assertIn("Local remctl service fallback is healthy", database["detail"])
+        self.assertIn("local remctl service fallback is healthy", database["detail"])
 
     def test_fmt_supports_sqlite_row_without_dict_get(self):
         conn = sqlite3.connect(":memory:")
