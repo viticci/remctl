@@ -92,7 +92,6 @@ class CliTests(unittest.TestCase):
             port=8123,
             allow_origin="https://example.com",
             enable_opengraph=True,
-            allow_unsafe_sqlite_writes=True,
         )
         self.assertEqual(
             args,
@@ -105,7 +104,6 @@ class CliTests(unittest.TestCase):
                 "--allow-origin",
                 "https://example.com",
                 "--enable-opengraph",
-                "--allow-unsafe-sqlite-writes",
             ],
         )
 
@@ -151,6 +149,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(settings["server_path"], "/Users/test/bin/remctl-server")
         self.assertEqual(settings["host"], "0.0.0.0")
         self.assertEqual(settings["port"], 19876)
+
+    def test_current_server_path_prefers_resolved_binary_over_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundled = Path(tmpdir) / "remctl-server"
+            bundled.write_text("#!/usr/bin/env python3\n")
+            with (
+                mock.patch.object(self.remctl, "SERVER_PATH", bundled),
+                mock.patch.object(self.remctl.shutil, "which", return_value="/tmp/on-path/remctl-server"),
+            ):
+                resolved = self.remctl.current_server_path()
+        self.assertEqual(resolved, bundled.resolve())
 
     def test_assess_local_api_probe_flags_degraded_database_as_failure(self):
         result = self.remctl.assess_local_api_probe(
@@ -383,6 +392,177 @@ class CliTests(unittest.TestCase):
         bridge_call.assert_not_called()
         osa_try.assert_called_once()
         self.assertIn("set due date of r to _rdt", osa_try.call_args.args[2])
+
+    def _assert_refuses_unsafe_fallback(self, cmd_name, args):
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["ZCKIDENTIFIER"] = None
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
+            mock.patch.object(self.remctl, "osa") as osa,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit):
+                getattr(self.remctl, cmd_name)(args)
+        bridge_call.assert_not_called()
+        osa_try.assert_not_called()
+        osa.assert_not_called()
+
+    def test_cmd_done_refuses_title_based_fallback_without_identifier(self):
+        self._assert_refuses_unsafe_fallback("cmd_done", SimpleNamespace(id=1, json=True))
+
+    def test_cmd_delete_refuses_title_based_fallback_without_identifier(self):
+        self._assert_refuses_unsafe_fallback("cmd_delete", SimpleNamespace(id=1, json=True, force=True))
+
+    def test_cmd_flag_refuses_title_based_fallback_without_identifier(self):
+        self._assert_refuses_unsafe_fallback("cmd_flag", SimpleNamespace(id=1, json=True))
+
+    def test_cmd_edit_refuses_title_based_fallback_without_identifier(self):
+        self._assert_refuses_unsafe_fallback(
+            "cmd_edit",
+            SimpleNamespace(
+                id=1,
+                json=True,
+                title="Retitle",
+                notes=None,
+                priority=None,
+                due=None,
+                url=None,
+                recurrence=None,
+                alarm=None,
+            ),
+        )
+
+    def test_handle_local_api_fallback_today_json_works(self):
+        items = [
+            {
+                "id": 42,
+                "title": "Ship remctl",
+                "list": "Work",
+                "completed": False,
+                "flagged": False,
+                "priority": "medium",
+                "subtaskCount": 0,
+                "isSubtask": False,
+                "dueDate": "2026-04-18T09:00:00",
+            }
+        ]
+        args = SimpleNamespace(cmd="today", json=True, no_overdue=False, format="json")
+        with (
+            mock.patch.object(self.remctl, "local_api_request", return_value=items) as api_request,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            handled = self.remctl.handle_local_api_fallback(args)
+        self.assertTrue(handled)
+        api_request.assert_called_once_with("GET", "/api/v1/today")
+        self.assertEqual(json.loads(stdout.getvalue()), items)
+
+    def test_handle_local_api_fallback_done_posts_complete(self):
+        args = SimpleNamespace(cmd="done", id=42, json=True)
+        with (
+            mock.patch.object(
+                self.remctl,
+                "local_api_request",
+                return_value={"status": "completed", "title": "Ship remctl"},
+            ) as api_request,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            handled = self.remctl.handle_local_api_fallback(args)
+        self.assertTrue(handled)
+        api_request.assert_called_once_with("POST", "/api/v1/reminders/42/complete", body={})
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"status": "completed", "id": 42, "title": "Ship remctl"},
+        )
+
+    def test_handle_local_api_fallback_edit_forwards_clear_due_and_bridge_fields(self):
+        args = SimpleNamespace(
+            cmd="edit",
+            id=42,
+            json=True,
+            title="Renamed",
+            notes="Updated notes",
+            priority="high",
+            due="clear",
+            url="https://example.com",
+            recurrence="weekly mon,wed",
+            alarm="15m",
+        )
+        with (
+            mock.patch.object(self.remctl, "local_api_request", return_value={"status": "updated"}) as api_request,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            handled = self.remctl.handle_local_api_fallback(args)
+        self.assertTrue(handled)
+        api_request.assert_called_once()
+        self.assertEqual(api_request.call_args.args, ("PATCH", "/api/v1/reminders/42"))
+        self.assertEqual(
+            api_request.call_args.kwargs["body"],
+            {
+                "title": "Renamed",
+                "notes": "Updated notes",
+                "priority": 1,
+                "due": None,
+                "url": "https://example.com",
+                "recurrence": {"frequency": "weekly", "interval": 1, "daysOfWeek": [2, 4]},
+                "alarm": "-15m",
+            },
+        )
+        self.assertEqual(json.loads(stdout.getvalue()), {"status": "updated", "id": 42})
+
+    def test_run_handler_with_fallback_uses_local_api_when_database_unavailable(self):
+        args = SimpleNamespace(cmd="today", json=True, no_overdue=False, format="json")
+        handler = mock.Mock(side_effect=self.remctl.RemindersDBUnavailable("db unavailable"))
+        with mock.patch.object(self.remctl, "handle_local_api_fallback", return_value=True) as fallback:
+            self.remctl.run_handler_with_fallback(args, handler)
+        fallback.assert_called_once_with(args)
+
+    def test_gather_doctor_checks_downgrades_database_failure_when_local_api_is_healthy(self):
+        def fake_path(path):
+            return SimpleNamespace(exists=lambda: True, __str__=lambda self: path)
+
+        with (
+            mock.patch.object(self.remctl, "reminders_store_access_error", return_value="db blocked"),
+            mock.patch.object(self.remctl, "find_main_db_path", return_value=None),
+            mock.patch.object(self.remctl, "STORE_DIR", fake_path("/tmp/store")),
+            mock.patch.object(self.remctl, "CONFIG_DIR", fake_path("/tmp/config")),
+            mock.patch.object(
+                self.remctl,
+                "TOKEN_FILE",
+                SimpleNamespace(
+                    exists=lambda: True,
+                    read_text=lambda: "secret",
+                    __str__=lambda self: "/tmp/token",
+                ),
+            ),
+            mock.patch.object(self.remctl, "current_cli_path", return_value=fake_path("/tmp/remctl")),
+            mock.patch.object(self.remctl, "current_bridge_path", return_value=fake_path("/tmp/remctl-bridge")),
+            mock.patch.object(self.remctl, "current_server_path", return_value=fake_path("/tmp/remctl-server")),
+            mock.patch.object(self.remctl.os, "access", return_value=True),
+            mock.patch.object(self.remctl, "detect_shell_name", return_value="zsh"),
+            mock.patch.object(self.remctl, "completion_target_path", return_value=fake_path("/tmp/_remctl")),
+            mock.patch.object(
+                self.remctl,
+                "launch_agent_status",
+                return_value={"installed": True, "running": True, "path": "/tmp/com.remctl.server.plist"},
+            ),
+            mock.patch.object(self.remctl, "parse_launch_agent_settings", return_value={"host": "127.0.0.1", "port": 19876}),
+            mock.patch.object(self.remctl, "local_api_probe", return_value={}),
+            mock.patch.object(
+                self.remctl,
+                "assess_local_api_probe",
+                return_value={"status": "ok", "detail": "healthy", "fix": None},
+            ),
+            mock.patch.object(self.remctl.shutil, "which", return_value="/tmp/remctl"),
+        ):
+            checks = self.remctl.gather_doctor_checks()
+        database = next(check for check in checks if check["name"] == "database")
+        self.assertEqual(database["status"], "warn")
+        self.assertIn("Local remctl service fallback is healthy", database["detail"])
 
 
 if __name__ == "__main__":

@@ -131,7 +131,6 @@ _remctl() {
                         '--port[Port]:port:' \
                         '--allow-origin[CORS origin]:origin:' \
                         '--enable-opengraph[Enable OpenGraph endpoint]' \
-                        '--allow-unsafe-sqlite-writes[Allow unsafe SQLite fallback]' \
                         '--doctor[Run doctor after setup]' \
                         '--json[JSON output]'
                     ;;
@@ -142,7 +141,6 @@ _remctl() {
                         '--port[Port]:port:' \
                         '--allow-origin[CORS origin]:origin:' \
                         '--enable-opengraph[Enable OpenGraph endpoint]' \
-                        '--allow-unsafe-sqlite-writes[Allow unsafe SQLite fallback]' \
                         '--no-start[Do not start after install]' \
                         '--keep-file[Keep plist when uninstalling]' \
                         '--json[JSON output]'

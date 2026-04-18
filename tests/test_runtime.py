@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,6 +51,18 @@ class RuntimeTests(unittest.TestCase):
     def test_mask_secret_hides_middle(self):
         self.assertEqual(remctl_runtime.mask_secret("abcdefgh12345678"), "abcd...5678")
         self.assertEqual(remctl_runtime.mask_secret("short"), "*****")
+
+    def test_due_today_window_uses_start_of_day_bounds(self):
+        now = datetime(2026, 4, 18, 14, 30, 0)
+        sod, eod = remctl_runtime.due_today_window(now)
+        self.assertEqual(sod, datetime(2026, 4, 18, 0, 0, 0))
+        self.assertEqual(eod, datetime(2026, 4, 19, 0, 0, 0))
+
+    def test_upcoming_window_starts_at_start_of_day(self):
+        now = datetime(2026, 4, 18, 14, 30, 0)
+        sod, end = remctl_runtime.upcoming_window(7, now)
+        self.assertEqual(sod, datetime(2026, 4, 18, 0, 0, 0))
+        self.assertEqual(end, datetime(2026, 4, 26, 0, 0, 0))
 
     def test_is_safe_remote_url_accepts_public_host(self):
         fake_addrinfo = [(None, None, None, None, ("93.184.216.34", 443))]

@@ -6,6 +6,7 @@ import ipaddress
 import os
 import shutil
 import socket
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -59,6 +60,21 @@ def resolve_binary_path(script_path: str, binary_name: str, env_var: str) -> Pat
         return Path(discovered)
 
     return script_dir / binary_name
+
+
+def start_of_day(now: datetime | None = None) -> datetime:
+    current = now or datetime.now()
+    return current.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def due_today_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    sod = start_of_day(now)
+    return sod, sod + timedelta(days=1)
+
+
+def upcoming_window(days: int = 7, now: datetime | None = None) -> tuple[datetime, datetime]:
+    sod = start_of_day(now)
+    return sod, sod + timedelta(days=days + 1)
 
 
 def mask_secret(secret: str, visible_chars: int = 4) -> str:

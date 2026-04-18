@@ -11,9 +11,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from remctl_runtime import resolve_binary_path, resolve_config_dir, resolve_store_dir
+from remctl_runtime import (
+    due_today_window,
+    resolve_binary_path,
+    resolve_config_dir,
+    resolve_store_dir,
+    start_of_day,
+    upcoming_window,
+)
 from remctl_serialization import (
     preload_extras as shared_preload_extras,
     serialize_reminder,
@@ -41,6 +49,18 @@ LAUNCH_AGENT_LABEL = "com.remctl.server"
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
     pass
+
+
+class RemindersDBUnavailable(RuntimeError):
+    """Raised when the local Reminders CoreData store is unavailable."""
+
+
+class LocalAPIUnavailable(RuntimeError):
+    """Raised when the local remctl-server fallback cannot be used."""
+
+
+class LocalAPIRequestError(RuntimeError):
+    """Raised when the local remctl-server returns a request error."""
 
 # ── Color System ─────────────────────────────────────────────────────────────
 
@@ -112,15 +132,28 @@ def show_splash():
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
+def reminders_store_access_error():
+    if STORE_DIR.exists() and not os.access(STORE_DIR, os.R_OK):
+        return (
+            f"Reminders store at {STORE_DIR} is not readable from {sys.executable}. "
+            "Grant Full Disk Access to this Python interpreter or use the local remctl service."
+        )
+    return None
+
+
 def find_main_db():
+    access_error = reminders_store_access_error()
+    if access_error:
+        raise RemindersDBUnavailable(access_error)
     db_path = find_main_db_path()
     if not db_path:
-        print("Error: No Reminders database found. Is iCloud Reminders enabled?", file=sys.stderr)
-        sys.exit(1)
+        raise RemindersDBUnavailable("No Reminders database found. Is iCloud Reminders enabled?")
     return db_path
 
 
 def find_main_db_path():
+    if reminders_store_access_error():
+        return None
     candidates = sorted(STORE_DIR.glob("Data-*.sqlite"), key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0] if candidates else None
 
@@ -312,9 +345,7 @@ def q_search(db, query, completed=False):
     ).fetchall()
 
 def q_due_today(db, include_overdue=True):
-    now = datetime.now()
-    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    eod = sod + timedelta(days=1)
+    sod, eod = due_today_window()
     if include_overdue:
         w = f"r.ZDUEDATE < {to_ts(eod)} AND r.ZDUEDATE IS NOT NULL"
     else:
@@ -334,9 +365,7 @@ def q_flagged(db):
 
 def q_upcoming(db, days=7):
     """Reminders due within the next N days (not overdue)."""
-    now = datetime.now()
-    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    future = sod + timedelta(days=days + 1)
+    sod, future = upcoming_window(days)
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
@@ -347,8 +376,7 @@ def q_upcoming(db, days=7):
 
 def q_overdue(db):
     """All overdue incomplete reminders."""
-    now = datetime.now()
-    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    sod = start_of_day()
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
@@ -360,7 +388,18 @@ def q_overdue(db):
 
 def fmt_due(v, colored=True):
     if not v: return ""
-    dt, now = ts(v), datetime.now()
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, str):
+        try:
+            dt = datetime.fromisoformat(v)
+        except ValueError:
+            return ""
+    else:
+        dt = ts(v)
+    if not dt:
+        return ""
+    now = datetime.now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if dt.date() == today.date():
         label = f" (today {dt.strftime('%H:%M')})" if dt.hour or dt.minute else " (today)"
@@ -384,22 +423,49 @@ def _color_priority(pri_val):
     if pri_val == 9: return C.green(p)
     return p
 
+
+def _priority_value_from_item(item):
+    if "ZPRIORITY" in item:
+        return item["ZPRIORITY"] or 0
+    return {"high": 1, "medium": 5, "low": 9}.get((item.get("priority") or "none").lower(), 0)
+
+
+def _list_name_from_item(item):
+    return item["list_name"] if "list_name" in item else item.get("list")
+
+
+def _url_from_item(item):
+    return item["ZICSURL"] if "ZICSURL" in item else item.get("url")
+
+
+def _subtask_count_from_item(item, db=None, _sc=None):
+    if "Z_PK" in item:
+        return (_sc or {}).get(item["Z_PK"], q_subtask_count(db, item["Z_PK"]) if db else 0)
+    return item.get("subtaskCount", 0) or 0
+
+
+def _tags_from_item(item, db=None, _ht=None):
+    if "Z_PK" in item:
+        return (_ht or {}).get(item["Z_PK"], [t["ZNAME"] for t in q_hashtags(db, item["Z_PK"])] if db else [])
+    return item.get("tags", []) or []
+
 def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
-    completed = r["ZCOMPLETED"]
+    completed = r["ZCOMPLETED"] if "ZCOMPLETED" in r else bool(r.get("completed"))
     if completed:
         status = C.green("[x]")
     else:
         status = C.dim("[ ]")
-    flag = C.yellow(" *") if r["ZFLAGGED"] else ""
-    pri_val = r["ZPRIORITY"] or 0
-    sc = (_sc or {}).get(r["Z_PK"], q_subtask_count(db, r["Z_PK"]) if db else 0)
-    tags = (_ht or {}).get(r["Z_PK"], [t["ZNAME"] for t in q_hashtags(db, r["Z_PK"])] if db else [])
+    flag = C.yellow(" *") if (r["ZFLAGGED"] if "ZFLAGGED" in r else bool(r.get("flagged"))) else ""
+    pri_val = _priority_value_from_item(r)
+    sc = _subtask_count_from_item(r, db=db, _sc=_sc)
+    tags = _tags_from_item(r, db=db, _ht=_ht)
     tag_str = " " + " ".join(f"#{t}" for t in tags) if tags else ""
     sub_str = f" [{sc} subtask{'s' if sc != 1 else ''}]" if sc > 0 else ""
     pri_str = f" {_color_priority(pri_val)}" if PRI.get(pri_val, "") else ""
-    id_str = C.dim(f"#{r['Z_PK']}")
-    title = r["ZTITLE"] or "(untitled)"
-    due_str = fmt_due(r["ZDUEDATE"])
+    rid = r["Z_PK"] if "Z_PK" in r else r.get("id", "?")
+    id_str = C.dim(f"#{rid}")
+    title = (r["ZTITLE"] if "ZTITLE" in r else r.get("title")) or "(untitled)"
+    due_str = fmt_due(r["ZDUEDATE"] if "ZDUEDATE" in r else r.get("dueDate"))
     if completed:
         title = C.dim(C.strikethrough(title))
         due_str = C.dim(due_str)
@@ -407,12 +473,15 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
         sub_str = C.dim(sub_str)
     parts = [f"{indent}{status} {id_str}{pri_str}{flag} {title}{due_str}{tag_str}{sub_str}"]
     if verbose:
-        if r["list_name"]:
-            parts.append(f"{indent}    List: {color_list_name(r['list_name'], db)}")
-        if r["ZNOTES"]:
-            parts.append(f"{indent}    Notes: {C.dim(str(r['ZNOTES'])[:200])}")
-        if r["ZICSURL"]:
-            parts.append(f"{indent}    URL: {C.dim(r['ZICSURL'])}")
+        list_name = _list_name_from_item(r)
+        if list_name:
+            parts.append(f"{indent}    List: {color_list_name(list_name, db)}")
+        notes = r["ZNOTES"] if "ZNOTES" in r else r.get("notes")
+        if notes:
+            parts.append(f"{indent}    Notes: {C.dim(str(notes)[:200])}")
+        url = _url_from_item(r)
+        if url:
+            parts.append(f"{indent}    URL: {C.dim(url)}")
     return "\n".join(parts)
 
 def to_dict(r, db=None, section=None, _sc=None, _ht=None):
@@ -523,8 +592,18 @@ def reminders_to_table_data(items, db=None):
     sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
     for r in items:
         due_str = ""
-        if r["ZDUEDATE"]:
-            dt = ts(r["ZDUEDATE"])
+        due_value = r["ZDUEDATE"] if "ZDUEDATE" in r else r.get("dueDate")
+        if due_value:
+            if isinstance(due_value, str):
+                try:
+                    dt = datetime.fromisoformat(due_value)
+                except ValueError:
+                    dt = None
+            else:
+                dt = ts(due_value)
+        else:
+            dt = None
+        if dt:
             if dt.date() == sod.date():
                 due_str = "Today"
                 if dt.hour or dt.minute:
@@ -535,16 +614,17 @@ def reminders_to_table_data(items, db=None):
                 due_str = C.red(f"Overdue {(now - dt).days}d")
             else:
                 due_str = dt.strftime("%Y-%m-%d")
-        pri_val = r["ZPRIORITY"] or 0
+        pri_val = _priority_value_from_item(r)
         pri_str = _color_priority(pri_val) if PRI.get(pri_val, "") else ""
-        title = r["ZTITLE"] or "(untitled)"
-        if r["ZFLAGGED"]:
+        title = (r["ZTITLE"] if "ZTITLE" in r else r.get("title")) or "(untitled)"
+        flagged = r["ZFLAGGED"] if "ZFLAGGED" in r else bool(r.get("flagged"))
+        if flagged:
             title = C.yellow("* ") + title
-        list_name = r["list_name"] or ""
+        list_name = _list_name_from_item(r) or ""
         if db and C.enabled:
             list_name = color_list_name(list_name, db)
         data.append({
-            "id": r["Z_PK"],
+            "id": r["Z_PK"] if "Z_PK" in r else r.get("id", ""),
             "title": title,
             "list": list_name,
             "due": due_str,
@@ -915,6 +995,20 @@ def _bridge_write(action, pk, db, extra=None):
     result = bridge_call(data)
     return result is not None and result.get("status") in ("completed", "uncompleted", "deleted", "updated", "flagged", "unflagged")
 
+
+def _refuse_unsafe_title_fallback(reminder, operation, reason):
+    title = reminder["ZTITLE"] or "(untitled)"
+    try:
+        reminder_id = reminder["Z_PK"]
+    except Exception:
+        reminder_id = "?"
+    print(
+        f"Error: {reason}. Refusing unsafe title-based fallback for "
+        f"#{reminder_id} ('{title}') while trying to {operation}.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 def cmd_done(a):
     db = open_db()
     r = q_reminder(db, a.id)
@@ -942,20 +1036,13 @@ def cmd_done(a):
         else:
             print(f"Completed: {r['ZTITLE']}")
         return
-
-    # Last resort: AppleScript by-name
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is false)\n'
-        f'if (count of rs) > 0 then\n'
-        f'set completed of item 1 of rs to true\n'
-        f'end if\nend tell\nend tell'
+    if not rid:
+        _refuse_unsafe_title_fallback(r, "complete it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "complete it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
-    else:
-        print(f"Completed: {r['ZTITLE']}")
 
 def cmd_undone(a):
     db = open_db()
@@ -982,19 +1069,13 @@ def cmd_undone(a):
         else:
             print(f"Uncompleted: {r['ZTITLE']}")
         return
-
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}" and completed is true)\n'
-        f'if (count of rs) > 0 then\n'
-        f'set completed of item 1 of rs to false\n'
-        f'end if\nend tell\nend tell'
+    if not rid:
+        _refuse_unsafe_title_fallback(r, "uncomplete it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "uncomplete it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
-    else:
-        print(f"Uncompleted: {r['ZTITLE']}")
 
 def cmd_delete(a):
     db = open_db()
@@ -1026,19 +1107,13 @@ def cmd_delete(a):
         else:
             print(f"Deleted: {r['ZTITLE']}")
         return
-
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-        f'if (count of rs) > 0 then\n'
-        f'delete item 1 of rs\n'
-        f'end if\nend tell\nend tell'
+    if not rid:
+        _refuse_unsafe_title_fallback(r, "delete it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "delete it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
-    else:
-        print(f"Deleted: {r['ZTITLE']}")
 
 def cmd_edit(a):
     db = open_db()
@@ -1156,39 +1231,16 @@ def cmd_edit(a):
                 print(f"Updated #{a.id}")
             return
 
-    # Last resort: AppleScript by-name. Warn loudly — this matches on title
-    # and can hit the wrong reminder if duplicates exist.
-    print(
-        f"Warning: #{a.id} has no ZCKIDENTIFIER; falling back to "
-        "title-based AppleScript match. If multiple reminders share this "
-        "title, the wrong one may be edited.",
-        file=sys.stderr,
-    )
-    parts = []
-    if a.title: parts.append(f'set name of r to "{esc(a.title)}"')
-    if a.notes: parts.append(f'set body of r to "{esc(a.notes)}"')
-    if a.priority and a.priority.lower() in pm:
-        parts.append(f"set priority of r to {pm[a.priority.lower()]}")
-    if a.due == "clear":
-        parts.append("set due date of r to missing value")
-    elif dt is not None:
-        parts.append(as_date_assign(dt))
-    if not parts:
+    if not has_applescript_fields and not has_bridge_only:
         print("Nothing to update.")
         return
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-        f'if (count of rs) > 0 then\n'
-        f'set r to item 1 of rs\n'
-        f'{chr(10).join(parts)}\n'
-        f'end if\nend tell\nend tell'
+    if not r["ZCKIDENTIFIER"]:
+        _refuse_unsafe_title_fallback(r, "edit it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "edit it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "updated", "id": a.id}))
-    else:
-        print(f"Updated #{a.id}")
 
 def cmd_search(a):
     db = open_db()
@@ -1484,19 +1536,13 @@ def cmd_flag(a):
             else:
                 print(f"Flagged: {r['ZTITLE']}")
             return
-
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-        f'if (count of rs) > 0 then\n'
-        f'set flagged of item 1 of rs to true\n'
-        f'end if\nend tell\nend tell'
+    if not rid:
+        _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "flag it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
-    else:
-        print(f"Flagged: {r['ZTITLE']}")
 
 def cmd_unflag(a):
     db = open_db()
@@ -1524,19 +1570,13 @@ def cmd_unflag(a):
             else:
                 print(f"Unflagged: {r['ZTITLE']}")
             return
-
-    osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(r["list_name"])}"\n'
-        f'set rs to (every reminder whose name is "{esc(r["ZTITLE"])}")\n'
-        f'if (count of rs) > 0 then\n'
-        f'set flagged of item 1 of rs to false\n'
-        f'end if\nend tell\nend tell'
+    if not rid:
+        _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
+    _refuse_unsafe_title_fallback(
+        r,
+        "unflag it",
+        "Identifier-based writes failed",
     )
-    if a.json:
-        print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
-    else:
-        print(f"Unflagged: {r['ZTITLE']}")
 
 def cmd_upcoming(a):
     db = open_db()
@@ -1820,6 +1860,9 @@ complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell c
 
 def get_completion_script(shell):
     if shell == "zsh":
+        source_path = Path(__file__).resolve().parent / "completions" / "_remctl"
+        if source_path.exists():
+            return source_path.read_text()
         return ZSH_COMPLETION
     if shell == "bash":
         return BASH_COMPLETION
@@ -1865,6 +1908,8 @@ def current_cli_path():
 
 
 def current_server_path():
+    if SERVER_PATH.exists():
+        return SERVER_PATH.resolve()
     discovered = shutil.which("remctl-server")
     if discovered:
         return Path(discovered).resolve()
@@ -1876,6 +1921,8 @@ def current_python_path():
 
 
 def current_bridge_path():
+    if BRIDGE_PATH.exists():
+        return BRIDGE_PATH.resolve()
     discovered = shutil.which("remctl-bridge")
     if discovered:
         return Path(discovered).resolve()
@@ -1905,7 +1952,6 @@ def launch_agent_program_args(
     port=DEFAULT_SERVER_PORT,
     allow_origin=None,
     enable_opengraph=False,
-    allow_unsafe_sqlite_writes=False,
 ):
     args = [str(server_path), "--port", str(port)]
     if python_path:
@@ -1916,8 +1962,6 @@ def launch_agent_program_args(
         args.extend(["--allow-origin", allow_origin])
     if enable_opengraph:
         args.append("--enable-opengraph")
-    if allow_unsafe_sqlite_writes:
-        args.append("--allow-unsafe-sqlite-writes")
     return args
 
 
@@ -1928,7 +1972,6 @@ def build_launch_agent_plist(
     port=DEFAULT_SERVER_PORT,
     allow_origin=None,
     enable_opengraph=False,
-    allow_unsafe_sqlite_writes=False,
 ):
     log_path = launch_agent_log_path()
     return {
@@ -1940,7 +1983,6 @@ def build_launch_agent_plist(
             port=port,
             allow_origin=allow_origin,
             enable_opengraph=enable_opengraph,
-            allow_unsafe_sqlite_writes=allow_unsafe_sqlite_writes,
         ),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -1962,7 +2004,6 @@ def write_launch_agent_plist(
     port=DEFAULT_SERVER_PORT,
     allow_origin=None,
     enable_opengraph=False,
-    allow_unsafe_sqlite_writes=False,
 ):
     path = launch_agent_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1976,7 +2017,6 @@ def write_launch_agent_plist(
                 port=port,
                 allow_origin=allow_origin,
                 enable_opengraph=enable_opengraph,
-                allow_unsafe_sqlite_writes=allow_unsafe_sqlite_writes,
             ),
             fh,
         )
@@ -2137,10 +2177,520 @@ def assess_local_api_probe(host, port, probe):
     }
 
 
+def local_api_connection_info():
+    settings = parse_launch_agent_settings() or {}
+    host = settings.get("host") or DEFAULT_SERVER_HOST
+    port = settings.get("port") or DEFAULT_SERVER_PORT
+    host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    token = TOKEN_FILE.read_text().strip() if TOKEN_FILE.exists() else ""
+    if not token:
+        raise LocalAPIUnavailable(
+            "Local API token not configured. Run remctl setup or remctl service install."
+        )
+    return host, port, token
+
+
+def local_api_request(method, path, *, query=None, body=None, timeout=5):
+    host, port, token = local_api_connection_info()
+    url = f"http://{host}:{port}{path}"
+    if query:
+        url += "?" + urlencode(query, doseq=True)
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = Request(url, headers=headers, data=data, method=method)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        message = str(exc)
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            message = payload.get("error") or payload.get("message") or message
+        except Exception:
+            pass
+        raise LocalAPIRequestError(message) from exc
+    except (URLError, OSError, json.JSONDecodeError) as exc:
+        raise LocalAPIUnavailable(f"Local API unavailable: {exc}") from exc
+
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        raise LocalAPIRequestError(payload.get("error", "Local API request failed"))
+    if isinstance(payload, dict) and "data" in payload:
+        return payload["data"]
+    return payload
+
+
+def _item_due_datetime(item):
+    value = item.get("dueDate")
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _item_is_overdue(item):
+    if "overdue" in item:
+        return bool(item["overdue"])
+    due_dt = _item_due_datetime(item)
+    return bool(due_dt and due_dt < start_of_day())
+
+
+def _print_reminder_json(items):
+    print(json.dumps(items, indent=2))
+
+
+def _print_list_payload(rows, json_mode=False, table_mode=False):
+    if json_mode:
+        print(json.dumps([{"id": row["id"], "title": row["name"]} for row in rows], indent=2))
+        return
+    if table_mode:
+        data = [{"id": row["id"], "title": row["name"], "list": "", "due": "", "pri": ""} for row in rows]
+        print(fmt_table(data))
+        return
+    print(C.bold("Reminder Lists:"))
+    for row in rows:
+        list_name = color_list_name(row["name"])
+        sec_count = row.get("sectionCount", 0) or 0
+        sec_info = C.dim(f" [{sec_count} sections]") if sec_count else ""
+        id_dim = C.dim(f"(id: {row['id']})")
+        print(f"  {list_name} {id_dim}{sec_info}")
+    print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
+
+
+def _print_show_payload(list_name, items, args):
+    if args.json:
+        _print_reminder_json(items)
+        return
+    if getattr(args, "format", None) == "table":
+        print(fmt_table(reminders_to_table_data(items)))
+        return
+    if not items:
+        print(f"No {'active ' if not args.completed else ''}reminders in '{list_name}'")
+        return
+    print(f"{C.bold(color_list_name(list_name))}:")
+    section_names = [item["section"] for item in items if item.get("section")]
+    if section_names:
+        sec_items, unsectioned = {}, []
+        for item in items:
+            section = item.get("section")
+            if section:
+                sec_items.setdefault(section, []).append(item)
+            else:
+                unsectioned.append(item)
+        for item in unsectioned:
+            print(fmt(item, verbose=args.verbose))
+        seen = []
+        for section in section_names:
+            if section not in seen:
+                seen.append(section)
+        for section in seen:
+            print(f"\n  {C.bold(f'[{section}]')}")
+            for item in sec_items[section]:
+                print(fmt(item, verbose=args.verbose, indent="  "))
+    else:
+        for item in items:
+            print(fmt(item, verbose=args.verbose))
+    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
+
+
+def _print_search_payload(query, items, args):
+    if args.json:
+        _print_reminder_json(items)
+        return
+    if getattr(args, "format", None) == "table":
+        print(fmt_table(reminders_to_table_data(items)))
+        return
+    if not items:
+        print(f"No reminders matching '{query}'")
+        return
+    print(f"Search: {C.bold(query)}")
+    for item in items:
+        print(fmt(item, verbose=args.verbose))
+    print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
+
+
+def _print_today_payload(items, args):
+    if args.no_overdue:
+        items = [item for item in items if not _item_is_overdue(item)]
+    if args.json:
+        _print_reminder_json(items)
+        return
+    if getattr(args, "format", None) == "table":
+        print(fmt_table(reminders_to_table_data(items)))
+        return
+    if not items:
+        print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
+        return
+    overdue = [item for item in items if _item_is_overdue(item)]
+    due = [item for item in items if not _item_is_overdue(item)]
+    if overdue:
+        print(C.red(f"Overdue ({len(overdue)}):"))
+        for item in overdue:
+            print(fmt(item, indent="  "))
+        print()
+    if due:
+        print(C.bold(f"Due Today ({len(due)}):"))
+        for item in due:
+            print(fmt(item, indent="  "))
+    print(f"\n{len(items)} total")
+
+
+def _print_simple_reminder_list(items, args, *, empty_message, heading, total_label, group_by_day=False):
+    if args.json:
+        _print_reminder_json(items)
+        return
+    if getattr(args, "format", None) == "table":
+        print(fmt_table(reminders_to_table_data(items)))
+        return
+    if not items:
+        print(empty_message)
+        return
+    if group_by_day:
+        print(C.bold(heading))
+        groups = {}
+        today = start_of_day()
+        for item in items:
+            due_dt = _item_due_datetime(item)
+            if not due_dt:
+                continue
+            day_key = due_dt.strftime("%Y-%m-%d")
+            day_label = due_dt.strftime("%A, %b %d")
+            if due_dt.date() == today.date():
+                day_label = "Today"
+            elif due_dt.date() == (today + timedelta(days=1)).date():
+                day_label = "Tomorrow"
+            groups.setdefault((day_key, day_label), []).append(item)
+        for (_, day_label), day_items in sorted(groups.items()):
+            print(f"\n  {C.bold(day_label)}:")
+            for item in day_items:
+                print(fmt(item, indent="    "))
+        print(f"\n{len(items)} {total_label}")
+        return
+    print(heading)
+    for item in items:
+        print(fmt(item, verbose=getattr(args, "verbose", False), indent="  "))
+    print(f"\n{len(items)} {total_label}")
+
+
+def _print_tags_payload(rows, json_mode=False):
+    if json_mode:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No tags found")
+        return
+    print(C.bold("Tags:"))
+    for row in rows:
+        print(f"  {C.magenta('#' + row['name'])}")
+    print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
+
+
+def _print_sections_payload(grouped, json_mode=False):
+    if json_mode:
+        print(json.dumps(grouped, indent=2))
+        return
+    if not grouped:
+        print("No sections found")
+        return
+    count = 0
+    for list_name, names in grouped.items():
+        print(f"{C.bold(color_list_name(list_name))}:")
+        for name in names:
+            count += 1
+            print(f"  - {name}")
+        print()
+    print(f"{count} section{'s' if count != 1 else ''}")
+
+
+def _print_stats_payload(stats, json_mode=False):
+    if json_mode:
+        print(json.dumps(stats, indent=2))
+        return
+    print(C.bold("Reminders Stats"))
+    print(f"  Total:      {stats['total']}")
+    print(f"  Active:     {C.green(str(stats['active']))}")
+    print(f"  Completed:  {C.dim(str(stats['completed']))}")
+    print(f"  Overdue:    {C.red(str(stats['overdue'])) if stats['overdue'] else '0'}")
+    print(f"  Flagged:    {C.yellow(str(stats['flagged'])) if stats['flagged'] else '0'}")
+    print(f"  Lists:      {stats['lists']}")
+    print(f"  Sections:   {stats['sections']}")
+
+
+def _print_info_payload(item, args):
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return
+    print(C.bold(f"Reminder #{item['id']}"))
+    print(f"  Title:     {item.get('title') or '(untitled)'}")
+    print(f"  List:      {color_list_name(item.get('list'))}")
+    if item.get("section"):
+        print(f"  Section:   {C.bold(item['section'])}")
+    status_str = C.green("Completed") if item.get("completed") else C.yellow("Active")
+    print(f"  Status:    {status_str}")
+    pri_display = item.get("priority", "none")
+    if pri_display == "high":
+        pri_display = C.red(pri_display)
+    elif pri_display == "medium":
+        pri_display = C.yellow(pri_display)
+    elif pri_display == "low":
+        pri_display = C.green(pri_display)
+    print(f"  Priority:  {pri_display}")
+    print(f"  Flagged:   {C.yellow('Yes') if item.get('flagged') else 'No'}")
+    if item.get("dueDate"):
+        due_dt = _item_due_datetime(item)
+        if due_dt:
+            print(f"  Due:       {due_dt.strftime('%b %d, %Y at %I:%M %p')}")
+    if item.get("createdDate"):
+        print(f"  Created:   {datetime.fromisoformat(item['createdDate']).strftime('%b %d, %Y at %I:%M %p')}")
+    if item.get("completionDate"):
+        print(f"  Completed: {datetime.fromisoformat(item['completionDate']).strftime('%b %d, %Y at %I:%M %p')}")
+    if item.get("notes"):
+        print(f"  Notes:     {item['notes']}")
+    if item.get("url"):
+        print(f"  URL:       {item['url']}")
+    if item.get("tags"):
+        print(f"  Tags:      {', '.join(C.magenta('#' + tag) for tag in item['tags'])}")
+    if item.get("parentTitle"):
+        print(f"  Parent:    #{item['parentID']} ({item['parentTitle']})")
+    elif item.get("parentID"):
+        print(f"  Parent:    #{item['parentID']}")
+    if item.get("subtasks"):
+        print(f"  Subtasks ({len(item['subtasks'])}):")
+        for sub in item["subtasks"]:
+            print(fmt(sub, indent="    "))
+    if item.get("attachments"):
+        print(f"  Attachments ({len(item['attachments'])}):")
+        for attachment in item["attachments"]:
+            print(
+                f"    - {attachment.get('filename') or 'untitled'} "
+                f"({attachment.get('type') or '?'})"
+            )
+    if item.get("deepLink"):
+        print(f"  Deep link: {C.dim(item['deepLink'])}")
+
+
+def _normalize_write_result(result, *, status, reminder_id, title=None, include_title=True):
+    payload = {"status": status, "id": reminder_id}
+    final_title = title if title is not None else result.get("title")
+    if include_title and final_title:
+        payload["title"] = final_title
+    return payload
+
+
+def handle_local_api_fallback(args):
+    cmd = getattr(args, "cmd", None) or "today"
+    if cmd == "lists":
+        rows = local_api_request("GET", "/api/v1/lists")
+        _print_list_payload(rows, json_mode=args.json, table_mode=getattr(args, "format", None) == "table")
+        return True
+    if cmd == "show":
+        items = local_api_request(
+            "GET",
+            f"/api/v1/lists/{quote(args.list, safe='')}",
+            query={"completed": "1"} if args.completed else None,
+        )
+        _print_show_payload(args.list, items, args)
+        return True
+    if cmd == "search":
+        query = {"q": args.query}
+        if args.completed:
+            query["completed"] = "1"
+        items = local_api_request("GET", "/api/v1/search", query=query)
+        _print_search_payload(args.query, items, args)
+        return True
+    if cmd == "today":
+        items = local_api_request("GET", "/api/v1/today")
+        _print_today_payload(items, args)
+        return True
+    if cmd == "upcoming":
+        days = args.days if hasattr(args, "days") and args.days else 7
+        items = local_api_request("GET", "/api/v1/upcoming", query={"days": str(days)})
+        _print_simple_reminder_list(
+            items,
+            args,
+            empty_message=f"Nothing due in the next {days} days",
+            heading=f"Upcoming ({days} days):",
+            total_label="upcoming",
+            group_by_day=True,
+        )
+        return True
+    if cmd == "overdue":
+        items = local_api_request("GET", "/api/v1/overdue")
+        _print_simple_reminder_list(
+            items,
+            args,
+            empty_message="No overdue reminders",
+            heading=C.red(C.bold(f"Overdue ({len(items)}):")),
+            total_label="overdue",
+        )
+        return True
+    if cmd == "flagged":
+        items = local_api_request("GET", "/api/v1/flagged")
+        _print_simple_reminder_list(
+            items,
+            args,
+            empty_message="No flagged reminders",
+            heading=C.bold("Flagged:"),
+            total_label="flagged",
+        )
+        return True
+    if cmd == "tags":
+        rows = local_api_request("GET", "/api/v1/tags")
+        _print_tags_payload(rows, json_mode=args.json)
+        return True
+    if cmd == "sections":
+        grouped = local_api_request("GET", "/api/v1/sections")
+        _print_sections_payload(grouped, json_mode=args.json)
+        return True
+    if cmd == "stats":
+        stats = local_api_request("GET", "/api/v1/stats")
+        _print_stats_payload(stats, json_mode=args.json)
+        return True
+    if cmd == "info":
+        item = local_api_request("GET", f"/api/v1/reminders/{args.id}")
+        _print_info_payload(item, args)
+        return True
+    if cmd == "subtasks":
+        item = local_api_request("GET", f"/api/v1/reminders/{args.id}")
+        subtasks = item.get("subtasks", [])
+        if args.json:
+            payload = dict(item)
+            payload["subtasks"] = subtasks
+            print(json.dumps(payload, indent=2))
+            return True
+        print(f"Parent: {item.get('title') or '(untitled)'}")
+        if not subtasks:
+            print("  No subtasks")
+        else:
+            for sub in subtasks:
+                print(fmt(sub, indent="  "))
+            print(f"\n{len(subtasks)} subtask{'s' if len(subtasks) != 1 else ''}")
+        return True
+    if cmd == "link":
+        if args.list:
+            query = {"completed": "1"} if args.completed else None
+            items = local_api_request("GET", f"/api/v1/lists/{quote(args.list, safe='')}", query=query)
+        else:
+            items = [local_api_request("GET", f"/api/v1/reminders/{rid}") for rid in args.ids]
+        results = [
+            {"id": item["id"], "title": item["title"], "link": item["deepLink"]}
+            for item in items
+            if item.get("deepLink")
+        ]
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            for item in results:
+                print(f"#{item['id']} {item['title']}")
+                print(f"  {C.dim(item['link'])}")
+        return True
+    if cmd == "open":
+        if getattr(args, "id", None):
+            item = local_api_request("GET", f"/api/v1/reminders/{args.id}")
+            if item.get("deepLink"):
+                subprocess.run(["open", item["deepLink"]])
+                print(f"Opened #{args.id} in Reminders.app")
+            else:
+                subprocess.run(["open", "-a", "Reminders"])
+                print("Opened Reminders.app (no deep link available)")
+        else:
+            subprocess.run(["open", "-a", "Reminders"])
+            print("Opened Reminders.app")
+        return True
+    if cmd == "done":
+        result = local_api_request("POST", f"/api/v1/reminders/{args.id}/complete", body={})
+        payload = _normalize_write_result(result, status="completed", reminder_id=args.id)
+        print(json.dumps(payload) if args.json else f"Completed: {payload.get('title', args.id)}")
+        return True
+    if cmd == "undone":
+        result = local_api_request("POST", f"/api/v1/reminders/{args.id}/uncomplete", body={})
+        payload = _normalize_write_result(result, status="uncompleted", reminder_id=args.id)
+        print(json.dumps(payload) if args.json else f"Uncompleted: {payload.get('title', args.id)}")
+        return True
+    if cmd == "flag":
+        result = local_api_request("POST", f"/api/v1/reminders/{args.id}/flag", body={})
+        payload = _normalize_write_result(result, status="flagged", reminder_id=args.id)
+        print(json.dumps(payload) if args.json else f"Flagged: {payload.get('title', args.id)}")
+        return True
+    if cmd == "unflag":
+        result = local_api_request("POST", f"/api/v1/reminders/{args.id}/unflag", body={})
+        payload = _normalize_write_result(result, status="unflagged", reminder_id=args.id)
+        print(json.dumps(payload) if args.json else f"Unflagged: {payload.get('title', args.id)}")
+        return True
+    if cmd == "delete":
+        reminder = local_api_request("GET", f"/api/v1/reminders/{args.id}")
+        if not args.force:
+            ans = input(f"Delete '{reminder.get('title')}' from {reminder.get('list')}? [y/N] ")
+            if not ans.lower().startswith("y"):
+                print("Cancelled.")
+                return True
+        local_api_request("DELETE", f"/api/v1/reminders/{args.id}")
+        payload = _normalize_write_result({}, status="deleted", reminder_id=args.id, title=reminder.get("title"))
+        print(json.dumps(payload) if args.json else f"Deleted: {payload.get('title', args.id)}")
+        return True
+    if cmd == "edit":
+        pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+        dt = None
+        if args.due and args.due != "clear":
+            dt = parse_due(args.due)
+            if dt is None:
+                print(
+                    f"Error: could not parse due date {args.due!r}. Use ISO "
+                    "(YYYY-MM-DD [HH:MM]) or shortcuts like today/tomorrow/eod/+3d.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        body = {}
+        if args.title:
+            body["title"] = args.title
+        if args.notes is not None:
+            body["notes"] = args.notes
+        if args.priority and args.priority.lower() in pm:
+            body["priority"] = pm[args.priority.lower()]
+        if args.due == "clear":
+            body["due"] = None
+        elif dt is not None:
+            body["due"] = dt.isoformat()
+        if getattr(args, "url", None):
+            body["url"] = args.url
+        if getattr(args, "recurrence", None):
+            body["recurrence"] = parse_recurrence(args.recurrence)
+        if getattr(args, "alarm", None):
+            body["alarm"] = parse_alarm(args.alarm)
+        if not body:
+            print("Nothing to update.")
+            return True
+        local_api_request("PATCH", f"/api/v1/reminders/{args.id}", body=body)
+        payload = {"status": "updated", "id": args.id}
+        print(json.dumps(payload) if args.json else f"Updated #{args.id}")
+        return True
+    return False
+
+
+def run_handler_with_fallback(args, handler):
+    try:
+        handler(args)
+    except RemindersDBUnavailable as exc:
+        try:
+            if handle_local_api_fallback(args):
+                return
+        except LocalAPIRequestError as api_exc:
+            print(f"Error: {api_exc}", file=sys.stderr)
+            sys.exit(1)
+        except LocalAPIUnavailable:
+            pass
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_completion(a):
     shell = a.shell if hasattr(a, 'shell') and a.shell else "zsh"
     try:
-        print(get_completion_script(shell))
+        sys.stdout.write(get_completion_script(shell))
     except ValueError as exc:
         print(f"Error: {exc}. Use bash, zsh, or fish.", file=sys.stderr)
         sys.exit(1)
@@ -2158,7 +2708,6 @@ def install_service(
     port=DEFAULT_SERVER_PORT,
     allow_origin=None,
     enable_opengraph=False,
-    allow_unsafe_sqlite_writes=False,
     start=True,
 ):
     if sys.platform != "darwin":
@@ -2173,7 +2722,6 @@ def install_service(
         port=port,
         allow_origin=allow_origin,
         enable_opengraph=enable_opengraph,
-        allow_unsafe_sqlite_writes=allow_unsafe_sqlite_writes,
     )
     service = None
     if start:
@@ -2270,7 +2818,6 @@ def cmd_service(a):
             port=a.port,
             allow_origin=a.allow_origin,
             enable_opengraph=a.enable_opengraph,
-            allow_unsafe_sqlite_writes=a.allow_unsafe_sqlite_writes,
             start=not a.no_start,
         )
     elif a.action == "start":
@@ -2345,13 +2892,22 @@ def gather_doctor_checks():
         None if STORE_DIR.exists() else "Set REMCTL_STORE_DIR if your Reminders store lives elsewhere.",
     )
 
+    db_access_error = reminders_store_access_error()
     db_path = find_main_db_path()
-    add(
-        "database",
-        "ok" if db_path else "fail",
-        str(db_path) if db_path else "No Reminders database found",
-        None if db_path else "Enable iCloud Reminders and open Reminders.app once.",
-    )
+    if db_access_error:
+        add(
+            "database",
+            "fail",
+            db_access_error,
+            f"Grant Full Disk Access to {sys.executable} or rely on remctl service fallback.",
+        )
+    else:
+        add(
+            "database",
+            "ok" if db_path else "fail",
+            str(db_path) if db_path else "No Reminders database found",
+            None if db_path else "Enable iCloud Reminders and open Reminders.app once.",
+        )
 
     cli_path = current_cli_path()
     cli_on_path = shutil.which("remctl") is not None
@@ -2426,6 +2982,18 @@ def gather_doctor_checks():
         probe = local_api_probe(host, port, token=token or None)
         api_check = assess_local_api_probe(host, port, probe)
         add("local_api", api_check["status"], api_check["detail"], api_check["fix"])
+        if api_check["status"] == "ok":
+            for check in checks:
+                if check["name"] == "database" and check["status"] == "fail":
+                    check["status"] = "warn"
+                    check["detail"] = (
+                        f"{check['detail']} Local remctl service fallback is healthy."
+                    )
+                    check["fix"] = (
+                        f"Grant Full Disk Access to {sys.executable} if you want direct "
+                        "database reads; otherwise the local remctl service fallback is working."
+                    )
+                    break
     else:
         add("local_api", "warn", "Server not running", "Run remctl service restart to probe the local API.")
 
@@ -2484,7 +3052,6 @@ def cmd_setup(a):
             port=a.port,
             allow_origin=a.allow_origin,
             enable_opengraph=a.enable_opengraph,
-            allow_unsafe_sqlite_writes=a.allow_unsafe_sqlite_writes,
             start=True,
         )
         if not service_result["ok"]:
@@ -2686,7 +3253,6 @@ def main():
     c.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help="Port for the launch agent's remctl-server process")
     c.add_argument("--allow-origin", help="Optional Access-Control-Allow-Origin for the launch agent")
     c.add_argument("--enable-opengraph", action="store_true", help="Enable OpenGraph fetches for the launch agent")
-    c.add_argument("--allow-unsafe-sqlite-writes", action="store_true", help="Allow unsafe SQLite write fallback in the launch agent")
     c.add_argument("--doctor", action="store_true", help="Run remctl doctor after setup")
     js(c)
 
@@ -2704,8 +3270,8 @@ def main():
             "  remctl service restart\n"
             "  remctl service uninstall\n"
             "\n"
-            "Only `install` uses --host, --port, --allow-origin, --enable-opengraph,\n"
-            "and --allow-unsafe-sqlite-writes. If `doctor` reports a degraded API with\n"
+            "Only `install` uses --host, --port, --allow-origin, and --enable-opengraph.\n"
+            "If `doctor` reports a degraded API with\n"
             "`database: not found`, grant Full Disk Access to the Python interpreter shown\n"
             "by `remctl service status`, then restart the service."
         ),
@@ -2716,7 +3282,6 @@ def main():
     c.add_argument("--port", type=int, default=DEFAULT_SERVER_PORT, help="Port for the launch agent's remctl-server process")
     c.add_argument("--allow-origin", help="Optional Access-Control-Allow-Origin for the launch agent")
     c.add_argument("--enable-opengraph", action="store_true", help="Enable OpenGraph fetches for the launch agent")
-    c.add_argument("--allow-unsafe-sqlite-writes", action="store_true", help="Allow unsafe SQLite write fallback in the launch agent")
     c.add_argument("--no-start", action="store_true", help="Install the launch agent without starting it")
     c.add_argument("--keep-file", action="store_true", help="Keep the plist file when uninstalling")
     js(c)
@@ -2754,11 +3319,11 @@ def main():
         a.verbose = False
         if a.format == "json":
             a.json = True
-            cmd_today(a)
+            run_handler_with_fallback(a, cmd_today)
         else:
             a.json = False
             show_splash()
-            cmd_today(a)
+            run_handler_with_fallback(a, cmd_today)
         return
 
     # Propagate --format table to subcommand
@@ -2801,7 +3366,7 @@ def main():
 
     handler = cmds.get(a.cmd)
     if handler:
-        handler(a)
+        run_handler_with_fallback(a, handler)
     else:
         p.print_help()
 

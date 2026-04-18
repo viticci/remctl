@@ -342,13 +342,13 @@ Server hardening defaults:
 - Binds to `127.0.0.1` by default instead of `0.0.0.0`
 - CORS is disabled unless `--allow-origin` is set
 - `/api/v1/og` is disabled unless `--enable-opengraph` is set
-- Direct SQLite reminder creation fallback is disabled unless `--allow-unsafe-sqlite-writes` is set
+- Writes stay on the bridge/CLI paths; there is no direct SQLite write fallback
 
 ### Authentication
 
 All endpoints (except `/health`) require a Bearer token:
 ```bash
-curl -H "Authorization: Bearer YOUR_TOKEN" http://mac-studio.tailc0622.ts.net:19876/api/v1/today
+curl -H "Authorization: Bearer YOUR_TOKEN" http://YOUR-HOSTNAME:19876/api/v1/today
 ```
 
 The token is stored at `~/.config/remctl/api-token` and auto-generated on first run.

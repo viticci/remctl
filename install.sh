@@ -94,6 +94,12 @@ cp "$SCRIPT_DIR/remctl_serialization.py" "$BIN_DIR/remctl_serialization.py"
 chmod 644 "$BIN_DIR/remctl_serialization.py"
 echo -e "  ${GREEN}✓${RESET} remctl_serialization.py → $BIN_DIR/remctl_serialization.py"
 
+echo -e "${BLUE}→${RESET} Installing zsh completion source..."
+mkdir -p "$BIN_DIR/completions"
+cp "$SCRIPT_DIR/completions/_remctl" "$BIN_DIR/completions/_remctl"
+chmod 644 "$BIN_DIR/completions/_remctl"
+echo -e "  ${GREEN}✓${RESET} _remctl → $BIN_DIR/completions/_remctl"
+
 # 2. Compile and install Swift bridge
 echo -e "${BLUE}→${RESET} Compiling remctl-bridge (Swift/EventKit)..."
 if command -v swiftc &>/dev/null; then

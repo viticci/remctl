@@ -13,6 +13,7 @@ Zero external dependencies — stdlib only.
 """
 
 import argparse
+from contextlib import closing
 import json
 import os
 import re
@@ -28,12 +29,15 @@ from urllib.parse import urlparse, parse_qs, unquote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from remctl_runtime import (
+    due_today_window,
     env_bool,
     is_safe_remote_url,
     mask_secret,
     resolve_binary_path,
     resolve_config_dir,
     resolve_store_dir,
+    start_of_day,
+    upcoming_window,
 )
 from remctl_serialization import (
     preload_extras as shared_preload_extras,
@@ -55,9 +59,6 @@ TOKEN_DIR = resolve_config_dir("remctl")
 TOKEN_FILE = TOKEN_DIR / "api-token"
 
 PRI_NAME = {0: "none", 1: "high", 5: "medium", 9: "low"}
-PRI_FROM_NAME = {"none": 0, "high": 1, "medium": 5, "low": 9}
-ALLOW_UNSAFE_SQLITE_WRITES = env_bool("REMCTL_ALLOW_UNSAFE_SQLITE_WRITES", False)
-
 _REM_COLS = """r.Z_PK, r.ZTITLE, r.ZNOTES, r.ZCOMPLETED, r.ZFLAGGED, r.ZPRIORITY,
     r.ZDUEDATE, r.ZALLDAY, r.ZCOMPLETIONDATE, r.ZCREATIONDATE,
     r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name"""
@@ -102,16 +103,6 @@ def open_db():
     if not db_path:
         raise RuntimeError("No Reminders database found. Is iCloud Reminders enabled?")
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def open_db_rw():
-    """Open the Reminders DB in read-write mode for direct writes."""
-    db_path = find_main_db()
-    if not db_path:
-        raise RuntimeError("No Reminders database found.")
-    conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -225,6 +216,14 @@ def q_section_memberships(db, list_pk):
     }
 
 
+def q_attachments(db, pk):
+    return db.execute(
+        "SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
+        "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0",
+        (pk,),
+    ).fetchall()
+
+
 def q_hashtags(db, pk):
     return db.execute(
         "SELECT h.ZNAME FROM ZREMCDOBJECT o "
@@ -257,8 +256,7 @@ def q_search(db, query, completed=False):
 
 
 def q_due_today(db, include_overdue=True):
-    sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    eod = sod + timedelta(days=1)
+    sod, eod = due_today_window()
     if include_overdue:
         where = f"r.ZDUEDATE < {to_ts(eod)} AND r.ZDUEDATE IS NOT NULL"
     else:
@@ -274,20 +272,19 @@ def q_due_today(db, include_overdue=True):
 
 
 def q_upcoming(db, days=7):
-    now = datetime.now()
-    end = now + timedelta(days=days)
+    sod, end = upcoming_window(days)
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
         f"WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
         f"AND l.Z_PK IS NOT NULL AND r.ZDUEDATE IS NOT NULL "
-        f"AND r.ZDUEDATE >= {to_ts(now)} AND r.ZDUEDATE < {to_ts(end)} "
+        f"AND r.ZDUEDATE >= {to_ts(sod)} AND r.ZDUEDATE < {to_ts(end)} "
         f"ORDER BY r.ZDUEDATE"
     ).fetchall()
 
 
 def q_overdue(db):
-    now = datetime.now()
+    now = start_of_day()
     return db.execute(
         f"SELECT {_REM_COLS} FROM ZREMCDREMINDER r "
         f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
@@ -406,16 +403,15 @@ def resolve_ck_id(pk):
     integer Z_PK IDs. This function maps between them via ZCKIDENTIFIER.
     """
     try:
-        db = open_db()
-        # Skip orphan rows (ZACCOUNT IS NULL) that the 2026-04-11 phantom-items
-        # bug left in the store — they shouldn't be addressable for writes.
-        r = db.execute(
-            "SELECT r.ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDREMINDER r "
-            "LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-            "WHERE r.Z_PK = ? AND r.ZACCOUNT IS NOT NULL AND r.ZMARKEDFORDELETION = 0",
-            (pk,)
-        ).fetchone()
-        db.close()
+        with closing(open_db()) as db:
+            # Skip orphan rows (ZACCOUNT IS NULL) that the 2026-04-11 phantom-items
+            # bug left in the store — they shouldn't be addressable for writes.
+            r = db.execute(
+                "SELECT r.ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDREMINDER r "
+                "LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+                "WHERE r.Z_PK = ? AND r.ZACCOUNT IS NOT NULL AND r.ZMARKEDFORDELETION = 0",
+                (pk,)
+            ).fetchone()
         if r and r["ZCKIDENTIFIER"]:
             return r["ZCKIDENTIFIER"], r["list_name"]
     except Exception:
@@ -433,13 +429,12 @@ def applescript_write(pk, action_data):
     Returns dict with status on success, None on failure/timeout.
     """
     try:
-        db = open_db()
-        r = db.execute(
-            "SELECT r.ZCKIDENTIFIER, r.ZTITLE, l.ZNAME as list_name "
-            "FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
-            "WHERE r.Z_PK = ?", (pk,)
-        ).fetchone()
-        db.close()
+        with closing(open_db()) as db:
+            r = db.execute(
+                "SELECT r.ZCKIDENTIFIER, r.ZTITLE, l.ZNAME as list_name "
+                "FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+                "WHERE r.Z_PK = ?", (pk,)
+            ).fetchone()
         if not r or not r["ZCKIDENTIFIER"]:
             return None
 
@@ -491,15 +486,18 @@ def applescript_write(pk, action_data):
                 notes = url
             if notes:
                 commands.append(f'set body of r to "{esc(notes)}"')
-            if action_data.get("due"):
+            if "due" in action_data:
                 due_str = action_data["due"]
-                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-                    try:
-                        dt = datetime.strptime(due_str, fmt)
-                        commands.append(as_date_assign(dt))
-                        break
-                    except ValueError:
-                        continue
+                if due_str in (None, ""):
+                    commands.append("set due date of r to missing value")
+                else:
+                    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+                        try:
+                            dt = datetime.strptime(due_str, fmt)
+                            commands.append(as_date_assign(dt))
+                            break
+                        except ValueError:
+                            continue
             pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
             if action_data.get("priority") is not None:
                 pri = action_data["priority"]
@@ -556,117 +554,6 @@ def applescript_write(pk, action_data):
         return None
 
 
-import uuid as _uuid
-
-
-def sqlite_create_reminder(action_data):
-    """Create a reminder by writing directly to the CoreData SQLite DB.
-
-    Last-resort fallback when both EventKit bridge and AppleScript are broken.
-    Uses the same DB the server reads from; iCloud daemon picks up changes.
-    """
-    try:
-        db = open_db_rw()
-        title = action_data.get("title", "Untitled")
-        notes = action_data.get("notes")
-        list_name = action_data.get("list", "Reminders")
-        priority_raw = action_data.get("priority", 0)
-        due_str = action_data.get("due")
-
-        # Resolve priority
-        if isinstance(priority_raw, str):
-            priority = PRI_FROM_NAME.get(priority_raw, 0)
-        else:
-            priority = priority_raw
-
-        # Resolve list PK
-        list_pk = db.execute(
-            "SELECT Z_PK FROM ZREMCDBASELIST "
-            "WHERE ZNAME = ? COLLATE NOCASE AND ZMARKEDFORDELETION = 0 LIMIT 1",
-            (list_name,),
-        ).fetchone()
-        if not list_pk:
-            db.close()
-            return {"ok": False, "error": f"List not found: {list_name}"}
-        list_pk = list_pk[0]
-
-        # Resolve Z_ENT for reminders
-        ent_row = db.execute(
-            "SELECT Z_ENT FROM ZREMCDREMINDER LIMIT 1"
-        ).fetchone()
-        z_ent = ent_row[0] if ent_row else 14
-
-        # Get next Z_PK
-        pk_row = db.execute(
-            "SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_ENT = ?", (z_ent,)
-        ).fetchone()
-        if pk_row:
-            next_pk = pk_row[0] + 1
-        else:
-            max_row = db.execute(
-                "SELECT MAX(Z_PK) FROM ZREMCDREMINDER"
-            ).fetchone()
-            next_pk = (max_row[0] or 0) + 1
-
-        # Parse due date
-        due_ts = None
-        all_day = 1
-        now = datetime.now()
-        if due_str:
-            if due_str == "today":
-                dt = now.replace(hour=12, minute=0, second=0, microsecond=0)
-            elif due_str == "tomorrow":
-                dt = (now + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
-            elif due_str.startswith("+") and due_str.endswith("d"):
-                days = int(due_str[1:-1])
-                dt = (now + timedelta(days=days)).replace(hour=12, minute=0, second=0, microsecond=0)
-            else:
-                try:
-                    dt = datetime.strptime(due_str, "%Y-%m-%d")
-                    dt = dt.replace(hour=12, minute=0, second=0)
-                except ValueError:
-                    try:
-                        dt = datetime.strptime(due_str, "%Y-%m-%d %H:%M")
-                        all_day = 0
-                    except ValueError:
-                        dt = None
-            if dt:
-                due_ts = to_ts(dt)
-
-        creation_ts = to_ts(now)
-        ck_id = str(_uuid.uuid4()).upper()
-
-        # Insert the reminder
-        db.execute(
-            "INSERT INTO ZREMCDREMINDER "
-            "(Z_PK, Z_ENT, Z_OPT, ZTITLE, ZNOTES, ZCOMPLETED, ZFLAGGED, "
-            "ZPRIORITY, ZDUEDATE, ZALLDAY, ZCREATIONDATE, ZLIST, "
-            "ZMARKEDFORDELETION, ZCKIDENTIFIER, ZPARENTREMINDER) "
-            "VALUES (?, ?, 1, ?, ?, 0, 0, ?, ?, ?, ?, ?, 0, ?, NULL)",
-            (next_pk, z_ent, title, notes, priority, due_ts, all_day,
-             creation_ts, list_pk, ck_id),
-        )
-
-        # Update Z_PRIMARYKEY counter
-        db.execute(
-            "UPDATE Z_PRIMARYKEY SET Z_MAX = ? WHERE Z_ENT = ?",
-            (next_pk, z_ent),
-        )
-
-        db.commit()
-        db.close()
-
-        deep_link = f"x-apple-reminderkit://REMCDReminder/{ck_id}"
-        sys.stderr.write(f"[sqlite_create] Created reminder #{next_pk} '{title}' in {list_name}\n")
-        return {
-            "ok": True,
-            "data": {"id": next_pk, "title": title, "deepLink": deep_link},
-        }
-    except Exception as e:
-        sys.stderr.write(f"[sqlite_create] Error: {e}\n")
-        return {"ok": False, "error": str(e)}
-
-
 def bridge_call(action_data, original_pk=None):
     """Write to Reminders.
 
@@ -674,7 +561,6 @@ def bridge_call(action_data, original_pk=None):
     1. update/complete/uncomplete/delete: AppleScript first (reliable iCloud sync)
     2. create/list ops: EventKit bridge (AppleScript can't create well)
     3. AppleScript failure or no bridge: remctl CLI fallback
-    4. Direct SQLite write as last resort for creates
     """
     resolved_pk = None
 
@@ -710,21 +596,31 @@ def bridge_call(action_data, original_pk=None):
             )
             if result.returncode == 0 and result.stdout.strip():
                 bridge_result = json.loads(result.stdout)
-                # Post-write verification for creates: check ZACCOUNT is set
-                if action == "create" and bridge_result.get("ok"):
-                    created_id = bridge_result.get("data", {}).get("id")
+                if action == "create":
+                    created_id = None
+                    if isinstance(bridge_result, dict):
+                        created_id = bridge_result.get("id")
+                        if created_id is None and isinstance(bridge_result.get("data"), dict):
+                            created_id = bridge_result["data"].get("id")
                     if created_id:
                         time.sleep(0.5)  # give remindd a moment to finalize
                         try:
-                            vdb = open_db()
-                            row = vdb.execute(
-                                "SELECT ZACCOUNT FROM ZREMCDREMINDER WHERE Z_PK = ?",
-                                (created_id,)
-                            ).fetchone()
-                            vdb.close()
-                            if row and row[0] is None:
+                            with closing(open_db()) as vdb:
+                                if isinstance(created_id, int) or (
+                                    isinstance(created_id, str) and created_id.isdigit()
+                                ):
+                                    row = vdb.execute(
+                                        "SELECT ZACCOUNT FROM ZREMCDREMINDER WHERE Z_PK = ?",
+                                        (int(created_id),),
+                                    ).fetchone()
+                                else:
+                                    row = vdb.execute(
+                                        "SELECT ZACCOUNT FROM ZREMCDREMINDER WHERE ZCKIDENTIFIER = ?",
+                                        (created_id,),
+                                    ).fetchone()
+                            if row and row[0] is None and isinstance(bridge_result, dict):
                                 sys.stderr.write(
-                                    f"[bridge_call] WARNING: Reminder #{created_id} created with ZACCOUNT=NULL "
+                                    f"[bridge_call] WARNING: Reminder {created_id} created with ZACCOUNT=NULL "
                                     f"(remindd may be unhealthy). Item will be invisible to Reminders.app.\n"
                                 )
                                 bridge_result["warning"] = "Reminder created but may not sync — remindd appears unhealthy"
@@ -733,19 +629,6 @@ def bridge_call(action_data, original_pk=None):
                 return bridge_result
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
             sys.stderr.write("[bridge_call] Bridge timed out or bad JSON, trying fallbacks\n")
-
-    # Direct SQLite writes into the Reminders CoreData store are retired.
-    # The previous implementation omitted ZACCOUNT (produced invisible
-    # rows), did not set ZCKDIRTYFLAGS (rows never synced), hardcoded
-    # Z_OPT=1 (broke Core Data optimistic locking on future edits), and
-    # raced on Z_PK allocation under ThreadingHTTPServer. ALLOW_UNSAFE_
-    # SQLITE_WRITES is accepted for backwards compat but is now a no-op.
-    if action == "create" and ALLOW_UNSAFE_SQLITE_WRITES:
-        sys.stderr.write(
-            "[bridge_call] Direct SQLite create was requested via "
-            "REMCTL_ALLOW_UNSAFE_SQLITE_WRITES but the path is retired "
-            "(risk of invisible rows + Core Data corruption). Skipping.\n"
-        )
 
     # Last resort: remctl CLI fallback
     return remctl_cli_fallback(action_data)
@@ -788,8 +671,8 @@ def remctl_cli_fallback(action_data):
             args.extend(["--title", action_data["title"]])
         if action_data.get("notes"):
             args.extend(["-n", action_data["notes"]])
-        if action_data.get("due"):
-            args.extend(["-d", action_data["due"]])
+        if "due" in action_data:
+            args.extend(["-d", "clear" if action_data["due"] in (None, "") else action_data["due"]])
         if action_data.get("priority") is not None:
             pri = action_data["priority"]
             if isinstance(pri, int):
@@ -1165,238 +1048,214 @@ class RemctlHandler(BaseHTTPRequestHandler):
     # ── GET routes ───────────────────────────────────────────────────────
 
     def _route_get(self, path, qs, t0):
-        db = open_db()
-
-        # GET /api/v1/lists
-        if path == "/api/v1/lists":
-            rows = q_lists(db)
-            counts = {
-                row["ZLIST"]: row["active_count"]
-                for row in db.execute(
-                    "SELECT ZLIST, COUNT(*) AS active_count "
-                    "FROM ZREMCDREMINDER "
-                    "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL "
-                    "GROUP BY ZLIST"
-                ).fetchall()
-            }
-            section_counts = {
-                row["ZLIST"]: row["section_count"]
-                for row in db.execute(
-                    "SELECT ZLIST, COUNT(*) AS section_count "
-                    "FROM ZREMCDBASESECTION "
-                    "WHERE ZMARKEDFORDELETION = 0 GROUP BY ZLIST"
-                ).fetchall()
-            }
-            data = []
-            for r in rows:
-                entry = {
-                    "id": r["Z_PK"],
-                    "name": r["ZNAME"],
-                    "activeCount": counts.get(r["Z_PK"], 0),
-                    "sectionCount": section_counts.get(r["Z_PK"], 0),
+        with closing(open_db()) as db:
+            # GET /api/v1/lists
+            if path == "/api/v1/lists":
+                rows = q_lists(db)
+                counts = {
+                    row["ZLIST"]: row["active_count"]
+                    for row in db.execute(
+                        "SELECT ZLIST, COUNT(*) AS active_count "
+                        "FROM ZREMCDREMINDER "
+                        "WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL "
+                        "GROUP BY ZLIST"
+                    ).fetchall()
                 }
-                # Parse emoji icon from ZBADGEEMBLEM JSON
-                emblem = r["ZBADGEEMBLEM"]
-                if emblem:
-                    try:
-                        emblem_data = json.loads(emblem)
-                        if "Emoji" in emblem_data:
-                            entry["icon"] = emblem_data["Emoji"]
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                data.append(entry)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
-
-        # GET /api/v1/lists/:name/sections
-        m = self._match(path, "/api/v1/lists/:name/sections")
-        if m:
-            name = unquote(m["name"])
-            pk = q_list_pk(db, name)
-            if pk is None:
-                self._error(f"List '{name}' not found", 404)
-                self._log_timing("GET", path, 404, t0)
-                db.close()
+                section_counts = {
+                    row["ZLIST"]: row["section_count"]
+                    for row in db.execute(
+                        "SELECT ZLIST, COUNT(*) AS section_count "
+                        "FROM ZREMCDBASESECTION "
+                        "WHERE ZMARKEDFORDELETION = 0 GROUP BY ZLIST"
+                    ).fetchall()
+                }
+                data = []
+                for r in rows:
+                    entry = {
+                        "id": r["Z_PK"],
+                        "name": r["ZNAME"],
+                        "activeCount": counts.get(r["Z_PK"], 0),
+                        "sectionCount": section_counts.get(r["Z_PK"], 0),
+                    }
+                    emblem = r["ZBADGEEMBLEM"]
+                    if emblem:
+                        try:
+                            emblem_data = json.loads(emblem)
+                            if "Emoji" in emblem_data:
+                                entry["icon"] = emblem_data["Emoji"]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    data.append(entry)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            secs = q_sections(db, pk)
-            data = [{"id": s["Z_PK"], "name": s["ZDISPLAYNAME"]} for s in secs]
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/lists/:name
-        m = self._match(path, "/api/v1/lists/:name")
-        if m:
-            name = unquote(m["name"])
-            pk = q_list_pk(db, name)
-            if pk is None:
-                self._error(f"List '{name}' not found", 404)
-                self._log_timing("GET", path, 404, t0)
-                db.close()
+            m = self._match(path, "/api/v1/lists/:name/sections")
+            if m:
+                name = unquote(m["name"])
+                pk = q_list_pk(db, name)
+                if pk is None:
+                    self._error(f"List '{name}' not found", 404)
+                    self._log_timing("GET", path, 404, t0)
+                    return
+                secs = q_sections(db, pk)
+                data = [{"id": s["Z_PK"], "name": s["ZDISPLAYNAME"]} for s in secs]
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            items = q_reminders(db, list_pk=pk, top_level=True)
-            data = reminders_to_list(db, items, with_sections_for_list_pk=pk)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/reminders/:id/subtasks
-        m = self._match(path, "/api/v1/reminders/:id/subtasks")
-        if m:
-            try:
-                rid = int(m["id"])
-            except ValueError:
-                self._error("Invalid reminder ID", 400)
-                self._log_timing("GET", path, 400, t0)
-                db.close()
+            m = self._match(path, "/api/v1/lists/:name")
+            if m:
+                name = unquote(m["name"])
+                pk = q_list_pk(db, name)
+                if pk is None:
+                    self._error(f"List '{name}' not found", 404)
+                    self._log_timing("GET", path, 404, t0)
+                    return
+                include_completed = qs.get("completed", ["0"])[0].lower() in {"1", "true", "yes", "on"}
+                items = q_reminders(db, list_pk=pk, completed=include_completed, top_level=True)
+                data = reminders_to_list(db, items, with_sections_for_list_pk=pk)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            parent = q_reminder(db, rid)
-            if not parent:
-                self._error(f"Reminder #{rid} not found", 404)
-                self._log_timing("GET", path, 404, t0)
-                db.close()
+
+            m = self._match(path, "/api/v1/reminders/:id/subtasks")
+            if m:
+                try:
+                    rid = int(m["id"])
+                except ValueError:
+                    self._error("Invalid reminder ID", 400)
+                    self._log_timing("GET", path, 400, t0)
+                    return
+                parent = q_reminder(db, rid)
+                if not parent:
+                    self._error(f"Reminder #{rid} not found", 404)
+                    self._log_timing("GET", path, 404, t0)
+                    return
+                subs = q_reminders(db, parent_pk=rid, completed=True)
+                data = reminders_to_list(db, subs)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            subs = q_reminders(db, parent_pk=rid, completed=True)
-            data = reminders_to_list(db, subs)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/reminders/:id
-        m = self._match(path, "/api/v1/reminders/:id")
-        if m:
-            try:
-                rid = int(m["id"])
-            except ValueError:
-                self._error("Invalid reminder ID", 400)
-                self._log_timing("GET", path, 400, t0)
-                db.close()
+            m = self._match(path, "/api/v1/reminders/:id")
+            if m:
+                try:
+                    rid = int(m["id"])
+                except ValueError:
+                    self._error("Invalid reminder ID", 400)
+                    self._log_timing("GET", path, 400, t0)
+                    return
+                r = q_reminder(db, rid)
+                if not r:
+                    self._error(f"Reminder #{rid} not found", 404)
+                    self._log_timing("GET", path, 404, t0)
+                    return
+                sec = None
+                if r["ZLIST"]:
+                    memberships = q_section_memberships(db, r["ZLIST"])
+                    sec = memberships.get(r["ZCKIDENTIFIER"])
+                d = reminder_to_dict(r, db, section=sec)
+                attachments = q_attachments(db, rid)
+                if attachments:
+                    d["attachments"] = [
+                        {
+                            "filename": attachment["ZFILENAME"],
+                            "type": attachment["ZATTACHMENTTYPERAWVALUE"],
+                            "uti": attachment["ZUTI"],
+                        }
+                        for attachment in attachments
+                    ]
+                subs = q_reminders(db, parent_pk=rid, completed=True)
+                if subs:
+                    d["subtasks"] = reminders_to_list(db, subs)
+                if r["ZPARENTREMINDER"]:
+                    parent = q_reminder(db, r["ZPARENTREMINDER"])
+                    if parent:
+                        d["parentTitle"] = parent["ZTITLE"]
+                self._ok(d)
+                self._log_timing("GET", path, 200, t0)
                 return
-            r = q_reminder(db, rid)
-            if not r:
-                self._error(f"Reminder #{rid} not found", 404)
-                self._log_timing("GET", path, 404, t0)
-                db.close()
+
+            if path == "/api/v1/today":
+                items = q_due_today(db, include_overdue=True)
+                sod = start_of_day()
+                data = reminders_to_list(db, items)
+                for d, r in zip(data, items):
+                    due_dt = ts(r["ZDUEDATE"])
+                    if due_dt and due_dt < sod:
+                        d["overdue"] = True
+                        d["overdueDays"] = (sod - due_dt).days
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            # Resolve section
-            sec = None
-            if r["ZLIST"]:
-                memberships = q_section_memberships(db, r["ZLIST"])
-                sec = memberships.get(r["ZCKIDENTIFIER"])
-            d = reminder_to_dict(r, db, section=sec)
-            # Include subtasks and attachments in detail view
-            subs = q_reminders(db, parent_pk=rid, completed=True)
-            if subs:
-                d["subtasks"] = reminders_to_list(db, subs)
-            self._ok(d)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/today
-        if path == "/api/v1/today":
-            items = q_due_today(db, include_overdue=True)
-            sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            data = reminders_to_list(db, items)
-            # Tag overdue items
-            for d, r in zip(data, items):
-                due_dt = ts(r["ZDUEDATE"])
-                if due_dt and due_dt < sod:
-                    d["overdue"] = True
-                    d["overdueDays"] = (sod - due_dt).days
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
-
-        # GET /api/v1/upcoming
-        if path == "/api/v1/upcoming":
-            try:
-                days = int(qs.get("days", ["7"])[0])
-            except ValueError:
-                self._error("Invalid 'days' query parameter", 400)
-                self._log_timing("GET", path, 400, t0)
-                db.close()
+            if path == "/api/v1/upcoming":
+                try:
+                    days = int(qs.get("days", ["7"])[0])
+                except ValueError:
+                    self._error("Invalid 'days' query parameter", 400)
+                    self._log_timing("GET", path, 400, t0)
+                    return
+                days = max(1, min(days, 90))
+                items = q_upcoming(db, days=days)
+                data = reminders_to_list(db, items)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            days = max(1, min(days, 90))
-            items = q_upcoming(db, days=days)
-            data = reminders_to_list(db, items)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/overdue
-        if path == "/api/v1/overdue":
-            items = q_overdue(db)
-            data = reminders_to_list(db, items)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
-
-        # GET /api/v1/flagged
-        if path == "/api/v1/flagged":
-            items = q_flagged(db)
-            data = reminders_to_list(db, items)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
-
-        # GET /api/v1/search
-        if path == "/api/v1/search":
-            query = qs.get("q", [""])[0]
-            if not query:
-                self._error("Missing 'q' query parameter", 400)
-                self._log_timing("GET", path, 400, t0)
-                db.close()
+            if path == "/api/v1/overdue":
+                items = q_overdue(db)
+                data = reminders_to_list(db, items)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
                 return
-            items = q_search(db, query)
-            data = reminders_to_list(db, items)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
 
-        # GET /api/v1/tags
-        if path == "/api/v1/tags":
-            rows = q_tags(db)
-            data = [{"name": r["ZNAME"]} for r in rows]
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
+            if path == "/api/v1/flagged":
+                items = q_flagged(db)
+                data = reminders_to_list(db, items)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
+                return
 
-        # GET /api/v1/sections
-        if path == "/api/v1/sections":
-            rows = q_sections(db)
-            grouped = {}
-            for r in rows:
-                ln = r["list_name"] or "?"
-                grouped.setdefault(ln, []).append({
-                    "id": r["Z_PK"],
-                    "name": r["ZDISPLAYNAME"],
-                })
-            self._ok(grouped)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
+            if path == "/api/v1/search":
+                query = qs.get("q", [""])[0]
+                if not query:
+                    self._error("Missing 'q' query parameter", 400)
+                    self._log_timing("GET", path, 400, t0)
+                    return
+                include_completed = qs.get("completed", ["0"])[0].lower() in {"1", "true", "yes", "on"}
+                items = q_search(db, query, completed=include_completed)
+                data = reminders_to_list(db, items)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
+                return
 
-        # GET /api/v1/stats
-        if path == "/api/v1/stats":
-            data = q_stats(db)
-            self._ok(data)
-            self._log_timing("GET", path, 200, t0)
-            db.close()
-            return
+            if path == "/api/v1/tags":
+                rows = q_tags(db)
+                data = [{"name": r["ZNAME"]} for r in rows]
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
+                return
 
-        db.close()
+            if path == "/api/v1/sections":
+                rows = q_sections(db)
+                grouped = {}
+                for r in rows:
+                    ln = r["list_name"] or "?"
+                    grouped.setdefault(ln, []).append({
+                        "id": r["Z_PK"],
+                        "name": r["ZDISPLAYNAME"],
+                    })
+                self._ok(grouped)
+                self._log_timing("GET", path, 200, t0)
+                return
+
+            if path == "/api/v1/stats":
+                data = q_stats(db)
+                self._ok(data)
+                self._log_timing("GET", path, 200, t0)
+                return
 
         # GET /api/v1/og?url=... — OpenGraph metadata (no DB needed)
         if path == "/api/v1/og":
@@ -1521,6 +1380,10 @@ class RemctlHandler(BaseHTTPRequestHandler):
                 action_data["flagged"] = body["flagged"]
             if body.get("url"):
                 action_data["url"] = body["url"]
+            if body.get("recurrence"):
+                action_data["recurrence"] = body["recurrence"]
+            if body.get("alarm"):
+                action_data["alarm"] = body["alarm"]
             result = bridge_call(action_data)
             if isinstance(result, dict) and result.get("ok") is False:
                 self._error(result.get("error", "Failed"), 500)
@@ -1586,6 +1449,10 @@ class RemctlHandler(BaseHTTPRequestHandler):
                 action_data["flagged"] = body["flagged"]
             if "url" in body:
                 action_data["url"] = body["url"]
+            if "recurrence" in body:
+                action_data["recurrence"] = body["recurrence"]
+            if "alarm" in body:
+                action_data["alarm"] = body["alarm"]
             result = bridge_call(action_data)
             if isinstance(result, dict) and result.get("ok") is False:
                 self._error(result.get("error", "Failed"), 500)
@@ -1691,7 +1558,6 @@ Auth: Bearer token required
 Token: {mask_secret(token)}  (from {token_source})
 CORS: {'disabled' if not allow_origin else allow_origin}
 OpenGraph: {'enabled' if enable_opengraph else 'disabled'}
-Unsafe SQLite writes: {'enabled' if ALLOW_UNSAFE_SQLITE_WRITES else 'disabled'}
 
 Database: {find_main_db() or 'NOT FOUND'}
 Bridge:   {BRIDGE_PATH} ({'available' if BRIDGE_PATH.exists() else 'not found, using remctl CLI fallback'})
@@ -1718,7 +1584,6 @@ Bridge:   {BRIDGE_PATH} ({'available' if BRIDGE_PATH.exists() else 'not found, u
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global ALLOW_UNSAFE_SQLITE_WRITES
     parser = argparse.ArgumentParser(
         prog="remctl-server",
         description="REST API server for iCloud Reminders (via remctl)",
@@ -1754,12 +1619,10 @@ def main():
     parser.add_argument(
         "--allow-unsafe-sqlite-writes",
         action="store_true",
-        default=ALLOW_UNSAFE_SQLITE_WRITES,
-        help="Allow direct SQLite reminder creation fallback. Unsafe and disabled by default.",
+        help=argparse.SUPPRESS,
     )
 
     args = parser.parse_args()
-    ALLOW_UNSAFE_SQLITE_WRITES = args.allow_unsafe_sqlite_writes
 
     if args.generate_token:
         token = secrets.token_urlsafe(32)
