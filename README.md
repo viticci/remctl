@@ -554,7 +554,7 @@ remctl service restart
 remctl doctor
 ```
 
-`remctl onboard` can open the Full Disk Access settings pane for you, but macOS still requires you to add the target manually.
+`remctl onboard` can open the Full Disk Access settings pane and copy the relevant path to the clipboard. In the file picker, press `Command-Shift-G`, paste the path, press Return, then click Open. macOS still requires you to add the target manually.
 
 ### Public-Friendly Setup Flow
 

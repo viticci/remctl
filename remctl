@@ -815,6 +815,7 @@ def full_disk_access_fix_text(*, api_healthy=False, rerun_command="remctl doctor
         intro,
         "Open System Settings > Privacy & Security > Full Disk Access and add:",
         *[f"  {target}" for target in targets],
+        "Tip: click +, press Command-Shift-G, paste the path, press Return, then click Open.",
         f"Then relaunch the terminal and rerun `{rerun_command}`.",
     ]
     if api_healthy:
@@ -833,6 +834,11 @@ def service_full_disk_access_target(settings=None):
     return f"{server_path} (or the Python interpreter that runs it)"
 
 
+def service_full_disk_access_clipboard_target(settings=None):
+    settings = settings or parse_launch_agent_settings() or {}
+    return settings.get("python_path") or settings.get("server_path") or str(current_server_path())
+
+
 def service_full_disk_access_fix_text(settings=None, *, rerun_command="remctl doctor"):
     target = service_full_disk_access_target(settings)
     return "\n".join(
@@ -840,6 +846,7 @@ def service_full_disk_access_fix_text(settings=None, *, rerun_command="remctl do
             "The local API runs as a separate launchd process, so it needs its own Full Disk Access grant.",
             "Open System Settings > Privacy & Security > Full Disk Access and add:",
             f"  {target}",
+            "Tip: click +, press Command-Shift-G, paste the path, press Return, then click Open.",
             "`remctl onboard` can open that settings pane, but macOS still requires you to add the target manually.",
             "Then run:",
             "  remctl service restart",
@@ -847,6 +854,20 @@ def service_full_disk_access_fix_text(settings=None, *, rerun_command="remctl do
             "`remctl service status` shows the current Server, Python, and Full Disk Access target.",
         ]
     )
+
+
+def copy_to_clipboard(text):
+    try:
+        proc = subprocess.run(
+            ["pbcopy"],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 def open_full_disk_access_settings():
@@ -866,6 +887,8 @@ def open_full_disk_access_settings():
 
 
 def print_full_disk_access_guidance(*, api_healthy=False, settings_opened=False, rerun_command="remctl doctor"):
+    clipboard_target = str(sys.executable)
+    copied = copy_to_clipboard(clipboard_target)
     print()
     print(C.bold("Full Disk Access"))
     if settings_opened:
@@ -875,6 +898,11 @@ def print_full_disk_access_guidance(*, api_healthy=False, settings_opened=False,
     print(C.dim("  macOS requires you to add the access target manually."))
     for target in full_disk_access_targets():
         print(C.dim(f"  Add: {target}"))
+    if copied:
+        print(C.dim(f"  Copied path to clipboard: {clipboard_target}"))
+    else:
+        print(C.dim(f"  Copy this path if you need the file picker: {clipboard_target}"))
+    print(C.dim("  In the file picker, press Command-Shift-G, paste the path, press Return, then click Open."))
     print(C.dim(f"  Then relaunch the terminal and rerun `{rerun_command}`."))
     if api_healthy:
         print(C.dim("  Direct SQLite reads are optional here because the local remctl service fallback is already healthy."))
@@ -882,6 +910,8 @@ def print_full_disk_access_guidance(*, api_healthy=False, settings_opened=False,
 
 def print_service_full_disk_access_guidance(*, settings_opened=False, rerun_command="remctl doctor"):
     settings = parse_launch_agent_settings() or {}
+    clipboard_target = service_full_disk_access_clipboard_target(settings)
+    copied = copy_to_clipboard(clipboard_target)
     print()
     print(C.bold("Full Disk Access for the local API service"))
     if settings_opened:
@@ -890,6 +920,11 @@ def print_service_full_disk_access_guidance(*, settings_opened=False, rerun_comm
         print(C.dim("  Open System Settings > Privacy & Security > Full Disk Access."))
     print(C.dim("  The service runs under launchd, so it needs its own access target."))
     print(C.dim(f"  Add: {service_full_disk_access_target(settings)}"))
+    if copied:
+        print(C.dim(f"  Copied path to clipboard: {clipboard_target}"))
+    else:
+        print(C.dim(f"  Copy this path: {clipboard_target}"))
+    print(C.dim("  In the file picker, press Command-Shift-G, paste the path, press Return, then click Open."))
     print(C.dim("  Then run `remctl service restart`."))
     print(C.dim(f"  Finally rerun `{rerun_command}`."))
 

@@ -92,6 +92,8 @@ The helper should show draggable rows for:
 Controls:
 
 - Open System Settings
+- Copy the selected executable path before the file picker opens
+- Show the `Command-Shift-G` shortcut for pasting an absolute path into the file picker
 - Reveal target in Finder
 - Copy path
 - Restart service
@@ -107,4 +109,3 @@ Controls:
   - `x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`
 - Do not attempt to edit TCC directly.
 - Do not promise that granting access is complete until `remctl doctor` verifies it.
-

@@ -306,6 +306,36 @@ class CliTests(unittest.TestCase):
         self.assertIn("/tmp/python3", text)
         self.assertIn("remctl onboard", text)
         self.assertIn("ignore this warning", text)
+        self.assertIn("Command-Shift-G", text)
+
+    def test_print_full_disk_access_guidance_copies_python_path(self):
+        with (
+            mock.patch.object(self.remctl.sys, "executable", "/tmp/python3"),
+            mock.patch.object(self.remctl, "full_disk_access_targets", return_value=["Terminal.app", "/tmp/python3"]),
+            mock.patch.object(self.remctl, "copy_to_clipboard", return_value=True) as copy_to_clipboard,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.print_full_disk_access_guidance(settings_opened=True)
+        copy_to_clipboard.assert_called_once_with("/tmp/python3")
+        output = stdout.getvalue()
+        self.assertIn("Copied path to clipboard: /tmp/python3", output)
+        self.assertIn("Command-Shift-G", output)
+
+    def test_print_service_full_disk_access_guidance_copies_service_python_path(self):
+        with (
+            mock.patch.object(
+                self.remctl,
+                "parse_launch_agent_settings",
+                return_value={"python_path": "/tmp/service-python", "server_path": "/tmp/remctl-server"},
+            ),
+            mock.patch.object(self.remctl, "copy_to_clipboard", return_value=True) as copy_to_clipboard,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.print_service_full_disk_access_guidance(settings_opened=True)
+        copy_to_clipboard.assert_called_once_with("/tmp/service-python")
+        output = stdout.getvalue()
+        self.assertIn("Copied path to clipboard: /tmp/service-python", output)
+        self.assertIn("Command-Shift-G", output)
 
     def test_open_full_disk_access_settings_tries_modern_url_before_legacy(self):
         calls = []
