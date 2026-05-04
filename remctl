@@ -1198,9 +1198,10 @@ def launch_full_disk_access_helper(*, include_cli=True, include_service=False, w
     ]
     for target in targets:
         args.extend(["--target", target["title"], target["path"], target["subtitle"]])
+    cli_command = shlex.quote(str(current_cli_path()))
     if include_service:
-        args.extend(["--after", "Restart Service", "remctl service restart"])
-    args.extend(["--after", "Run Doctor", "remctl doctor"])
+        args.extend(["--after", "Restart Service", f"{cli_command} service restart"])
+    args.extend(["--after", "Run Doctor", f"{cli_command} doctor"])
     try:
         if wait:
             return subprocess.run(args).returncode == 0
@@ -4084,7 +4085,8 @@ def cmd_setup(a):
         print()
         print("Next:")
         print("  1. remctl onboard   # grant macOS Reminders, Automation, and Full Disk Access permissions")
-        print("  2. remctl doctor    # verify the CLI and optional service")
+        print("  2. remctl permissions full-disk-access   # visual Full Disk Access setup")
+        print("  3. remctl doctor    # verify the CLI and optional service")
         if getattr(a, "doctor", False):
             print()
             cmd_doctor(SimpleNamespace(json=False))
@@ -4099,8 +4101,9 @@ def main():
         epilog=(
             "Normal setup flow:\n"
             "  1. ./install.sh --bootstrap   # copy files, create config, install completions\n"
-            "  2. remctl onboard             # trigger macOS permissions and open Full Disk Access\n"
-            "  3. remctl doctor              # verify the CLI and optional service\n"
+            "  2. remctl onboard             # trigger Reminders and Automation prompts\n"
+            "  3. remctl permissions full-disk-access   # visual Full Disk Access setup\n"
+            "  4. remctl doctor              # verify the CLI and optional service\n"
             "\n"
             "Examples:\n"
             "  remctl onboard\n"

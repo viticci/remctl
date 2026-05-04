@@ -86,7 +86,13 @@ curl -X POST http://127.0.0.1:19876/api/v1/reminders \
 
 ## Service Notes
 
-The service has its own macOS privacy grants. If `/health` says the database is not found but the CLI works, grant Full Disk Access to the Python interpreter printed by:
+The service has its own macOS privacy grants. If `/health` says the database is not found but the CLI works, use the visual helper:
+
+```bash
+remctl permissions full-disk-access --scope service
+```
+
+Manual fallback: grant Full Disk Access to the Python interpreter printed by:
 
 ```bash
 remctl service status

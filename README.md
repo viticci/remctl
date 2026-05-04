@@ -28,6 +28,7 @@ git clone https://github.com/viticci/remctl.git
 cd remctl
 ./install.sh --bootstrap
 remctl onboard
+remctl permissions full-disk-access
 remctl doctor
 remctl today
 ```
@@ -107,16 +108,19 @@ Run:
 
 ```bash
 remctl onboard
+remctl permissions full-disk-access
 remctl doctor
 ```
 
-If Full Disk Access is missing, RemCTL opens a guided helper:
+The visual permission helper is the default Full Disk Access flow. It opens System Settings, copies the first target path, and shows draggable targets for the CLI and optional service.
+
+If you only need to fix the background API service, run:
 
 ```bash
-remctl permissions full-disk-access
+remctl permissions full-disk-access --scope service
 ```
 
-The helper opens System Settings, copies the first target path, and shows draggable targets for the CLI and optional service. In the System Settings file picker, drag a target row in, or press `Command-Shift-G`, paste the copied path, press Return, then click Open.
+Manual fallback: `remctl doctor` and `remctl service status` print the exact target paths. Open System Settings > Privacy & Security > Full Disk Access, click `+`, press `Command-Shift-G`, paste the printed path, press Return, then click Open.
 
 The background API service is a separate launchd process, so it can need its own Full Disk Access grant. `remctl service status` prints the exact service target.
 

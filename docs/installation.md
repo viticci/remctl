@@ -39,6 +39,7 @@ It does not grant macOS permissions. Apple requires those grants to happen inter
 
 ```bash
 remctl onboard
+remctl permissions full-disk-access
 remctl doctor
 remctl today
 ```
@@ -51,11 +52,13 @@ remctl today
 4. Checks direct database access.
 5. Opens the guided Full Disk Access helper when needed.
 
+`remctl permissions full-disk-access` is safe to run even if the direct CLI path already works. It is the clearest first-run path because it shows every Full Disk Access target visually before you run `doctor`.
+
 ## Full Disk Access
 
 macOS does not provide a native Full Disk Access prompt for command-line tools.
 
-If `remctl onboard` or `remctl doctor` says Full Disk Access is missing:
+Default visual flow:
 
 ```bash
 remctl permissions full-disk-access
@@ -80,6 +83,15 @@ Then run:
 remctl service restart
 remctl doctor
 ```
+
+Manual fallback:
+
+```bash
+remctl doctor
+remctl service status
+```
+
+Use the exact target printed by those commands. Open System Settings > Privacy & Security > Full Disk Access, click `+`, press `Command-Shift-G`, paste the path, press Return, then click Open.
 
 ## Optional Local API Service
 

@@ -80,15 +80,24 @@ func revealInFinder(_ path: String) {
     NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
 }
 
-final class ClosureTarget: NSObject {
-    let closure: () -> Void
+final class ActionButton: NSButton {
+    private let handler: (ActionButton) -> Void
 
-    init(_ closure: @escaping () -> Void) {
-        self.closure = closure
+    init(title: String, handler: @escaping (ActionButton) -> Void) {
+        self.handler = handler
+        super.init(frame: .zero)
+        self.title = title
+        target = self
+        action = #selector(performAction)
+        bezelStyle = .rounded
     }
 
-    @objc func invoke() {
-        closure()
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func performAction(_ sender: Any?) {
+        handler(self)
     }
 }
 
@@ -104,7 +113,6 @@ func label(_ text: String, font: NSFont, color: NSColor = .labelColor, lines: In
 
 final class TargetRowView: NSView, NSDraggingSource {
     private let target: PermissionTarget
-    private var actions: [ClosureTarget] = []
 
     init(target: PermissionTarget, onLog: @escaping (String) -> Void) {
         self.target = target
@@ -131,20 +139,15 @@ final class TargetRowView: NSView, NSDraggingSource {
         textStack.alignment = .leading
         textStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let copyAction = ClosureTarget { [target] in
+        let copyButton = ActionButton(title: "Copy Path") { _ in
             copyPath(target.path)
             onLog("Copied: \(target.path)")
         }
-        let copyButton = NSButton(title: "Copy Path", target: copyAction, action: #selector(ClosureTarget.invoke))
-        copyButton.bezelStyle = .rounded
 
-        let revealAction = ClosureTarget { [target] in
+        let revealButton = ActionButton(title: "Reveal") { _ in
             revealInFinder(target.path)
             onLog("Revealed in Finder: \(target.path)")
         }
-        let revealButton = NSButton(title: "Reveal", target: revealAction, action: #selector(ClosureTarget.invoke))
-        revealButton.bezelStyle = .rounded
-        actions.append(contentsOf: [copyAction, revealAction])
 
         let buttonStack = NSStackView(views: [copyButton, revealButton])
         buttonStack.orientation = .horizontal
@@ -195,7 +198,6 @@ final class TargetRowView: NSView, NSDraggingSource {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let options: Options
     private var window: NSWindow?
-    private var actions: [ClosureTarget] = []
     private let outputView = NSTextView()
 
     init(options: Options) {
@@ -230,21 +232,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lines: 3
         )
 
-        let openAction = ClosureTarget {
+        let openButton = ActionButton(title: "Open Full Disk Access") { _ in
             openFullDiskAccessSettings()
             self.log("Opened Full Disk Access settings.")
         }
-        let openButton = NSButton(title: "Open Full Disk Access", target: openAction, action: #selector(ClosureTarget.invoke))
-        openButton.bezelStyle = .rounded
         openButton.keyEquivalent = "\r"
-        actions.append(openAction)
 
-        let quitAction = ClosureTarget {
+        let quitButton = ActionButton(title: "Done") { _ in
             NSApp.terminate(nil)
         }
-        let quitButton = NSButton(title: "Done", target: quitAction, action: #selector(ClosureTarget.invoke))
-        quitButton.bezelStyle = .rounded
-        actions.append(quitAction)
 
         let topButtons = NSStackView(views: [openButton, quitButton])
         topButtons.orientation = .horizontal
@@ -277,12 +273,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         outputScroll.heightAnchor.constraint(equalToConstant: 104).isActive = true
 
         let commandButtons = options.afterCommands.map { command in
-            let action = ClosureTarget { [weak self] in
-                self?.runCommand(command)
+            let button = ActionButton(title: command.title) { [weak self] button in
+                self?.runCommand(command, sender: button)
             }
-            let button = NSButton(title: command.title, target: action, action: #selector(ClosureTarget.invoke))
-            button.bezelStyle = .rounded
-            actions.append(action)
+            button.toolTip = command.command
             return button
         }
         let commandsStack = NSStackView(views: commandButtons)
@@ -325,29 +319,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         outputView.scrollToEndOfDocument(nil)
     }
 
-    private func runCommand(_ command: AfterCommand) {
-        log("$ \(command.command)")
+    private func commandEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let homeBin = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("bin").path
+        let defaultPath = "\(homeBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        if let inheritedPath = environment["PATH"], !inheritedPath.isEmpty {
+            environment["PATH"] = "\(defaultPath):\(inheritedPath)"
+        } else {
+            environment["PATH"] = defaultPath
+        }
+        return environment
+    }
+
+    private func runCommand(_ command: AfterCommand, sender: NSButton? = nil) {
+        let originalTitle = sender?.title
+        sender?.isEnabled = false
+        if let originalTitle {
+            sender?.title = "\(originalTitle)..."
+        }
+        log("Running \(command.title): \(command.command)")
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-lc", command.command]
+            process.environment = self.commandEnvironment()
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
             do {
                 try process.run()
-                process.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 DispatchQueue.main.async {
                     if !output.isEmpty {
                         self.log(output)
                     }
                     self.log(process.terminationStatus == 0 ? "Command completed." : "Command failed with exit \(process.terminationStatus).")
+                    sender?.isEnabled = true
+                    if let originalTitle {
+                        sender?.title = originalTitle
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.log("Could not run command: \(error.localizedDescription)")
+                    sender?.isEnabled = true
+                    if let originalTitle {
+                        sender?.title = originalTitle
+                    }
                 }
             }
         }

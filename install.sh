@@ -23,8 +23,7 @@ Options:
 Notes:
   The installer copies binaries into ~/bin by default.
   Use PREFIX="$HOME/.local" if you want ~/.local/bin instead.
-  Run `remctl onboard` after install to trigger macOS permission prompts.
-  Run `remctl permissions full-disk-access` for the guided Full Disk Access helper.
+  Run `remctl onboard`, then `remctl permissions full-disk-access` for the visual Full Disk Access flow.
   The optional service is a separate launchd process and may need its own Full Disk Access grant.
 EOF
 }
@@ -204,8 +203,8 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}Done!${RESET} RemCTL v1.0.0 installed."
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-    echo -e "${DIM}Next: run 'remctl onboard', then 'remctl doctor'. Use 'remctl permissions full-disk-access' if Full Disk Access is missing.${RESET}"
+    echo -e "${DIM}Next: run 'remctl onboard', then 'remctl permissions full-disk-access', then 'remctl doctor'.${RESET}"
 else
-    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac. Use 'remctl permissions full-disk-access' when 'remctl doctor' reports missing Full Disk Access.${RESET}"
+    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual Full Disk Access setup.${RESET}"
 fi
 echo ""

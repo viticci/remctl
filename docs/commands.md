@@ -153,4 +153,4 @@ remctl service status
 remctl completion zsh
 ```
 
-Use [installation.md](installation.md) for the first-run permission flow.
+Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor` plus `remctl service status`, then adding the printed target in System Settings.
