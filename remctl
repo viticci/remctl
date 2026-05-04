@@ -3621,7 +3621,16 @@ def cmd_setup(a):
             print(f"Launch agent: {launch_agent_path()}")
             print(f"Full Disk Access target: {service_full_disk_access_target(settings)}")
         else:
-            print("Local API service: not installed (optional; run `remctl service install` if you need the REST API)")
+            service = launch_agent_status()
+            if service["installed"]:
+                state = "running" if service["running"] else ("loaded" if service["loaded"] else "stopped")
+                settings = parse_launch_agent_settings() or {}
+                print(f"Local API service: already installed ({state})")
+                print(f"Launch agent: {service['path']}")
+                if settings:
+                    print(f"Full Disk Access target: {service_full_disk_access_target(settings)}")
+            else:
+                print("Local API service: not installed (optional; run `remctl service install` if you need the REST API)")
         print()
         print("Next:")
         print("  1. remctl onboard   # grant macOS Reminders, Automation, and Full Disk Access permissions")

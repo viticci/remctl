@@ -203,6 +203,47 @@ class CliTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"SHELL": "/bin/zsh"}, clear=False):
             self.assertEqual(self.remctl.resolve_setup_shell("auto"), "zsh")
 
+    def test_cmd_setup_reports_existing_service_when_service_install_is_skipped(self):
+        args = SimpleNamespace(
+            shell="skip",
+            service="skip",
+            host="127.0.0.1",
+            port=19876,
+            allow_origin=None,
+            enable_opengraph=False,
+            doctor=False,
+            json=False,
+        )
+        with (
+            mock.patch.object(self.remctl, "ensure_api_token", return_value=("token", False)),
+            mock.patch.object(
+                self.remctl,
+                "launch_agent_status",
+                return_value={
+                    "installed": True,
+                    "loaded": True,
+                    "running": True,
+                    "path": "/tmp/com.remctl.server.plist",
+                },
+            ),
+            mock.patch.object(
+                self.remctl,
+                "parse_launch_agent_settings",
+                return_value={
+                    "python_path": "/tmp/service-python",
+                    "server_path": "/tmp/remctl-server",
+                    "host": "127.0.0.1",
+                    "port": 19876,
+                },
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_setup(args)
+        output = stdout.getvalue()
+        self.assertIn("Local API service: already installed (running)", output)
+        self.assertIn("/tmp/com.remctl.server.plist", output)
+        self.assertIn("Full Disk Access target: /tmp/service-python", output)
+
     def test_bridge_access_check_for_onboarding_reports_authorized_bridge(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_path = Path(tmpdir) / "remctl-bridge"
