@@ -326,7 +326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let subtitleField = label(options.subtitle, font: .systemFont(ofSize: 14), color: .secondaryLabelColor, lines: 2)
 
         let instructions = label(
-            "1. Click Open Full Disk Access. 2. Click + in System Settings. 3. Drag a target row into the picker, or press Command-Shift-G and paste the copied path. 4. Restart/check RemCTL.",
+            "1. Click Open Full Disk Access. 2. Click + in System Settings. 3. Drag each target row into the picker, or press Command-Shift-G and paste the copied path. 4. When rows are verified, restart the service if shown, then run Doctor.",
             font: .systemFont(ofSize: 13),
             color: .secondaryLabelColor,
             lines: 3

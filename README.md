@@ -116,7 +116,7 @@ remctl permissions full-disk-access
 remctl doctor
 ```
 
-The visual permission helper is the default Full Disk Access flow. It opens System Settings, copies the first target path, shows draggable targets for the CLI and optional service, and marks verified targets with a green check.
+The visual permission helper is the default Full Disk Access flow. It opens System Settings, copies the first target path, shows draggable targets for the CLI and optional service, and marks verified targets with a green check. If the service target is shown, restart the service after access is verified.
 
 If you only need to fix the background API service, run:
 

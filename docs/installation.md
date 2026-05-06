@@ -56,7 +56,7 @@ remctl today
 4. Checks direct database access.
 5. Opens the guided Full Disk Access helper when needed.
 
-`remctl permissions full-disk-access` is safe to run even if the direct CLI path already works. It is the clearest first-run path because it shows every Full Disk Access target visually before you run `doctor`.
+`remctl permissions full-disk-access` is safe to run even if the direct CLI path already works. It is the clearest first-run path because it shows every Full Disk Access target visually before you run `doctor`. If the optional service is installed, onboarding may include both the CLI target and the local API service target; the service still needs `remctl service restart` after its row is verified.
 
 ## Full Disk Access
 

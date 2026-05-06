@@ -3966,7 +3966,8 @@ def cmd_onboard(a):
         needs_cli_access = needs_full_disk_access_guidance(database_check)
         needs_service_access = needs_full_disk_access_guidance(api_check)
         if needs_cli_access or needs_service_access:
-            if launch_full_disk_access_helper(include_cli=needs_cli_access, include_service=needs_service_access):
+            include_cli_target = needs_cli_access or needs_service_access
+            if launch_full_disk_access_helper(include_cli=include_cli_target, include_service=needs_service_access):
                 print_permission_helper_opened()
             elif needs_cli_access:
                 print_full_disk_access_guidance(
