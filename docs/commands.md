@@ -23,6 +23,26 @@ remctl tags
 remctl stats
 ```
 
+## Flags, Priorities, Urgent, and Recurrence
+
+```bash
+remctl flagged
+remctl urgent
+remctl flag 23880
+remctl unflag 23880
+remctl add "Deploy" -d +3d -p high
+remctl edit 23880 -p low
+remctl edit 23880 --recurrence "weekly mon,wed"
+```
+
+RemCTL keeps these states distinct:
+
+- priority is written with `-p high`, `-p medium`, or `-p low` and shown as `!!!`, `!!`, or `!`
+- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`
+- macOS 26 urgent reminders are shown with `⏰` and listed with `urgent`
+- urgent is read-only in RemCTL because it is stored in private ReminderKit metadata
+- recurring reminders are shown with a `↻` badge and, in table output, a `Repeat` column
+
 ## Creating
 
 ```bash
@@ -99,6 +119,7 @@ Human-readable output shows:
 
 - `#ID` for each reminder
 - the `#ID` colored with its list color when available
+- priority markers: `!!!` for high, `!!` for medium, `!` for low
 - `⚑` for flagged reminders
 - `⏰` for macOS 26 urgent reminders
 - repeat badges such as `↻ monthly` for recurring reminders

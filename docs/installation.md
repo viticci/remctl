@@ -31,9 +31,11 @@ Install to `~/.local/bin`:
 PREFIX="$HOME/.local" ./install.sh --bootstrap
 ```
 
-`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, creates `~/.config/remctl/api-token`, installs shell completion when supported, and prints a doctor report.
+`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, creates `~/.config/remctl/api-token`, and installs shell completion when supported.
 
 It does not grant macOS permissions. Apple requires those grants to happen interactively.
+
+It also does not run `doctor` by default. A new user should grant permissions first, then verify with `doctor` so the first health report is meaningful. For upgrades on an already-authorized Mac, use `./install.sh --doctor` if you want an immediate health check.
 
 ## First Run
 
@@ -179,4 +181,6 @@ swiftc -O -framework AppKit -framework Foundation -o ~/bin/remctl-permissions re
 cp remctl-server ~/bin/remctl-server && chmod +x ~/bin/remctl-server
 ~/bin/remctl setup --shell auto
 ~/bin/remctl onboard
+~/bin/remctl permissions full-disk-access
+~/bin/remctl doctor
 ```

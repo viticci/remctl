@@ -14,7 +14,7 @@ usage() {
 Usage: ./install.sh [options]
 
 Options:
-  --bootstrap                 Install completions, create config, and print a doctor report
+  --bootstrap                 Install completions and create config for first-run onboarding
   --with-service              Install and start the launch agent after copying binaries
   --doctor                    Run `remctl doctor` after installation
   --shell-completions SHELL   Install completions for auto, zsh, bash, fish, or none (default: auto)
@@ -24,6 +24,7 @@ Notes:
   The installer copies binaries into ~/bin by default.
   Use PREFIX="$HOME/.local" if you want ~/.local/bin instead.
   Run `remctl onboard`, then `remctl permissions full-disk-access` for the visual Full Disk Access flow.
+  Run `remctl doctor` after permissions, or pass --doctor when upgrading an already-authorized install.
   The optional service is a separate launchd process and may need its own Full Disk Access grant.
 EOF
 }
@@ -32,7 +33,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --bootstrap)
             BOOTSTRAP=1
-            RUN_DOCTOR=1
             shift
             ;;
         --with-service)
@@ -192,7 +192,7 @@ if [[ "$SETUP_SHELL" != "skip" || "$WITH_SERVICE" -eq 1 ]]; then
     "${SETUP_ARGS[@]}"
 fi
 
-if [[ "$RUN_DOCTOR" -eq 1 || "$BOOTSTRAP" -eq 1 ]]; then
+if [[ "$RUN_DOCTOR" -eq 1 ]]; then
     echo -e "${BLUE}→${RESET} Running remctl doctor..."
     if ! "$BIN_DIR/remctl" doctor; then
         echo -e "${YELLOW}⚠${RESET}  Doctor found setup issues. This is common before macOS permissions are granted."
@@ -203,7 +203,7 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}Done!${RESET} RemCTL v1.0.0 installed."
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
-    echo -e "${DIM}Next: run 'remctl onboard', then 'remctl permissions full-disk-access', then 'remctl doctor'.${RESET}"
+    echo -e "${DIM}Bootstrap is ready. Next: run 'remctl onboard', then 'remctl permissions full-disk-access', then 'remctl doctor'.${RESET}"
 else
     echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual Full Disk Access setup.${RESET}"
 fi

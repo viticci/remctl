@@ -33,6 +33,8 @@ remctl doctor
 remctl today
 ```
 
+`--bootstrap` prepares the install, but it does not run `doctor` before macOS permissions are granted. Run the visual permission flow first, then verify.
+
 If you install to `~/.local/bin`, use the same prefix every time:
 
 ```bash
