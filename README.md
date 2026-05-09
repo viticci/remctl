@@ -1,5 +1,7 @@
 # RemCTL: The Power-User Reminders CLI
 
+![RemCTL](https://cdn.macstories.net/cleanshot-2026-05-04-at-18-15-17-2x-1777911332976.png)
+
 Fast, scriptable Apple Reminders for macOS.
 
 RemCTL reads the local iCloud Reminders database directly for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to iPhone, iPad, and Mac.
