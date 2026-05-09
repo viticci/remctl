@@ -20,7 +20,7 @@ xcode-select --install
 Default install to `~/bin`:
 
 ```bash
-git clone https://github.com/remctl/remctl.git
+git clone https://github.com/viticci/remctl.git
 cd remctl
 ./install.sh --bootstrap
 ```

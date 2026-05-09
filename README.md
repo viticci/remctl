@@ -23,7 +23,7 @@ Why this architecture exists:
 ## Quick Start
 
 ```bash
-git clone https://github.com/remctl/remctl.git
+git clone https://github.com/viticci/remctl.git
 cd remctl
 ./install.sh --bootstrap
 remctl onboard
