@@ -142,6 +142,128 @@ static BOOL looksLikeWebURL(NSString *value) {
     return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
 }
 
+static NSArray<NSDictionary *> *subtaskSpecArray(NSDictionary *cmd) {
+    id value = cmd[@"subtasks"];
+    if (value && value != [NSNull null]) {
+        if (![value isKindOfClass:[NSArray class]]) {
+            fail(@"subtasks must be an array of objects");
+        }
+        NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+        for (id item in (NSArray *)value) {
+            if (![item isKindOfClass:[NSDictionary class]]) {
+                fail(@"subtasks must contain only objects");
+            }
+            NSString *title = [(NSDictionary *)item objectForKey:@"title"];
+            if (![title isKindOfClass:[NSString class]] || title.length == 0) {
+                fail(@"Each subtask object requires a title");
+            }
+            [result addObject:item];
+        }
+        return result;
+    }
+
+    NSArray<NSString *> *titles = stringArray(cmd[@"titles"], @"titles");
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    for (NSString *title in titles) {
+        [result addObject:@{@"title": title}];
+    }
+    return result;
+}
+
+static void addURLsToChange(REMReminderChangeItem *change, NSArray<NSString *> *urls, NSInteger *addedURLs) {
+    if (urls.count == 0) return;
+    id attachmentContext = [change attachmentContext];
+    for (NSString *urlString in urls) {
+        if (!looksLikeWebURL(urlString)) {
+            fail([NSString stringWithFormat:@"Invalid web URL: %@", urlString]);
+        }
+        [attachmentContext addURLAttachmentWithURL:[NSURL URLWithString:urlString]];
+        if (addedURLs) *addedURLs += 1;
+    }
+}
+
+static void addTagsToChange(REMReminderChangeItem *change, NSArray<NSString *> *tags, NSInteger *addedTags) {
+    if (tags.count == 0) return;
+    id hashtagContext = [change hashtagContext];
+    for (NSString *tag in tags) {
+        [hashtagContext addHashtagWithType:1 name:tag];
+        if (addedTags) *addedTags += 1;
+    }
+}
+
+static void addImagesToChange(REMReminderChangeItem *change, NSArray<NSString *> *images, NSDictionary *cmd, NSInteger *addedImages) {
+    if (images.count == 0) return;
+    id attachmentContext = [change attachmentContext];
+    for (NSString *path in images) {
+        if (![[NSFileManager defaultManager] isReadableFileAtPath:path]) {
+            fail([NSString stringWithFormat:@"Image is not readable: %@", path]);
+        }
+        NSURL *fileURL = [NSURL fileURLWithPath:path];
+        NSImage *image = [[NSImage alloc] initWithContentsOfURL:fileURL];
+        if (!image || image.size.width <= 0 || image.size.height <= 0) {
+            fail([NSString stringWithFormat:@"Image attachment must be a readable image file: %@", path]);
+        }
+        NSUInteger width = [cmd[@"width"] unsignedIntegerValue];
+        NSUInteger height = [cmd[@"height"] unsignedIntegerValue];
+        if (width == 0 || height == 0) {
+            width = (NSUInteger)lrint(image.size.width);
+            height = (NSUInteger)lrint(image.size.height);
+        }
+        NSError *error = nil;
+        id attachment = [attachmentContext addImageAttachmentWithURL:fileURL width:width height:height error:&error];
+        if (!attachment) fail(error.localizedDescription ?: [NSString stringWithFormat:@"Image attachment failed: %@", path]);
+        if (addedImages) *addedImages += 1;
+    }
+}
+
+static void addLocationToChange(REMReminderChangeItem *change, NSDictionary *cmd) {
+    id latValue = cmd[@"latitude"];
+    id lonValue = cmd[@"longitude"];
+    id titleValue = cmd[@"locationTitle"] ?: cmd[@"location_title"];
+    if ((!latValue || latValue == [NSNull null]) && (!lonValue || lonValue == [NSNull null]) && (!titleValue || titleValue == [NSNull null])) {
+        return;
+    }
+    if (!latValue || latValue == [NSNull null] || !lonValue || lonValue == [NSNull null]) {
+        fail(@"Location alarms require latitude and longitude");
+    }
+    NSString *title = [titleValue isKindOfClass:[NSString class]] && [titleValue length] ? titleValue : @"Location";
+    double lat = [latValue doubleValue];
+    double lon = [lonValue doubleValue];
+    double radius = [cmd[@"radius"] doubleValue];
+    NSInteger proximity = [cmd[@"proximity"] integerValue];
+    if (radius <= 0.0) radius = 100.0;
+    if (proximity != 1 && proximity != 2) proximity = 1;
+    if (lat < -90.0 || lat > 90.0) fail(@"latitude must be between -90 and 90");
+    if (lon < -180.0 || lon > 180.0) fail(@"longitude must be between -180 and 180");
+    REMStructuredLocation *location = [[REMStructuredLocation alloc]
+        initWithTitle:title
+        locationUID:[[NSUUID UUID] UUIDString]
+        latitude:lat
+        longitude:lon
+        radius:radius
+        address:cmd[@"address"]
+        routing:nil
+        referenceFrameString:nil
+        contactLabel:nil
+        mapKitHandle:nil];
+    id trigger = [[REMAlarmLocationTrigger alloc] initWithStructuredLocation:location proximity:proximity];
+    id alarm = [[REMAlarm alloc] initWithTrigger:trigger];
+    [change addAlarm:alarm];
+}
+
+static void applyPrivateMetadataToChange(REMReminderChangeItem *change, NSDictionary *cmd, NSInteger *addedURLs, NSInteger *addedTags, NSInteger *addedImages) {
+    addURLsToChange(change, stringArray(cmd[@"urls"], @"urls"), addedURLs);
+    addTagsToChange(change, stringArray(cmd[@"tags"], @"tags"), addedTags);
+    addImagesToChange(change, stringArray(cmd[@"images"], @"images"), cmd, addedImages);
+    if (cmd[@"flagged"] && cmd[@"flagged"] != [NSNull null]) {
+        [[change flaggedContext] setFlagged:[cmd[@"flagged"] boolValue] ? 1 : 0];
+    }
+    if (cmd[@"urgent"] && cmd[@"urgent"] != [NSNull null]) {
+        [[change urgentAlarmContext] setIsUrgentStateEnabledForCurrentUser:[cmd[@"urgent"] boolValue]];
+    }
+    addLocationToChange(change, cmd);
+}
+
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         NSData *input = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
@@ -218,17 +340,28 @@ int main(int argc, const char * argv[]) {
         } else if ([action isEqualToString:@"add_tags"]) {
             if (tags.count == 0) fail(@"At least one tag is required");
         } else if ([action isEqualToString:@"add_subtasks"]) {
-            NSArray<NSString *> *titles = stringArray(cmd[@"titles"], @"titles");
-            if (titles.count == 0) fail(@"At least one subtask title is required");
+            NSArray<NSDictionary *> *subtaskSpecs = subtaskSpecArray(cmd);
+            if (subtaskSpecs.count == 0) fail(@"At least one subtask is required");
             id subtaskContext = [change subtaskContext];
             NSMutableArray *subtaskURLs = [NSMutableArray array];
-            for (NSString *title in titles) {
+            NSMutableArray *subtaskDetails = [NSMutableArray array];
+            for (NSDictionary *subtaskSpec in subtaskSpecs) {
+                NSString *title = subtaskSpec[@"title"];
                 id subtask = [save addReminderWithTitle:title toReminderSubtaskContextChangeItem:subtaskContext];
+                if (!subtask) fail([NSString stringWithFormat:@"Could not create subtask: %@", title]);
                 id subtaskID = [subtask remObjectID];
-                if (subtaskID) [subtaskURLs addObject:[[subtaskID urlRepresentation] absoluteString] ?: @""];
+                NSString *subtaskURL = subtaskID ? ([[subtaskID urlRepresentation] absoluteString] ?: @"") : @"";
+                NSString *subtaskIdentifier = subtaskID && [subtaskID respondsToSelector:@selector(uuid)] ? [[subtaskID uuid] UUIDString] : @"";
+                if (subtaskURL.length) [subtaskURLs addObject:subtaskURL];
+                [subtaskDetails addObject:@{
+                    @"id": subtaskIdentifier ?: @"",
+                    @"title": title ?: @"",
+                    @"url": subtaskURL ?: @"",
+                }];
                 addedSubtasks += 1;
             }
             details[@"subtaskURLs"] = subtaskURLs;
+            details[@"subtasks"] = subtaskDetails;
         } else if ([action isEqualToString:@"assign_section"]) {
             NSString *sectionID = cmd[@"sectionId"];
             if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");

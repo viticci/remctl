@@ -53,7 +53,7 @@ Writes go through Apple-supported APIs:
 
 There is also an explicitly unsupported opt-in helper:
 
-3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
+3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, rich subtasks, image attachments, real flag state, urgent state, and location alarms. For rich subtasks, `remctl-private` creates the child and applies private child metadata, then `remctl-bridge` applies public child fields such as notes and due dates. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
 
 The bridge is detected next to the installed CLI. Override it with:
 

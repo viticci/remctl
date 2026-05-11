@@ -20,7 +20,7 @@ Verified on macOS/iCloud sync:
 - synced tags: `--private -t remctl,work`
 - section assignment: `--private --section "Research"`
 - section creation and assignment: `--private --new-section "Research"`
-- subtasks: `--private --subtask "Follow up"`
+- subtasks: `--private --subtask "Follow up"` or rich JSON objects with child metadata
 - image attachments: `--private --image ~/Desktop/mockup.png`
 - real flag state: `edit ID --private --flagged` or `add ... --private -f`
 - urgent state: `edit ID --private --urgent`
@@ -43,6 +43,9 @@ remctl add "Prepare screenshots" -l Projects --private \
   --image ~/Desktop/mockup.png \
   --subtask "Export final PNG"
 
+remctl add "Launch assets" -l Projects --private \
+  --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"],"urgent":true}'
+
 remctl add "Flagged private task" -l Work --private -f
 ```
 
@@ -56,11 +59,14 @@ remctl edit 23880 --private -t remctl,work
 remctl edit 23880 --private --section "Research"
 remctl edit 23880 --private --new-section "Inbox Zero"
 remctl edit 23880 --private --subtask "Follow up"
+remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"],"flagged":true}'
 remctl edit 23880 --private --image ~/Desktop/mockup.png
 remctl edit 23880 --private --flagged --urgent
 remctl edit 23880 --private --no-flagged --no-urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --proximity arriving
 ```
+
+`--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`, `address`). Public fields such as notes and due dates are applied through `remctl-bridge`; private fields such as rich links and tags are applied through `remctl-private`.
 
 ## Guardrails
 
@@ -76,7 +82,7 @@ remctl edit 23880 --urgent
 
 These fail because they would otherwise look successful while silently dropping private metadata.
 
-`--private --url` accepts `http` and `https` URLs. Image attachments must point to readable image files. Location alarms validate latitude, longitude, radius, and proximity before saving.
+`--private --url` and subtask `url`/`urls` accept `http` and `https` URLs. Image attachments must point to readable image files. Location alarms validate latitude, longitude, radius, and proximity before saving.
 
 ## Installation and Doctor
 

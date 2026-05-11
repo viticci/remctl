@@ -38,8 +38,10 @@ Use `--private` only when Federico explicitly asks for private Reminders metadat
 ```bash
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --section "Research" --json
 remctl add "Prepare screenshots" -l Projects --private --image ~/Desktop/mockup.png --subtask "Export PNG" --json
+remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}' --json
 remctl edit 23880 --private --url "https://example.com" -t remctl --json
 remctl edit 23880 --private --section "Research" --subtask "Follow up" --json
+remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"]}' --json
 remctl edit 23880 --private --flagged --urgent --json
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --json
 ```
@@ -48,6 +50,7 @@ Private metadata rules:
 
 - `--private --url` creates a synced web rich link. Without `--private`, `--url` is appended to notes.
 - `--private -t/--tags` creates real synced tags. On `add` without `--private`, tags are inline title hashtags. On `edit`, tags require `--private`.
+- `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.

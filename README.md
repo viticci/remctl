@@ -68,6 +68,7 @@ remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
 remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
 remctl edit 23880 -d clear
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
+remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
 remctl info 23880 --json
 ```
 

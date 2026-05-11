@@ -968,6 +968,242 @@ def normalize_image_paths(values):
     return result
 
 
+def normalize_string_list(value, field):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if field == "tags":
+            return split_csv(value)
+        value = value.strip()
+        return [value] if value else []
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if not isinstance(item, str):
+                print(f"Error: subtask {field} must contain only strings.", file=sys.stderr)
+                sys.exit(1)
+            item = item.strip()
+            if item:
+                result.extend(split_csv(item) if field == "tags" else [item])
+        return result
+    print(f"Error: subtask {field} must be a string or array of strings.", file=sys.stderr)
+    sys.exit(1)
+
+
+def normalize_json_bool(value, field):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    print(f"Error: subtask {field} must be a boolean.", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_subtask_specs(values):
+    specs = []
+    for raw in normalize_repeatable(values):
+        if raw.lstrip().startswith("{"):
+            try:
+                spec = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                print(f"Error: invalid --subtask JSON: {exc.msg}.", file=sys.stderr)
+                sys.exit(1)
+            if not isinstance(spec, dict):
+                print("Error: --subtask JSON must be an object.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            spec = {"title": raw}
+
+        title = spec.get("title")
+        if not isinstance(title, str) or not title.strip():
+            print("Error: each --subtask requires a non-empty title.", file=sys.stderr)
+            sys.exit(1)
+
+        normalized = {"title": title.strip()}
+        if "notes" in spec:
+            if spec["notes"] is not None and not isinstance(spec["notes"], str):
+                print("Error: subtask notes must be a string.", file=sys.stderr)
+                sys.exit(1)
+            normalized["notes"] = spec["notes"]
+
+        if spec.get("due"):
+            dt = parse_due(str(spec["due"]))
+            if not dt:
+                print(
+                    f"Error: could not parse subtask due date {spec['due']!r}. "
+                    "Use ISO (YYYY-MM-DD [HH:MM]) or shortcuts like today/tomorrow/eod/+3d.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            normalized["due"] = dt.isoformat()
+
+        if spec.get("priority"):
+            priority = str(spec["priority"]).lower()
+            if priority not in {"high", "h", "medium", "med", "m", "low", "l", "none"}:
+                print("Error: subtask priority must be high, medium, low, or none.", file=sys.stderr)
+                sys.exit(1)
+            normalized["priority"] = priority
+
+        if spec.get("alarm"):
+            alarm = parse_alarm(str(spec["alarm"]))
+            if not alarm:
+                print(f"Error: could not parse subtask alarm {spec['alarm']!r}.", file=sys.stderr)
+                sys.exit(1)
+            normalized["alarm"] = alarm
+
+        if spec.get("recurrence"):
+            normalized["recurrence"] = parse_recurrence(str(spec["recurrence"]))
+
+        urls = normalize_string_list(spec.get("urls", spec.get("url")), "urls")
+        for url in urls:
+            if not is_web_url(url):
+                print("Error: --private --subtask url requires an http or https URL.", file=sys.stderr)
+                sys.exit(1)
+        if urls:
+            normalized["urls"] = urls
+
+        tags = normalize_string_list(spec.get("tags"), "tags")
+        if tags:
+            normalized["tags"] = tags
+
+        images = normalize_string_list(spec.get("images", spec.get("image")), "images")
+        if images:
+            readable_images = []
+            for image in images:
+                image_path = str(Path(image).expanduser())
+                if not os.path.isfile(image_path) or not os.access(image_path, os.R_OK):
+                    print(f"Error: subtask image attachment is not readable: {image_path}", file=sys.stderr)
+                    sys.exit(1)
+                readable_images.append(image_path)
+            normalized["images"] = readable_images
+
+        for bool_field in ("flagged", "urgent"):
+            if bool_field in spec:
+                normalized[bool_field] = normalize_json_bool(spec.get(bool_field), bool_field)
+
+        latitude = spec.get("latitude")
+        longitude = spec.get("longitude")
+        location_title = spec.get("locationTitle", spec.get("location_title"))
+        if latitude is not None or longitude is not None or location_title is not None:
+            if latitude is None or longitude is None:
+                print("Error: subtask location alarms require both latitude and longitude.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                latitude = float(latitude)
+                longitude = float(longitude)
+                radius = float(spec.get("radius", 100))
+            except (TypeError, ValueError):
+                print("Error: subtask location latitude, longitude, and radius must be numbers.", file=sys.stderr)
+                sys.exit(1)
+            if latitude < -90 or latitude > 90:
+                print("Error: subtask latitude must be between -90 and 90.", file=sys.stderr)
+                sys.exit(1)
+            if longitude < -180 or longitude > 180:
+                print("Error: subtask longitude must be between -180 and 180.", file=sys.stderr)
+                sys.exit(1)
+            if radius <= 0:
+                print("Error: subtask radius must be greater than 0.", file=sys.stderr)
+                sys.exit(1)
+            proximity_text = str(spec.get("proximity", "arriving")).lower()
+            if proximity_text not in {"arriving", "leaving"}:
+                print("Error: subtask proximity must be arriving or leaving.", file=sys.stderr)
+                sys.exit(1)
+            normalized.update({
+                "locationTitle": str(location_title or "Location"),
+                "latitude": latitude,
+                "longitude": longitude,
+                "radius": radius,
+                "proximity": 2 if proximity_text == "leaving" else 1,
+            })
+            if spec.get("address"):
+                normalized["address"] = str(spec["address"])
+
+        specs.append(normalized)
+    return specs
+
+
+def subtask_specs_need_bridge(specs):
+    bridge_fields = {"notes", "due", "priority", "alarm", "recurrence"}
+    return any(bridge_fields.intersection(spec.keys()) for spec in specs)
+
+
+def bridge_update_subtask(subtask_id, spec):
+    pm = {"high": 1, "h": 1, "medium": 5, "med": 5, "m": 5, "low": 9, "l": 9, "none": 0}
+    data = {"action": "update", "id": subtask_id}
+    if "notes" in spec:
+        data["notes"] = spec["notes"]
+    if "due" in spec:
+        data["due"] = spec["due"]
+    if "priority" in spec:
+        data["priority"] = pm[spec["priority"]]
+    if "alarm" in spec:
+        data["alarm"] = spec["alarm"]
+    if "recurrence" in spec:
+        data["recurrence"] = spec["recurrence"]
+    if len(data) == 2:
+        return None
+    for _ in range(3):
+        result = bridge_call(data)
+        if result and result.get("status") == "updated":
+            return result
+        time.sleep(0.2)
+    print(
+        f"Error: created subtask '{spec['title']}' but failed to apply its public metadata.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def apply_subtask_private_metadata(subtask_id, spec):
+    updates = []
+    urls = spec.get("urls", [])
+    tags = spec.get("tags", [])
+    if urls or tags:
+        updates.append(private_action({
+            "action": "add_private_metadata",
+            "id": subtask_id,
+            "urls": urls,
+            "tags": tags,
+        }))
+    if spec.get("images"):
+        updates.append(private_action({
+            "action": "add_attachments",
+            "id": subtask_id,
+            "files": [],
+            "images": spec["images"],
+        }))
+    if "flagged" in spec:
+        updates.append(private_action({
+            "action": "set_flagged",
+            "id": subtask_id,
+            "flagged": bool(spec["flagged"]),
+        }))
+    if "urgent" in spec:
+        updates.append(private_action({
+            "action": "set_urgent",
+            "id": subtask_id,
+            "urgent": bool(spec["urgent"]),
+        }))
+    if "latitude" in spec or "longitude" in spec:
+        updates.append(private_action({
+            "action": "add_location_alarm",
+            "id": subtask_id,
+            "title": spec.get("locationTitle") or "Location",
+            "latitude": spec["latitude"],
+            "longitude": spec["longitude"],
+            "radius": spec.get("radius", 100),
+            "proximity": spec.get("proximity", 1),
+            "address": spec.get("address"),
+        }))
+    return updates
+
+
 def is_web_url(value):
     if not value:
         return False
@@ -1001,6 +1237,8 @@ def validate_private_args(a):
         if getattr(a, "radius", 100) is not None and getattr(a, "radius", 100) <= 0:
             print("Error: --radius must be greater than 0.", file=sys.stderr)
             sys.exit(1)
+
+    parse_subtask_specs(getattr(a, "subtask", None))
 
 
 def private_action(data):
@@ -1107,13 +1345,40 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "name": a.new_section,
         }))
 
-    subtasks = normalize_repeatable(getattr(a, "subtask", None))
+    subtasks = parse_subtask_specs(getattr(a, "subtask", None))
     if subtasks:
-        results.append(private_action({
+        subtask_result = private_action({
             "action": "add_subtasks",
             "id": reminder_ckid,
-            "titles": subtasks,
-        }))
+            "subtasks": subtasks,
+        })
+        bridge_updates = []
+        child_private_updates = []
+        for spec, subtask in zip(subtasks, subtask_result.get("subtasks", [])):
+            subtask_id = subtask.get("id") if isinstance(subtask, dict) else None
+            if subtask_id:
+                private_updates = apply_subtask_private_metadata(subtask_id, spec)
+                if private_updates:
+                    child_private_updates.append({
+                        "id": subtask_id,
+                        "title": spec["title"],
+                        "updates": private_updates,
+                    })
+                bridge_update = bridge_update_subtask(subtask_id, spec)
+                if bridge_update:
+                    bridge_updates.append({
+                        "id": subtask_id,
+                        "title": spec["title"],
+                        "status": bridge_update.get("status"),
+                    })
+        if subtask_specs_need_bridge(subtasks) and len(bridge_updates) < sum(1 for spec in subtasks if subtask_specs_need_bridge([spec])):
+            print("Error: private helper did not return subtask IDs for bridge metadata updates.", file=sys.stderr)
+            sys.exit(1)
+        if bridge_updates:
+            subtask_result["bridgeUpdates"] = bridge_updates
+        if child_private_updates:
+            subtask_result["childPrivateUpdates"] = child_private_updates
+        results.append(subtask_result)
 
     images = normalize_image_paths(getattr(a, "image", None))
     if images:
@@ -1920,6 +2185,9 @@ def cmd_add(a):
     if wants_private:
         require_private_metadata(a)
         validate_private_args(a)
+        if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
+            print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
+            sys.exit(1)
     target_list_pk = None
     if wants_private and getattr(a, "list", None):
         db = open_db()
@@ -2152,6 +2420,9 @@ def cmd_edit(a):
     if wants_private:
         require_private_metadata(a)
         validate_private_args(a)
+        if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
+            print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
+            sys.exit(1)
 
     pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
 
@@ -2898,7 +3169,7 @@ _remctl() {
                 '--private[Use unsupported private ReminderKit metadata writes]' \
                 '--section[Assign to existing section]:section:' \
                 '--new-section[Create and assign to new section]:section:' \
-                '--subtask[Add private subtask]:title:' \
+                '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
@@ -2916,7 +3187,7 @@ _remctl() {
                 '--private[Use unsupported private ReminderKit metadata writes]' \
                 '--section[Assign to existing section]:section:' \
                 '--new-section[Create and assign to new section]:section:' \
-                '--subtask[Add private subtask]:title:' \
+                '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--flagged[Set real private flag]' \
                 '--no-flagged[Clear real private flag]' \
@@ -3001,14 +3272,14 @@ complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell c
 complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsupported private ReminderKit metadata writes"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
-complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l image -d "Add private image attachment" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, web rich link with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -s t -l tags -d "Tags, synced with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l private -d "Use unsupported private ReminderKit metadata writes"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Create and assign to new section" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l image -d "Add private image attachment" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l flagged -d "Set real private flag"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-flagged -d "Clear real private flag"
@@ -3658,6 +3929,7 @@ def main():
             "  remctl add \"Review PR\" -l Work -d tomorrow\n"
             "  remctl add \"Research\" -l Projects --private --url https://example.com -t remctl --section Research\n"
             "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
+            "  remctl add \"Launch assets\" -l Projects --private --subtask '{\"title\":\"Export PNG\",\"notes\":\"Use final crop\",\"due\":\"tomorrow\",\"url\":\"https://example.com\",\"tags\":[\"media\"]}'\n"
             "\n"
             "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
             "With --private, --url creates a synced web rich link and -t/--tags creates synced Reminders tags.\n"
@@ -3677,7 +3949,7 @@ def main():
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("--section", help="Private metadata: assign to an existing section in the target list")
     c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
-    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask (repeatable)")
+    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
     c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
     js(c)
 
@@ -3696,6 +3968,7 @@ def main():
             "  remctl edit 23880 -d clear\n"
             "  remctl edit 23880 --private --url https://example.com -t remctl\n"
             "  remctl edit 23880 --private --section Research --subtask \"Follow up\"\n"
+            "  remctl edit 23880 --private --subtask '{\"title\":\"Follow up\",\"notes\":\"Bring latest numbers\",\"due\":\"next friday at 3pm\",\"url\":\"https://example.com\",\"tags\":[\"work\"]}'\n"
             "  remctl edit 23880 --private --flagged --urgent\n"
             "  remctl edit 23880 --private --location-title \"Apple Park\" --latitude 37.3349 --longitude -122.0090 --radius 200\n"
             "\n"
@@ -3715,7 +3988,7 @@ def main():
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list and assign this reminder")
-    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask (repeatable)")
+    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
     c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
     c.add_argument("--flagged", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set the real flagged state")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")

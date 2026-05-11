@@ -60,12 +60,16 @@ Unsupported private metadata writes:
 ```bash
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
 remctl add "Prepare images" -l Projects --private --image ~/Desktop/mockup.png --subtask "Export final PNG"
+remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
 remctl edit 23880 --private --section "Research"
+remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"]}'
 remctl edit 23880 --private --flagged --urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
 ```
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
+
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 

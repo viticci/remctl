@@ -8,7 +8,6 @@ remctl-permissions
 __pycache__/
 *.pyc
 *.pyo
-/tests/
 
 # macOS
 .DS_Store
