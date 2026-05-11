@@ -1,6 +1,6 @@
 #!/bin/bash
 # RemCTL Installer
-# Installs remctl, remctl-bridge, remctl-permissions, and shared runtime helpers.
+# Installs remctl, remctl-bridge, remctl-private, remctl-permissions, and shared runtime helpers.
 
 set -euo pipefail
 
@@ -21,6 +21,7 @@ Options:
 Notes:
   The installer copies binaries into ~/bin by default.
   Use PREFIX="$HOME/.local" if you want ~/.local/bin instead.
+  remctl-private is optional and only used by explicit --private writes.
   Run `remctl onboard`, then `remctl permissions full-disk-access` for the visual Full Disk Access flow.
   Run `remctl doctor` after permissions, or pass --doctor when upgrading an already-authorized install.
 EOF
@@ -104,7 +105,7 @@ mv "$completion_tmp" "$BIN_DIR/completions/_remctl"
 chmod 644 "$BIN_DIR/completions/_remctl"
 echo -e "  ${GREEN}✓${RESET} _remctl → $BIN_DIR/completions/_remctl"
 
-# 2. Compile and install Swift helpers
+# 2. Compile and install helpers
 if command -v swiftc &>/dev/null; then
     echo -e "${BLUE}→${RESET} Compiling remctl-bridge (Swift/EventKit)..."
     if swiftc -O \
@@ -135,6 +136,24 @@ else
     echo -e "  ${YELLOW}⚠${RESET} swiftc not found — install Xcode Command Line Tools"
     echo -e "    ${DIM}Run: xcode-select --install${RESET}"
     echo -e "    ${DIM}remctl will fall back to AppleScript for writes and manual Full Disk Access steps${RESET}"
+fi
+
+if command -v clang &>/dev/null; then
+    echo -e "${BLUE}→${RESET} Compiling remctl-private (unsupported private ReminderKit helper)..."
+    if clang -fobjc-arc -O \
+        -F/System/Library/PrivateFrameworks \
+        -framework Foundation \
+        -framework AppKit \
+        -framework ReminderKit \
+        -o "$BIN_DIR/remctl-private" \
+        "$SCRIPT_DIR/remctl-private.m" 2>/dev/null; then
+        chmod +x "$BIN_DIR/remctl-private"
+        echo -e "  ${GREEN}✓${RESET} remctl-private → $BIN_DIR/remctl-private"
+    else
+        echo -e "  ${YELLOW}⚠${RESET} remctl-private did not compile — private metadata writes unavailable"
+    fi
+else
+    echo -e "  ${YELLOW}⚠${RESET} clang not found — private metadata writes unavailable"
 fi
 
 # 3. Check PATH

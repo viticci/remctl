@@ -40,7 +40,7 @@ RemCTL keeps these states distinct:
 - priority is written with `-p high`, `-p medium`, or `-p low` and shown as `!!!`, `!!`, or `!`
 - flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`
 - macOS 26 urgent reminders are shown with `⏰` and listed with `urgent`
-- urgent is read-only in RemCTL because it is stored in private ReminderKit metadata
+- urgent is normally read-only because it is stored in private ReminderKit metadata; power users can opt into unsupported private writes with `--private`
 - recurring reminders are shown with a `↻` badge and, in table output, a `Repeat` column
 
 ## Creating
@@ -54,6 +54,20 @@ remctl add "Deploy" -d +3d -p high
 remctl add "Pay rent" -d "2026-06-01" -f
 remctl add "Check app" --url "https://example.com"
 ```
+
+Unsupported private metadata writes:
+
+```bash
+remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
+remctl add "Prepare images" -l Projects --private --image ~/Desktop/mockup.png --subtask "Export final PNG"
+remctl edit 23880 --private --section "Research"
+remctl edit 23880 --private --flagged --urgent
+remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
+```
+
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+
+See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
 Recurring reminders:
 

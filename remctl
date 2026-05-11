@@ -10,6 +10,7 @@ import argparse, csv, io, json, os, platform, plistlib, re, shlex, shutil, sqlit
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 from remctl_runtime import (
     due_today_window,
@@ -37,6 +38,7 @@ VERSION = "1.0.0"
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
 BRIDGE_PATH = resolve_binary_path(__file__, "remctl-bridge", "REMCTL_BRIDGE_PATH")
+PRIVATE_PATH = resolve_binary_path(__file__, "remctl-private", "REMCTL_PRIVATE_PATH")
 PERMISSIONS_PATH = resolve_binary_path(__file__, "remctl-permissions", "REMCTL_PERMISSIONS_PATH")
 CONFIG_DIR = resolve_config_dir("remctl")
 ONBOARD_STATE_FILE = CONFIG_DIR / "onboard-state.json"
@@ -881,6 +883,282 @@ def bridge_call(data):
         return result["payload"]
     return None
 
+
+# ── Private ReminderKit Integration ──────────────────────────────────────────
+
+def private_metadata_enabled(a=None):
+    """True when the caller explicitly opted into private ReminderKit writes."""
+    if a is not None and (getattr(a, "private", False) or getattr(a, "private_metadata", False)):
+        return True
+    return False
+
+
+def private_available():
+    """Check if remctl-private (private ReminderKit helper) is available."""
+    return PRIVATE_PATH.exists() and PRIVATE_PATH.stat().st_mode & 0o111
+
+
+def private_call_result(data, timeout=30):
+    """Call remctl-private and return raw subprocess + parsed JSON details."""
+    try:
+        proc = subprocess.run(
+            [str(PRIVATE_PATH)], input=json.dumps(data),
+            capture_output=True, text=True, timeout=timeout
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+    payload = None
+    if proc.stdout:
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            payload = None
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "payload": payload,
+    }
+
+
+def private_call(data):
+    """Call remctl-private with JSON data. Returns parsed JSON response."""
+    result = private_call_result(data)
+    if result and result["returncode"] == 0 and isinstance(result["payload"], dict):
+        return result["payload"]
+    return None
+
+
+def require_private_metadata(a=None):
+    if not private_metadata_enabled(a):
+        print(
+            "Error: private metadata writes require --private.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not private_available():
+        print(
+            "Error: remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def split_csv(value):
+    if not value:
+        return []
+    return [part.strip().lstrip("#") for part in value.split(",") if part.strip().lstrip("#")]
+
+
+def normalize_repeatable(values):
+    result = []
+    for value in values or []:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                result.append(value)
+    return result
+
+
+def normalize_image_paths(values):
+    result = []
+    for value in normalize_repeatable(values):
+        result.append(str(Path(value).expanduser()))
+    return result
+
+
+def is_web_url(value):
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def validate_private_args(a):
+    url = getattr(a, "url", None)
+    if url and not is_web_url(url):
+        print("Error: --private --url requires an http or https URL.", file=sys.stderr)
+        sys.exit(1)
+
+    for image in normalize_image_paths(getattr(a, "image", None)):
+        if not os.path.isfile(image) or not os.access(image, os.R_OK):
+            print(f"Error: image attachment is not readable: {image}", file=sys.stderr)
+            sys.exit(1)
+
+    latitude = getattr(a, "latitude", None)
+    longitude = getattr(a, "longitude", None)
+    if latitude is not None or longitude is not None:
+        if latitude is None or longitude is None:
+            print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
+            sys.exit(1)
+        if latitude < -90 or latitude > 90:
+            print("Error: --latitude must be between -90 and 90.", file=sys.stderr)
+            sys.exit(1)
+        if longitude < -180 or longitude > 180:
+            print("Error: --longitude must be between -180 and 180.", file=sys.stderr)
+            sys.exit(1)
+        if getattr(a, "radius", 100) is not None and getattr(a, "radius", 100) <= 0:
+            print("Error: --radius must be greater than 0.", file=sys.stderr)
+            sys.exit(1)
+
+
+def private_action(data):
+    result = private_call(data)
+    if not result or result.get("status") != "updated":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    return result
+
+
+def resolve_section_ckid(db, list_pk, section_name):
+    if not section_name:
+        return None
+    if not list_pk:
+        print("Error: --section requires a known list. Pass -l/--list when creating.", file=sys.stderr)
+        sys.exit(1)
+    matches = [s for s in q_sections(db, list_pk) if (s["ZDISPLAYNAME"] or "").lower() == section_name.lower()]
+    if not matches:
+        print(f"Error: section not found in target list: {section_name}", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"Error: multiple sections named {section_name!r} in target list", file=sys.stderr)
+        sys.exit(1)
+    row = db.execute(
+        "SELECT ZCKIDENTIFIER FROM ZREMCDBASESECTION WHERE Z_PK = ?",
+        (matches[0]["Z_PK"],),
+    ).fetchone()
+    if not row or not row["ZCKIDENTIFIER"]:
+        print(f"Error: section has no stable CloudKit identifier: {section_name}", file=sys.stderr)
+        sys.exit(1)
+    return row["ZCKIDENTIFIER"]
+
+
+def private_changes_from_args(a):
+    return any([
+        getattr(a, "url", None),
+        getattr(a, "tags", None),
+        getattr(a, "section", None),
+        getattr(a, "new_section", None),
+        getattr(a, "subtask", None),
+        getattr(a, "image", None),
+        getattr(a, "flag", False),
+        getattr(a, "flagged", None) is not None,
+        getattr(a, "urgent", None) is not None,
+        getattr(a, "location_title", None),
+        getattr(a, "latitude", None) is not None,
+        getattr(a, "longitude", None) is not None,
+    ])
+
+
+def private_only_changes_from_args(a):
+    return any([
+        getattr(a, "section", None),
+        getattr(a, "new_section", None),
+        getattr(a, "subtask", None),
+        getattr(a, "image", None),
+        getattr(a, "flagged", None) is not None,
+        getattr(a, "urgent", None) is not None,
+        getattr(a, "location_title", None),
+        getattr(a, "latitude", None) is not None,
+        getattr(a, "longitude", None) is not None,
+    ])
+
+
+def refuse_private_args_without_opt_in(a):
+    if private_only_changes_from_args(a) and not private_metadata_enabled(a):
+        print(
+            "Error: section, subtask, image, urgent, flagged, and location writes require --private. "
+            "Example: remctl add \"Title\" -l Projects --private --section \"Research\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
+    require_private_metadata(a)
+    results = []
+    tags = split_csv(getattr(a, "tags", None))
+    urls = [getattr(a, "url")] if getattr(a, "url", None) else []
+
+    if urls or tags:
+        results.append(private_action({
+            "action": "add_private_metadata",
+            "id": reminder_ckid,
+            "urls": urls,
+            "tags": tags,
+        }))
+
+    if getattr(a, "section", None):
+        if db is None:
+            db = open_db()
+        section_id = resolve_section_ckid(db, list_pk, a.section)
+        results.append(private_action({
+            "action": "assign_section",
+            "id": reminder_ckid,
+            "sectionId": section_id,
+        }))
+
+    if getattr(a, "new_section", None):
+        results.append(private_action({
+            "action": "add_section_and_assign",
+            "id": reminder_ckid,
+            "name": a.new_section,
+        }))
+
+    subtasks = normalize_repeatable(getattr(a, "subtask", None))
+    if subtasks:
+        results.append(private_action({
+            "action": "add_subtasks",
+            "id": reminder_ckid,
+            "titles": subtasks,
+        }))
+
+    images = normalize_image_paths(getattr(a, "image", None))
+    if images:
+        results.append(private_action({
+            "action": "add_attachments",
+            "id": reminder_ckid,
+            "files": [],
+            "images": images,
+        }))
+
+    flagged_value = getattr(a, "flagged", None)
+    if flagged_value is None and getattr(a, "flag", False):
+        flagged_value = True
+    if flagged_value is not None:
+        results.append(private_action({
+            "action": "set_flagged",
+            "id": reminder_ckid,
+            "flagged": bool(flagged_value),
+        }))
+
+    if getattr(a, "urgent", None) is not None:
+        results.append(private_action({
+            "action": "set_urgent",
+            "id": reminder_ckid,
+            "urgent": bool(a.urgent),
+        }))
+
+    if getattr(a, "latitude", None) is not None or getattr(a, "longitude", None) is not None:
+        if getattr(a, "latitude", None) is None or getattr(a, "longitude", None) is None:
+            print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
+            sys.exit(1)
+        proximity = 2 if getattr(a, "proximity", "arriving") == "leaving" else 1
+        results.append(private_action({
+            "action": "add_location_alarm",
+            "id": reminder_ckid,
+            "title": getattr(a, "location_title", None) or "Location",
+            "latitude": a.latitude,
+            "longitude": a.longitude,
+            "radius": getattr(a, "radius", None) or 100,
+            "proximity": proximity,
+            "address": getattr(a, "address", None),
+        }))
+
+    return results
+
 # ── Onboarding ───────────────────────────────────────────────────────────────
 
 def check_result(name, status, detail, fix=None):
@@ -1633,8 +1911,24 @@ def cmd_show(a):
     print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
 
 def cmd_add(a):
+    refuse_private_args_without_opt_in(a)
     title = a.title
-    if a.tags:
+    wants_private = private_metadata_enabled(a) and private_changes_from_args(a)
+    if wants_private and not bridge_available():
+        print("Error: private metadata creation requires remctl-bridge so the reminder has a stable ID.", file=sys.stderr)
+        sys.exit(1)
+    if wants_private:
+        require_private_metadata(a)
+        validate_private_args(a)
+    target_list_pk = None
+    if wants_private and getattr(a, "list", None):
+        db = open_db()
+        target_list_pk = q_list_pk(db, a.list)
+        if target_list_pk is None:
+            print(f"Error: list not found: {a.list}", file=sys.stderr)
+            sys.exit(1)
+
+    if a.tags and not wants_private:
         for t in a.tags.split(","):
             t = t.strip()
             h = t if t.startswith("#") else f"#{t}"
@@ -1653,18 +1947,31 @@ def cmd_add(a):
         if dt: data["due"] = dt.isoformat()
         if a.priority and a.priority.lower() in pm:
             data["priority"] = pm[a.priority.lower()]
-        if a.flag: data["flagged"] = True
-        if hasattr(a, 'url') and a.url: data["url"] = a.url
+        if a.flag and not wants_private: data["flagged"] = True
+        if hasattr(a, 'url') and a.url and not wants_private: data["url"] = a.url
         if hasattr(a, 'recurrence') and a.recurrence:
             data["recurrence"] = parse_recurrence(a.recurrence)
         if hasattr(a, 'alarm') and a.alarm:
             data["alarm"] = parse_alarm(a.alarm)
         result = bridge_call(data)
         if result and result.get("status") == "created":
+            private_results = []
+            if wants_private:
+                private_results = apply_private_changes(
+                    result.get("id", ""),
+                    a,
+                    db=open_db(),
+                    list_pk=target_list_pk,
+                )
             if a.json:
-                print(json.dumps({"status": "created", "id": result.get("id", ""), "title": title}))
+                payload = {"status": "created", "id": result.get("id", ""), "title": title}
+                if private_results:
+                    payload["private"] = private_results
+                print(json.dumps(payload))
             else:
                 print(f"Created: {title}")
+                if private_results:
+                    print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
             return
 
     # Fall back to AppleScript. Warn about fields AppleScript can't express,
@@ -1832,11 +2139,19 @@ def cmd_delete(a):
     )
 
 def cmd_edit(a):
+    refuse_private_args_without_opt_in(a)
+    if getattr(a, "tags", None) and not private_metadata_enabled(a):
+        print("Error: editing synced tags requires --private.", file=sys.stderr)
+        sys.exit(1)
     db = open_db()
     r = q_reminder(db, a.id)
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
+    wants_private = private_metadata_enabled(a) and private_changes_from_args(a)
+    if wants_private:
+        require_private_metadata(a)
+        validate_private_args(a)
 
     pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
 
@@ -1885,7 +2200,7 @@ def cmd_edit(a):
         # Merge url into notes to keep URL-append semantics identical across
         # bridge and AppleScript paths.
         notes_body = a.notes
-        if hasattr(a, 'url') and a.url:
+        if hasattr(a, 'url') and a.url and not wants_private:
             notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
         if notes_body is not None:
             data["notes"] = notes_body
@@ -1903,20 +2218,44 @@ def cmd_edit(a):
         if has_changes:
             result = bridge_call(data)
             if result and result.get("status") == "updated":
+                private_results = apply_private_changes(
+                    r["ZCKIDENTIFIER"],
+                    a,
+                    db=db,
+                    list_pk=r["ZLIST"],
+                ) if wants_private else []
                 if a.json:
-                    print(json.dumps({"status": "updated", "id": a.id}))
+                    payload = {"status": "updated", "id": a.id}
+                    if private_results:
+                        payload["private"] = private_results
+                    print(json.dumps(payload))
                 else:
                     print(f"Updated #{a.id}")
+                    if private_results:
+                        print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
                 return
+        elif wants_private:
+            private_results = apply_private_changes(
+                r["ZCKIDENTIFIER"],
+                a,
+                db=db,
+                list_pk=r["ZLIST"],
+            )
+            if a.json:
+                print(json.dumps({"status": "updated", "id": a.id, "private": private_results}, indent=2))
+            else:
+                print(f"Updated #{a.id}")
+                print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
+            return
 
     # AppleScript fallback for when bridge isn't available.
     has_bridge_only = (
         (hasattr(a, 'recurrence') and a.recurrence) or
-        (hasattr(a, 'alarm') and a.alarm)
+        (hasattr(a, 'alarm') and a.alarm) or wants_private
     )
     has_applescript_fields = bool(
         a.title or a.notes or a.due or a.priority
-        or (hasattr(a, 'url') and a.url)
+        or (hasattr(a, 'url') and a.url and not wants_private)
     )
 
     if r["ZCKIDENTIFIER"] and has_applescript_fields and not has_bridge_only:
@@ -1924,7 +2263,7 @@ def cmd_edit(a):
         if a.title:
             parts.append(f'set name of r to "{esc(a.title)}"')
         notes_body = a.notes
-        if hasattr(a, 'url') and a.url:
+        if hasattr(a, 'url') and a.url and not wants_private:
             notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
         if notes_body:
             parts.append(f'set body of r to "{esc(notes_body)}"')
@@ -1954,6 +2293,7 @@ def cmd_edit(a):
         "edit it",
         "Identifier-based writes failed",
     )
+
 
 def cmd_search(a):
     db = open_db()
@@ -2552,6 +2892,54 @@ _remctl() {
         'permissions:Open guided macOS permission helper'
         'completion:Generate shell completions'
     )
+    case "$words[2]" in
+        add)
+            _arguments \
+                '--private[Use unsupported private ReminderKit metadata writes]' \
+                '--section[Assign to existing section]:section:' \
+                '--new-section[Create and assign to new section]:section:' \
+                '--subtask[Add private subtask]:title:' \
+                '--image[Add private image attachment]:path:_files' \
+                '--url[URL, web rich link with --private]:url:' \
+                '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
+                '(-l --list)'{-l,--list}'[Target list]:list:' \
+                '(-d --due)'{-d,--due}'[Due date]:due:' \
+                '(-p --priority)'{-p,--priority}'[Priority]:priority:(high medium low)' \
+                '(-f --flag)'{-f,--flag}'[Flag reminder]' \
+                '--recurrence[Recurrence rule]:recurrence:' \
+                '--alarm[Alarm]:alarm:' \
+                '--json[JSON output]'
+            return
+            ;;
+        edit)
+            _arguments \
+                '--private[Use unsupported private ReminderKit metadata writes]' \
+                '--section[Assign to existing section]:section:' \
+                '--new-section[Create and assign to new section]:section:' \
+                '--subtask[Add private subtask]:title:' \
+                '--image[Add private image attachment]:path:_files' \
+                '--flagged[Set real private flag]' \
+                '--no-flagged[Clear real private flag]' \
+                '--urgent[Set private urgent state]' \
+                '--no-urgent[Clear private urgent state]' \
+                '--location-title[Location alarm title]:title:' \
+                '--latitude[Location alarm latitude]:latitude:' \
+                '--longitude[Location alarm longitude]:longitude:' \
+                '--radius[Location alarm radius meters]:radius:' \
+                '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
+                '--address[Location alarm address label]:address:' \
+                '--title[New title]:title:' \
+                '--url[URL, web rich link with --private]:url:' \
+                '(-t --tags)'{-t,--tags}'[Synced tags with --private]:tags:' \
+                '(-n --notes)'{-n,--notes}'[Notes]:notes:' \
+                '(-d --due)'{-d,--due}'[Due date or clear]:due:' \
+                '(-p --priority)'{-p,--priority}'[Priority]:priority:(high medium low none)' \
+                '--recurrence[Recurrence rule]:recurrence:' \
+                '--alarm[Alarm]:alarm:' \
+                '--json[JSON output]'
+            return
+            ;;
+    esac
     _describe 'command' commands
 }
 compdef _remctl remctl
@@ -2563,7 +2951,14 @@ BASH_COMPLETION = '''_remctl() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     commands="lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-create list-rename list-delete onboard doctor setup permissions completion"
 
-    if [ $COMP_CWORD -eq 1 ]; then
+    local cmd="${COMP_WORDS[1]}"
+    if [ "$cmd" = "add" ]; then
+        COMPREPLY=( $(compgen -W "--private --section --new-section --subtask --image --url --tags -t --list -l --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "edit" ]; then
+        COMPREPLY=( $(compgen -W "--private --section --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --location-title --latitude --longitude --radius --proximity --address --title --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        return
+    elif [ $COMP_CWORD -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     fi
 }
@@ -2603,6 +2998,29 @@ complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose setup and r
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
 complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Open guided macOS permission helper"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
+complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsupported private ReminderKit metadata writes"
+complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l image -d "Add private image attachment" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, web rich link with --private" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -s t -l tags -d "Tags, synced with --private" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l private -d "Use unsupported private ReminderKit metadata writes"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l section -d "Assign to existing section" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l image -d "Add private image attachment" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l flagged -d "Set real private flag"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-flagged -d "Clear real private flag"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l urgent -d "Set private urgent state"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-urgent -d "Clear private urgent state"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l location-title -d "Location alarm title" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l latitude -d "Location alarm latitude" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l longitude -d "Location alarm longitude" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l radius -d "Location alarm radius" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Location trigger" -a "arriving leaving"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l address -d "Location alarm address label" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
 '''
 
 def get_completion_script(shell):
@@ -2662,6 +3080,15 @@ def current_bridge_path():
     if discovered:
         return Path(discovered).resolve()
     return BRIDGE_PATH.resolve()
+
+
+def current_private_path():
+    if PRIVATE_PATH.exists():
+        return PRIVATE_PATH.resolve()
+    discovered = shutil.which("remctl-private")
+    if discovered:
+        return Path(discovered).resolve()
+    return PRIVATE_PATH.resolve()
 
 
 def current_permissions_path():
@@ -3024,6 +3451,15 @@ def gather_doctor_checks():
         bridge_fix,
     )
 
+    private_path = current_private_path()
+    private_ok = private_path.exists() and os.access(private_path, os.X_OK)
+    add(
+        "private_helper",
+        "ok" if private_ok else "warn",
+        str(private_path),
+        None if private_ok else "Run ./install.sh to compile remctl-private, or avoid --private writes.",
+    )
+
     permissions_path = current_permissions_path()
     permissions_ok = permissions_path.exists() and os.access(permissions_path, os.X_OK)
     add(
@@ -3187,7 +3623,9 @@ def main():
             "  remctl permissions full-disk-access\n"
             "\n"
             "Use `remctl onboard --help`, `remctl permissions --help`, `remctl setup --help`, and `remctl doctor --help`\n"
-            "for onboarding details."
+            "for onboarding details.\n"
+            "\n"
+            "Private metadata writes are unsupported and opt-in: pass --private on add/edit."
         ),
         formatter_class=HelpFormatter,
     )
@@ -3208,27 +3646,85 @@ def main():
     c.add_argument("list"); c.add_argument("--completed", action="store_true", help="Include completed")
     vb(c); js(c)
 
-    c = sub.add_parser("add", help="Add a reminder (syncs via bridge/AppleScript)")
+    c = sub.add_parser(
+        "add",
+        help="Add a reminder (syncs via bridge/AppleScript)",
+        description=(
+            "Add a reminder through the normal EventKit bridge. With --private, selected metadata "
+            "is written afterward through the unsupported private ReminderKit helper."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl add \"Review PR\" -l Work -d tomorrow\n"
+            "  remctl add \"Research\" -l Projects --private --url https://example.com -t remctl --section Research\n"
+            "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
+            "\n"
+            "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
+            "With --private, --url creates a synced web rich link and -t/--tags creates synced Reminders tags.\n"
+            "Private metadata is unsupported by Apple and never writes SQLite directly."
+        ),
+        formatter_class=HelpFormatter,
+    )
     c.add_argument("title"); c.add_argument("-l", "--list")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD, today, tomorrow, +3d, eod, eow, 'next friday at 3pm'")
     c.add_argument("-p", "--priority", help="high, medium, low")
     c.add_argument("-f", "--flag", action="store_true")
-    c.add_argument("-t", "--tags", help="Comma-separated (inline #hashtags)")
-    c.add_argument("--url", help="URL (appended to notes — Reminders URL field is read-only via EventKit)")
+    c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
+    c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', yearly (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
+    c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/subtasks/images")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    c.add_argument("--section", help="Private metadata: assign to an existing section in the target list")
+    c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
+    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask (repeatable)")
+    c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
     js(c)
 
     c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
     c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
 
-    c = sub.add_parser("edit", help="Edit a reminder")
+    c = sub.add_parser(
+        "edit",
+        help="Edit a reminder",
+        description=(
+            "Edit a reminder through normal EventKit/AppleScript paths. With --private, selected "
+            "metadata is written through the unsupported private ReminderKit helper."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl edit 23880 -d clear\n"
+            "  remctl edit 23880 --private --url https://example.com -t remctl\n"
+            "  remctl edit 23880 --private --section Research --subtask \"Follow up\"\n"
+            "  remctl edit 23880 --private --flagged --urgent\n"
+            "  remctl edit 23880 --private --location-title \"Apple Park\" --latitude 37.3349 --longitude -122.0090 --radius 200\n"
+            "\n"
+            "Without --private, --url is appended to notes. Synced tags, web rich links, sections, subtasks, images, "
+            "real flag state, urgent state, and location alarms require --private."
+        ),
+        formatter_class=HelpFormatter,
+    )
     c.add_argument("id", type=int); c.add_argument("--title")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD or 'clear'")
     c.add_argument("-p", "--priority")
-    c.add_argument("--url", help="URL (appended to notes — Reminders URL field is read-only via EventKit)")
+    c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence (bridge only)")
     c.add_argument("--alarm", help="Alarm (bridge only)")
+    c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/subtasks/images/location alarms")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
+    c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
+    c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list and assign this reminder")
+    c.add_argument("--subtask", action="append", help="Private metadata: add a subtask (repeatable)")
+    c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
+    c.add_argument("--flagged", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set the real flagged state")
+    c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
+    c.add_argument("--location-title", help="Private metadata: location alarm title")
+    c.add_argument("--latitude", type=float, help="Private metadata: location alarm latitude")
+    c.add_argument("--longitude", type=float, help="Private metadata: location alarm longitude")
+    c.add_argument("--radius", type=float, default=100.0, help="Private metadata: location alarm radius in meters")
+    c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Private metadata: location alarm trigger direction")
+    c.add_argument("--address", help="Private metadata: location alarm address label")
     js(c)
 
     c = sub.add_parser("delete", help="Delete a reminder")

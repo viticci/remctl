@@ -7,7 +7,7 @@ RemCTL is a copy-based install, not a Python package. The installer copies the C
 - macOS 14 or later
 - Python 3.10 or later
 - iCloud Reminders enabled
-- Xcode Command Line Tools for the Swift write bridge and permission helper
+- Xcode Command Line Tools for the Swift write bridge, permission helper, and optional private ReminderKit helper
 
 Install Xcode Command Line Tools if needed:
 
@@ -31,7 +31,7 @@ Install to `~/.local/bin`:
 PREFIX="$HOME/.local" ./install.sh --bootstrap
 ```
 
-`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, creates `~/.config/remctl`, and installs shell completion when supported.
+`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, compiles the optional `remctl-private` helper when `clang` is available, creates `~/.config/remctl`, and installs shell completion when supported.
 
 It does not grant macOS permissions. Apple requires those grants to happen interactively.
 
@@ -55,6 +55,10 @@ remctl today
 3. Triggers the Automation prompt used by AppleScript fallback operations.
 4. Checks direct database access.
 5. Opens the guided Full Disk Access helper when needed.
+
+Private metadata writes do not require a separate first-run flow. They use the same Reminders permission grant as normal EventKit writes, but they also require the optional `remctl-private` binary installed next to `remctl`. `remctl doctor` reports this as `private_helper`. If it is missing, normal commands keep working; only `--private` writes are unavailable.
+
+See [private-metadata.md](private-metadata.md) for supported private fields and examples.
 
 `remctl permissions full-disk-access` is safe to run even if direct CLI reads already work. It is the clearest first-run path because it shows the Full Disk Access targets visually before you run `doctor`.
 
@@ -140,6 +144,7 @@ cp remctl_runtime.py ~/bin/remctl_runtime.py
 cp remctl_serialization.py ~/bin/remctl_serialization.py
 swiftc -O -framework EventKit -framework Foundation -o ~/bin/remctl-bridge remctl-bridge.swift
 swiftc -O -framework AppKit -framework Foundation -o ~/bin/remctl-permissions remctl-permissions.swift
+clang -fobjc-arc -O -F/System/Library/PrivateFrameworks -framework Foundation -framework AppKit -framework ReminderKit -o ~/bin/remctl-private remctl-private.m
 ~/bin/remctl setup --shell auto
 ~/bin/remctl onboard
 ~/bin/remctl permissions full-disk-access

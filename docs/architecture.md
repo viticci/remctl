@@ -8,10 +8,14 @@ RemCTL intentionally splits reads and writes.
 remctl (Python)
   ├─ reads Reminders CoreData SQLite database
   ├─ formats human and JSON output
-  └─ calls remctl-bridge for writes
+  ├─ calls remctl-bridge for normal writes
+  └─ calls remctl-private for opt-in private metadata writes
 
 remctl-bridge (Swift)
   └─ writes through EventKit
+
+remctl-private (Objective-C)
+  └─ writes selected private metadata through private ReminderKit APIs
 
 remctl-permissions (Swift/AppKit)
   └─ guides Full Disk Access setup with draggable targets
@@ -47,11 +51,23 @@ Writes go through Apple-supported APIs:
 1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, complete, delete, recurrence, alarms, URLs appended to notes, and list management.
 2. AppleScript is a fallback for operations that still need Reminders.app automation behavior.
 
+There is also an explicitly unsupported opt-in helper:
+
+3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
+
 The bridge is detected next to the installed CLI. Override it with:
 
 ```bash
 REMCTL_BRIDGE_PATH=/path/to/remctl-bridge remctl add "Test"
 ```
+
+Override the private helper path with:
+
+```bash
+REMCTL_PRIVATE_PATH=/path/to/remctl-private remctl edit 123 --private --url https://example.com
+```
+
+See [private-metadata.md](private-metadata.md) for supported private fields, known limits, and verification rules.
 
 ## Recurrence
 
@@ -71,7 +87,7 @@ Human output summarizes the same data with badges such as `↻ weekly Mon, Wed`.
 
 Flags are read from `ZFLAGGED` and shown as `⚑`.
 
-macOS 26 urgent reminders are read from `ZISURGENTSTATEENABLEDFORCURRENTUSER` and shown as `⏰`. Apple describes urgent reminders as reminders that schedule an alarm when due; RemCTL treats this as read-only metadata and does not write the private urgent fields.
+macOS 26 urgent reminders are read from `ZISURGENTSTATEENABLEDFORCURRENTUSER` and shown as `⏰`. Apple describes urgent reminders as reminders that schedule an alarm when due. Normal writes do not touch the private urgent fields; `edit --private --urgent` can write them through the unsupported private helper.
 
 ## Permissions
 
@@ -95,6 +111,7 @@ The helper opens the Full Disk Access pane, copies the first path to the clipboa
 
 ```bash
 REMCTL_BRIDGE_PATH=/path/to/remctl-bridge
+REMCTL_PRIVATE_PATH=/path/to/remctl-private
 REMCTL_PERMISSIONS_PATH=/path/to/remctl-permissions
 REMCTL_PATH=/path/to/remctl
 REMCTL_STORE_DIR=/path/to/reminders/store

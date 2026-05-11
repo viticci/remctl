@@ -14,12 +14,14 @@ Most Reminders CLIs are wrappers around EventKit. That is fine for simple tasks,
 remctl
   reads:  ~/Library/Group Containers/group.com.apple.reminders/.../Data-*.sqlite
   writes: remctl-bridge -> EventKit
+  private: remctl-private -> private ReminderKit APIs (--private only)
 ```
 
 Why this architecture exists:
 
 - **Direct SQLite reads** expose sections, subtasks, tags, attachments, deep links, list colors, and recurrence metadata in tens of milliseconds.
 - **EventKit writes** keep Reminders and iCloud in charge of mutations. RemCTL does not write directly to the database.
+- **Private metadata writes** are unsupported and explicitly opt-in with `--private`. They use Apple's private ReminderKit APIs, not direct SQLite mutation, and should be treated as experimental power-user functionality.
 - **The CLI is the product**. There is no background service, API token, localhost server, or launch agent to configure.
 
 ## Quick Start
@@ -65,6 +67,7 @@ remctl show Work --format table
 remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
 remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
 remctl edit 23880 -d clear
+remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
 remctl info 23880 --json
 ```
 
@@ -134,6 +137,7 @@ remctl doctor
 
 - [Installation and onboarding](docs/installation.md)
 - [Command guide](docs/commands.md)
+- [Private metadata writes](docs/private-metadata.md)
 - [Architecture](docs/architecture.md)
 
 ## Project Layout
@@ -142,6 +146,7 @@ remctl doctor
 | --- | --- |
 | `remctl` | Main Python CLI |
 | `remctl-bridge.swift` | Swift/EventKit write helper source |
+| `remctl-private.m` | Unsupported private ReminderKit metadata helper source |
 | `remctl-permissions.swift` | Swift/AppKit guided Full Disk Access helper source |
 | `remctl_runtime.py` | Shared paths, config, date windows, safety helpers |
 | `remctl_serialization.py` | Shared reminder JSON serialization |
