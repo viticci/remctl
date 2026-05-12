@@ -6,7 +6,9 @@ RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users an
 
 RemCTL reads the user's local iCloud Reminders database directly (with native macOS permission access) for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
 
-Most Reminders CLIs are wrappers around EventKit. That is fine for simple tasks, but EventKit does not expose everything Reminders users now rely on, such as subtasks, tags, or the new 'urgent' reminders in iOS and macOS 26. RemCTL can read nearly every piece of metadata from tasks in the Reminders app.
+Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata to reminders such as sections, subtasks, tags, image attachments, and location-based alarms by using the native ReminderKit framework.
+
+As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 – without breaking iCloud sync.
 
 ## How It Works
 
@@ -22,9 +24,10 @@ Why this architecture exists:
 - **Direct SQLite reads** expose sections, subtasks, tags, attachments, deep links, list colors, and recurrence metadata in tens of milliseconds.
 - **EventKit writes** keep Reminders and iCloud in charge of mutations. RemCTL does not write directly to the database.
 - **Private metadata writes** are unsupported and explicitly opt-in with `--private`. They use Apple's private ReminderKit APIs, not direct SQLite mutation, and should be treated as experimental power-user functionality.
-- **The CLI is the product**. There is no background service, API token, localhost server, or launch agent to configure.
 
 ## Quick Start
+
+The easiest experience is to ask your agent (Claude Code or Codex) to set up RemCTL for you by pointing it at this repo. Alternatively:
 
 ```bash
 git clone https://github.com/viticci/remctl.git
@@ -76,7 +79,7 @@ The full command guide is in [docs/commands.md](docs/commands.md).
 
 ## Private API Features
 
-RemCTL's default writes use EventKit. For metadata Apple does not expose publicly, RemCTL has an explicit `--private` mode backed by `remctl-private`, an Objective-C helper that uses Apple's private ReminderKit framework and saves through the Reminders stack. It never writes directly to SQLite.
+RemCTL's default writes use EventKit. For metadata Apple does not expose publicly, RemCTL has an explicit `--private` mode backed by `remctl-private`, an Objective-C helper that uses Apple's private ReminderKit framework and saves through the Reminders stack. RemCTL *never* writes directly to SQLite (which would break iCloud sync and cause database corruption issues).
 
 Private writes are opt-in and power-user only:
 
@@ -112,7 +115,7 @@ NO_COLOR=1 remctl today
 
 ## macOS Permissions
 
-RemCTL may need three macOS grants:
+RemCTL may need three macOS permission grants:
 
 - Reminders access for EventKit writes
 - Automation access for AppleScript fallback operations
