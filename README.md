@@ -103,7 +103,7 @@ remctl smart-list-edit --smart-list-id 170 --private --priority high
 remctl smart-list-delete "Tagged or Today" --private --force
 ```
 
-Smart-list writes are private ReminderKit writes and always require `--private`; RemCTL rejects unknown filter shapes before saving. Repeated included lists default to union behavior (`--list-match any`) so smart lists can aggregate Work and Projects. Use:
+Smart-list writes are private ReminderKit writes and always require `--private`; RemCTL rejects unknown filter shapes before saving. Reminders supports only one `lists` filter family in a smart list. To filter by multiple lists, add multiple selected lists inside that one filter by repeating `--include-list`, `--exclude-list`, `--include-list-id`, or `--exclude-list-id`; repeated included lists default to union behavior (`--list-match any`) so smart lists can aggregate Work and Projects. Do not model multiple independent list-filter rows for one smart list. Use:
 
 - [docs/commands.md#smart-lists](docs/commands.md#smart-lists) for command syntax and supported filters.
 - [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples) for private API behavior, safety notes, and reverse-engineered filter storage details.
@@ -191,7 +191,7 @@ remctl doctor --for-agent --json
 
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `info` includes private rich-link URLs, so agents should not need raw SQLite checks for ordinary rich-link verification.
 
-For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
+For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. Reminders has one `lists` filter slot per smart list; repeat list flags only to add selections to that single slot. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
 
 Agents should pass deterministic due dates, ideally `YYYY-MM-DD HH:MM` after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
 
