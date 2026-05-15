@@ -80,6 +80,16 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_list_symbols_reports_official_reminders_emblems(self):
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.remctl.cmd_list_symbols(SimpleNamespace(json=True))
+
+        payload = json.loads(stdout.getvalue())
+        names = [symbol["name"] for symbol in payload["symbols"]]
+        self.assertEqual(payload["count"], 71)
+        self.assertIn("education3", names)
+        self.assertIn("fitness", names)
+
     def test_list_create_uses_bridge_contract_fields(self):
         args = SimpleNamespace(name="Project X", color="blue", private=False, symbol=None, emoji=None, json=True)
         with (

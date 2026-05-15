@@ -28,6 +28,7 @@ remctl search "query" --json
 remctl search "query" --completed --json
 remctl info 23880 --json
 remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high --json
+remctl list-symbols --json
 remctl edit 23880 -d clear --json
 remctl done 23880 --json
 ```
@@ -60,7 +61,7 @@ Private metadata rules:
 - `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
-- `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write private list symbols, emoji badges, and exact `#RRGGBB` colors. Reminders' picker icons use private emblem names such as `education3`; arbitrary SF Symbol strings can be saved but may not render on every OS/device.
+- `list-symbols` prints the 71 official Reminders emblem names. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write private list symbols, emoji badges, and exact `#RRGGBB` colors. Reminders' picker icons use private emblem names such as `education3`; arbitrary SF Symbol strings can be saved but may not render on every OS/device.
 - List names resolve exact first, then case-insensitive, then normalized names such as `Weekly 513` for `🗓️ Weekly 513`. If multiple lists match, RemCTL fails before writing; use `--list-id`.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private writes with `remctl info <numeric-id> --json`; if cross-device sync matters, ask the user to check iPhone/iPad.

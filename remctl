@@ -204,6 +204,80 @@ LIST_COLOR_MAP = {
 
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
+OFFICIAL_LIST_SYMBOLS = [
+    ("default", "ListBadgeDefault", "☺"),
+    ("bookmarks1", "ListBadgeBookmarks1", "☷"),
+    ("bookmarks2", "ListBadgeBookmarks2", "▮"),
+    ("celebration1", "ListBadgeCelebration1", "🎁"),
+    ("celebration2", "ListBadgeCelebration2", "🎂"),
+    ("education1", "ListBadgeEducation1", "🎓"),
+    ("education2", "ListBadgeEducation2", "🎒"),
+    ("education3", "ListBadgeEducation3", "✎"),
+    ("education4", "ListBadgeEducation4", "◰"),
+    ("education5", "ListBadgeEducation5", "▰"),
+    ("finance1", "ListBadgeFinance1", "💳"),
+    ("finance2", "ListBadgeFinance2", "💵"),
+    ("finance3", "ListBadgeFinance3", "▭"),
+    ("fitness", "ListBadgeFitness", "🏋"),
+    ("sport1", "ListBadgeSport1", "🏋"),
+    ("sport2", "ListBadgeSport2", "🏃"),
+    ("food", "ListBadgeFood", "🍴"),
+    ("wine", "ListBadgeWine", "🍷"),
+    ("health1", "ListBadgeHealth1", "💊"),
+    ("health2", "ListBadgeHealth2", "🩺"),
+    ("lifestyle1", "ListBadgeLifestyle1", "🪑"),
+    ("location1", "ListBadgeLocation1", "⌂"),
+    ("location2", "ListBadgeLocation2", "▦"),
+    ("location3", "ListBadgeLocation3", "◫"),
+    ("vacation", "ListBadgeVacation", "⛺"),
+    ("media1", "ListBadgeMedia1", "▭"),
+    ("media2", "ListBadgeMedia2", "♪"),
+    ("media3", "ListBadgeMedia3", "▯"),
+    ("media4", "ListBadgeMedia4", "🎮"),
+    ("media5", "ListBadgeMedia5", "🎧"),
+    ("nature1", "ListBadgeNature1", "☘"),
+    ("nature2", "ListBadgeNature2", "🥕"),
+    ("people1", "ListBadgePeople1", "♟"),
+    ("people2", "ListBadgePeople2", "👥"),
+    ("people3", "ListBadgePeople3", "👪"),
+    ("pet1", "ListBadgePet1", "🐾"),
+    ("pet2", "ListBadgePet2", "🧸"),
+    ("pet3", "ListBadgePet3", "🐟"),
+    ("shopping1", "ListBadgeShopping1", "▣"),
+    ("shopping2", "ListBadgeShopping2", "🛒"),
+    ("shopping3", "ListBadgeShopping3", "▥"),
+    ("shopping4", "ListBadgeShopping4", "▧"),
+    ("sport3", "ListBadgeSport3", "⚽"),
+    ("sport4", "ListBadgeSport4", "⚾"),
+    ("sport5", "ListBadgeSport5", "🏀"),
+    ("sport6", "ListBadgeSport6", "🏈"),
+    ("lifestyle2", "ListBadgeLifestyle2", "🎾"),
+    ("transport1", "ListBadgeTransport1", "🚆"),
+    ("transport2", "ListBadgeTransport2", "✈"),
+    ("transport3", "ListBadgeTransport3", "⛵"),
+    ("transport4", "ListBadgeTransport4", "🚗"),
+    ("weather1", "ListBadgeWeather1", "☂"),
+    ("weather2", "ListBadgeWeather2", "☀"),
+    ("weather3", "ListBadgeWeather3", "☾"),
+    ("weather4", "ListBadgeWeather4", "💧"),
+    ("weather5", "ListBadgeWeather5", "❄"),
+    ("concept1", "ListBadgeConcept1", "🔥"),
+    ("work1", "ListBadgeWork1", "💼"),
+    ("work2", "ListBadgeWork2", "🔧"),
+    ("work3", "ListBadgeWork3", "✂"),
+    ("concept2", "ListBadgeConcept2", "⌖"),
+    ("symbol1", "ListBadgeSymbol1", "{}"),
+    ("concept3", "ListBadgeConcept3", "💡"),
+    ("symbol2", "ListBadgeSymbol2", "‼"),
+    ("symbol3", "ListBadgeSymbol3", "*"),
+    ("symbol4", "ListBadgeSymbol4", "■"),
+    ("symbol5", "ListBadgeSymbol5", "●"),
+    ("symbol6", "ListBadgeSymbol6", "▲"),
+    ("symbol7", "ListBadgeSymbol7", "◆"),
+    ("work4", "ListBadgeWork4", "♥"),
+    ("work5", "ListBadgeWork5", "★"),
+]
+
 def normalize_list_color(value):
     if not value:
         return None
@@ -2593,6 +2667,25 @@ def cmd_lists(a):
         print(f"  {list_name} {id_dim}{sec_info}")
     print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
 
+def cmd_list_symbols(a):
+    rows = [
+        {"name": name, "asset": asset, "preview": preview}
+        for name, asset, preview in OFFICIAL_LIST_SYMBOLS
+    ]
+    if a.json:
+        print(json.dumps({
+            "count": len(rows),
+            "note": "These are Reminders' bundled list badge emblems; emoji badges are separate.",
+            "symbols": rows,
+        }, indent=2, ensure_ascii=False))
+        return
+    print(C.bold(f"Official Reminders list symbols ({len(rows)}):"))
+    print(C.dim("Use these with: remctl list-create \"Name\" --private --symbol <name>"))
+    print(C.dim("Preview glyphs are text approximations; Reminders renders the bundled badge assets."))
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        print(f"  {row['preview']:<2}  {row['name']:<{width}}  {C.dim(row['asset'])}")
+
 def cmd_show(a):
     db = open_db()
     list_ref = resolve_list_or_die(db, name=a.list)
@@ -3717,6 +3810,7 @@ _remctl() {
         'open:Open in Reminders.app'
         'export:Export reminders'
         'import:Import reminders'
+        'list-symbols:List official Reminders list symbols'
         'list-create:Create a new list'
         'list-edit:Edit private list appearance'
         'list-rename:Rename a list'
@@ -3792,7 +3886,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-create list-edit list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-symbols list-create list-edit list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -3842,6 +3936,7 @@ complete -c remctl -n "__fish_use_subcommand" -a link -d "Get deep links"
 complete -c remctl -n "__fish_use_subcommand" -a open -d "Open in Reminders.app"
 complete -c remctl -n "__fish_use_subcommand" -a export -d "Export reminders"
 complete -c remctl -n "__fish_use_subcommand" -a import -d "Import reminders"
+complete -c remctl -n "__fish_use_subcommand" -a list-symbols -d "List official Reminders list symbols"
 complete -c remctl -n "__fish_use_subcommand" -a list-create -d "Create a new list"
 complete -c remctl -n "__fish_use_subcommand" -a list-edit -d "Edit private list appearance"
 complete -c remctl -n "__fish_use_subcommand" -a list-rename -d "Rename a list"
@@ -4668,6 +4763,9 @@ def main():
 
     c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c)
 
+    c = sub.add_parser("list-symbols", help="List official Reminders list symbols")
+    js(c)
+
     c = sub.add_parser("list-create", help="Create a new list")
     c.add_argument("name")
     c.add_argument("--color", help="List color name; with --private also accepts #RRGGBB")
@@ -4850,6 +4948,7 @@ def main():
         "unflag": cmd_unflag,
         "upcoming": cmd_upcoming,
         "overdue": cmd_overdue,
+        "list-symbols": cmd_list_symbols,
         "list-create": cmd_list_create,
         "list-edit": cmd_list_edit,
         "list-rename": cmd_list_rename,
