@@ -110,6 +110,9 @@ class CliTests(unittest.TestCase):
 
         self.assertIn("Official Reminders List Symbols", html)
         self.assertIn("data:image/png;base64,ZmFrZQ==", html)
+        self.assertIn("Preview official colors", html)
+        self.assertIn('data-color="#FF8D28"', html)
+        self.assertIn("aria-pressed", html)
         self.assertIn("education3", html)
         self.assertIn("ListBadgeFitness", html)
 

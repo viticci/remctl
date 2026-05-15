@@ -309,6 +309,22 @@ def validate_list_color(value, *, private=False):
         print(f"Error: unsupported list color {value!r}. Use {examples}.", file=sys.stderr)
         sys.exit(1)
 
+def rgb_to_hex(rgb):
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+def blend_rgb(rgb, target=(255, 255, 255), amount=0.34):
+    return tuple(round(channel + (target_channel - channel) * amount) for channel, target_channel in zip(rgb, target))
+
+def list_color_preview_rows():
+    return [
+        {
+            "name": name,
+            "hex": rgb_to_hex(rgb),
+            "highlight": rgb_to_hex(blend_rgb(rgb)),
+        }
+        for name, rgb in LIST_COLOR_MAP.items()
+    ]
+
 def parse_list_color(blob):
     """Extract color info from ZCOLOR binary plist (NSKeyedArchiver)."""
     if not blob:
@@ -2758,6 +2774,19 @@ if !missing.isEmpty {
 
 def build_list_symbols_html(rows, image_data_by_asset):
     cards = []
+    colors = list_color_preview_rows()
+    swatches = []
+    for index, color in enumerate(colors):
+        name = html_lib.escape(color["name"])
+        hex_value = html_lib.escape(color["hex"])
+        highlight = html_lib.escape(color["highlight"])
+        pressed = "true" if index == 1 else "false"
+        active_class = " active" if index == 1 else ""
+        swatches.append(
+            f'''<button class="swatch{active_class}" type="button" aria-pressed="{pressed}" data-color="{hex_value}" data-highlight="{highlight}" style="--swatch: {hex_value};" title="{name}">
+  <span></span><strong>{name}</strong>
+</button>'''
+        )
     for row in rows:
         asset = html_lib.escape(row["asset"])
         name = html_lib.escape(row["name"])
@@ -2792,6 +2821,7 @@ def build_list_symbols_html(rows, image_data_by_asset):
   --card: rgba(255, 255, 255, .82);
   --line: rgba(0, 0, 0, .08);
   --badge: #ff9f0a;
+  --badge-highlight: #ffc466;
 }}
 @media (prefers-color-scheme: dark) {{
   :root {{
@@ -2815,10 +2845,6 @@ main {{
   padding: 34px 24px 44px;
 }}
 header {{
-  display: flex;
-  justify-content: space-between;
-  gap: 20px;
-  align-items: end;
   margin-bottom: 22px;
 }}
 h1 {{
@@ -2835,6 +2861,55 @@ p {{
 .count {{
   color: var(--muted);
   white-space: nowrap;
+}}
+.toolbar {{
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 20px;
+  margin-bottom: 18px;
+}}
+.swatches {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}}
+.swatches legend {{
+  width: 100%;
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}}
+.swatch {{
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px 5px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}}
+.swatch span {{
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--swatch);
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .18);
+}}
+.swatch strong {{
+  font-size: 12px;
+  font-weight: 600;
+}}
+.swatch.active {{
+  border-color: var(--badge);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--badge), transparent 72%);
 }}
 .grid {{
   display: grid;
@@ -2858,7 +2933,7 @@ p {{
   display: grid;
   place-items: center;
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 28%, #ffc466, var(--badge) 68%);
+  background: radial-gradient(circle at 35% 28%, var(--badge-highlight), var(--badge) 68%);
   box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .12), 0 3px 10px rgba(0, 0, 0, .12);
 }}
 .badge img {{
@@ -2891,16 +2966,40 @@ code {{
 <body>
 <main>
   <header>
-    <div>
-      <h1>Official Reminders List Symbols</h1>
-      <p>These are the native badge assets bundled with RemindersUICore. Use the symbol name with <code>remctl list-create "Name" --private --symbol &lt;name&gt;</code>.</p>
+    <div class="toolbar">
+      <div>
+        <h1>Official Reminders List Symbols</h1>
+        <p>These are the native badge assets bundled with RemindersUICore. Use the symbol name with <code>remctl list-create "Name" --private --symbol &lt;name&gt;</code>.</p>
+      </div>
+      <div class="count">{len(rows)} symbols</div>
     </div>
-    <div class="count">{len(rows)} symbols</div>
+    <fieldset class="swatches">
+      <legend>Preview official colors</legend>
+{''.join(swatches)}
+    </fieldset>
   </header>
   <section class="grid">
 {''.join(cards)}
   </section>
 </main>
+<script>
+(() => {{
+  const root = document.documentElement;
+  const buttons = [...document.querySelectorAll('.swatch')];
+  function apply(button) {{
+    root.style.setProperty('--badge', button.dataset.color);
+    root.style.setProperty('--badge-highlight', button.dataset.highlight);
+    buttons.forEach(candidate => {{
+      const active = candidate === button;
+      candidate.classList.toggle('active', active);
+      candidate.setAttribute('aria-pressed', String(active));
+    }});
+  }}
+  buttons.forEach(button => button.addEventListener('click', () => apply(button)));
+  const active = document.querySelector('.swatch.active') || buttons[0];
+  if (active) apply(active);
+}})();
+</script>
 </body>
 </html>
 '''
