@@ -33,16 +33,26 @@
 - (id)remObjectID;
 @end
 
+@interface REMAccountChangeItem : NSObject
+- (void)addSmartListChangeItem:(id)smartListChangeItem;
+@end
+
 @interface REMAccountCapabilities : NSObject
 - (BOOL)supportsCustomSmartLists;
 @end
 
 @interface REMSmartListChangeItem : NSObject
 - (id)remObjectID;
+- (id)customContext;
 - (void)setFilterData:(NSData *)filterData;
 - (void)setName:(NSString *)name;
+- (void)setParentOwnerID:(id)objectID;
 - (void)setSmartListType:(NSString *)smartListType;
 - (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
+@end
+
+@interface REMSmartListCustomContextChangeItem : NSObject
+- (void)setName:(NSString *)name;
 @end
 
 @interface REMSmartList : NSObject
@@ -456,6 +466,18 @@ int main(int argc, const char * argv[]) {
                 smartListObjectID:nil];
             if (!change) {
                 fail(@"Could not create ReminderKit smart list change item");
+            }
+            // addCustomSmartListWithName creates storage, but Reminders only treats it
+            // as a live custom smart list after account ownership is explicit.
+            if ([change respondsToSelector:@selector(setParentOwnerID:)]) {
+                [change setParentOwnerID:[account remObjectID]];
+            }
+            if ([accountChange respondsToSelector:@selector(addSmartListChangeItem:)]) {
+                [accountChange addSmartListChangeItem:change];
+            }
+            id customContext = [change respondsToSelector:@selector(customContext)] ? [change customContext] : nil;
+            if (customContext && [customContext respondsToSelector:@selector(setName:)]) {
+                [(REMSmartListCustomContextChangeItem *)customContext setName:name];
             }
             [change setSmartListType:@"com.apple.reminders.smartlist.custom"];
             [change setFilterData:filterData];
