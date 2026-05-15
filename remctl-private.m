@@ -9,6 +9,7 @@
 
 @interface REMStore : NSObject
 - (id)fetchReminderWithObjectID:(id)objectID error:(NSError **)error;
+- (id)fetchListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListSectionWithObjectID:(id)objectID error:(NSError **)error;
 @end
 
@@ -54,6 +55,22 @@
 
 @interface REMListChangeItem : NSObject
 - (id)sectionsContextChangeItem;
+- (id)appearanceContext;
+- (void)setColor:(id)color;
+- (void)setName:(NSString *)name;
+@end
+
+@interface REMListAppearanceContextChangeItem : NSObject
+- (void)setBadgeEmblem:(NSString *)emblem;
+- (void)setBadge:(id)badge;
+@end
+
+@interface REMListBadge : NSObject
+- (instancetype)initWithEmoji:(NSString *)emoji;
+@end
+
+@interface REMColor : NSObject
+- (instancetype)initWithRed:(double)red green:(double)green blue:(double)blue alpha:(double)alpha colorSpace:(NSInteger)colorSpace daSymbolicColorName:(NSString *)daSymbolicColorName daHexString:(NSString *)daHexString ckSymbolicColorName:(NSString *)ckSymbolicColorName;
 @end
 
 @interface REMListSectionChangeItem : NSObject
@@ -133,6 +150,10 @@ static NSURL *sectionURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDListSection/%@", ckIdentifier]];
 }
 
+static NSURL *listURL(NSString *ckIdentifier) {
+    return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDList/%@", ckIdentifier]];
+}
+
 static BOOL looksLikeWebURL(NSString *value) {
     NSURL *url = [NSURL URLWithString:value];
     if (!url || url.host.length == 0) {
@@ -140,6 +161,64 @@ static BOOL looksLikeWebURL(NSString *value) {
     }
     NSString *scheme = [url.scheme lowercaseString];
     return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+}
+
+static NSString *normalizedColorName(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) return nil;
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return nil;
+    if ([trimmed hasPrefix:@"#"]) return [trimmed uppercaseString];
+    return [trimmed lowercaseString];
+}
+
+static REMColor *makeREMColor(NSString *value) {
+    NSString *name = normalizedColorName(value);
+    if (!name) return nil;
+    NSDictionary<NSString *, NSDictionary *> *colors = @{
+        @"red": @{@"hex": @"#FF2968", @"r": @1.0, @"g": @0.1607843137254902, @"b": @0.40784313725490196, @"ck": @"red"},
+        @"orange": @{@"hex": @"#FF8D28", @"r": @1.0, @"g": @0.5529411764705883, @"b": @0.1568627450980392, @"ck": @"orange"},
+        @"yellow": @{@"hex": @"#FFCC00", @"r": @1.0, @"g": @0.8, @"b": @0.0, @"ck": @"yellow"},
+        @"green": @{@"hex": @"#63DA38", @"r": @0.38823529411764707, @"g": @0.8549019607843137, @"b": @0.2196078431372549, @"ck": @"green"},
+        @"blue": @{@"hex": @"#0088FF", @"r": @0.0, @"g": @0.5333333333333333, @"b": @1.0, @"ck": @"blue"},
+        @"purple": @{@"hex": @"#CC73E1", @"r": @0.8, @"g": @0.45098039215686275, @"b": @0.8823529411764706, @"ck": @"purple"},
+        @"brown": @{@"hex": @"#A2845E", @"r": @0.6352941176470588, @"g": @0.5176470588235295, @"b": @0.3686274509803922, @"ck": @"brown"},
+        @"gray": @{@"hex": @"#5B626A", @"r": @0.3568627450980392, @"g": @0.3843137254901961, @"b": @0.41568627450980394, @"ck": @"gray"},
+        @"cyan": @{@"hex": @"#5AC8FA", @"r": @0.35294117647058826, @"g": @0.7843137254901961, @"b": @0.9803921568627451, @"ck": @"cyan"},
+        @"teal": @{@"hex": @"#30B0C7", @"r": @0.18823529411764706, @"g": @0.6901960784313725, @"b": @0.7803921568627451, @"ck": @"teal"},
+    };
+    NSDictionary *entry = colors[name];
+    if (entry) {
+        return [[REMColor alloc]
+            initWithRed:[entry[@"r"] doubleValue]
+            green:[entry[@"g"] doubleValue]
+            blue:[entry[@"b"] doubleValue]
+            alpha:1.0
+            colorSpace:2
+            daSymbolicColorName:entry[@"ck"]
+            daHexString:entry[@"hex"]
+            ckSymbolicColorName:entry[@"ck"]];
+    }
+
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^#[0-9A-F]{6}$" options:0 error:nil];
+    if (![regex firstMatchInString:name options:0 range:NSMakeRange(0, name.length)]) {
+        fail([NSString stringWithFormat:@"Unsupported list color: %@", value]);
+    }
+    unsigned int r = 0, g = 0, b = 0;
+    NSScanner *scanner = [NSScanner scannerWithString:[name substringFromIndex:1]];
+    unsigned int rgb = 0;
+    [scanner scanHexInt:&rgb];
+    r = (rgb >> 16) & 0xff;
+    g = (rgb >> 8) & 0xff;
+    b = rgb & 0xff;
+    return [[REMColor alloc]
+        initWithRed:(double)r / 255.0
+        green:(double)g / 255.0
+        blue:(double)b / 255.0
+        alpha:1.0
+        colorSpace:2
+        daSymbolicColorName:@"custom"
+        daHexString:name
+        ckSymbolicColorName:@"custom"];
 }
 
 static NSArray<NSDictionary *> *subtaskSpecArray(NSDictionary *cmd) {
@@ -292,9 +371,65 @@ int main(int argc, const char * argv[]) {
             @"set_flagged",
             @"set_urgent",
             @"add_location_alarm",
+            @"set_list_appearance",
         ]];
         if (![action isKindOfClass:[NSString class]] || ![allowedActions containsObject:action]) {
             fail(@"Unknown action");
+        }
+        if ([action isEqualToString:@"set_list_appearance"]) {
+            NSString *listID = cmd[@"listId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            NSURL *objectURL = listURL(listID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit list object ID");
+            }
+            REMStore *store = [REMStore new];
+            id list = [store fetchListWithObjectID:objectID error:&error];
+            if (!list) {
+                fail(error.localizedDescription ?: @"List not found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListChangeItem *change = [save updateList:list];
+            if (!change) {
+                fail(@"Could not create ReminderKit list change item");
+            }
+
+            NSMutableDictionary *details = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"status": @"updated",
+                @"action": action,
+                @"listId": listID,
+            }];
+            NSString *newName = cmd[@"name"];
+            if ([newName isKindOfClass:[NSString class]] && newName.length) {
+                [change setName:newName];
+                details[@"name"] = newName;
+            }
+            NSString *color = cmd[@"color"];
+            if ([color isKindOfClass:[NSString class]] && color.length) {
+                [change setColor:makeREMColor(color)];
+                details[@"color"] = normalizedColorName(color) ?: color;
+            }
+            id appearance = [change appearanceContext];
+            NSString *symbol = cmd[@"symbol"];
+            NSString *emoji = cmd[@"emoji"];
+            if ([symbol isKindOfClass:[NSString class]] && symbol.length) {
+                [appearance setBadgeEmblem:symbol];
+                details[@"symbol"] = symbol;
+            }
+            if ([emoji isKindOfClass:[NSString class]] && emoji.length) {
+                id badge = [[REMListBadge alloc] initWithEmoji:emoji];
+                [appearance setBadge:badge];
+                details[@"emoji"] = emoji;
+            }
+
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit list save failed");
+            }
+            output(details);
+            return 0;
         }
         NSString *reminderID = cmd[@"id"];
         if (![reminderID isKindOfClass:[NSString class]] || reminderID.length == 0) {

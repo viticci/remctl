@@ -2,7 +2,7 @@
 
 RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`.
 
-This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add` or `edit`.
+This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, or private list appearance commands.
 
 RemCTL still does not write directly to SQLite.
 
@@ -26,6 +26,7 @@ Verified on macOS/iCloud sync:
 - real flag state: `edit ID --private --flagged` or `add ... --private -f`
 - urgent state: `edit ID --private --urgent`
 - location alarms: `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090`
+- list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
 
 Not exposed:
 
@@ -76,6 +77,26 @@ remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --l
 Subtask due dates use the same parser as parent reminders. Invalid parent or subtask due dates fail before RemCTL creates or edits anything, so private metadata is not silently dropped onto a partially-created reminder.
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
+
+## List Appearance Examples
+
+```bash
+remctl list-create "Research" --color orange --private --symbol education3
+remctl list-create "Focus" --private --color '#34C759' --emoji 🎯
+remctl list-edit Projects --private --color orange --symbol education3
+remctl list-edit --list-id 144 --private --symbol pencil.and.ruler
+remctl list-edit Projects --private --emoji 📌
+```
+
+List colors and badge emblems were reverse-engineered from `ZREMCDBASELIST`. `ZCOLOR` stores a `REMColor` keyed archive. `ZBADGEEMBLEM` stores either an emoji JSON string or a private Reminders emblem name. RemCTL writes those values through ReminderKit change items, not by editing the database.
+
+Important limits:
+
+- `list-create --color NAME` works without `--private` through EventKit for normal color names.
+- `list-create --private --color '#RRGGBB'` and `list-edit --private --color '#RRGGBB'` use private ReminderKit for exact custom colors.
+- `--symbol` writes an emblem string. Reminders' own picker uses private names such as `education3`; arbitrary SF Symbol strings can be stored but may not render in Reminders on every OS/device.
+- `--emoji` writes a Reminders emoji badge.
+- `list-edit` resolves by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
 
 ## Guardrails
 

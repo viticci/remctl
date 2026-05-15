@@ -6,7 +6,7 @@ attachments, completion status, list colors). Writes via remctl-bridge (EventKit
 with AppleScript fallback. Zero Python dependencies with small shared helpers.
 """
 
-import argparse, csv, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, time
+import argparse, csv, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, time, unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,15 +191,47 @@ PRI_NAME = {0: "none", 1: "high", 5: "medium", 9: "low"}
 
 LIST_COLOR_MAP = {
     "red": (255, 41, 104),
-    "orange": (255, 149, 0),
+    "orange": (255, 141, 40),
     "yellow": (255, 204, 0),
     "green": (99, 218, 56),
-    "blue": (0, 122, 255),
+    "blue": (0, 136, 255),
     "purple": (204, 115, 225),
     "brown": (162, 132, 94),
+    "gray": (91, 98, 106),
     "cyan": (90, 200, 250),
     "teal": (48, 176, 199),
 }
+
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+def normalize_list_color(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    if HEX_COLOR_RE.match(value):
+        return value.upper()
+    return value.lower()
+
+def is_supported_public_list_color(value):
+    normalized = normalize_list_color(value)
+    return normalized in LIST_COLOR_MAP
+
+def is_supported_private_list_color(value):
+    normalized = normalize_list_color(value)
+    return normalized in LIST_COLOR_MAP or bool(normalized and HEX_COLOR_RE.match(normalized))
+
+def validate_list_color(value, *, private=False):
+    if not value:
+        return
+    if private:
+        ok = is_supported_private_list_color(value)
+        examples = "red, orange, yellow, green, blue, purple, brown, gray, cyan, or #RRGGBB"
+    else:
+        ok = is_supported_public_list_color(value)
+        examples = "red, orange, yellow, green, blue, purple, brown, gray, or cyan"
+    if not ok:
+        print(f"Error: unsupported list color {value!r}. Use {examples}.", file=sys.stderr)
+        sys.exit(1)
 
 def parse_list_color(blob):
     """Extract color info from ZCOLOR binary plist (NSKeyedArchiver)."""
@@ -284,11 +316,126 @@ def q_lists(db):
         "ORDER BY ZNAME"
     ).fetchall()
 
+def _row_value(row, key):
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        if key == "Z_PK":
+            return row[0]
+        if key == "ZNAME":
+            return row[1]
+        raise
+
+def normalize_list_lookup_name(name):
+    if not name:
+        return ""
+    text = unicodedata.normalize("NFKC", str(name)).casefold()
+    parts = []
+    last_space = False
+    for ch in text:
+        if ch.isalnum():
+            parts.append(ch)
+            last_space = False
+        else:
+            category = unicodedata.category(ch)
+            if ch.isspace() or category[0] in {"M", "P", "S", "Z"}:
+                if parts and not last_space:
+                    parts.append(" ")
+                    last_space = True
+    return "".join(parts).strip()
+
+def list_ref_payload(row, *, requested=None, method="exact"):
+    return {
+        "id": _row_value(row, "Z_PK"),
+        "title": _row_value(row, "ZNAME"),
+        "requested": requested,
+        "method": method,
+    }
+
+def resolve_list_ref(db, name=None, list_id=None):
+    if list_id is not None:
+        row = db.execute(
+            "SELECT Z_PK, ZNAME FROM ZREMCDBASELIST "
+            "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
+            "AND ZNAME IS NOT NULL AND ZNAME != ''",
+            (list_id,),
+        ).fetchone()
+        return list_ref_payload(row, requested=str(list_id), method="id") if row else None
+
+    if not name:
+        return None
+
+    rows = q_lists(db)
+    exact = [row for row in rows if _row_value(row, "ZNAME") == name]
+    if len(exact) == 1:
+        return list_ref_payload(exact[0], requested=name, method="exact")
+    if len(exact) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [list_ref_payload(row) for row in exact]}
+
+    folded = str(name).casefold()
+    ci = [row for row in rows if str(_row_value(row, "ZNAME")).casefold() == folded]
+    if len(ci) == 1:
+        return list_ref_payload(ci[0], requested=name, method="case_insensitive")
+    if len(ci) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [list_ref_payload(row) for row in ci]}
+
+    normalized = normalize_list_lookup_name(name)
+    if not normalized:
+        return None
+    normalized_matches = [
+        row for row in rows
+        if normalize_list_lookup_name(_row_value(row, "ZNAME")) == normalized
+    ]
+    if len(normalized_matches) == 1:
+        return list_ref_payload(normalized_matches[0], requested=name, method="normalized")
+    if len(normalized_matches) > 1:
+        return {
+            "error": "ambiguous",
+            "requested": name,
+            "candidates": [list_ref_payload(row) for row in normalized_matches],
+        }
+    return None
+
+def _print_list_resolution_error(requested, result=None):
+    if result and result.get("error") == "ambiguous":
+        options = ", ".join(
+            f"{candidate['id']} ({candidate['title']})"
+            for candidate in result.get("candidates", [])
+        )
+        print(
+            f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Error: list not found: {requested}", file=sys.stderr)
+
+def resolve_list_or_die(db, name=None, list_id=None):
+    result = resolve_list_ref(db, name=name, list_id=list_id)
+    if result and not result.get("error"):
+        return result
+    requested = f"id {list_id}" if list_id is not None else name
+    _print_list_resolution_error(requested, result)
+    sys.exit(1)
+
 def q_list_pk(db, name):
-    r = db.execute(
-        "SELECT Z_PK FROM ZREMCDBASELIST WHERE ZNAME = ? COLLATE NOCASE AND ZMARKEDFORDELETION = 0 LIMIT 1", (name,)
+    result = resolve_list_ref(db, name=name)
+    return result["id"] if result and not result.get("error") else None
+
+def q_list_ckid(db, list_pk):
+    row = db.execute(
+        "SELECT ZCKIDENTIFIER FROM ZREMCDBASELIST "
+        "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3",
+        (list_pk,),
     ).fetchone()
-    return r[0] if r else None
+    return row["ZCKIDENTIFIER"] if row and row["ZCKIDENTIFIER"] else None
+
+def q_list_exact_name_count(db, name):
+    row = db.execute(
+        "SELECT COUNT(*) AS count FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME = ?",
+        (name,),
+    ).fetchone()
+    return row["count"] if row else 0
 
 _RECURRENCE_COLS = """
     (SELECT rr.ZFREQUENCY FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND rr.ZMARKEDFORDELETION = 0 AND rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_frequency,
@@ -1294,6 +1441,53 @@ def private_action(data):
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
     return result
+
+def validate_list_appearance_args(a):
+    symbol = getattr(a, "symbol", None)
+    emoji = getattr(a, "emoji", None)
+    if symbol and emoji:
+        print("Error: pass either --symbol or --emoji, not both.", file=sys.stderr)
+        sys.exit(1)
+    color = getattr(a, "color", None)
+    validate_list_color(color, private=private_metadata_enabled(a))
+    if (symbol or emoji) and not private_metadata_enabled(a):
+        print(
+            "Error: list symbols and emojis require --private. "
+            "Example: remctl list-create \"Projects\" --private --symbol education3",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+def list_private_appearance_payload(a):
+    payload = {}
+    if getattr(a, "new_name", None):
+        payload["name"] = a.new_name
+    if getattr(a, "color", None) and private_metadata_enabled(a):
+        payload["color"] = normalize_list_color(a.color)
+    if getattr(a, "symbol", None):
+        payload["symbol"] = a.symbol.strip()
+    if getattr(a, "emoji", None):
+        payload["emoji"] = a.emoji.strip()
+    return payload
+
+def apply_private_list_appearance(db, list_pk, a, *, exit_on_error=True):
+    require_private_metadata(a)
+    ckid = q_list_ckid(db, list_pk)
+    if not ckid:
+        print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    payload = list_private_appearance_payload(a)
+    if not payload:
+        return None
+    payload.update({"action": "set_list_appearance", "listId": ckid})
+    result = private_call(payload)
+    if result and result.get("status") == "updated":
+        return result
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    if exit_on_error:
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    return {"status": "error", "message": message}
 
 
 def normalize_section_id(value):
@@ -2401,10 +2595,9 @@ def cmd_lists(a):
 
 def cmd_show(a):
     db = open_db()
-    pk = q_list_pk(db, a.list)
-    if pk is None:
-        print(f"Error: List '{a.list}' not found", file=sys.stderr)
-        sys.exit(1)
+    list_ref = resolve_list_or_die(db, name=a.list)
+    pk = list_ref["id"]
+    list_name = list_ref["title"]
     items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
     pks = [i["Z_PK"] for i in items]
     sc, ht = preload_extras(db, pks)
@@ -2420,9 +2613,9 @@ def cmd_show(a):
         print(fmt_table(reminders_to_table_data(items, db)))
         return
     if not items:
-        print(f"No {'active ' if not a.completed else ''}reminders in '{a.list}'")
+        print(f"No {'active ' if not a.completed else ''}reminders in '{list_name}'")
         return
-    print(f"{C.bold(color_list_name(a.list, db))}:")
+    print(f"{C.bold(color_list_name(list_name, db))}:")
     if secs:
         sec_items, unsectioned = {}, []
         for item in items:
@@ -2461,12 +2654,19 @@ def cmd_add(a):
             sys.exit(1)
     db = None
     target_list_pk = None
-    if wants_private and getattr(a, "list", None):
-        db = open_db()
-        target_list_pk = q_list_pk(db, a.list)
-        if target_list_pk is None:
-            print(f"Error: list not found: {a.list}", file=sys.stderr)
-            sys.exit(1)
+    target_list_name = getattr(a, "list", None)
+    list_resolution = None
+    list_id = getattr(a, "list_id", None)
+    if target_list_name or list_id is not None:
+        try:
+            db = open_db()
+            list_resolution = resolve_list_or_die(db, name=target_list_name, list_id=list_id)
+            target_list_pk = list_resolution["id"]
+            target_list_name = list_resolution["title"]
+        except RemindersDBUnavailable:
+            if list_id is not None or wants_private:
+                raise
+            target_list_name = getattr(a, "list", None)
 
     if a.tags and not wants_private:
         for t in a.tags.split(","):
@@ -2479,7 +2679,7 @@ def cmd_add(a):
     # Try bridge first
     if bridge_available():
         data = {"action": "create", "title": title}
-        if a.list: data["list"] = a.list
+        if target_list_name: data["list"] = target_list_name
         if a.notes: data["notes"] = a.notes
         if dt: data["due"] = dt.isoformat()
         if a.priority and a.priority.lower() in pm:
@@ -2511,6 +2711,13 @@ def cmd_add(a):
                 created_row = None
             if a.json:
                 payload = {"status": "created", "id": result.get("id", ""), "title": title}
+                if list_resolution and list_resolution.get("method") != "exact":
+                    payload["resolvedList"] = {
+                        "requested": list_resolution.get("requested"),
+                        "title": list_resolution["title"],
+                        "id": list_resolution["id"],
+                        "method": list_resolution["method"],
+                    }
                 if created_row:
                     payload["numericId"] = created_row["Z_PK"]
                 if private_results:
@@ -2518,6 +2725,8 @@ def cmd_add(a):
                 print(json.dumps(payload))
             else:
                 print(f"Created: {title}")
+                if list_resolution and list_resolution.get("method") != "exact":
+                    print(f"List: {list_resolution['title']} (resolved from {list_resolution['requested']})")
                 if created_row:
                     print(f"ID: #{created_row['Z_PK']}")
                 if private_results:
@@ -2537,7 +2746,7 @@ def cmd_add(a):
             "cannot be set via AppleScript and will be dropped.",
             file=sys.stderr,
         )
-    lst = f'tell list "{esc(a.list)}"' if a.list else "tell default list"
+    lst = f'tell list "{esc(target_list_name)}"' if target_list_name else "tell default list"
     s = f'tell application "Reminders"\n{lst}\nset r to make new reminder with properties {{name:"{esc(title)}"}}\n'
     if a.notes: s += f'set body of r to "{esc(a.notes)}"\n'
     if a.priority and a.priority.lower() in pm:
@@ -3095,10 +3304,8 @@ def cmd_link(a):
     db = open_db()
     ids = a.ids
     if a.list:
-        pk = q_list_pk(db, a.list)
-        if pk is None:
-            print(f"Error: List '{a.list}' not found", file=sys.stderr)
-            sys.exit(1)
+        list_ref = resolve_list_or_die(db, name=a.list)
+        pk = list_ref["id"]
         items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
         ids = [i["Z_PK"] for i in items]
     if not ids:
@@ -3264,22 +3471,102 @@ def cmd_overdue(a):
     print(f"\n{len(items)} overdue")
 
 def cmd_list_create(a):
+    validate_list_appearance_args(a)
+    private_payload_needed = bool(list_private_appearance_payload(a))
+    preflight_db = None
+    if private_payload_needed:
+        require_private_metadata(a)
+        preflight_db = open_db()
+        existing = q_list_exact_name_count(preflight_db, a.name)
+        if existing:
+            print(
+                f"Error: list already exists: {a.name}. Use list-edit with --list-id for existing lists.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if not bridge_available():
         print("Error: remctl-bridge required for list management", file=sys.stderr)
         sys.exit(1)
     data = {"action": "create_list", "title": a.name}
-    if hasattr(a, 'color') and a.color:
+    if hasattr(a, 'color') and a.color and is_supported_public_list_color(a.color):
         data["color"] = a.color
     result = bridge_call(data)
     if result and result.get("status") == "created":
+        appearance_result = None
+        if private_payload_needed:
+            db = preflight_db or open_db()
+            list_ref = None
+            for _ in range(20):
+                list_ref = resolve_list_ref(db, name=a.name)
+                if list_ref and not list_ref.get("error"):
+                    break
+                time.sleep(0.2)
+            if not list_ref or list_ref.get("error"):
+                _print_list_resolution_error(a.name, list_ref)
+                sys.exit(1)
+            appearance_result = apply_private_list_appearance(db, list_ref["id"], a, exit_on_error=False)
+            if not appearance_result or appearance_result.get("status") != "updated":
+                rollback = bridge_call({"action": "delete_list", "title": a.name}) if bridge_available() else None
+                message = appearance_result.get("message") if isinstance(appearance_result, dict) else "private helper failed"
+                if rollback and rollback.get("status") == "deleted":
+                    print(
+                        f"Error: private list appearance failed after creation, so the new list was deleted: {message}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Error: private list appearance failed after creation: {message}. "
+                        f"Delete the new list manually if it should not remain: {a.name}",
+                        file=sys.stderr,
+                    )
+                sys.exit(1)
         if a.json:
-            print(json.dumps({"status": "created", "name": a.name}))
+            payload = {"status": "created", "name": a.name}
+            if appearance_result:
+                payload["private"] = appearance_result
+            print(json.dumps(payload))
         else:
             print(f"Created list: {a.name}")
+            if appearance_result:
+                details = []
+                if getattr(a, "color", None):
+                    details.append(f"color={normalize_list_color(a.color)}")
+                if getattr(a, "symbol", None):
+                    details.append(f"symbol={a.symbol}")
+                if getattr(a, "emoji", None):
+                    details.append(f"emoji={a.emoji}")
+                if details:
+                    print(f"Updated private appearance: {', '.join(details)}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to create list '{a.name}'" + (f": {message}" if message else ""), file=sys.stderr)
         sys.exit(1)
+
+def cmd_list_edit(a):
+    validate_list_appearance_args(a)
+    if not (getattr(a, "new_name", None) or getattr(a, "color", None) or getattr(a, "symbol", None) or getattr(a, "emoji", None)):
+        print("Error: pass at least one of --new-name, --color, --symbol, or --emoji.", file=sys.stderr)
+        sys.exit(1)
+    if getattr(a, "name", None) and getattr(a, "list_id", None) is not None:
+        print("Error: pass either a list name or --list-id, not both.", file=sys.stderr)
+        sys.exit(1)
+    if not getattr(a, "name", None) and getattr(a, "list_id", None) is None:
+        print("Error: pass a list name or --list-id.", file=sys.stderr)
+        sys.exit(1)
+    require_private_metadata(a)
+    db = open_db()
+    list_ref = resolve_list_or_die(db, name=getattr(a, "name", None), list_id=getattr(a, "list_id", None))
+    result = apply_private_list_appearance(db, list_ref["id"], a)
+    output_name = getattr(a, "new_name", None) or list_ref["title"]
+    if a.json:
+        print(json.dumps({
+            "status": "updated",
+            "id": list_ref["id"],
+            "name": output_name,
+            "private": result,
+        }))
+    else:
+        print(f"Updated list: {output_name}")
 
 def cmd_list_rename(a):
     if not bridge_available():
@@ -3321,10 +3608,8 @@ def cmd_list_delete(a):
 def cmd_export(a):
     db = open_db()
     if a.list:
-        pk = q_list_pk(db, a.list)
-        if pk is None:
-            print(f"Error: List '{a.list}' not found", file=sys.stderr)
-            sys.exit(1)
+        list_ref = resolve_list_or_die(db, name=a.list)
+        pk = list_ref["id"]
         items = q_reminders(db, list_pk=pk, completed=True, top_level=False, limit=10000)
     else:
         items = q_reminders(db, completed=True, top_level=False, limit=10000)
@@ -3433,6 +3718,7 @@ _remctl() {
         'export:Export reminders'
         'import:Import reminders'
         'list-create:Create a new list'
+        'list-edit:Edit private list appearance'
         'list-rename:Rename a list'
         'list-delete:Delete a list'
         'onboard:Prompt for macOS permissions and verify readiness'
@@ -3506,7 +3792,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-create list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-create list-edit list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -3517,6 +3803,12 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "list-create" ]; then
+        COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "list-edit" ]; then
+        COMPREPLY=( $(compgen -W "--list-id --new-name --color --private --symbol --emoji --json" -- "$cur") )
         return
     elif [ $COMP_CWORD -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -3551,6 +3843,7 @@ complete -c remctl -n "__fish_use_subcommand" -a open -d "Open in Reminders.app"
 complete -c remctl -n "__fish_use_subcommand" -a export -d "Export reminders"
 complete -c remctl -n "__fish_use_subcommand" -a import -d "Import reminders"
 complete -c remctl -n "__fish_use_subcommand" -a list-create -d "Create a new list"
+complete -c remctl -n "__fish_use_subcommand" -a list-edit -d "Edit private list appearance"
 complete -c remctl -n "__fish_use_subcommand" -a list-rename -d "Rename a list"
 complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
 complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Prompt for macOS permissions and verify readiness"
@@ -3559,6 +3852,16 @@ complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell complet
 complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Open guided macOS permission helper"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
 complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Print agent-focused context and TCC guidance"
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l color -d "List color name; with --private also accepts #RRGGBB" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l private -d "Use private ReminderKit list appearance writes"
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Private Reminders list emblem name" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l emoji -d "Private Reminders list emoji badge" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l list-id -d "Edit a list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l new-name -d "Rename the list through private ReminderKit" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l color -d "List color name or #RRGGBB" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l private -d "Required for list appearance writes"
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l symbol -d "Private Reminders list emblem name" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l emoji -d "Private Reminders list emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsupported private ReminderKit metadata writes"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign to section by stable ID" -r
@@ -4212,7 +4515,7 @@ def main():
             "Use `remctl onboard --help`, `remctl permissions --help`, `remctl setup --help`, and `remctl doctor --help`\n"
             "for onboarding details.\n"
             "\n"
-            "Private metadata writes are unsupported and opt-in: pass --private on add/edit."
+            "Private metadata writes are unsupported and opt-in: pass --private on add/edit/list-create/list-edit."
         ),
         formatter_class=HelpFormatter,
     )
@@ -4257,6 +4560,7 @@ def main():
         formatter_class=HelpFormatter,
     )
     c.add_argument("title"); c.add_argument("-l", "--list")
+    c.add_argument("--list-id", type=int, help="Create in a list by stable numeric ID")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD, today, tomorrow, tonight at 11, Friday at 15:00, +3d, eod, eow")
     c.add_argument("-p", "--priority", help="high, medium, low")
     c.add_argument("-f", "--flag", action="store_true")
@@ -4364,8 +4668,23 @@ def main():
 
     c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c)
 
-    c = sub.add_parser("list-create", help="Create a new list (bridge only)")
-    c.add_argument("name"); c.add_argument("--color", help="List color name"); js(c)
+    c = sub.add_parser("list-create", help="Create a new list")
+    c.add_argument("name")
+    c.add_argument("--color", help="List color name; with --private also accepts #RRGGBB")
+    c.add_argument("--private", action="store_true", help="Use private ReminderKit for list symbol/emoji/exact color")
+    c.add_argument("--symbol", help="Private Reminders list emblem name, e.g. education3 or pencil.and.ruler")
+    c.add_argument("--emoji", help="Private Reminders list emoji badge, e.g. 📌")
+    js(c)
+
+    c = sub.add_parser("list-edit", help="Edit private list appearance by name or ID")
+    c.add_argument("name", nargs="?", help="List name to edit")
+    c.add_argument("--list-id", type=int, help="Edit a list by stable numeric ID")
+    c.add_argument("--new-name", help="Rename the list through private ReminderKit")
+    c.add_argument("--color", help="List color name or #RRGGBB")
+    c.add_argument("--symbol", help="Private Reminders list emblem name")
+    c.add_argument("--emoji", help="Private Reminders list emoji badge")
+    c.add_argument("--private", action="store_true", help="Required for list appearance writes")
+    js(c)
 
     c = sub.add_parser("list-rename", help="Rename a list (bridge only)")
     c.add_argument("name"); c.add_argument("new_name"); js(c)
@@ -4532,6 +4851,7 @@ def main():
         "upcoming": cmd_upcoming,
         "overdue": cmd_overdue,
         "list-create": cmd_list_create,
+        "list-edit": cmd_list_edit,
         "list-rename": cmd_list_rename,
         "list-delete": cmd_list_delete,
         "export": cmd_export,

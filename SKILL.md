@@ -13,7 +13,7 @@ RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreDat
 - Use the repo command while developing RemCTL itself: `./remctl ...` from the repo root.
 - Prefer JSON for automation and verification: `remctl today --json`, `remctl show Work --json`, `remctl info <id> --json`.
 - Never write directly to the Reminders SQLite database.
-- For private metadata, use regular `add` or `edit` with `--private`; do not use a separate command or raw database mutation.
+- For private reminder metadata, use regular `add` or `edit` with `--private`; for private list appearance, use `list-create --private` or `list-edit --private`. Do not use raw database mutation.
 - After changing repo code, reinstall before testing the user-facing command: `./install.sh && hash -r`.
 
 ## Common Commands
@@ -34,7 +34,7 @@ remctl done 23880 --json
 
 ## Private Metadata
 
-Use `--private` only when the user explicitly asks for private Reminders metadata or when a command needs synced web rich links, real tags, sections, subtasks, image attachments, real flags, urgent state, or location alarms.
+Use `--private` only when the user explicitly asks for private Reminders metadata or when a command needs synced web rich links, real tags, sections, subtasks, image attachments, real flags, urgent state, location alarms, or list appearance metadata.
 
 ```bash
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --section "Research" --json
@@ -47,6 +47,9 @@ remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8 --
 remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"]}' --json
 remctl edit 23880 --private --flagged --urgent --json
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --json
+remctl list-create "Research" --color orange --private --symbol education3 --json
+remctl list-edit Projects --private --color '#FF8D28' --symbol pencil.and.ruler --json
+remctl list-edit --list-id 144 --private --emoji 📌 --json
 ```
 
 Private metadata rules:
@@ -57,6 +60,8 @@ Private metadata rules:
 - `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
+- `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write private list symbols, emoji badges, and exact `#RRGGBB` colors. Reminders' picker icons use private emblem names such as `education3`; arbitrary SF Symbol strings can be saved but may not render on every OS/device.
+- List names resolve exact first, then case-insensitive, then normalized names such as `Weekly 513` for `🗓️ Weekly 513`. If multiple lists match, RemCTL fails before writing; use `--list-id`.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private writes with `remctl info <numeric-id> --json`; if cross-device sync matters, ask the user to check iPhone/iPad.
 

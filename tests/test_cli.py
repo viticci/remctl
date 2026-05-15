@@ -45,8 +45,43 @@ class CliTests(unittest.TestCase):
     def test_parse_due_rejects_invalid_clock_time(self):
         self.assertIsNone(self.remctl.parse_due("today at 25:00"))
 
+    def _list_db(self, names):
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute(
+            "CREATE TABLE ZREMCDBASELIST ("
+            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER)"
+        )
+        for idx, name in enumerate(names, start=1):
+            db.execute(
+                "INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT) VALUES (?, ?, ?, 0, 3)",
+                (idx, name, f"CK-{idx}"),
+            )
+        return db
+
+    def test_list_resolution_matches_single_normalized_name(self):
+        db = self._list_db(["🗓️ Weekly 513", "Work"])
+        try:
+            result = self.remctl.resolve_list_ref(db, name="Weekly 513")
+
+            self.assertEqual(result["id"], 1)
+            self.assertEqual(result["title"], "🗓️ Weekly 513")
+            self.assertEqual(result["method"], "normalized")
+        finally:
+            db.close()
+
+    def test_list_resolution_rejects_ambiguous_normalized_name(self):
+        db = self._list_db(["🗓️ Weekly 513", "Weekly-513"])
+        try:
+            result = self.remctl.resolve_list_ref(db, name="Weekly 513")
+
+            self.assertEqual(result["error"], "ambiguous")
+            self.assertEqual(sorted(candidate["title"] for candidate in result["candidates"]), ["Weekly-513", "🗓️ Weekly 513"])
+        finally:
+            db.close()
+
     def test_list_create_uses_bridge_contract_fields(self):
-        args = SimpleNamespace(name="Project X", color="blue", json=True)
+        args = SimpleNamespace(name="Project X", color="blue", private=False, symbol=None, emoji=None, json=True)
         with (
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call", return_value={"status": "created"}) as bridge_call,
@@ -56,6 +91,48 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             bridge_call.call_args.args[0],
             {"action": "create_list", "title": "Project X", "color": "blue"},
+        )
+
+    def test_list_create_rejects_symbol_without_private_before_bridge(self):
+        args = SimpleNamespace(name="Project X", color=None, private=False, symbol="education3", emoji=None, json=True)
+        with (
+            mock.patch.object(self.remctl, "bridge_available") as bridge_available,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_list_create(args)
+        bridge_available.assert_not_called()
+
+    def test_list_edit_private_targets_resolved_list_id(self):
+        db = self._list_db(["Projects"])
+        args = SimpleNamespace(
+            name=None,
+            list_id=1,
+            new_name=None,
+            color="#123456",
+            private=True,
+            symbol="pencil.and.ruler",
+            emoji=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_list_edit(args)
+        finally:
+            db.close()
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "set_list_appearance",
+                "listId": "CK-1",
+                "color": "#123456",
+                "symbol": "pencil.and.ruler",
+            },
         )
 
     def test_list_rename_and_delete_use_bridge_contract_fields(self):
@@ -264,7 +341,11 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(self.remctl, "open_db", return_value=fake_db),
-            mock.patch.object(self.remctl, "q_list_pk", return_value=7),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 7, "title": "Projects", "requested": "Projects", "method": "exact"},
+            ),
             mock.patch.object(
                 self.remctl,
                 "bridge_call",
@@ -316,6 +397,11 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call", return_value={"status": "created", "id": "UUID-1"}),
             mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 7, "title": "Projects", "requested": "Projects", "method": "exact"},
+            ),
             mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value={"Z_PK": 17839}),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
@@ -323,6 +409,46 @@ class CliTests(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["numericId"], 17839)
+
+    def test_cmd_add_uses_resolved_list_name_for_bridge(self):
+        args = SimpleNamespace(
+            title="Weekly",
+            list="Weekly 513",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            section=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", return_value={"status": "created", "id": "UUID-1"}) as bridge_call,
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 156, "title": "🗓️ Weekly 513", "requested": "Weekly 513", "method": "normalized"},
+            ),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_add(args)
+
+        self.assertEqual(bridge_call.call_args.args[0]["list"], "🗓️ Weekly 513")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["resolvedList"]["title"], "🗓️ Weekly 513")
+        self.assertEqual(payload["resolvedList"]["method"], "normalized")
 
     def test_subtask_accepts_json_metadata(self):
         specs = self.remctl.parse_subtask_specs([

@@ -38,7 +38,7 @@ This exposes fields EventKit does not expose cleanly for fast list views:
 - tags
 - attachments
 - deep links
-- list colors
+- list colors and badge emblems
 - recurrence rules
 - macOS 26 urgent state
 
@@ -53,7 +53,7 @@ Writes go through Apple-supported APIs:
 
 There is also an explicitly unsupported opt-in helper:
 
-3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, rich subtasks, image attachments, real flag state, urgent state, and location alarms. For rich subtasks, `remctl-private` creates the child and applies private child metadata, then `remctl-bridge` applies public child fields such as notes and due dates. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
+3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, rich subtasks, image attachments, real flag state, urgent state, location alarms, and list appearance metadata such as exact colors, private emblem names, and emoji badges. For rich subtasks, `remctl-private` creates the child and applies private child metadata, then `remctl-bridge` applies public child fields such as notes and due dates. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
 
 The bridge is detected next to the installed CLI. Override it with:
 
@@ -68,6 +68,15 @@ REMCTL_PRIVATE_PATH=/path/to/remctl-private remctl edit 123 --private --url http
 ```
 
 See [private-metadata.md](private-metadata.md) for supported private fields, known limits, and verification rules.
+
+## List Appearance
+
+Reminders stores list appearance on `ZREMCDBASELIST`:
+
+- `ZCOLOR` is a keyed archive containing a `REMColor` object with symbolic color names, hex, and RGB values.
+- `ZBADGEEMBLEM` is text. Emoji badges are stored as JSON such as `{"Emoji":"📌"}`; Reminders picker icons are stored as private emblem names such as `education3`.
+
+RemCTL reads these fields directly for display. Normal `list-create --color NAME` still writes through EventKit. Private list appearance writes use `REMStore.fetchListWithObjectID`, `REMSaveRequest.updateList`, `REMListChangeItem.setColor`, and `REMListChangeItem.appearanceContext.setBadgeEmblem` / `setBadge`, then save through ReminderKit. Arbitrary emblem strings can be saved, but Reminders may not render every SF Symbol name in the UI.
 
 ## Recurrence
 

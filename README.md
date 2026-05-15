@@ -6,7 +6,7 @@ RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users an
 
 RemCTL reads the user's local iCloud Reminders database directly (with native macOS permission access) for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
 
-Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata to reminders such as sections, subtasks, tags, image attachments, and location-based alarms by using the native ReminderKit framework.
+Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, subtasks, tags, image attachments, location-based alarms, and list appearance metadata by using the native ReminderKit framework.
 
 As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 – without breaking iCloud sync.
 
@@ -58,7 +58,7 @@ Full setup details live in [docs/installation.md](docs/installation.md).
 | See what is due | `today`, `upcoming`, `overdue` |
 | Browse reminders | `lists`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks` |
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag` |
-| Organize | `list-create`, `list-rename`, `list-delete`, `sections`, `tags` |
+| Organize | `list-create`, `list-edit`, `list-rename`, `list-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
@@ -72,6 +72,8 @@ remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
 remctl edit 23880 -d clear
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
 remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
+remctl list-create "Research" --color orange --private --symbol education3
+remctl list-edit Projects --private --color orange --symbol pencil.and.ruler
 remctl info 23880 --json
 ```
 
@@ -91,9 +93,11 @@ remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
 remctl edit 23880 --private --image ~/Desktop/mockup.png --flagged --urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
+remctl list-edit Projects --private --color '#FF8D28' --symbol education3
+remctl list-edit Projects --private --emoji 📌
 ```
 
-Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, and location alarms. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
+Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, and list appearance metadata. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus private list symbols or emoji badges. Reminders stores built-in icons as private emblem names such as `education3`; arbitrary SF Symbol names can be written, but Reminders may not render every symbol in its UI. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
 
 This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, and agents should verify writes with `remctl info ID --json` plus a UI/device check when sync behavior matters.
 
@@ -154,6 +158,8 @@ remctl doctor --for-agent --json
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `info` includes private rich-link URLs, so agents should not need raw SQLite checks for ordinary rich-link verification.
 
 Agents should pass deterministic due dates, ideally `YYYY-MM-DD HH:MM` after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
+
+List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`.
 
 Do not mutate the Reminders SQLite database. Use RemCTL commands or EventKit.
 

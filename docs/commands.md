@@ -49,6 +49,8 @@ RemCTL keeps these states distinct:
 ```bash
 remctl add "Buy milk"
 remctl add "Review PR" -l Work
+remctl add "Write column" -l "Weekly 513"   # safely resolves 🗓️ Weekly 513 when unambiguous
+remctl add "Write column" --list-id 156
 remctl add "Call dentist" -d tomorrow
 remctl add "Team meeting" -d "next monday at 3pm"
 remctl add "Deploy" -d +3d -p high
@@ -72,11 +74,13 @@ remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --l
 
 `search` matches reminder titles and notes. By default it searches active reminders; add `--completed` to include completed reminders.
 
+List names are resolved conservatively for writes: exact match first, then case-insensitive match, then a normalized fallback that ignores decorative punctuation and emoji. If more than one list matches, RemCTL fails before writing and prints the candidate IDs; pass `--list-id` to target one explicitly.
+
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL uses the only non-empty matching section when there is exactly one. If the duplicate is still ambiguous, use `--section-id`.
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, and location alarms. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, location alarms, and list appearance metadata. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
@@ -109,9 +113,18 @@ remctl delete 23880 --force
 
 ```bash
 remctl list-create "Project X" --color blue
+remctl list-create "Project X" --color orange --private --symbol education3
+remctl list-edit "Project X" --private --color '#FF8D28' --symbol pencil.and.ruler
+remctl list-edit --list-id 144 --private --emoji 📌
 remctl list-rename "Project X" "Project Y"
 remctl list-delete "Project Y" --force
 ```
+
+`list-create --color NAME` uses EventKit and supports Reminders color names such as `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, and `cyan`.
+
+List symbols and emoji badges are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance editor; use `--list-id` when duplicate or normalized names could match more than one list. With `--private`, `--color` also accepts `#RRGGBB`.
+
+Reminders stores many picker icons as private emblem names, not public SF Symbol names. For example, the pencil/ruler icon shown by Reminders for Federico's Projects list is stored as `education3`. Arbitrary symbol strings such as `pencil.and.ruler` can be saved through ReminderKit, but Reminders may not render every string in its UI.
 
 ## Import and Export
 
