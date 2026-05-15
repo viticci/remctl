@@ -75,7 +75,8 @@ remctl smart-list-create "Flagged Review" --private --flagged --json
 remctl smart-list-create "High Priority" --private --priority high --json
 remctl smart-list-create "Tagged or Today" --private --match any --tags remctl --date today --json
 remctl smart-list-create "Work and Projects" --private --include-list-id 135 --include-list-id 144 --json
-remctl smart-list-edit "Tagged or Today" --private --include-list Work --date no-date --json
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆 --json
+remctl smart-list-edit "Tagged or Today" --private --include-list Work --date no-date --color red --emoji 📆 --json
 remctl smart-list-edit --smart-list-id 170 --private --match any --tags remctl,codex --json
 remctl smart-list-delete "Flagged Review" --private --force --json
 ```
@@ -88,7 +89,7 @@ Private metadata rules:
 - `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
-- `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
+- `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
 - `smart-lists` is read-only and safe. `smart-list-create`, `smart-list-edit`, and `smart-list-delete` use unsupported private ReminderKit APIs and require `--private`; filter writes support the official Reminders filters decoded from Reminders.app.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private reminder writes with `remctl info <numeric-id> --json`.
@@ -109,10 +110,11 @@ remctl smart-list-create "Next Hour" --private --date-relative in-next:1:hour:pa
 remctl smart-list-create "Near Home" --private --location-title Home --latitude 41.9 --longitude 12.5 --radius 100 --proximity enter --json
 remctl smart-list-create "Work and Projects" --private --include-list-id 135 --include-list-id 144 --json
 remctl smart-list-create "Work and Projects (All)" --private --include-list-id 135 --include-list-id 144 --list-match all --json
-remctl smart-list-edit --smart-list-id 170 --private --filter-json @filter.json --json
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆 --json
+remctl smart-list-edit --smart-list-id 170 --private --filter-json @filter.json --color red --emoji 📆 --json
 ```
 
-Supported filter families are tags (`--tags`, `--tag-match all|any`, `--any-tag`, `--untagged`), date (`--date any|today|no-date`, `--date-today-include-past-due`, `--date-on`, `--date-before`, `--date-after`, `--date-range START,END`, `--date-relative in-next:1:hour[:past-due]`), time (`morning`, `afternoon`, `evening`, `night`, `no-time`), priority (`high`, `medium`, `low`), flag (`--flagged`), vehicle location (`--vehicle connected|disconnected`), specific location (`--location-title`, `--latitude`, `--longitude`, `--radius`, `--proximity enter|leave|arriving|leaving`), list inclusion/exclusion (`--include-list`, `--exclude-list`, `--include-list-id`, `--exclude-list-id`, `--list-match all|any`), and top-level matching (`--match all|any`). Reminders supports one `lists` filter family per smart list; repeated list flags add selected lists to that single filter, not multiple list-filter rows. Repeated included lists default to `--list-match any` so aggregating Work and Projects creates a union.
+Supported filter families are tags (`--tags`, `--tag-match all|any`, `--any-tag`, `--untagged`), date (`--date any|today|no-date`, `--date-today-include-past-due`, `--date-on`, `--date-before`, `--date-after`, `--date-range START,END`, `--date-relative in-next:1:hour[:past-due]`), time (`morning`, `afternoon`, `evening`, `night`, `no-time`), priority (`high`, `medium`, `low`), flag (`--flagged`), vehicle location (`--vehicle connected|disconnected`), specific location (`--location-title`, `--latitude`, `--longitude`, `--radius`, `--proximity enter|leave|arriving|leaving`), list inclusion/exclusion (`--include-list`, `--exclude-list`, `--include-list-id`, `--exclude-list-id`, `--list-match all|any`), and top-level matching (`--match all|any`). `smart-list-create` and `smart-list-edit` also accept appearance flags `--color`, `--symbol`, and `--emoji`. Reminders supports one `lists` filter family per smart list; repeated list flags add selected lists to that single filter, not multiple list-filter rows. Repeated included lists default to `--list-match any` so aggregating Work and Projects creates a union.
 
 `--filter-json` is an advanced escape hatch for raw official filter JSON or `@path`; unknown or unsupported smart-list filter shapes are rejected before writing. `smart-list-edit` and `smart-list-delete` target custom smart lists by exact name or `--smart-list-id` and never match built-in smart lists.
 

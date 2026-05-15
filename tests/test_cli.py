@@ -332,6 +332,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["filterData"], "eyJmbGFnZ2VkIjp0cnVlfQ==")
         self.assertEqual(json.loads(stdout.getvalue())["filter"]["kind"], "flagged")
 
+    def test_smart_list_create_passes_appearance_to_private_helper(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="Due Before June 1",
+            private=True,
+            flagged=True,
+            priority=None,
+            color="red",
+            symbol=None,
+            emoji="📆",
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    return_value={"status": "created", "id": "SMART-1", "color": "red", "emoji": "📆"},
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_smart_list_create(args)
+        finally:
+            db.close()
+
+        payload = private_call.call_args.args[0]
+        self.assertEqual(payload["action"], "create_smart_list")
+        self.assertEqual(payload["color"], "red")
+        self.assertEqual(payload["emoji"], "📆")
+
     def test_smart_list_create_builds_official_multi_filter_payload(self):
         db = self._smart_list_db()
         args = SimpleNamespace(
@@ -560,6 +592,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["smartListId"], "CUSTOM-1")
         self.assertEqual(json.loads(base64.b64decode(payload["filterData"]).decode("utf-8")), {"date": {"noDate": ""}})
         self.assertEqual(json.loads(stdout.getvalue())["status"], "updated")
+
+    def test_smart_list_edit_can_update_appearance_without_filter(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="High Priority",
+            smart_list_id=None,
+            private=True,
+            color="#123456",
+            symbol=None,
+            emoji="📆",
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    return_value={"status": "updated", "id": "CUSTOM-1", "color": "#123456", "emoji": "📆"},
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_smart_list_edit(args)
+        finally:
+            db.close()
+
+        payload = private_call.call_args.args[0]
+        self.assertEqual(
+            payload,
+            {
+                "action": "update_smart_list",
+                "smartListId": "CUSTOM-1",
+                "color": "#123456",
+                "emoji": "📆",
+            },
+        )
+        self.assertNotIn("filter", json.loads(stdout.getvalue()))
 
     def test_smart_list_delete_rejects_without_private_before_helper(self):
         args = SimpleNamespace(name="High Priority", smart_list_id=None, private=False, force=True, json=True)

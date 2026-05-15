@@ -1600,7 +1600,7 @@ def validate_list_appearance_args(a):
         sys.exit(1)
     if (symbol or emoji) and not private_metadata_enabled(a):
         print(
-            "Error: list symbols and emojis require --private. "
+            "Error: list and smart-list symbols/emojis require --private. "
             "Example: remctl list-create \"Projects\" --private --symbol education3",
             file=sys.stderr,
         )
@@ -1631,6 +1631,13 @@ def list_private_appearance_payload(a, *, include_public_color_names=True):
     if getattr(a, "emoji", None):
         payload["emoji"] = a.emoji.strip()
     return payload
+
+def list_appearance_changes_from_args(a):
+    return any([
+        getattr(a, "color", None),
+        getattr(a, "symbol", None),
+        getattr(a, "emoji", None),
+    ])
 
 def apply_private_list_appearance(db, list_pk, a, *, exit_on_error=True, include_public_color_names=True):
     require_private_metadata(a)
@@ -2897,10 +2904,44 @@ def smart_list_filter_payload_from_args(a, db):
         location=location,
     )
 
+def smart_list_filter_changes_from_args(a):
+    if getattr(a, "filter_json", None):
+        return True
+    if bool(getattr(a, "flagged", False)):
+        return True
+    if bool(getattr(a, "any_tag", False)) or bool(getattr(a, "untagged", False)):
+        return True
+    if bool(getattr(a, "date_today_include_past_due", False)):
+        return True
+    for name in (
+        "priority",
+        "tags",
+        "date",
+        "date_on",
+        "date_before",
+        "date_after",
+        "date_range",
+        "date_relative",
+        "time",
+        "include_list",
+        "exclude_list",
+        "include_list_id",
+        "exclude_list_id",
+        "vehicle",
+        "location_title",
+        "latitude",
+        "longitude",
+    ):
+        value = getattr(a, name, None)
+        if value not in (None, "", []):
+            return True
+    return False
+
 def cmd_smart_list_create(a):
     if not private_metadata_enabled(a):
         print("Error: smart-list-create requires --private.", file=sys.stderr)
         sys.exit(1)
+    validate_list_appearance_args(a)
     db = open_db()
     try:
         filter_payload = smart_list_filter_payload_from_args(a, db)
@@ -2917,11 +2958,13 @@ def cmd_smart_list_create(a):
         )
         sys.exit(1)
 
-    result = private_call({
+    request = {
         "action": "create_smart_list",
         "name": a.name,
         "filterData": base64.b64encode(filter_data).decode("ascii"),
-    })
+    }
+    request.update(list_private_appearance_payload(a))
+    result = private_call(request)
     if not result or result.get("status") != "created":
         message = result.get("message") if isinstance(result, dict) else "private helper failed"
         print(f"Error: Failed to create smart list '{a.name}': {message}", file=sys.stderr)
@@ -2946,6 +2989,7 @@ def cmd_smart_list_edit(a):
     if not a.name and a.smart_list_id is None:
         print("Error: provide a smart list name or --smart-list-id.", file=sys.stderr)
         sys.exit(1)
+    validate_list_appearance_args(a)
     require_private_metadata(a)
     db = open_db()
     matches = q_custom_smart_list_delete_matches(db, name=a.name, smart_list_id=a.smart_list_id)
@@ -2958,35 +3002,47 @@ def cmd_smart_list_edit(a):
         for row in matches:
             print(f"  {row['Z_PK']}: {smart_list_display_name(row)}", file=sys.stderr)
         sys.exit(1)
-    try:
-        filter_payload = smart_list_filter_payload_from_args(a, db)
-        filter_data = encode_supported_filter_payload(filter_payload)
-    except SmartListFilterError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    has_filter_changes = smart_list_filter_changes_from_args(a)
+    has_appearance_changes = list_appearance_changes_from_args(a)
+    if not has_filter_changes and not has_appearance_changes:
+        print("Error: pass at least one smart-list filter or appearance option.", file=sys.stderr)
         sys.exit(1)
+    filter_data = None
+    if has_filter_changes:
+        try:
+            filter_payload = smart_list_filter_payload_from_args(a, db)
+            filter_data = encode_supported_filter_payload(filter_payload)
+        except SmartListFilterError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     row = matches[0]
-    result = private_call({
+    request = {
         "action": "update_smart_list",
         "smartListId": row["ZCKIDENTIFIER"],
-        "filterData": base64.b64encode(filter_data).decode("ascii"),
-    })
+    }
+    if filter_data is not None:
+        request["filterData"] = base64.b64encode(filter_data).decode("ascii")
+    request.update(list_private_appearance_payload(a))
+    result = private_call(request)
     if not result or result.get("status") != "updated":
         message = result.get("message") if isinstance(result, dict) else "private helper failed"
         print(f"Error: Failed to edit smart list '{smart_list_display_name(row)}': {message}", file=sys.stderr)
         sys.exit(1)
     if a.json:
-        print(json.dumps({
+        payload = {
             "status": "updated",
             "id": row["Z_PK"],
             "objectUUID": row["ZCKIDENTIFIER"],
             "name": smart_list_display_name(row),
-            "filter": decode_smart_list_filter_blob(filter_data)["summary"],
             "private": result,
-        }, ensure_ascii=False))
+        }
+        if filter_data is not None:
+            payload["filter"] = decode_smart_list_filter_blob(filter_data)["summary"]
+        print(json.dumps(payload, ensure_ascii=False))
     else:
         print(f"Updated smart list: {smart_list_display_name(row)}")
-        summary = decode_smart_list_filter_blob(filter_data)["summary"]
+        summary = decode_smart_list_filter_blob(filter_data)["summary"] if filter_data is not None else None
         if summary:
             print(f"Filter: {summary['description']}")
 
@@ -4689,6 +4745,9 @@ _remctl() {
         smart-list-create)
             _arguments \
                 '--private[Use private ReminderKit smart-list creation]' \
+                '--color[Smart-list color name or #RRGGBB]:color:' \
+                '--symbol[Official Reminders list symbol]:symbol:' \
+                '--emoji[Private Reminders emoji badge]:emoji:' \
                 '--flagged[Filter to flagged reminders]' \
                 '--priority[Priority filter]:priority:(high medium low)' \
                 '--match[Match all or any filters]:match:(all any)' \
@@ -4722,6 +4781,9 @@ _remctl() {
             _arguments \
                 '--private[Use private ReminderKit smart-list editing]' \
                 '--smart-list-id[Edit by numeric smart-list ID]:id:' \
+                '--color[Smart-list color name or #RRGGBB]:color:' \
+                '--symbol[Official Reminders list symbol]:symbol:' \
+                '--emoji[Private Reminders emoji badge]:emoji:' \
                 '--flagged[Filter to flagged reminders]' \
                 '--priority[Priority filter]:priority:(high medium low)' \
                 '--match[Match all or any filters]:match:(all any)' \
@@ -4811,10 +4873,10 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --json" -- "$cur") )
         return
     elif [ "$cmd" = "smart-list-create" ]; then
-        COMPREPLY=( $(compgen -W "--private --match --filter-json --flagged --priority --tags --tag-match --any-tag --untagged --date --date-today-include-past-due --date-on --date-before --date-after --date-range --date-relative --time --include-list --exclude-list --include-list-id --exclude-list-id --list-match --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --color --symbol --emoji --match --filter-json --flagged --priority --tags --tag-match --any-tag --untagged --date --date-today-include-past-due --date-on --date-before --date-after --date-range --date-relative --time --include-list --exclude-list --include-list-id --exclude-list-id --list-match --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
         return
     elif [ "$cmd" = "smart-list-edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --smart-list-id --match --filter-json --flagged --priority --tags --tag-match --any-tag --untagged --date --date-today-include-past-due --date-on --date-before --date-after --date-range --date-relative --time --include-list --exclude-list --include-list-id --exclude-list-id --list-match --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --smart-list-id --color --symbol --emoji --match --filter-json --flagged --priority --tags --tag-match --any-tag --untagged --date --date-today-include-past-due --date-on --date-before --date-after --date-range --date-relative --time --include-list --exclude-list --include-list-id --exclude-list-id --list-match --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
         return
     elif [ "$cmd" = "smart-list-delete" ]; then
         COMPREPLY=( $(compgen -W "--private --smart-list-id --force --json" -- "$cur") )
@@ -4891,6 +4953,9 @@ complete -c remctl -n "__fish_seen_subcommand_from list-create" -l private -d "U
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Official Reminders list symbol name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l emoji -d "Private Reminders list emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l private -d "Use private ReminderKit smart-list creation"
+complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l color -d "Smart-list color name or #RRGGBB" -r
+complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l symbol -d "Official Reminders list symbol" -r
+complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l emoji -d "Private Reminders emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l flagged -d "Filter to flagged reminders"
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l priority -d "Priority filter" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l json -d "JSON output"
@@ -5777,6 +5842,7 @@ def main():
             "  remctl smart-list-create \"Tagged or Today\" --private --match any --tags remctl --date today\n"
             "  remctl smart-list-create \"Work and Projects\" --private --include-list-id 135 --include-list-id 144\n"
             "  remctl smart-list-create \"Work and Projects (All)\" --private --include-list-id 135 --include-list-id 144 --list-match all\n"
+            "  remctl smart-list-create \"Due Before June 1\" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆\n"
             "  remctl smart-list-create \"Near Home\" --private --location-title Home --latitude 41.9 --longitude 12.5 --proximity enter\n"
             "\n"
             "This command never writes SQLite directly. Unknown smart-list filter shapes are rejected."
@@ -5785,6 +5851,9 @@ def main():
     )
     c.add_argument("name")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit smart-list creation")
+    c.add_argument("--color", help="Smart-list color name or #RRGGBB")
+    c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
+    c.add_argument("--emoji", help="Private Reminders list emoji badge")
     add_smart_list_filter_arguments(c)
     js(c)
 
@@ -5798,6 +5867,7 @@ def main():
         epilog=(
             "Examples:\n"
             "  remctl smart-list-edit \"Flagged Review\" --private --priority high\n"
+            "  remctl smart-list-edit \"Due Before June 1\" --private --color red --emoji 📆\n"
             "  remctl smart-list-edit --smart-list-id 170 --private --match any --tags remctl,codex\n"
         ),
         formatter_class=HelpFormatter,
@@ -5805,6 +5875,9 @@ def main():
     c.add_argument("name", nargs="?", help="Custom smart list name")
     c.add_argument("--smart-list-id", type=int, help="Edit by numeric smart-list ID from smart-lists")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit smart-list editing")
+    c.add_argument("--color", help="Smart-list color name or #RRGGBB")
+    c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
+    c.add_argument("--emoji", help="Private Reminders list emoji badge")
     add_smart_list_filter_arguments(c)
     js(c)
 

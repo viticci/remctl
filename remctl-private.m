@@ -43,7 +43,9 @@
 
 @interface REMSmartListChangeItem : NSObject
 - (id)remObjectID;
+- (id)appearanceContext;
 - (id)customContext;
+- (void)setColor:(id)color;
 - (void)setFilterData:(NSData *)filterData;
 - (void)setName:(NSString *)name;
 - (void)setParentOwnerID:(id)objectID;
@@ -53,6 +55,8 @@
 
 @interface REMSmartListCustomContextChangeItem : NSObject
 - (void)setName:(NSString *)name;
+- (void)setColor:(id)color;
+- (void)setBadge:(id)badge;
 @end
 
 @interface REMSmartList : NSObject
@@ -104,6 +108,7 @@
 @end
 
 @interface REMListBadge : NSObject
+- (instancetype)initWithEmblem:(NSString *)emblem;
 - (instancetype)initWithEmoji:(NSString *)emoji;
 @end
 
@@ -141,6 +146,9 @@
 - (instancetype)initWithTrigger:(id)trigger;
 @end
 
+static NSString *normalizedColorName(NSString *value);
+static REMColor *makeREMColor(NSString *value);
+
 static void output(NSDictionary *dict) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
     if (data) {
@@ -163,6 +171,67 @@ static void setCustomSmartListSupportedVersion(id change) {
         [change setValue:version forKey:@"effectiveMinimumSupportedVersion"];
     } @catch (NSException *exception) {
         fail([NSString stringWithFormat:@"Could not set custom smart list supported version: %@", exception.reason ?: exception.name]);
+    }
+}
+
+static void applyListAppearance(id change, NSDictionary *cmd, NSMutableDictionary *details, NSString *targetDescription) {
+    NSString *color = cmd[@"color"];
+    if ([color isKindOfClass:[NSString class]] && color.length) {
+        id colorTarget = change;
+        if (![colorTarget respondsToSelector:@selector(setColor:)] && [change respondsToSelector:@selector(customContext)]) {
+            id customContext = [change customContext];
+            if ([customContext respondsToSelector:@selector(setColor:)]) {
+                colorTarget = customContext;
+            }
+        }
+        if (![colorTarget respondsToSelector:@selector(setColor:)]) {
+            fail([NSString stringWithFormat:@"%@ does not support color changes", targetDescription ?: @"Target"]);
+        }
+        [colorTarget setColor:makeREMColor(color)];
+        details[@"color"] = normalizedColorName(color) ?: color;
+    }
+
+    NSString *symbol = cmd[@"symbol"];
+    NSString *emoji = cmd[@"emoji"];
+    if (([symbol isKindOfClass:[NSString class]] && symbol.length) || ([emoji isKindOfClass:[NSString class]] && emoji.length)) {
+        id appearance = nil;
+        id badgeTarget = nil;
+        if ([change respondsToSelector:@selector(appearanceContext)]) {
+            appearance = [change appearanceContext];
+        }
+        if (!appearance && [change respondsToSelector:@selector(setBadge:)]) {
+            badgeTarget = change;
+        }
+        if (!appearance && !badgeTarget && [change respondsToSelector:@selector(customContext)]) {
+            id customContext = [change customContext];
+            if ([customContext respondsToSelector:@selector(setBadge:)]) {
+                badgeTarget = customContext;
+            }
+        }
+        if (!appearance && !badgeTarget) {
+            fail([NSString stringWithFormat:@"%@ does not support badge changes", targetDescription ?: @"Target"]);
+        }
+        if (appearance && ![appearance respondsToSelector:@selector(setBadge:)] && ![appearance respondsToSelector:@selector(setBadgeEmblem:)]) {
+            fail([NSString stringWithFormat:@"Could not create %@ appearance context", targetDescription ?: @"target"]);
+        }
+        if ([symbol isKindOfClass:[NSString class]] && symbol.length) {
+            if (appearance && [appearance respondsToSelector:@selector(setBadgeEmblem:)]) {
+                [appearance setBadgeEmblem:symbol];
+            } else {
+                id badge = [[REMListBadge alloc] initWithEmblem:symbol];
+                [badgeTarget setBadge:badge];
+            }
+            details[@"symbol"] = symbol;
+        }
+        if ([emoji isKindOfClass:[NSString class]] && emoji.length) {
+            id badge = [[REMListBadge alloc] initWithEmoji:emoji];
+            if (appearance) {
+                [appearance setBadge:badge];
+            } else {
+                [badgeTarget setBadge:badge];
+            }
+            details[@"emoji"] = emoji;
+        }
     }
 }
 
@@ -494,19 +563,22 @@ int main(int argc, const char * argv[]) {
             [change setSmartListType:@"com.apple.reminders.smartlist.custom"];
             [change setFilterData:filterData];
 
+            NSMutableDictionary *details = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"status": @"created",
+                @"action": action,
+                @"name": name,
+            }];
+            applyListAppearance(change, cmd, details, @"Smart list");
+
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit smart list save failed");
             }
             id objectID = [change remObjectID];
             NSString *uuid = objectID && [objectID respondsToSelector:@selector(uuid)] ? [[objectID uuid] UUIDString] : @"";
             NSString *url = objectID && [objectID respondsToSelector:@selector(urlRepresentation)] ? [[objectID urlRepresentation] absoluteString] : @"";
-            output(@{
-                @"status": @"created",
-                @"action": action,
-                @"name": name,
-                @"id": uuid ?: @"",
-                @"url": url ?: @"",
-            });
+            details[@"id"] = uuid ?: @"";
+            details[@"url"] = url ?: @"";
+            output(details);
             return 0;
         }
         if ([action isEqualToString:@"update_smart_list"]) {
@@ -522,8 +594,12 @@ int main(int argc, const char * argv[]) {
             if (name && ![name isKindOfClass:[NSString class]]) {
                 fail(@"name must be a string");
             }
-            if (!filterData && (!name || name.length == 0)) {
-                fail(@"name or filterData is required");
+            BOOL hasAppearanceChange =
+                ([cmd[@"color"] isKindOfClass:[NSString class]] && [cmd[@"color"] length] > 0) ||
+                ([cmd[@"symbol"] isKindOfClass:[NSString class]] && [cmd[@"symbol"] length] > 0) ||
+                ([cmd[@"emoji"] isKindOfClass:[NSString class]] && [cmd[@"emoji"] length] > 0);
+            if (!filterData && (!name || name.length == 0) && !hasAppearanceChange) {
+                fail(@"name, filterData, or appearance metadata is required");
             }
             NSURL *objectURL = smartListURL(smartListID);
             id objectID = [REMObjectID objectIDWithURL:objectURL];
@@ -549,14 +625,16 @@ int main(int argc, const char * argv[]) {
             if (name.length > 0) {
                 [change setName:name];
             }
-            if (![save saveSynchronouslyWithError:&error]) {
-                fail(error.localizedDescription ?: @"ReminderKit smart list update failed");
-            }
-            output(@{
+            NSMutableDictionary *details = [NSMutableDictionary dictionaryWithDictionary:@{
                 @"status": @"updated",
                 @"action": action,
                 @"id": smartListID,
-            });
+            }];
+            applyListAppearance(change, cmd, details, @"Smart list");
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit smart list update failed");
+            }
+            output(details);
             return 0;
         }
         if ([action isEqualToString:@"delete_smart_list"]) {
@@ -637,23 +715,7 @@ int main(int argc, const char * argv[]) {
                 [change setName:newName];
                 details[@"name"] = newName;
             }
-            NSString *color = cmd[@"color"];
-            if ([color isKindOfClass:[NSString class]] && color.length) {
-                [change setColor:makeREMColor(color)];
-                details[@"color"] = normalizedColorName(color) ?: color;
-            }
-            id appearance = [change appearanceContext];
-            NSString *symbol = cmd[@"symbol"];
-            NSString *emoji = cmd[@"emoji"];
-            if ([symbol isKindOfClass:[NSString class]] && symbol.length) {
-                [appearance setBadgeEmblem:symbol];
-                details[@"symbol"] = symbol;
-            }
-            if ([emoji isKindOfClass:[NSString class]] && emoji.length) {
-                id badge = [[REMListBadge alloc] initWithEmoji:emoji];
-                [appearance setBadge:badge];
-                details[@"emoji"] = emoji;
-            }
+            applyListAppearance(change, cmd, details, @"List");
 
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit list save failed");

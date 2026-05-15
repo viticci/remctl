@@ -80,6 +80,7 @@ remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
 remctl smart-lists --json
 remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "Tagged or Today" --private --match any --tags remctl --date today
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
 remctl smart-list-edit "Tagged or Today" --private --include-list Work --date no-date
 remctl smart-list-delete "Flagged Review" --private --force
 remctl list-edit Projects --private --color orange --symbol education3
@@ -99,11 +100,12 @@ RemCTL can inspect built-in and custom smart lists with `smart-lists`. It can al
 remctl smart-lists --json
 remctl smart-list-create "Tagged or Today" --private --match any --tags remctl --date today
 remctl smart-list-create "Work and Projects" --private --include-list-id 135 --include-list-id 144
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
 remctl smart-list-edit --smart-list-id 170 --private --priority high
 remctl smart-list-delete "Tagged or Today" --private --force
 ```
 
-Smart-list writes are private ReminderKit writes and always require `--private`; RemCTL rejects unknown filter shapes before saving. Reminders supports only one `lists` filter family in a smart list. To filter by multiple lists, add multiple selected lists inside that one filter by repeating `--include-list`, `--exclude-list`, `--include-list-id`, or `--exclude-list-id`; repeated included lists default to union behavior (`--list-match any`) so smart lists can aggregate Work and Projects. Do not model multiple independent list-filter rows for one smart list. Use:
+Smart-list writes are private ReminderKit writes and always require `--private`; RemCTL rejects unknown filter shapes before saving. Smart lists support the same private appearance flags as lists: `--color`, `--symbol`, and `--emoji`. Reminders supports only one `lists` filter family in a smart list. To filter by multiple lists, add multiple selected lists inside that one filter by repeating `--include-list`, `--exclude-list`, `--include-list-id`, or `--exclude-list-id`; repeated included lists default to union behavior (`--list-match any`) so smart lists can aggregate Work and Projects. Do not model multiple independent list-filter rows for one smart list. Use:
 
 - [docs/commands.md#smart-lists](docs/commands.md#smart-lists) for command syntax and supported filters.
 - [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples) for private API behavior, safety notes, and reverse-engineered filter storage details.
@@ -127,11 +129,11 @@ remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "Tagged or Today" --private --match any --tags remctl --date today
 remctl smart-list-create "Work No Date" --private --include-list Work --date no-date
 remctl smart-list-create "Near Home" --private --location-title Home --latitude 41.9 --longitude 12.5 --proximity enter
-remctl smart-list-edit "Tagged or Today" --private --priority high
+remctl smart-list-edit "Tagged or Today" --private --priority high --color red --emoji 📆
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list appearance metadata, and experimental custom smart-list creation/editing/deletion for the official Reminders filters: tags, date, time, priority, flag, location, lists, and all/any matching. `smart-lists` is read-only and safe; `smart-list-create`, `smart-list-edit`, and `smart-list-delete` require `--private`, and filter writes reject unknown shapes before writing. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
+Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list and smart-list appearance metadata, and experimental custom smart-list creation/editing/deletion for the official Reminders filters: tags, date, time, priority, flag, location, lists, and all/any matching. `smart-lists` is read-only and safe; `smart-list-create`, `smart-list-edit`, and `smart-list-delete` require `--private`, and filter writes reject unknown shapes before writing. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges on both lists and smart lists. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
 
 This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, reminder metadata writes should be verified with `remctl info ID --json`, and smart-list writes should be verified with `remctl smart-lists --json` plus a UI/device check when sync behavior matters.
 

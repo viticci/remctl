@@ -157,13 +157,14 @@ remctl smart-list-create "Tagged or Today" --private --match any --tags remctl -
 remctl smart-list-create "Work No Date" --private --include-list Work --date no-date
 remctl smart-list-create "Work and Projects" --private --include-list-id 135 --include-list-id 144
 remctl smart-list-create "Work and Projects (All)" --private --include-list-id 135 --include-list-id 144 --list-match all
-remctl smart-list-edit "Tagged or Today" --private --priority high
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
+remctl smart-list-edit "Tagged or Today" --private --priority high --color red --emoji 📆
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
 `smart-lists` is a read-only inspector. It reports built-in and custom smart lists with numeric ID, object UUID, smart-list type, filter byte length, and a decoded summary when RemCTL recognizes the filter payload.
 
-`smart-list-create` and `smart-list-edit` are private ReminderKit support and always require `--private`. They support the official Reminders smart-list filters decoded from Reminders.app: `--tags`, `--any-tag`, `--untagged`, `--date`, `--date-on`, `--date-before`, `--date-after`, `--date-range`, `--date-relative`, `--time`, `--priority`, `--flagged`, `--vehicle`, specific `--location-title`/coordinates, `--include-list`, `--exclude-list`, `--include-list-id`, `--exclude-list-id`, `--list-match all|any`, and top-level `--match all|any`. Reminders supports only one `lists` filter family per smart list; repeat list flags to add selected lists to that single filter. Repeated included lists default to `--list-match any`, which is the expected union behavior for aggregating multiple Reminders lists.
+`smart-list-create` and `smart-list-edit` are private ReminderKit support and always require `--private`. They support private appearance flags (`--color`, `--symbol`, and `--emoji`) plus the official Reminders smart-list filters decoded from Reminders.app: `--tags`, `--any-tag`, `--untagged`, `--date`, `--date-on`, `--date-before`, `--date-after`, `--date-range`, `--date-relative`, `--time`, `--priority`, `--flagged`, `--vehicle`, specific `--location-title`/coordinates, `--include-list`, `--exclude-list`, `--include-list-id`, `--exclude-list-id`, `--list-match all|any`, and top-level `--match all|any`. Reminders supports only one `lists` filter family per smart list; repeat list flags to add selected lists to that single filter. Repeated included lists default to `--list-match any`, which is the expected union behavior for aggregating multiple Reminders lists.
 
 `smart-list-edit` replaces the filter for an existing custom smart list by exact name or `--smart-list-id`. `smart-list-delete` only matches custom smart lists by exact name or `--smart-list-id`, never built-in smart lists, and requires `--private`.
 

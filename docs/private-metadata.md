@@ -114,15 +114,16 @@ remctl smart-list-create "Tagged or Today" --private --match any --tags remctl -
 remctl smart-list-create "Work No Date" --private --include-list Work --date no-date
 remctl smart-list-create "Work and Projects" --private --include-list-id 135 --include-list-id 144
 remctl smart-list-create "Work and Projects (All)" --private --include-list-id 135 --include-list-id 144 --list-match all
-remctl smart-list-edit "Tagged or Today" --private --priority high
+remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
+remctl smart-list-edit "Tagged or Today" --private --priority high --color red --emoji 📆
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
 `smart-lists` is read-only and safe. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads.
 
-`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts the official Reminders filters decoded from Reminders.app: tags, date, time, priority, flag, location, lists, and all/any matching. Reminders supports one `lists` filter family per smart list; repeated list flags add selections to that single filter. Repeated included lists default to union behavior with `--list-match any`; pass `--list-match all` only when you intentionally want the stricter list operation. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
+`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts private appearance flags plus the official Reminders filters decoded from Reminders.app: tags, date, time, priority, flag, location, lists, and all/any matching. Reminders supports one `lists` filter family per smart list; repeated list flags add selections to that single filter. Repeated included lists default to union behavior with `--list-match any`; pass `--list-match all` only when you intentionally want the stricter list operation. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
 
-`smart-list-edit` fetches an existing custom smart list by exact name or numeric `--smart-list-id`, replaces its `filterData` through ReminderKit, and requires `--private`. It never edits built-in smart lists.
+`smart-list-edit` fetches an existing custom smart list by exact name or numeric `--smart-list-id`, replaces its `filterData` and/or private appearance metadata through ReminderKit, and requires `--private`. It never edits built-in smart lists.
 
 `smart-list-delete` deletes through ReminderKit and requires `--private`. It only targets custom smart lists by exact name or numeric `--smart-list-id`; built-in smart lists are never matched.
 
