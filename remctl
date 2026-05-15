@@ -418,7 +418,8 @@ def q_lists(db):
 
 def q_smart_lists(db):
     return db.execute(
-        "SELECT Z_PK, ZNAME, ZCKIDENTIFIER, ZSMARTLISTTYPE, ZFILTERDATA FROM ZREMCDBASELIST "
+        "SELECT Z_PK, ZNAME, ZCKIDENTIFIER, ZSMARTLISTTYPE, ZFILTERDATA, "
+        "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND (Z_ENT = 4 OR ZSMARTLISTTYPE IS NOT NULL) "
         "ORDER BY COALESCE(ZNAME, ''), Z_PK"
     ).fetchall()
@@ -2762,6 +2763,16 @@ def smart_list_to_dict(row):
         "smartListType": row["ZSMARTLISTTYPE"],
         "filterLength": len(filter_data) if filter_data else 0,
     }
+    try:
+        minimum_version = row["ZMINIMUMSUPPORTEDAPPVERSION"]
+        effective_minimum_version = row["ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION"]
+    except (IndexError, KeyError):
+        minimum_version = None
+        effective_minimum_version = None
+    if minimum_version is not None:
+        payload["minimumSupportedVersion"] = minimum_version
+    if effective_minimum_version is not None:
+        payload["effectiveMinimumSupportedVersion"] = effective_minimum_version
     if decoded["summary"] is not None:
         payload["filter"] = decoded["summary"]
     if decoded["encoding"]:

@@ -156,6 +156,16 @@ static void fail(NSString *message) {
     exit(1);
 }
 
+static void setCustomSmartListSupportedVersion(id change) {
+    NSNumber *version = @(20220430);
+    @try {
+        [change setValue:version forKey:@"minimumSupportedVersion"];
+        [change setValue:version forKey:@"effectiveMinimumSupportedVersion"];
+    } @catch (NSException *exception) {
+        fail([NSString stringWithFormat:@"Could not set custom smart list supported version: %@", exception.reason ?: exception.name]);
+    }
+}
+
 static NSArray<NSString *> *stringArray(id value, NSString *field) {
     if (!value || value == [NSNull null]) {
         return @[];
@@ -479,6 +489,8 @@ int main(int argc, const char * argv[]) {
             if (customContext && [customContext respondsToSelector:@selector(setName:)]) {
                 [(REMSmartListCustomContextChangeItem *)customContext setName:name];
             }
+            // Reminders' edit UI ignores filterData when this stays at the default 0.
+            setCustomSmartListSupportedVersion(change);
             [change setSmartListType:@"com.apple.reminders.smartlist.custom"];
             [change setFilterData:filterData];
 
@@ -530,6 +542,7 @@ int main(int argc, const char * argv[]) {
                 fail(@"Could not create ReminderKit smart list change item");
             }
             [change setSmartListType:@"com.apple.reminders.smartlist.custom"];
+            setCustomSmartListSupportedVersion(change);
             if (filterData) {
                 [change setFilterData:filterData];
             }

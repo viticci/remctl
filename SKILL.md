@@ -92,7 +92,7 @@ Private metadata rules:
 - `smart-lists` is read-only and safe. `smart-list-create`, `smart-list-edit`, and `smart-list-delete` use unsupported private ReminderKit APIs and require `--private`; filter writes support the official Reminders filters decoded from Reminders.app.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private reminder writes with `remctl info <numeric-id> --json`.
-- Verify custom smart-list writes with `remctl smart-lists --json` and check the target custom smart list, decoded filter summary, and `filter.supported`.
+- Verify custom smart-list writes with `remctl smart-lists --json` and check the target custom smart list, decoded filter summary, `filter.supported`, and `minimumSupportedVersion`/`effectiveMinimumSupportedVersion` `20220430`; Reminders.app can show zero filters when those private version fields are left at `0`.
 - If cross-device sync matters, ask the user to check iPhone/iPad after CLI verification.
 
 ## Smart List Filters

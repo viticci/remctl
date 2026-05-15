@@ -233,24 +233,28 @@ class CliTests(unittest.TestCase):
         db.execute(
             "CREATE TABLE ZREMCDBASELIST ("
             "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, "
-            "Z_ENT INTEGER, ZSMARTLISTTYPE TEXT, ZFILTERDATA BLOB)"
+            "Z_ENT INTEGER, ZSMARTLISTTYPE TEXT, ZFILTERDATA BLOB, "
+            "ZMINIMUMSUPPORTEDAPPVERSION INTEGER, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER)"
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
-            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA) "
-            "VALUES (?, ?, ?, 0, 4, ?, ?)",
-            (1, None, "BUILTIN-1", "com.apple.reminders.smartlist.flagged", None),
+            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
+            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?)",
+            (1, None, "BUILTIN-1", "com.apple.reminders.smartlist.flagged", None, 0, 0),
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
-            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA) "
-            "VALUES (?, ?, ?, 0, 4, ?, ?)",
-            (2, "High Priority", "CUSTOM-1", self.remctl.CUSTOM_SMART_LIST_TYPE, b'{"priorities":["high"]}'),
+            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
+            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?)",
+            (2, "High Priority", "CUSTOM-1", self.remctl.CUSTOM_SMART_LIST_TYPE, b'{"priorities":["high"]}', 20220430, 20220430),
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
-            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA) "
-            "VALUES (?, ?, ?, 0, 3, NULL, NULL)",
+            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
+            "VALUES (?, ?, ?, 0, 3, NULL, NULL, NULL, NULL)",
             (10, "Reminders", "LIST-1"),
         )
         return db
@@ -271,6 +275,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[0]["name"], "Flagged")
         self.assertEqual(payload[0]["filterLength"], 0)
         self.assertEqual(payload[1]["kind"], "custom")
+        self.assertEqual(payload[1]["minimumSupportedVersion"], 20220430)
+        self.assertEqual(payload[1]["effectiveMinimumSupportedVersion"], 20220430)
         self.assertEqual(payload[1]["filter"]["kind"], "priority")
         self.assertEqual(payload[1]["filterJSON"], {"priorities": ["high"]})
 

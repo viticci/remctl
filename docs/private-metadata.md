@@ -120,7 +120,7 @@ remctl smart-list-delete "Flagged Review" --private --force
 
 `smart-lists` is read-only and safe. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads.
 
-`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts the official Reminders filters decoded from Reminders.app: tags, date, time, priority, flag, location, lists, and all/any matching. Repeated included lists default to union behavior with `--list-match any`; pass `--list-match all` only when you intentionally want the stricter list operation. It does not write SQLite.
+`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts the official Reminders filters decoded from Reminders.app: tags, date, time, priority, flag, location, lists, and all/any matching. Repeated included lists default to union behavior with `--list-match any`; pass `--list-match all` only when you intentionally want the stricter list operation. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
 
 `smart-list-edit` fetches an existing custom smart list by exact name or numeric `--smart-list-id`, replaces its `filterData` through ReminderKit, and requires `--private`. It never edits built-in smart lists.
 
