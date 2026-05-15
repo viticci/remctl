@@ -116,7 +116,8 @@ remctl list-symbols
 remctl list-symbols --json
 remctl list-create "Project X" --color blue
 remctl list-create "Project X" --color orange --private --symbol education3
-remctl list-edit "Project X" --private --color '#FF8D28' --symbol pencil.and.ruler
+remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
+remctl list-edit "Project X" --private --color '#FF8D28' --symbol education3
 remctl list-edit --list-id 144 --private --emoji 📌
 remctl list-rename "Project X" "Project Y"
 remctl list-delete "Project Y" --force
@@ -126,7 +127,7 @@ remctl list-delete "Project Y" --force
 
 List symbols and emoji badges are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance editor; use `--list-id` when duplicate or normalized names could match more than one list. With `--private`, `--color` also accepts `#RRGGBB`.
 
-`list-symbols` prints the 71 official Reminders emblem names bundled in RemindersUICore. Reminders stores picker icons as private emblem names, not public SF Symbol names. For example, the pencil/ruler icon shown by Reminders for Federico's Projects list is stored as `education3`. Arbitrary symbol strings such as `pencil.and.ruler` can be saved through ReminderKit, but Reminders may not render every string in its UI.
+`list-symbols` prints the 71 official Reminders emblem names bundled in RemindersUICore. Reminders stores picker icons as private emblem names, not public SF Symbol names. For example, the pencil/ruler icon shown by Reminders for Federico's Projects list is stored as `education3`. `--symbol` is intentionally restricted to official names because arbitrary SF Symbol strings can be accepted by ReminderKit but render as the default list icon in Reminders. Use `--emoji` for custom standard emoji badges.
 
 ## Import and Export
 

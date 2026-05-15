@@ -85,7 +85,7 @@ remctl list-symbols
 remctl list-create "Research" --color orange --private --symbol education3
 remctl list-create "Focus" --private --color '#34C759' --emoji 🎯
 remctl list-edit Projects --private --color orange --symbol education3
-remctl list-edit --list-id 144 --private --symbol pencil.and.ruler
+remctl list-edit --list-id 144 --private --symbol education3
 remctl list-edit Projects --private --emoji 📌
 ```
 
@@ -95,8 +95,8 @@ Important limits:
 
 - `list-create --color NAME` works without `--private` through EventKit for normal color names.
 - `list-create --private --color '#RRGGBB'` and `list-edit --private --color '#RRGGBB'` use private ReminderKit for exact custom colors.
-- `--symbol` writes an emblem string. Reminders' own picker uses private names such as `education3`; arbitrary SF Symbol strings can be stored but may not render in Reminders on every OS/device.
-- `--emoji` writes a Reminders emoji badge.
+- `--symbol` writes one of the official Reminders emblem names printed by `list-symbols`. Reminders' own picker uses private names such as `education3`; arbitrary SF Symbol strings are rejected because they fall back to the default icon in Reminders.
+- `--emoji` writes a Reminders emoji badge for standard emoji such as `🥶` or `📌`.
 - `list-edit` resolves by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
 
 ## Guardrails

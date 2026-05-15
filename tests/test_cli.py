@@ -113,6 +113,18 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_list_create(args)
         bridge_available.assert_not_called()
 
+    def test_list_create_rejects_unsupported_symbol_before_bridge(self):
+        args = SimpleNamespace(name="Project X", color=None, private=True, symbol="sparkles", emoji=None, json=True)
+        with (
+            mock.patch.object(self.remctl, "bridge_available") as bridge_available,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_list_create(args)
+        bridge_available.assert_not_called()
+        self.assertIn("unsupported list symbol", stderr.getvalue())
+        self.assertIn("list-symbols", stderr.getvalue())
+
     def test_list_edit_private_targets_resolved_list_id(self):
         db = self._list_db(["Projects"])
         args = SimpleNamespace(
@@ -121,7 +133,7 @@ class CliTests(unittest.TestCase):
             new_name=None,
             color="#123456",
             private=True,
-            symbol="pencil.and.ruler",
+            symbol="education3",
             emoji=None,
             json=True,
         )
@@ -141,7 +153,7 @@ class CliTests(unittest.TestCase):
                 "action": "set_list_appearance",
                 "listId": "CK-1",
                 "color": "#123456",
-                "symbol": "pencil.and.ruler",
+                "symbol": "education3",
             },
         )
 

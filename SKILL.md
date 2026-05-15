@@ -49,7 +49,8 @@ remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring lates
 remctl edit 23880 --private --flagged --urgent --json
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --json
 remctl list-create "Research" --color orange --private --symbol education3 --json
-remctl list-edit Projects --private --color '#FF8D28' --symbol pencil.and.ruler --json
+remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶 --json
+remctl list-edit Projects --private --color '#FF8D28' --symbol education3 --json
 remctl list-edit --list-id 144 --private --emoji 📌 --json
 ```
 
@@ -61,7 +62,7 @@ Private metadata rules:
 - `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
-- `list-symbols` prints the 71 official Reminders emblem names. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write private list symbols, emoji badges, and exact `#RRGGBB` colors. Reminders' picker icons use private emblem names such as `education3`; arbitrary SF Symbol strings can be saved but may not render on every OS/device.
+- `list-symbols` prints the 71 official Reminders emblem names. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private` and `list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
 - List names resolve exact first, then case-insensitive, then normalized names such as `Weekly 513` for `🗓️ Weekly 513`. If multiple lists match, RemCTL fails before writing; use `--list-id`.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private writes with `remctl info <numeric-id> --json`; if cross-device sync matters, ask the user to check iPhone/iPad.

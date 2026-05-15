@@ -278,6 +278,8 @@ OFFICIAL_LIST_SYMBOLS = [
     ("work5", "ListBadgeWork5", "★"),
 ]
 
+OFFICIAL_LIST_SYMBOL_NAMES = {name for name, _, _ in OFFICIAL_LIST_SYMBOLS}
+
 def normalize_list_color(value):
     if not value:
         return None
@@ -1522,8 +1524,14 @@ def validate_list_appearance_args(a):
     if symbol and emoji:
         print("Error: pass either --symbol or --emoji, not both.", file=sys.stderr)
         sys.exit(1)
-    color = getattr(a, "color", None)
-    validate_list_color(color, private=private_metadata_enabled(a))
+    if symbol is not None:
+        normalized_symbol = symbol.strip()
+        if not normalized_symbol:
+            print("Error: --symbol cannot be empty.", file=sys.stderr)
+            sys.exit(1)
+    if emoji is not None and not emoji.strip():
+        print("Error: --emoji cannot be empty.", file=sys.stderr)
+        sys.exit(1)
     if (symbol or emoji) and not private_metadata_enabled(a):
         print(
             "Error: list symbols and emojis require --private. "
@@ -1531,6 +1539,17 @@ def validate_list_appearance_args(a):
             file=sys.stderr,
         )
         sys.exit(1)
+    if symbol is not None:
+        normalized_symbol = symbol.strip()
+        if normalized_symbol not in OFFICIAL_LIST_SYMBOL_NAMES:
+            print(
+                f"Error: unsupported list symbol {normalized_symbol!r}. "
+                "Run `remctl list-symbols` to see official names, or use --emoji for custom emoji badges.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    color = getattr(a, "color", None)
+    validate_list_color(color, private=private_metadata_enabled(a))
 
 def list_private_appearance_payload(a, *, include_public_color_names=True):
     payload = {}
@@ -3958,13 +3977,13 @@ complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell c
 complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Print agent-focused context and TCC guidance"
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l color -d "List color name; with --private also accepts #RRGGBB" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l private -d "Use private ReminderKit list appearance writes"
-complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Private Reminders list emblem name" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Official Reminders list symbol name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l emoji -d "Private Reminders list emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l list-id -d "Edit a list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l new-name -d "Rename the list through private ReminderKit" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l color -d "List color name or #RRGGBB" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l private -d "Required for list appearance writes"
-complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l symbol -d "Private Reminders list emblem name" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l symbol -d "Official Reminders list symbol name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l emoji -d "Private Reminders list emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsupported private ReminderKit metadata writes"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
@@ -4779,7 +4798,7 @@ def main():
     c.add_argument("name")
     c.add_argument("--color", help="List color name; with --private also accepts #RRGGBB")
     c.add_argument("--private", action="store_true", help="Use private ReminderKit for list symbol/emoji/exact color")
-    c.add_argument("--symbol", help="Private Reminders list emblem name, e.g. education3 or pencil.and.ruler")
+    c.add_argument("--symbol", help="Official Reminders list symbol name, e.g. education3; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge, e.g. 📌")
     js(c)
 
@@ -4788,7 +4807,7 @@ def main():
     c.add_argument("--list-id", type=int, help="Edit a list by stable numeric ID")
     c.add_argument("--new-name", help="Rename the list through private ReminderKit")
     c.add_argument("--color", help="List color name or #RRGGBB")
-    c.add_argument("--symbol", help="Private Reminders list emblem name")
+    c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge")
     c.add_argument("--private", action="store_true", help="Required for list appearance writes")
     js(c)

@@ -74,7 +74,8 @@ remctl add "Research" -l Projects --private --url "https://example.com" -t remct
 remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
 remctl list-symbols
 remctl list-create "Research" --color orange --private --symbol education3
-remctl list-edit Projects --private --color orange --symbol pencil.and.ruler
+remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
+remctl list-edit Projects --private --color orange --symbol education3
 remctl info 23880 --json
 ```
 
@@ -98,7 +99,7 @@ remctl list-edit Projects --private --color '#FF8D28' --symbol education3
 remctl list-edit Projects --private --emoji 📌
 ```
 
-Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, and list appearance metadata. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus private list symbols or emoji badges. `list-symbols` prints the 71 official Reminders emblem names. Reminders stores built-in icons as private emblem names such as `education3`; arbitrary SF Symbol names can be written, but Reminders may not render every symbol in its UI. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
+Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, and list appearance metadata. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges. `list-symbols` prints the 71 official Reminders emblem names. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
 
 This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, and agents should verify writes with `remctl info ID --json` plus a UI/device check when sync behavior matters.
 
