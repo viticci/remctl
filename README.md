@@ -77,6 +77,8 @@ remctl info 23880 --json
 
 The full command guide is in [docs/commands.md](docs/commands.md).
 
+Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
+
 ## Private API Features
 
 RemCTL's default writes use EventKit. For metadata Apple does not expose publicly, RemCTL has an explicit `--private` mode backed by `remctl-private`, an Objective-C helper that uses Apple's private ReminderKit framework and saves through the Reminders stack. RemCTL *never* writes directly to SQLite (which would break iCloud sync and cause database corruption issues).
@@ -150,6 +152,8 @@ remctl doctor --for-agent --json
 `search` matches reminder titles and notes. By default it searches active reminders; pass `--completed` to include completed reminders too.
 
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `info` includes private rich-link URLs, so agents should not need raw SQLite checks for ordinary rich-link verification.
+
+Agents should pass deterministic due dates, ideally `YYYY-MM-DD HH:MM` after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
 
 Do not mutate the Reminders SQLite database. Use RemCTL commands or EventKit.
 

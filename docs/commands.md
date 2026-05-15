@@ -179,12 +179,14 @@ JSON output preserves machine-readable fields:
 | `+Nh` | `-d +2h` |
 | `eod` | `-d eod` |
 | `eow` | `-d eow` |
+| `tonight at <time>` | `-d "tonight at 11"` |
+| `<day> at <time>` | `-d "Friday at 15:00"` |
 | `next <day>` | `-d "next friday"` |
 | `next <day> at <time>` | `-d "next monday at 3pm"` |
 | ISO date | `-d 2026-04-15` |
 | ISO date and time | `-d "2026-04-15 14:00"` |
 
-Natural-language parsing uses `parsedatetime` when it is installed. The core CLI has no required Python dependencies.
+If `-d/--due` is present and RemCTL cannot parse it, `add` and `edit` fail before writing. In `--json` mode, the error has `code: "invalid_due_date"` plus accepted examples so agents can retry with a deterministic value. Natural-language parsing uses `parsedatetime` when it is installed, but the core CLI has no required Python dependencies; agents should prefer `YYYY-MM-DD HH:MM` when they can resolve the date themselves.
 
 ## Setup Commands
 
@@ -209,3 +211,5 @@ remctl info <numericId> --json
 ```
 
 `add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, so raw SQLite verification should not be needed for normal rich-link tasks.
+
+If an agent supplies an invalid due date, RemCTL creates nothing and exits with a structured `invalid_due_date` error on stderr. Retry the same `add` command with one of the provided examples or a normalized `YYYY-MM-DD HH:MM` value; do not create first and patch the due date afterward.

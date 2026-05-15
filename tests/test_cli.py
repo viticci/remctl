@@ -29,12 +29,18 @@ class CliTests(unittest.TestCase):
     def test_parse_due_accepts_today_and_tomorrow_with_times(self):
         today_due = self.remctl.parse_due("today at 3pm")
         tomorrow_due = self.remctl.parse_due("tomorrow 15:30")
+        tonight_due = self.remctl.parse_due("tonight at 11")
+        friday_due = self.remctl.parse_due("Friday at 15:00")
 
         self.assertIsNotNone(today_due)
         self.assertEqual((today_due.hour, today_due.minute), (15, 0))
         self.assertIsNotNone(tomorrow_due)
         self.assertEqual((tomorrow_due.hour, tomorrow_due.minute), (15, 30))
         self.assertEqual((tomorrow_due.date() - today_due.date()).days, 1)
+        self.assertIsNotNone(tonight_due)
+        self.assertEqual((tonight_due.hour, tonight_due.minute), (23, 0))
+        self.assertIsNotNone(friday_due)
+        self.assertEqual((friday_due.hour, friday_due.minute), (15, 0))
 
     def test_parse_due_rejects_invalid_clock_time(self):
         self.assertIsNone(self.remctl.parse_due("today at 25:00"))
@@ -129,6 +135,73 @@ class CliTests(unittest.TestCase):
         bridge_call.assert_not_called()
         open_db.assert_not_called()
         self.assertIn("require --private", stderr.getvalue())
+
+    def test_cmd_add_rejects_unparseable_due_before_writing(self):
+        args = SimpleNamespace(
+            title="Should not be created",
+            list="Projects",
+            notes=None,
+            due="today at 25:00",
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            section=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            json=False,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_available") as bridge_available,
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.remctl.cmd_add(args)
+        self.assertEqual(raised.exception.code, 2)
+        bridge_available.assert_not_called()
+        bridge_call.assert_not_called()
+        self.assertIn("No reminder was created", stderr.getvalue())
+        self.assertIn("today at 3pm", stderr.getvalue())
+
+    def test_cmd_add_json_reports_structured_unparseable_due_error(self):
+        args = SimpleNamespace(
+            title="Should not be created",
+            list="Projects",
+            notes=None,
+            due="nonsense date",
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            section=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.remctl.cmd_add(args)
+        self.assertEqual(raised.exception.code, 2)
+        bridge_call.assert_not_called()
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["code"], "invalid_due_date")
+        self.assertEqual(payload["field"], "due")
+        self.assertEqual(payload["input"], "nonsense date")
+        self.assertIn("examples", payload)
 
     def test_cmd_edit_rejects_tags_without_private_before_reading_database(self):
         args = SimpleNamespace(

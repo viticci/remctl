@@ -73,6 +73,8 @@ remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --l
 
 `--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`, `address`). Public fields such as notes and due dates are applied through `remctl-bridge`; private fields such as rich links and tags are applied through `remctl-private`.
 
+Subtask due dates use the same parser as parent reminders. Invalid parent or subtask due dates fail before RemCTL creates or edits anything, so private metadata is not silently dropped onto a partially-created reminder.
+
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
 
 ## Guardrails

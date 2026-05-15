@@ -2199,18 +2199,59 @@ def parse_clock_time(value):
         return None
     return hour, minute
 
+def due_date_examples(now=None):
+    current = now or datetime.now()
+    today_text = current.strftime("%Y-%m-%d")
+    tomorrow_text = (current + timedelta(days=1)).strftime("%Y-%m-%d")
+    return [
+        f"{today_text} 15:00",
+        "today at 3pm",
+        "tomorrow 09:30",
+        "tonight at 11",
+        "Friday at 15:00",
+        "+3d",
+    ]
+
+def invalid_due_date_payload(value, field="due"):
+    return {
+        "status": "error",
+        "code": "invalid_due_date",
+        "field": field,
+        "input": value,
+        "message": "Could not parse due date. No reminder was created or changed.",
+        "examples": due_date_examples(),
+    }
+
+def fail_invalid_due_date(value, *, json_mode=False, field="due"):
+    payload = invalid_due_date_payload(value, field=field)
+    if json_mode:
+        print(json.dumps(payload), file=sys.stderr)
+    else:
+        print(f"Error: could not parse due date {value!r}.", file=sys.stderr)
+        print("No reminder was created or changed.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Use exact forms like:", file=sys.stderr)
+        for example in payload["examples"]:
+            print(f"  {example}", file=sys.stderr)
+    sys.exit(2)
+
 def parse_due(s):
     """Parse due date. Accepts:
       - ISO: 2026-04-15, 2026-04-15 14:00, 2026-04-15T14:00
-      - Shortcuts: today, today at 3pm, tomorrow 15:00, eod, eow, +3d, +1w, +2h, +1m
+      - Shortcuts: today, today at 3pm, tomorrow 15:00, tonight at 11, eod, eow, +3d, +1w, +2h, +1m
       - Relative: "in 3 days", "in 2 weeks"
-      - Named days: "next monday", "next friday at 3pm"
+      - Named days: "friday at 15:00", "next friday at 3pm"
       - Natural language (if parsedatetime installed): "march 30 2pm"
     """
     if not s: return None
     sl = s.lower().strip()
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     now = datetime.now()
+    days_map = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+        "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6
+    }
 
     # Exact shortcuts
     if sl == "today": return today
@@ -2231,6 +2272,20 @@ def parse_due(s):
             base = today if day_name == "today" else today + timedelta(days=1)
             return base.replace(hour=hour, minute=minute)
 
+    # "tonight at 11" means the next occurrence of that time, preferring today.
+    m = re.match(r'^tonight(?:\s+at)?\s+(.+)$', sl)
+    if m:
+        time_text = m.group(1)
+        parsed_time = parse_clock_time(time_text)
+        if parsed_time:
+            hour, minute = parsed_time
+            if not re.search(r'\b(?:am|pm)\b', time_text) and 1 <= hour <= 11:
+                hour += 12
+            dt = today.replace(hour=hour, minute=minute)
+            if dt <= now:
+                dt += timedelta(days=1)
+            return dt
+
     # Relative: +3d, +1w, +2m, +2h
     m = re.match(r'^[+]?(\d+)([dwmh])$', sl)
     if m:
@@ -2240,26 +2295,24 @@ def parse_due(s):
         if unit == 'h': return now + timedelta(hours=n)
         if unit == 'm': return today + timedelta(days=n * 30)
 
-    # "next monday", "next friday at 3pm"
-    days_map = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-        "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6
-    }
-    m = re.match(r'^next\s+(\w+)(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$', sl)
+    # "friday at 15:00", "fri 3pm", "this friday", "next friday at 3pm".
+    m = re.match(r'^(?:(next|this)\s+)?(\w+)(?:\s+(?:at\s+)?(.+))?$', sl)
     if m:
-        day_name, hour, minute, ampm = m.groups()
+        qualifier, day_name, time_text = m.groups()
         if day_name in days_map:
             target = days_map[day_name]
             days_ahead = (target - today.weekday()) % 7
-            if days_ahead == 0: days_ahead = 7
+            if qualifier == "next" and days_ahead == 0:
+                days_ahead = 7
             dt = today + timedelta(days=days_ahead)
-            if hour:
-                parsed_time = parse_clock_time(f"{hour}:{minute or '00'}{ampm or ''}")
+            if time_text:
+                parsed_time = parse_clock_time(time_text)
                 if not parsed_time:
                     return None
-                h, min_value = parsed_time
-                dt = dt.replace(hour=h, minute=min_value)
+                hour, minute = parsed_time
+                dt = dt.replace(hour=hour, minute=minute)
+                if qualifier != "next" and dt <= now:
+                    dt += timedelta(days=7)
             return dt
 
     # "in N days/weeks/hours/months"
@@ -2394,6 +2447,9 @@ def cmd_add(a):
     refuse_private_args_without_opt_in(a)
     title = a.title
     wants_private = private_metadata_enabled(a) and private_changes_from_args(a)
+    dt = parse_due(a.due)
+    if a.due and not dt:
+        fail_invalid_due_date(a.due, json_mode=getattr(a, "json", False))
     if wants_private and not bridge_available():
         print("Error: private metadata creation requires remctl-bridge so the reminder has a stable ID.", file=sys.stderr)
         sys.exit(1)
@@ -2419,9 +2475,6 @@ def cmd_add(a):
             if h not in title:
                 title += f" {h}"
     pm = {"high": 1, "h": 1, "medium": 5, "med": 5, "m": 5, "low": 9, "l": 9}
-    dt = parse_due(a.due)
-    if a.due and not dt:
-        print(f"Warning: Could not parse due date '{a.due}'. Creating reminder without due date.", file=sys.stderr)
 
     # Try bridge first
     if bridge_available():
@@ -2662,12 +2715,7 @@ def cmd_edit(a):
     if a.due and a.due != "clear":
         dt = parse_due(a.due)
         if dt is None:
-            print(
-                f"Error: could not parse due date {a.due!r}. Use ISO "
-                "(YYYY-MM-DD [HH:MM]) or shortcuts like today/tomorrow/eod/+3d.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            fail_invalid_due_date(a.due, json_mode=getattr(a, "json", False))
 
     # Auto double-tap: if Reminders' displayed due date already equals the
     # requested target, AppleScript treats it as a no-op and pushes only
@@ -4195,6 +4243,7 @@ def main():
         epilog=(
             "Examples:\n"
             "  remctl add \"Review PR\" -l Work -d tomorrow\n"
+            "  remctl add \"Ship notes\" -l Work -d \"Friday at 15:00\"\n"
             "  remctl add \"Research\" -l Projects --private --url https://example.com -t remctl --section Research\n"
             "  remctl add \"Research\" -l Projects --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8\n"
             "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
@@ -4202,12 +4251,13 @@ def main():
             "\n"
             "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
             "With --private, --url creates a synced web rich link and -t/--tags creates synced Reminders tags.\n"
+            "If -d/--due is present and cannot be parsed, add fails before creating the reminder.\n"
             "Private metadata is unsupported by Apple and never writes SQLite directly."
         ),
         formatter_class=HelpFormatter,
     )
     c.add_argument("title"); c.add_argument("-l", "--list")
-    c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD, today, tomorrow, +3d, eod, eow, 'next friday at 3pm'")
+    c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD, today, tomorrow, tonight at 11, Friday at 15:00, +3d, eod, eow")
     c.add_argument("-p", "--priority", help="high, medium, low")
     c.add_argument("-f", "--flag", action="store_true")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
