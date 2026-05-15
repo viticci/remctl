@@ -1532,25 +1532,28 @@ def validate_list_appearance_args(a):
         )
         sys.exit(1)
 
-def list_private_appearance_payload(a):
+def list_private_appearance_payload(a, *, include_public_color_names=True):
     payload = {}
     if getattr(a, "new_name", None):
         payload["name"] = a.new_name
-    if getattr(a, "color", None) and private_metadata_enabled(a):
-        payload["color"] = normalize_list_color(a.color)
+    color = getattr(a, "color", None)
+    if color and private_metadata_enabled(a):
+        normalized_color = normalize_list_color(color)
+        if include_public_color_names or (normalized_color and HEX_COLOR_RE.match(normalized_color)):
+            payload["color"] = normalized_color
     if getattr(a, "symbol", None):
         payload["symbol"] = a.symbol.strip()
     if getattr(a, "emoji", None):
         payload["emoji"] = a.emoji.strip()
     return payload
 
-def apply_private_list_appearance(db, list_pk, a, *, exit_on_error=True):
+def apply_private_list_appearance(db, list_pk, a, *, exit_on_error=True, include_public_color_names=True):
     require_private_metadata(a)
     ckid = q_list_ckid(db, list_pk)
     if not ckid:
         print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
         sys.exit(1)
-    payload = list_private_appearance_payload(a)
+    payload = list_private_appearance_payload(a, include_public_color_names=include_public_color_names)
     if not payload:
         return None
     payload.update({"action": "set_list_appearance", "listId": ckid})
@@ -3565,7 +3568,7 @@ def cmd_overdue(a):
 
 def cmd_list_create(a):
     validate_list_appearance_args(a)
-    private_payload_needed = bool(list_private_appearance_payload(a))
+    private_payload_needed = bool(list_private_appearance_payload(a, include_public_color_names=False))
     preflight_db = None
     if private_payload_needed:
         require_private_metadata(a)
@@ -3597,7 +3600,13 @@ def cmd_list_create(a):
             if not list_ref or list_ref.get("error"):
                 _print_list_resolution_error(a.name, list_ref)
                 sys.exit(1)
-            appearance_result = apply_private_list_appearance(db, list_ref["id"], a, exit_on_error=False)
+            appearance_result = apply_private_list_appearance(
+                db,
+                list_ref["id"],
+                a,
+                exit_on_error=False,
+                include_public_color_names=False,
+            )
             if not appearance_result or appearance_result.get("status") != "updated":
                 rollback = bridge_call({"action": "delete_list", "title": a.name}) if bridge_available() else None
                 message = appearance_result.get("message") if isinstance(appearance_result, dict) else "private helper failed"
