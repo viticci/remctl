@@ -2,7 +2,7 @@
 
 RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`.
 
-This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private list appearance and pinning commands, or custom smart-list creation/editing/deletion.
+This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private list appearance and pinning commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
 
 RemCTL still does not write directly to SQLite.
 
@@ -29,11 +29,13 @@ Verified on macOS/iCloud sync:
 - list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
 - list pin state: `list-pin "Project X" --private`, `list-unpin --list-id 144 --private`
 - custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
+- Reminders templates: `template-create "Packing Template" --from-list Packing --private`, `template-apply "Packing Template" --private`, and exact cleanup via `template-delete "Packing Template" --private --force`
 
 Not exposed:
 
 - generic file/PDF attachments. They are rejected because Reminders does not reliably display them.
 - guessed or undocumented smart-list filter keys beyond the official Reminders.app samples decoded by `smart-lists`.
+- iCloud template link creation. Existing template links can be read, but publishing/revoking links is not exposed.
 - raw SQLite writes. Earlier experiments proved direct row insertion can stay local-only and fail to sync.
 
 ## Create Examples
@@ -149,6 +151,30 @@ remctl smart-list-delete "Flagged Review" --private --force
 
 Developer note: on the verified macOS 26 store, `ZFILTERDATA` for custom smart lists is UTF-8 JSON bytes. The decoder also accepts older research samples that wrap the same JSON in an `NSKeyedArchiver` object whose root class is `ReminderKitInternal.REMCustomSmartListFilterDescriptor`, keyed field is `data`, and payload is UTF-8 JSON. Known decoded keys are `operation`, `hashtags`, `date`, `time`, `priorities`, `flagged`, `location`, and `lists`, but not every decoded shape materializes when written back. The `lists` key is a single filter descriptor; Reminders.app currently materializes only one included list through this write path.
 
+## Template Examples
+
+```bash
+remctl templates
+remctl templates --json
+remctl template-info "Rome: Things To See" --json
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-create "Archive Template" --from-list-id 144 --include-completed --private
+remctl template-apply "Packing Template" --private --json
+remctl template-delete "Packing Template" --private --force
+```
+
+Templates are stored separately from lists in `ZREMCDTEMPLATE`; their saved reminders live in `ZREMCDSAVEDREMINDER`, and template sections use `ZREMCDBASESECTION` with `ZTEMPLATE`. `templates` and `template-info` are read-only direct database inspectors. `template-info` decodes the saved-reminder `ZMETADATA` JSON envelope enough to expose titles, tags, flags, priority, recurrence rules, alarm trigger dictionaries, and metadata keys without dumping large rich-text blobs.
+
+`template-create` writes through `REMSaveRequest.addTemplateWithName:configuration:toAccountChangeItem:` after building a `REMTemplateConfiguration` from the source list object ID. It requires `--private`, rejects duplicate exact template names before saving, and never writes SQLite. `--include-completed` maps to ReminderKit's `shouldSaveCompleted` template configuration.
+
+`template-apply` fetches the template by object ID and calls `REMSaveRequest.addListUsingTemplate:toAccountChangeItem:`. The new list name is controlled by Reminders' template behavior. Verify the created list with `lists --json` and `show <list> --json`.
+
+`template-delete` fetches the template by object ID, updates it through ReminderKit, and removes it from the parent account. It deletes the saved template only; lists already created from that template are separate lists.
+
+Template writes are list-level only. RemCTL does not append individual reminders to existing templates, copy selected reminders into a template, or offer flags to strip subtasks or due dates while saving. Those operations would need a separate native ReminderKit API before they are safe enough for this CLI.
+
+Existing iCloud template links are read as `publicLink` when `ZPUBLICLINKURLUUID` exists. Creating or revoking iCloud sharing links is intentionally not implemented because the private `shareTemplate` operation did not reliably materialize a public link in the local store during testing.
+
 ## Guardrails
 
 Private-only options fail before writes unless `--private` is set.
@@ -161,6 +187,8 @@ remctl edit 23880 -t remctl
 remctl edit 23880 --urgent
 remctl add "Milk" -l Groceries --grocery
 remctl list-create "Groceries" --groceries
+remctl template-create "Packing Template" --from-list Packing
+remctl template-apply "Packing Template"
 ```
 
 These fail because they would otherwise look successful while silently dropping private metadata.
@@ -187,4 +215,4 @@ REMCTL_PRIVATE_PATH=/tmp/remctl-private remctl edit 23880 --private --url https:
 
 ## Agent Notes
 
-Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, so agents should not query SQLite directly for ordinary rich-link verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.
+Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, so agents should not query SQLite directly for ordinary rich-link verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. For templates, verify with `remctl templates --json` or `remctl template-info`, then verify applied template lists with `remctl show <list> --json`. Do not ask RemCTL to mutate individual saved reminders inside a template; current support is whole-list template create/apply/delete. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.

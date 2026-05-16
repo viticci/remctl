@@ -7,6 +7,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -90,6 +91,52 @@ class CliTests(unittest.TestCase):
         )
         return db
 
+    def _template_db(self):
+        db = self._list_db(["Source"])
+        db.execute(
+            "CREATE TABLE ZREMCDTEMPLATE ("
+            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, "
+            "ZCREATIONDATE REAL, ZLASTMODIFIEDDATE REAL, ZPUBLICLINKCREATIONDATE REAL, "
+            "ZPUBLICLINKEXPIRATIONDATE REAL, ZPUBLICLINKLASTMODIFIEDDATE REAL, "
+            "ZBADGEEMBLEM TEXT, ZCOLOR BLOB, ZPUBLICLINKURLUUID BLOB, ZPUBLICLINKCONFIGURATIONDATA BLOB)"
+        )
+        db.execute(
+            "CREATE TABLE ZREMCDSAVEDREMINDER ("
+            "Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZCKIDENTIFIER TEXT, ZPARENTSAVEDREMINDERIDENTIFIER BLOB, "
+            "ZPRIORITY INTEGER, ZDISPLAYDATEISALLDAY INTEGER, ZDISPLAYDATEDATE REAL, ZCREATIONDATE REAL, "
+            "ZMETADATA BLOB, ZMARKEDFORDELETION INTEGER, ZTEMPLATE INTEGER)"
+        )
+        db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN Z_ENT INTEGER")
+        db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN ZCANONICALNAME TEXT")
+        db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN ZTEMPLATE INTEGER")
+        db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN ZCREATIONDATE REAL")
+        db.execute(
+            "INSERT INTO ZREMCDTEMPLATE "
+            "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, ZCREATIONDATE, ZLASTMODIFIEDDATE, "
+            "ZPUBLICLINKCREATIONDATE, ZPUBLICLINKLASTMODIFIEDDATE, ZBADGEEMBLEM, ZPUBLICLINKURLUUID, ZPUBLICLINKCONFIGURATIONDATA) "
+            "VALUES (1, 'Rome: Things To See', 'TEMPLATE-1', 0, 100, 200, 300, 400, 'star', ?, X'0102')",
+            (uuid.UUID("3A6B9DE5-80A4-4180-8AFC-1D261121E344").bytes,),
+        )
+        metadata = {
+            "title": "Colosseum",
+            "flagged": 1,
+            "priority": 1,
+            "hashtags": [{"name": "rome"}],
+            "recurrenceRules": [{"frequency": 1, "interval": 1}],
+        }
+        db.execute(
+            "INSERT INTO ZREMCDSAVEDREMINDER "
+            "(Z_PK, ZTITLE, ZCKIDENTIFIER, ZPRIORITY, ZDISPLAYDATEISALLDAY, ZCREATIONDATE, ZMETADATA, ZMARKEDFORDELETION, ZTEMPLATE) "
+            "VALUES (10, 'Colosseum', 'ITEM-1', 1, 0, 150, ?, 0, 1)",
+            (b"\x01" + json.dumps(metadata).encode("utf-8"),),
+        )
+        db.execute(
+            "INSERT INTO ZREMCDBASESECTION "
+            "(Z_PK, Z_ENT, ZDISPLAYNAME, ZCANONICALNAME, ZTEMPLATE, ZCKIDENTIFIER, ZMARKEDFORDELETION, ZCREATIONDATE) "
+            "VALUES (20, 8, 'Ancient Rome', 'Ancient Rome', 1, 'SECTION-1', 0, 125)"
+        )
+        return db
+
     def test_list_resolution_matches_single_normalized_name(self):
         db = self._list_db(["🗓️ Weekly 513", "Work"])
         try:
@@ -161,6 +208,141 @@ class CliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Groceries", output)
         self.assertIn("🥕", output)
+
+    def test_templates_json_reports_counts_and_existing_public_link(self):
+        db = self._template_db()
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_templates(SimpleNamespace(json=True))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["name"], "Rome: Things To See")
+        self.assertEqual(payload[0]["itemCount"], 1)
+        self.assertEqual(payload[0]["sectionCount"], 1)
+        self.assertEqual(payload[0]["publicLink"]["uuid"], "3A6B9DE5-80A4-4180-8AFC-1D261121E344")
+        self.assertEqual(
+            payload[0]["publicLink"]["url"],
+            "https://www.icloud.com/reminders/template/3A6B9DE5-80A4-4180-8AFC-1D261121E344#Rome:_Things_To_See",
+        )
+
+    def test_template_info_json_includes_saved_items_and_sections(self):
+        db = self._template_db()
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_template_info(SimpleNamespace(name="Rome: Things To See", template_id=None, json=True))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["sections"][0]["name"], "Ancient Rome")
+        self.assertEqual(payload["items"][0]["title"], "Colosseum")
+        self.assertTrue(payload["items"][0]["flagged"])
+        self.assertEqual(payload["items"][0]["priority"], "high")
+        self.assertEqual(payload["items"][0]["tags"], ["rome"])
+
+    def test_template_create_requires_private_before_helper(self):
+        args = SimpleNamespace(
+            name="Packing Template",
+            from_list="Source",
+            from_list_id=None,
+            include_completed=False,
+            private=False,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "private_available") as private_available,
+            mock.patch.object(self.remctl, "private_call") as private_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_template_create(args)
+
+        private_available.assert_not_called()
+        private_call.assert_not_called()
+        self.assertIn("--private", stderr.getvalue())
+
+    def test_template_create_uses_private_helper(self):
+        db = self._template_db()
+        args = SimpleNamespace(
+            name="Packing Template",
+            from_list="Source",
+            from_list_id=None,
+            include_completed=True,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "TEMPLATE-2"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_template_create(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "create_template",
+                "name": "Packing Template",
+                "listId": "CK-1",
+                "includeCompleted": True,
+            },
+        )
+
+    def test_template_apply_uses_private_helper(self):
+        db = self._template_db()
+        args = SimpleNamespace(name="Rome: Things To See", template_id=None, private=True, json=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "LIST-2"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_template_apply(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "apply_template",
+                "templateId": "TEMPLATE-1",
+            },
+        )
+
+    def test_template_delete_uses_private_helper(self):
+        db = self._template_db()
+        args = SimpleNamespace(name=None, template_id=1, private=True, force=True, json=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "deleted"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_template_delete(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "delete_template",
+                "templateId": "TEMPLATE-1",
+            },
+        )
 
     def test_list_symbols_reports_official_reminders_emblems(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:

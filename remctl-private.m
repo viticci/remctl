@@ -12,6 +12,7 @@
 - (id)fetchListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListSectionWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchCustomSmartListWithObjectID:(id)objectID error:(NSError **)error;
+- (id)fetchTemplateWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchPrimaryActiveCloudKitAccountWithError:(NSError **)error;
 - (id)fetchDefaultAccountWithError:(NSError **)error;
 @end
@@ -22,10 +23,13 @@
 - (id)updateReminder:(id)reminder;
 - (id)updateList:(id)list;
 - (id)updateSmartList:(id)smartList;
+- (id)updateTemplate:(id)templateObject;
 - (id)addReminderWithTitle:(NSString *)title toReminderSubtaskContextChangeItem:(id)context;
 - (id)addListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem listObjectID:(id)objectID;
 - (id)addListSectionWithDisplayName:(NSString *)name toListSectionContextChangeItem:(id)context;
 - (id)addCustomSmartListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem smartListObjectID:(id)objectID;
+- (id)addTemplateWithName:(NSString *)name configuration:(id)configuration toAccountChangeItem:(id)accountChangeItem;
+- (id)addListUsingTemplate:(id)templateObject toAccountChangeItem:(id)accountChangeItem;
 - (BOOL)saveSynchronouslyWithError:(NSError **)error;
 @end
 
@@ -64,6 +68,19 @@
 @interface REMSmartList : NSObject
 - (id)account;
 - (id)remObjectID;
+@end
+
+@interface REMTemplate : NSObject
+- (id)remObjectID;
+@end
+
+@interface REMTemplateChangeItem : NSObject
+- (id)remObjectID;
+- (void)removeFromParentAccount;
+@end
+
+@interface REMTemplateConfiguration : NSObject
+- (instancetype)initWithSourceListID:(id)sourceListID shouldSaveCompleted:(BOOL)shouldSaveCompleted;
 @end
 
 @interface REMReminderChangeItem : NSObject
@@ -318,6 +335,10 @@ static NSURL *smartListURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDSmartList/%@", ckIdentifier]];
 }
 
+static NSURL *templateURL(NSString *ckIdentifier) {
+    return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDTemplate/%@", ckIdentifier]];
+}
+
 static BOOL looksLikeWebURL(NSString *value) {
     NSURL *url = [NSURL URLWithString:value];
     if (!url || url.host.length == 0) {
@@ -556,6 +577,9 @@ int main(int argc, const char * argv[]) {
             @"create_smart_list",
             @"update_smart_list",
             @"delete_smart_list",
+            @"create_template",
+            @"apply_template",
+            @"delete_template",
         ]];
         if (![action isKindOfClass:[NSString class]] || ![allowedActions containsObject:action]) {
             fail(@"Unknown action");
@@ -776,6 +800,145 @@ int main(int argc, const char * argv[]) {
                 @"status": @"deleted",
                 @"action": action,
                 @"id": smartListID,
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"create_template"]) {
+            NSString *name = cmd[@"name"];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+                fail(@"name is required");
+            }
+            NSString *listID = cmd[@"listId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            BOOL includeCompleted = [cmd[@"includeCompleted"] boolValue];
+            NSURL *listObjectURL = listURL(listID);
+            id listObjectID = [REMObjectID objectIDWithURL:listObjectURL];
+            if (!listObjectID) {
+                fail(@"Could not build ReminderKit source list object ID");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            id list = [store fetchListWithObjectID:listObjectID error:&error];
+            if (!list) {
+                fail(error.localizedDescription ?: @"Source list not found");
+            }
+            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            if (!account) {
+                account = [store fetchDefaultAccountWithError:&error];
+            }
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active Reminders account found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id accountChange = [save updateAccount:account];
+            if (!accountChange) {
+                fail(@"Could not create ReminderKit account change item");
+            }
+            REMTemplateConfiguration *configuration = [[REMTemplateConfiguration alloc]
+                initWithSourceListID:listObjectID
+                shouldSaveCompleted:includeCompleted];
+            REMTemplateChangeItem *change = [save
+                addTemplateWithName:name
+                configuration:configuration
+                toAccountChangeItem:accountChange];
+            if (!change) {
+                fail(@"Could not create ReminderKit template change item");
+            }
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit template save failed");
+            }
+            id objectID = [change remObjectID];
+            NSString *uuid = objectID && [objectID respondsToSelector:@selector(uuid)] ? [[objectID uuid] UUIDString] : @"";
+            NSString *url = objectID && [objectID respondsToSelector:@selector(urlRepresentation)] ? [[objectID urlRepresentation] absoluteString] : @"";
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"name": name,
+                @"sourceListId": listID,
+                @"includeCompleted": @(includeCompleted),
+                @"id": uuid ?: @"",
+                @"url": url ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"apply_template"]) {
+            NSString *templateID = cmd[@"templateId"];
+            if (![templateID isKindOfClass:[NSString class]] || templateID.length == 0) {
+                fail(@"templateId is required");
+            }
+            NSURL *objectURL = templateURL(templateID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit template object ID");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMTemplate *templateObject = [store fetchTemplateWithObjectID:objectID error:&error];
+            if (!templateObject) {
+                fail(error.localizedDescription ?: @"Template not found");
+            }
+            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            if (!account) {
+                account = [store fetchDefaultAccountWithError:&error];
+            }
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active Reminders account found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id accountChange = [save updateAccount:account];
+            if (!accountChange) {
+                fail(@"Could not create ReminderKit account change item");
+            }
+            REMListChangeItem *change = [save addListUsingTemplate:templateObject toAccountChangeItem:accountChange];
+            if (!change) {
+                fail(@"Could not create ReminderKit list from template change item");
+            }
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit template application failed");
+            }
+            id newObjectID = [change remObjectID];
+            NSString *uuid = newObjectID && [newObjectID respondsToSelector:@selector(uuid)] ? [[newObjectID uuid] UUIDString] : @"";
+            NSString *url = newObjectID && [newObjectID respondsToSelector:@selector(urlRepresentation)] ? [[newObjectID urlRepresentation] absoluteString] : @"";
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"templateId": templateID,
+                @"id": uuid ?: @"",
+                @"url": url ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"delete_template"]) {
+            NSString *templateID = cmd[@"templateId"];
+            if (![templateID isKindOfClass:[NSString class]] || templateID.length == 0) {
+                fail(@"templateId is required");
+            }
+            NSURL *objectURL = templateURL(templateID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit template object ID");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMTemplate *templateObject = [store fetchTemplateWithObjectID:objectID error:&error];
+            if (!templateObject) {
+                fail(error.localizedDescription ?: @"Template not found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMTemplateChangeItem *change = [save updateTemplate:templateObject];
+            if (!change) {
+                fail(@"Could not create ReminderKit template change item");
+            }
+            [change removeFromParentAccount];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit template delete failed");
+            }
+            output(@{
+                @"status": @"deleted",
+                @"action": action,
+                @"id": templateID,
             });
             return 0;
         }

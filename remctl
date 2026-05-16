@@ -6,11 +6,11 @@ attachments, completion status, list colors). Writes via remctl-bridge (EventKit
 with AppleScript fallback. Zero Python dependencies with small shared helpers.
 """
 
-import argparse, base64, csv, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata
+import argparse, base64, csv, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from remctl_runtime import (
     due_today_window,
@@ -148,6 +148,7 @@ def show_splash():
     print(C.dim("    upcoming    Next 7 days                  flagged     Flagged reminders"))
     print(C.dim("    urgent      Urgent reminders             stats       Statistics"))
     print(C.dim("    lists       All lists                    smart-lists Inspect smart lists"))
+    print(C.dim("    templates   Saved templates              template-info Inspect template"))
     print()
     print(C.dim("  remctl --help for full command reference"))
     print()
@@ -472,6 +473,111 @@ def q_custom_smart_list_delete_matches(db, name=None, smart_list_id=None):
         (CUSTOM_SMART_LIST_TYPE, name),
     ).fetchall()
 
+
+def template_select_columns(db):
+    columns = [
+        "Z_PK",
+        "ZNAME",
+        "ZCKIDENTIFIER",
+        "ZCREATIONDATE",
+        "ZLASTMODIFIEDDATE",
+        "ZPUBLICLINKCREATIONDATE",
+        "ZPUBLICLINKEXPIRATIONDATE",
+        "ZPUBLICLINKLASTMODIFIEDDATE",
+    ]
+    table_columns = table_column_names(db, "ZREMCDTEMPLATE")
+    optional_columns = [
+        "ZBADGEEMBLEM",
+        "ZCOLOR",
+        "ZPUBLICLINKURLUUID",
+        "ZPUBLICLINKCONFIGURATIONDATA",
+    ]
+    columns.extend(column for column in optional_columns if column in table_columns)
+    return columns
+
+
+def saved_reminder_select_columns(db):
+    columns = [
+        "Z_PK",
+        "ZTITLE",
+        "ZCKIDENTIFIER",
+        "ZPARENTSAVEDREMINDERIDENTIFIER",
+        "ZPRIORITY",
+        "ZDISPLAYDATEISALLDAY",
+        "ZDISPLAYDATEDATE",
+        "ZCREATIONDATE",
+        "ZMETADATA",
+    ]
+    table_columns = table_column_names(db, "ZREMCDSAVEDREMINDER")
+    return [column for column in columns if column in table_columns]
+
+
+def q_templates(db):
+    columns = template_select_columns(db)
+    return db.execute(
+        f"SELECT {', '.join(columns)}, "
+        "(SELECT COUNT(*) FROM ZREMCDSAVEDREMINDER sr WHERE sr.ZTEMPLATE = ZREMCDTEMPLATE.Z_PK AND sr.ZMARKEDFORDELETION = 0) AS item_count, "
+        "(SELECT COUNT(*) FROM ZREMCDBASESECTION s WHERE s.ZTEMPLATE = ZREMCDTEMPLATE.Z_PK AND s.ZMARKEDFORDELETION = 0) AS section_count "
+        "FROM ZREMCDTEMPLATE "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZNAME IS NOT NULL AND ZNAME != '' "
+        "ORDER BY ZNAME, Z_PK"
+    ).fetchall()
+
+
+def q_template_exact_name_count(db, name):
+    row = db.execute(
+        "SELECT COUNT(*) AS count FROM ZREMCDTEMPLATE "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZNAME = ?",
+        (name,),
+    ).fetchone()
+    return row["count"] if row else 0
+
+
+def q_template_matches(db, name=None, template_id=None):
+    columns = template_select_columns(db)
+    base_select = (
+        f"SELECT {', '.join(columns)}, "
+        "(SELECT COUNT(*) FROM ZREMCDSAVEDREMINDER sr WHERE sr.ZTEMPLATE = ZREMCDTEMPLATE.Z_PK AND sr.ZMARKEDFORDELETION = 0) AS item_count, "
+        "(SELECT COUNT(*) FROM ZREMCDBASESECTION s WHERE s.ZTEMPLATE = ZREMCDTEMPLATE.Z_PK AND s.ZMARKEDFORDELETION = 0) AS section_count "
+        "FROM ZREMCDTEMPLATE "
+    )
+    if template_id is not None:
+        return db.execute(
+            base_select + "WHERE ZMARKEDFORDELETION = 0 AND Z_PK = ?",
+            (template_id,),
+        ).fetchall()
+    return db.execute(
+        base_select + "WHERE ZMARKEDFORDELETION = 0 AND ZNAME = ? ORDER BY Z_PK",
+        (name,),
+    ).fetchall()
+
+
+def q_template_sections(db, template_pk):
+    columns = ["Z_PK", "ZDISPLAYNAME", "ZCKIDENTIFIER", "ZCANONICALNAME", "ZCREATIONDATE"]
+    table_columns = table_column_names(db, "ZREMCDBASESECTION")
+    columns = [column for column in columns if column in table_columns]
+    if not columns:
+        return []
+    return db.execute(
+        f"SELECT {', '.join(columns)} FROM ZREMCDBASESECTION "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZTEMPLATE = ? "
+        "ORDER BY Z_PK",
+        (template_pk,),
+    ).fetchall()
+
+
+def q_template_saved_reminders(db, template_pk):
+    columns = saved_reminder_select_columns(db)
+    if not columns:
+        return []
+    return db.execute(
+        f"SELECT {', '.join(columns)} FROM ZREMCDSAVEDREMINDER "
+        "WHERE ZMARKEDFORDELETION = 0 AND ZTEMPLATE = ? "
+        "ORDER BY Z_PK",
+        (template_pk,),
+    ).fetchall()
+
+
 def _row_value(row, key):
     try:
         return row[key]
@@ -692,6 +798,226 @@ def q_list_by_pk(db, list_pk):
         "AND ZNAME IS NOT NULL AND ZNAME != ''",
         (list_pk,),
     ).fetchone()
+
+
+def q_list_reminder_count_for_template(db, list_pk, include_completed=False):
+    try:
+        where = [
+            "ZMARKEDFORDELETION = 0",
+            "ZLIST = ?",
+            "ZACCOUNT IS NOT NULL",
+        ]
+        if not include_completed:
+            where.append("ZCOMPLETED = 0")
+        row = db.execute(
+            f"SELECT COUNT(*) AS count FROM ZREMCDREMINDER WHERE {' AND '.join(where)}",
+            (list_pk,),
+        ).fetchone()
+        return row["count"] if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def uuid_from_blob(value):
+    if not value:
+        return None
+    try:
+        data = bytes(value)
+        if len(data) != 16:
+            return None
+        return str(uuid.UUID(bytes=data)).upper()
+    except (TypeError, ValueError):
+        return None
+
+
+def template_deep_link(object_uuid):
+    return f"x-apple-reminderkit://REMCDTemplate/{object_uuid}" if object_uuid else None
+
+
+def template_public_link(template_name, public_uuid):
+    if not public_uuid:
+        return None
+    fragment = quote(str(template_name or "").replace(" ", "_"), safe=":_")
+    return f"https://www.icloud.com/reminders/template/{public_uuid}#{fragment}"
+
+
+def decode_template_metadata(blob):
+    if not blob:
+        return None
+    try:
+        data = bytes(blob)
+        if data.startswith(b"\x01"):
+            data = data[1:]
+        payload = json.loads(data.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def template_ref_payload(row, *, requested=None, method="exact"):
+    return {
+        "id": row["Z_PK"],
+        "name": row["ZNAME"],
+        "objectUUID": row["ZCKIDENTIFIER"],
+        "requested": requested,
+        "method": method,
+    }
+
+
+def resolve_template_ref(db, name=None, template_id=None):
+    if template_id is not None:
+        rows = q_template_matches(db, template_id=template_id)
+        return template_ref_payload(rows[0], requested=str(template_id), method="id") if rows else None
+    if not name:
+        return None
+    rows = q_template_matches(db, name=name)
+    if len(rows) == 1:
+        return template_ref_payload(rows[0], requested=name, method="exact")
+    if len(rows) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [template_ref_payload(row) for row in rows]}
+    return None
+
+
+def _print_template_resolution_error(requested, result=None):
+    if result and result.get("error") == "ambiguous":
+        options = ", ".join(
+            f"{candidate['id']} ({candidate['name']})"
+            for candidate in result.get("candidates", [])
+        )
+        print(
+            f"Error: multiple templates match {requested!r}. Use --template-id with one of: {options}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Error: template not found: {requested}", file=sys.stderr)
+
+
+def resolve_required_template_target_or_die(db, *, name=None, template_id=None):
+    if name and template_id is not None:
+        print("Error: pass either a template name or --template-id, not both.", file=sys.stderr)
+        sys.exit(1)
+    if not name and template_id is None:
+        print("Error: pass a template name or --template-id.", file=sys.stderr)
+        sys.exit(1)
+    result = resolve_template_ref(db, name=name, template_id=template_id)
+    if result and not result.get("error"):
+        return result
+    requested = f"id {template_id}" if template_id is not None else name
+    _print_template_resolution_error(requested, result)
+    sys.exit(1)
+
+
+def _template_time(row, key):
+    value = _row_get(row, key)
+    return ts(value).isoformat() if value else None
+
+
+def _metadata_tags(metadata):
+    tags = []
+    for tag in (metadata or {}).get("hashtags", []) or []:
+        if isinstance(tag, dict) and tag.get("name"):
+            tags.append(tag["name"])
+        elif isinstance(tag, str):
+            tags.append(tag)
+    return tags
+
+
+def saved_reminder_to_dict(row):
+    metadata = decode_template_metadata(_row_get(row, "ZMETADATA")) or {}
+    title = _row_get(row, "ZTITLE") or metadata.get("title") or ""
+    payload = {
+        "id": row["Z_PK"],
+        "title": title,
+        "objectUUID": _row_get(row, "ZCKIDENTIFIER"),
+        "priority": PRI_NAME.get(_row_get(row, "ZPRIORITY", metadata.get("priority", 0)) or 0, "none"),
+    }
+    created = _template_time(row, "ZCREATIONDATE")
+    if created:
+        payload["createdDate"] = created
+    display_date = _template_time(row, "ZDISPLAYDATEDATE")
+    if display_date:
+        payload["displayDate"] = display_date
+        payload["displayDateIsAllDay"] = bool(_row_get(row, "ZDISPLAYDATEISALLDAY", 0))
+    parent_uuid = uuid_from_blob(_row_get(row, "ZPARENTSAVEDREMINDERIDENTIFIER"))
+    if parent_uuid:
+        payload["parentObjectUUID"] = parent_uuid
+    if metadata:
+        payload["metadataKeys"] = sorted(metadata.keys())
+        payload["flagged"] = bool(metadata.get("flagged", False))
+        tags = _metadata_tags(metadata)
+        if tags:
+            payload["tags"] = tags
+        if metadata.get("dueDateComponents"):
+            payload["dueDateComponents"] = metadata["dueDateComponents"]
+        if metadata.get("startDateComponents"):
+            payload["startDateComponents"] = metadata["startDateComponents"]
+        if metadata.get("recurrenceRules"):
+            payload["recurrenceRules"] = metadata["recurrenceRules"]
+        alarm_triggers = metadata.get("alarmTriggers")
+        if alarm_triggers:
+            payload["alarmTriggers"] = alarm_triggers
+        if metadata.get("notesDocumentData"):
+            payload["hasNotes"] = True
+    return payload
+
+
+def template_section_to_dict(row):
+    payload = {
+        "id": row["Z_PK"],
+        "name": _row_get(row, "ZDISPLAYNAME") or _row_get(row, "ZCANONICALNAME") or "",
+        "objectUUID": _row_get(row, "ZCKIDENTIFIER"),
+    }
+    created = _template_time(row, "ZCREATIONDATE")
+    if created:
+        payload["createdDate"] = created
+    canonical = _row_get(row, "ZCANONICALNAME")
+    if canonical and canonical != payload["name"]:
+        payload["canonicalName"] = canonical
+    return payload
+
+
+def template_to_dict(row, db=None, *, include_items=False):
+    object_uuid = _row_get(row, "ZCKIDENTIFIER")
+    payload = {
+        "id": row["Z_PK"],
+        "name": row["ZNAME"],
+        "objectUUID": object_uuid,
+        "deepLink": template_deep_link(object_uuid),
+        "itemCount": _row_get(row, "item_count", 0),
+        "sectionCount": _row_get(row, "section_count", 0),
+    }
+    for key, out_key in (
+        ("ZCREATIONDATE", "createdDate"),
+        ("ZLASTMODIFIEDDATE", "modifiedDate"),
+    ):
+        value = _template_time(row, key)
+        if value:
+            payload[out_key] = value
+    if _row_has_key(row, "ZBADGEEMBLEM") and row["ZBADGEEMBLEM"]:
+        payload["badgeEmblem"] = row["ZBADGEEMBLEM"]
+    public_uuid = uuid_from_blob(_row_get(row, "ZPUBLICLINKURLUUID"))
+    if public_uuid:
+        public = {
+            "uuid": public_uuid,
+            "url": template_public_link(row["ZNAME"], public_uuid),
+        }
+        for key, out_key in (
+            ("ZPUBLICLINKCREATIONDATE", "createdDate"),
+            ("ZPUBLICLINKLASTMODIFIEDDATE", "modifiedDate"),
+            ("ZPUBLICLINKEXPIRATIONDATE", "expirationDate"),
+        ):
+            value = _template_time(row, key)
+            if value:
+                public[out_key] = value
+        config = _row_get(row, "ZPUBLICLINKCONFIGURATIONDATA")
+        if config:
+            public["configurationLength"] = len(config)
+        payload["publicLink"] = public
+    if include_items and db is not None:
+        payload["sections"] = [template_section_to_dict(item) for item in q_template_sections(db, row["Z_PK"])]
+        payload["items"] = [saved_reminder_to_dict(item) for item in q_template_saved_reminders(db, row["Z_PK"])]
+    return payload
+
 
 _RECURRENCE_COLS = """
     (SELECT rr.ZFREQUENCY FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND rr.ZMARKEDFORDELETION = 0 AND rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_frequency,
@@ -3111,6 +3437,199 @@ def cmd_smart_lists(a):
         print(f"    {smart_type} · filter bytes: {length} · {desc}")
     print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
 
+
+def cmd_templates(a):
+    db = open_db()
+    rows = q_templates(db)
+    payload = [template_to_dict(row) for row in rows]
+    if a.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if not payload:
+        print("No templates")
+        return
+    print(C.bold("Templates:"))
+    for item in payload:
+        bits = [f"id: {item['id']}", f"{item['itemCount']} item{'s' if item['itemCount'] != 1 else ''}"]
+        if item.get("sectionCount"):
+            bits.append(f"{item['sectionCount']} section{'s' if item['sectionCount'] != 1 else ''}")
+        if item.get("publicLink"):
+            bits.append("shared")
+        print(f"  {item['name']} {C.dim('(' + ', '.join(bits) + ')')}")
+    print(f"\n{len(payload)} template{'s' if len(payload) != 1 else ''}")
+
+
+def cmd_template_info(a):
+    db = open_db()
+    ref = resolve_required_template_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        template_id=getattr(a, "template_id", None),
+    )
+    row = q_template_matches(db, template_id=ref["id"])[0]
+    payload = template_to_dict(row, db, include_items=True)
+    if a.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(C.bold(payload["name"]))
+    print(f"ID: {payload['id']}")
+    if payload.get("objectUUID"):
+        print(f"Object UUID: {payload['objectUUID']}")
+    if payload.get("deepLink"):
+        print(f"Deep link: {payload['deepLink']}")
+    print(f"Items: {payload['itemCount']}")
+    print(f"Sections: {payload['sectionCount']}")
+    if payload.get("publicLink"):
+        print(f"Existing public link: {payload['publicLink']['url']}")
+    if payload.get("sections"):
+        print("\nSections:")
+        for section in payload["sections"]:
+            print(f"  {section['name']} {C.dim('(id: ' + str(section['id']) + ')')}")
+    if payload.get("items"):
+        print("\nSaved Reminders:")
+        for item in payload["items"]:
+            tags = f" #{' #'.join(item.get('tags', []))}" if item.get("tags") else ""
+            priority = f" {PRI.get({'high': 1, 'medium': 5, 'low': 9}.get(item.get('priority'), 0), '')}".rstrip()
+            print(f"  - {item['title']}{priority}{tags}")
+
+
+def cmd_template_create(a):
+    if not private_metadata_enabled(a):
+        print("Error: template-create requires --private.", file=sys.stderr)
+        sys.exit(1)
+    require_private_metadata(a)
+    db = open_db()
+    if q_template_exact_name_count(db, a.name):
+        print(
+            f"Error: template already exists: {a.name}. Use a unique template name.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    list_ref = resolve_required_list_target_or_die(
+        db,
+        name=getattr(a, "from_list", None),
+        list_id=getattr(a, "from_list_id", None),
+    )
+    if not list_ref.get("objectUUID"):
+        print("Error: source list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    expected_items = q_list_reminder_count_for_template(
+        db,
+        list_ref["id"],
+        include_completed=bool(getattr(a, "include_completed", False)),
+    )
+    result = private_call({
+        "action": "create_template",
+        "name": a.name,
+        "listId": list_ref["objectUUID"],
+        "includeCompleted": bool(getattr(a, "include_completed", False)),
+    })
+    if not result or result.get("status") != "created":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: Failed to create template '{a.name}': {message}", file=sys.stderr)
+        sys.exit(1)
+    payload = {
+        "status": "created",
+        "name": a.name,
+        "sourceList": list_ref,
+        "private": result,
+    }
+    if expected_items is not None:
+        payload["expectedItemCount"] = expected_items
+    template_payload = None
+    for _ in range(12):
+        fresh = open_db()
+        matches = q_template_matches(fresh, name=a.name)
+        if matches:
+            template_payload = template_to_dict(matches[0], fresh, include_items=True)
+            if expected_items is None or template_payload.get("itemCount", 0) >= expected_items:
+                break
+        if expected_items in (None, 0):
+            break
+        time.sleep(0.25)
+    if template_payload:
+        payload["template"] = template_payload
+    if a.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Created template: {a.name}")
+        print(f"Source list: {list_ref['title']}")
+
+
+def cmd_template_apply(a):
+    if not private_metadata_enabled(a):
+        print("Error: template-apply requires --private.", file=sys.stderr)
+        sys.exit(1)
+    require_private_metadata(a)
+    db = open_db()
+    ref = resolve_required_template_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        template_id=getattr(a, "template_id", None),
+    )
+    result = private_call({
+        "action": "apply_template",
+        "templateId": ref["objectUUID"],
+    })
+    if not result or result.get("status") != "created":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: Failed to create list from template '{ref['name']}': {message}", file=sys.stderr)
+        sys.exit(1)
+    payload = {
+        "status": "created",
+        "template": ref,
+        "private": result,
+    }
+    created_uuid = result.get("id")
+    if created_uuid:
+        fresh = open_db()
+        row = fresh.execute(
+            f"SELECT {', '.join(list_select_columns(fresh))} FROM ZREMCDBASELIST "
+            "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZCKIDENTIFIER = ?",
+            (created_uuid,),
+        ).fetchone()
+        if row:
+            payload["list"] = list_to_dict(row)
+    if a.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        name = payload.get("list", {}).get("title") or result.get("name") or ref["name"]
+        print(f"Created list from template: {name}")
+
+
+def cmd_template_delete(a):
+    if not private_metadata_enabled(a):
+        print("Error: template-delete requires --private.", file=sys.stderr)
+        sys.exit(1)
+    require_private_metadata(a)
+    db = open_db()
+    ref = resolve_required_template_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        template_id=getattr(a, "template_id", None),
+    )
+    if not a.force:
+        ans = input(f"Delete template '{ref['name']}'? [y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return
+    result = private_call({
+        "action": "delete_template",
+        "templateId": ref["objectUUID"],
+    })
+    if not result or result.get("status") != "deleted":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: Failed to delete template '{ref['name']}': {message}", file=sys.stderr)
+        sys.exit(1)
+    if a.json:
+        print(json.dumps({
+            "status": "deleted",
+            "template": ref,
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Deleted template: {ref['name']}")
+
 def _smart_list_csv_values(*values):
     result = []
     for value in values:
@@ -4964,6 +5483,8 @@ _remctl() {
     local -a commands=(
         'lists:List all iCloud reminder lists'
         'smart-lists:Inspect Reminders smart lists'
+        'templates:Inspect saved Reminders templates'
+        'template-info:Show a saved Reminders template'
         'show:Show reminders in a list'
         'add:Add a reminder'
         'done:Complete a reminder'
@@ -4992,6 +5513,9 @@ _remctl() {
         'smart-list-create:Create a private custom smart list'
         'smart-list-edit:Edit a private custom smart list'
         'smart-list-delete:Delete a private custom smart list'
+        'template-create:Create a private Reminders template from an entire list'
+        'template-apply:Create a list from a saved Reminders template'
+        'template-delete:Delete a saved Reminders template'
         'list-edit:Edit private list appearance'
         'list-pin:Pin a list in Reminders'
         'list-unpin:Unpin a list in Reminders'
@@ -5009,6 +5533,17 @@ _remctl() {
                 '--list-id[Show list by stable numeric ID]:id:' \
                 '--completed[Include completed reminders]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
+                '--json[JSON output]'
+            return
+            ;;
+        templates)
+            _arguments \
+                '--json[JSON output]'
+            return
+            ;;
+        template-info)
+            _arguments \
+                '--template-id[Read by numeric template ID]:id:' \
                 '--json[JSON output]'
             return
             ;;
@@ -5157,6 +5692,30 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        template-create)
+            _arguments \
+                '--from-list[Source list name]:list:' \
+                '--from-list-id[Source list numeric ID]:id:' \
+                '--include-completed[Include completed reminders]' \
+                '--private[Use private ReminderKit template creation]' \
+                '--json[JSON output]'
+            return
+            ;;
+        template-apply)
+            _arguments \
+                '--template-id[Apply by numeric template ID]:id:' \
+                '--private[Use private ReminderKit template application]' \
+                '--json[JSON output]'
+            return
+            ;;
+        template-delete)
+            _arguments \
+                '--template-id[Delete by numeric template ID]:id:' \
+                '--private[Use private ReminderKit template deletion]' \
+                '--force[Skip confirmation prompt]' \
+                '--json[JSON output]'
+            return
+            ;;
         list-create)
             _arguments \
                 '--color[List color name; with --private also accepts #RRGGBB]:color:' \
@@ -5213,7 +5772,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists smart-lists show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -5249,6 +5808,21 @@ BASH_COMPLETION = '''_remctl() {
     elif [ "$cmd" = "smart-list-delete" ]; then
         COMPREPLY=( $(compgen -W "--private --smart-list-id --force --json" -- "$cur") )
         return
+    elif [ "$cmd" = "templates" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "$cur") )
+        return
+    elif [ "$cmd" = "template-info" ]; then
+        COMPREPLY=( $(compgen -W "--template-id --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "template-create" ]; then
+        COMPREPLY=( $(compgen -W "--from-list --from-list-id --include-completed --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "template-apply" ]; then
+        COMPREPLY=( $(compgen -W "--template-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "template-delete" ]; then
+        COMPREPLY=( $(compgen -W "--template-id --private --force --json" -- "$cur") )
+        return
     elif [ "$cmd" = "list-edit" ]; then
         COMPREPLY=( $(compgen -W "--list-id --new-name --color --private --symbol --emoji --groceries --standard --grocery-locale --json" -- "$cur") )
         return
@@ -5271,6 +5845,8 @@ complete -F _remctl remctl
 FISH_COMPLETION = '''# Fish completion for remctl
 complete -c remctl -n "__fish_use_subcommand" -a lists -d "List all iCloud reminder lists"
 complete -c remctl -n "__fish_use_subcommand" -a smart-lists -d "Inspect Reminders smart lists"
+complete -c remctl -n "__fish_use_subcommand" -a templates -d "Inspect saved Reminders templates"
+complete -c remctl -n "__fish_use_subcommand" -a template-info -d "Show a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a show -d "Show reminders in a list"
 complete -c remctl -n "__fish_use_subcommand" -a add -d "Add a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete a reminder"
@@ -5299,6 +5875,9 @@ complete -c remctl -n "__fish_use_subcommand" -a list-create -d "Create a new li
 complete -c remctl -n "__fish_use_subcommand" -a smart-list-create -d "Create a private custom smart list"
 complete -c remctl -n "__fish_use_subcommand" -a smart-list-edit -d "Edit a private custom smart list"
 complete -c remctl -n "__fish_use_subcommand" -a smart-list-delete -d "Delete a private custom smart list"
+complete -c remctl -n "__fish_use_subcommand" -a template-create -d "Create a private Reminders template from an entire list"
+complete -c remctl -n "__fish_use_subcommand" -a template-apply -d "Create a list from a saved Reminders template"
+complete -c remctl -n "__fish_use_subcommand" -a template-delete -d "Delete a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a list-edit -d "Edit private list appearance"
 complete -c remctl -n "__fish_use_subcommand" -a list-pin -d "Pin a list in Reminders"
 complete -c remctl -n "__fish_use_subcommand" -a list-unpin -d "Unpin a list in Reminders"
@@ -5361,6 +5940,21 @@ complete -c remctl -n "__fish_seen_subcommand_from smart-list-delete" -l private
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-delete" -l smart-list-id -d "Delete by numeric smart-list ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-delete" -l force -d "Skip confirmation prompt"
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-delete" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from templates" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from template-info" -l template-id -d "Read by numeric template ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from template-info" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from template-create" -l from-list -d "Source list name" -r
+complete -c remctl -n "__fish_seen_subcommand_from template-create" -l from-list-id -d "Source list numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from template-create" -l include-completed -d "Include completed reminders"
+complete -c remctl -n "__fish_seen_subcommand_from template-create" -l private -d "Use private ReminderKit template creation"
+complete -c remctl -n "__fish_seen_subcommand_from template-create" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from template-apply" -l template-id -d "Apply by numeric template ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from template-apply" -l private -d "Use private ReminderKit template application"
+complete -c remctl -n "__fish_seen_subcommand_from template-apply" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from template-delete" -l template-id -d "Delete by numeric template ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from template-delete" -l private -d "Use private ReminderKit template deletion"
+complete -c remctl -n "__fish_seen_subcommand_from template-delete" -l force -d "Skip confirmation prompt"
+complete -c remctl -n "__fish_seen_subcommand_from template-delete" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l list-id -d "Edit a list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l new-name -d "Rename the list through private ReminderKit" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l color -d "List color name or #RRGGBB" -r
@@ -6034,7 +6628,7 @@ def main():
             "for onboarding details.\n"
             "\n"
             "Private metadata writes are unsupported and opt-in: pass --private on "
-            "add/edit/list-create/list-edit/list-pin/list-unpin/smart-list-*."
+            "add/edit/list-create/list-edit/list-pin/list-unpin/smart-list-*/template-*."
         ),
         formatter_class=HelpFormatter,
     )
@@ -6052,6 +6646,25 @@ def main():
     c = sub.add_parser("lists", help="List all iCloud reminder lists"); js(c)
 
     c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c)
+
+    c = sub.add_parser("templates", help="Inspect saved Reminders templates"); js(c)
+
+    c = sub.add_parser(
+        "template-info",
+        help="Show a saved Reminders template",
+        description="Read a saved Reminders template, including its saved reminders, sections, and any existing public link metadata.",
+        epilog=(
+            "Examples:\n"
+            "  remctl template-info \"Rome: Things To See\"\n"
+            "  remctl template-info --template-id 2 --json\n"
+            "\n"
+            "Existing public template links are reported read-only. RemCTL does not create iCloud sharing links."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Template name")
+    c.add_argument("--template-id", type=int, help="Read by numeric template ID from templates")
+    js(c)
 
     c = sub.add_parser("show", help="Show reminders in a list (grouped by section)")
     c.add_argument("list", nargs="?", help="List name")
@@ -6276,6 +6889,66 @@ def main():
     c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
     js(c)
 
+    c = sub.add_parser(
+        "template-create",
+        help="Create a private Reminders template from an entire list",
+        description=(
+            "Save an entire existing list as a Reminders template through unsupported private ReminderKit APIs. "
+            "This command does not append individual reminders to existing templates, strip subtasks or due dates, "
+            "or create an iCloud sharing link."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl template-create \"Packing Template\" --from-list Packing --private --json\n"
+            "  remctl template-create \"Archive Template\" --from-list-id 144 --include-completed --private\n"
+            "\n"
+            "Template support is list-level: use a source list as-is, then apply the saved template to create a new list."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", help="Template name")
+    c.add_argument("--from-list", help="Source list name")
+    c.add_argument("--from-list-id", type=int, help="Source list numeric ID")
+    c.add_argument("--include-completed", action="store_true", help="Include completed reminders in the saved template")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit template creation")
+    js(c)
+
+    c = sub.add_parser(
+        "template-apply",
+        help="Create a list from a saved Reminders template",
+        description=(
+            "Create a new list from a saved Reminders template through unsupported private ReminderKit APIs. "
+            "This does not modify the saved template."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl template-apply \"Packing Template\" --private --json\n"
+            "  remctl template-apply --template-id 2 --private\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Template name")
+    c.add_argument("--template-id", type=int, help="Apply by numeric template ID from templates")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit template application")
+    js(c)
+
+    c = sub.add_parser(
+        "template-delete",
+        help="Delete a saved Reminders template",
+        description="Delete a saved Reminders template through unsupported private ReminderKit APIs.",
+        epilog=(
+            "Examples:\n"
+            "  remctl template-delete \"Packing Template\" --private --force\n"
+            "  remctl template-delete --template-id 2 --private --force --json\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Template name")
+    c.add_argument("--template-id", type=int, help="Delete by numeric template ID from templates")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit template deletion")
+    c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    js(c)
+
     c = sub.add_parser("list-edit", help="Edit private list appearance by name or ID")
     c.add_argument("name", nargs="?", help="List name to edit")
     c.add_argument("--list-id", type=int, help="Edit a list by stable numeric ID")
@@ -6452,6 +7125,8 @@ def main():
     cmds = {
         "lists": cmd_lists,
         "smart-lists": cmd_smart_lists,
+        "templates": cmd_templates,
+        "template-info": cmd_template_info,
         "show": cmd_show,
         "add": cmd_add,
         "done": cmd_done,
@@ -6478,6 +7153,9 @@ def main():
         "smart-list-create": cmd_smart_list_create,
         "smart-list-edit": cmd_smart_list_edit,
         "smart-list-delete": cmd_smart_list_delete,
+        "template-create": cmd_template_create,
+        "template-apply": cmd_template_apply,
+        "template-delete": cmd_template_delete,
         "list-edit": cmd_list_edit,
         "list-pin": cmd_list_pin,
         "list-unpin": cmd_list_unpin,

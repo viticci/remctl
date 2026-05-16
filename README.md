@@ -6,7 +6,7 @@ RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users an
 
 RemCTL reads the user's local iCloud Reminders database directly (with native macOS permission access) for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
 
-Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, subtasks, tags, image attachments, location-based alarms, list appearance metadata, Groceries list metadata, and custom smart lists by using the native ReminderKit framework.
+Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, subtasks, tags, image attachments, location-based alarms, list appearance metadata, Groceries list metadata, custom smart lists, and Reminders templates by using the native ReminderKit framework.
 
 As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 – without breaking iCloud sync.
 
@@ -56,9 +56,9 @@ Full setup details live in [docs/installation.md](docs/installation.md).
 | Task | Commands |
 | --- | --- |
 | See what is due | `today`, `upcoming`, `overdue` |
-| Browse reminders | `lists`, `smart-lists`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks` |
+| Browse reminders | `lists`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks` |
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag` |
-| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `sections`, `tags` |
+| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
@@ -85,13 +85,18 @@ remctl smart-list-create "Priority or Today" --private --match any --priority hi
 remctl smart-list-create "Due Before June 1" --private --date-range 2026-05-16,2026-05-31 --color red --emoji 📆
 remctl smart-list-edit "Priority or Today" --private --priority high
 remctl smart-list-delete "Flagged Review" --private --force
+remctl templates --json
+remctl template-info "Rome: Things To See" --json
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-apply "Packing Template" --private --json
+remctl template-delete "Packing Template" --private --force
 remctl list-edit Projects --private --color orange --symbol education3
 remctl list-pin "Project X" --private
 remctl list-rename --list-id 123 --new-name "Project X Archive"
 remctl info 23880 --json
 ```
 
-The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes.
+The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes. Template commands are covered in [docs/commands.md#templates](docs/commands.md#templates) and [docs/private-metadata.md#template-examples](docs/private-metadata.md#template-examples).
 
 Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
 
@@ -131,6 +136,21 @@ Smart-list writes are private ReminderKit writes and always require `--private`;
 - [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples) for private API behavior, safety notes, and reverse-engineered filter storage details.
 - [SKILL.md](SKILL.md) for the concise agent contract.
 
+## Templates
+
+Reminders templates are saved lists with saved reminders inside them. RemCTL reads them from the local template tables and can create, apply, and delete templates through private ReminderKit APIs. Template support is intentionally list-level: RemCTL can save an entire source list as a template and apply a template to create a new list. It does not append individual reminders to existing templates or strip subtasks/due dates while saving. Existing public template links are reported as read-only metadata; RemCTL does not create iCloud sharing links.
+
+```bash
+remctl templates --json
+remctl template-info "Rome: Things To See" --json
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-create "Archive Template" --from-list-id 144 --include-completed --private
+remctl template-apply "Packing Template" --private --json
+remctl template-delete "Packing Template" --private --force
+```
+
+`template-create`, `template-apply`, and `template-delete` require `--private`. `template-create` takes one source list; `--include-completed` is the only content-selection flag. Verify template writes with `templates --json` and `template-info`; verify applied templates with `lists --json` and `show <new list> --json`.
+
 ## Private API Features
 
 RemCTL's default writes use EventKit. For metadata Apple does not expose publicly, RemCTL has an explicit `--private` mode backed by `remctl-private`, an Objective-C helper that uses Apple's private ReminderKit framework and saves through the Reminders stack. RemCTL *never* writes directly to SQLite (which would break iCloud sync and cause database corruption issues).
@@ -155,11 +175,14 @@ remctl smart-list-create "Projects Today" --private --include-list Projects --da
 remctl smart-list-create "Near Home" --private --location-title Home --latitude 41.9 --longitude 12.5 --proximity enter
 remctl smart-list-edit "Priority or Today" --private --priority high --color red --emoji 📆
 remctl smart-list-delete "Flagged Review" --private --force
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-apply "Packing Template" --private --json
+remctl template-delete "Packing Template" --private --force
 ```
 
-Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list appearance and pin state, Groceries list creation/conversion/locale metadata, Groceries categorization verification, smart-list appearance metadata, and experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters. `smart-lists` is read-only and safe; `smart-list-create`, `smart-list-edit`, and `smart-list-delete` require `--private`, and filter writes reject unknown or known non-materializing shapes before writing. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges on both lists and smart lists. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` use ReminderKit's private grocery context; `add/edit --private --grocery` verifies Reminders' automatic sorter first and falls back to the explicit private categorizer only when needed. `list-pin` and `list-unpin` also require `--private` and save through ReminderKit. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
+Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list appearance and pin state, Groceries list creation/conversion/locale metadata, Groceries categorization verification, smart-list appearance metadata, experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. `smart-lists` and `templates` are read-only and safe; `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, and `template-delete` require `--private`. Template commands can report existing public links, but do not create iCloud sharing links. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges on both lists and smart lists. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` use ReminderKit's private grocery context; `add/edit --private --grocery` verifies Reminders' automatic sorter first and falls back to the explicit private categorizer only when needed. `list-pin` and `list-unpin` also require `--private` and save through ReminderKit. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
 
-This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, reminder metadata writes should be verified with `remctl info ID --json`, and smart-list writes should be verified with `remctl smart-lists --json` plus a UI/device check when sync behavior matters.
+This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, reminder metadata writes should be verified with `remctl info ID --json`, smart-list writes should be verified with `remctl smart-lists --json`, and template writes should be verified with `remctl templates --json` plus a UI/device check when sync behavior matters.
 
 ## Output
 
@@ -220,6 +243,8 @@ For fast agent writes, call `remctl add ... --json`, use the returned `numericId
 
 For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. Reminders.app currently materializes only one included-list filter at a time; RemCTL rejects repeated included lists and list exclusions before writing. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
 
+For template automation, use `templates --json` and `template-info` to inspect saved templates. Use `template-create`, `template-apply`, and `template-delete` with `--private`; verify template rows with `templates --json` or `template-info`, and verify applied lists with `show <list> --json`. Template writes are list-level only: do not assume support for appending individual reminders to a template or excluding subtasks/due dates. Existing iCloud template links are read-only metadata.
+
 For Groceries automation, use `lists --json` to detect `listType: "groceries"` and `grocery.locale`, then use `add --private --grocery` or `edit --private --grocery` only against an existing Groceries list. Verify with `show <list> --json` and check the reminder's `section` after categorization.
 
 Agents should pass deterministic due dates, ideally `YYYY-MM-DD HH:MM` after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
@@ -245,8 +270,10 @@ remctl doctor
 - [Installation and onboarding](docs/installation.md)
 - [Command guide](docs/commands.md)
 - [Smart-list command syntax](docs/commands.md#smart-lists)
+- [Template command syntax](docs/commands.md#templates)
 - [Private metadata writes](docs/private-metadata.md)
 - [Smart-list private API notes](docs/private-metadata.md#smart-list-examples)
+- [Template private API notes](docs/private-metadata.md#template-examples)
 - [Architecture](docs/architecture.md)
 
 ## Project Layout

@@ -13,6 +13,8 @@ remctl flagged
 remctl urgent
 remctl lists
 remctl smart-lists
+remctl templates
+remctl template-info "Rome: Things To See"
 remctl show Shopping
 remctl show --list-id 153
 remctl show Work --completed
@@ -77,13 +79,18 @@ remctl add "Milk" -l Groceries --private --grocery
 remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "High Priority" --private --priority high
 remctl smart-list-delete "Flagged Review" --private --force
+remctl templates --json
+remctl template-info "Rome: Things To See" --json
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-apply "Packing Template" --private --json
+remctl template-delete "Packing Template" --private --force
 ```
 
 `search` matches reminder titles and notes. By default it searches active reminders; add `--completed` to include completed reminders.
 
 ## CLI Syntax Rules
 
-RemCTL uses nouns for read-only inspectors (`lists`, `smart-lists`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, `list-create`, `smart-list-edit`). List-management commands keep the `list-*` prefix; custom smart-list writes keep the `smart-list-*` prefix.
+RemCTL uses nouns for read-only inspectors (`lists`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, `list-create`, `smart-list-edit`). List-management commands keep the `list-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
 
 Use `--json` on subcommands when scripting. The global `--format json` is equivalent for commands with JSON output; `--format table` is for human-readable tabular views. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
@@ -95,7 +102,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, location alarms, list appearance metadata, list pin state, Groceries list metadata and categorization verification, and custom smart-list creation/editing/deletion for verified materializing Reminders filters. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, location alarms, list appearance metadata, list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
@@ -177,6 +184,31 @@ remctl smart-list-delete "Flagged Review" --private --force
 `smart-list-create` and `smart-list-edit` are private ReminderKit support and always require `--private`. They support private appearance flags (`--color`, `--symbol`, and `--emoji`) plus the filters that currently materialize in Reminders.app through this write path: `--any-tag`, date filters (`--date any|today`, today+past-due, on/before/after/range), time filters (`morning`, `afternoon`, `evening`, `night`), priority filters including comma-separated Priority: Any, `--flagged`, `--vehicle connected`, specific `--location-title`/coordinates, one `--include-list` or one `--include-list-id`, and top-level `--match all|any`. Known zero-filter writes are rejected before saving: selected tags, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list.
 
 `smart-list-edit` replaces the filter for an existing custom smart list by exact name or `--smart-list-id`. `smart-list-delete` only matches custom smart lists by exact name or `--smart-list-id`, never built-in smart lists, and requires `--private`.
+
+## Templates
+
+```bash
+remctl templates
+remctl templates --json
+remctl template-info "Rome: Things To See"
+remctl template-info --template-id 2 --json
+remctl template-create "Packing Template" --from-list Packing --private --json
+remctl template-create "Archive Template" --from-list-id 144 --include-completed --private
+remctl template-apply "Packing Template" --private --json
+remctl template-apply --template-id 2 --private
+remctl template-delete "Packing Template" --private --force
+remctl template-delete --template-id 2 --private --force --json
+```
+
+`templates` is a read-only inspector for saved Reminders templates. It reports numeric ID, object UUID, deep link, item count, section count, dates, badge metadata, and any existing public template link. Existing iCloud links are read-only metadata; RemCTL does not create or revoke template sharing links.
+
+`template-info` reads one template by exact name or `--template-id` and includes saved reminder rows, decoded template metadata keys, tags, recurrence rules, alarm trigger dictionaries, and template sections when present.
+
+`template-create`, `template-apply`, and `template-delete` are private ReminderKit commands and always require `--private`. `template-create` saves an entire existing list as a template by `--from-list` or `--from-list-id`; pass `--include-completed` only when completed reminders should be part of the saved template. `template-apply` creates a new list from the selected template. `template-delete` deletes only the saved template, not lists previously created from it.
+
+Template writes are list-level only. RemCTL does not append individual reminders to an existing template, copy selected reminders into a template, or offer flags to strip subtasks or due dates while saving a template.
+
+Verify template writes with `remctl templates --json` or `remctl template-info`. Verify applied templates with `remctl lists --json` and `remctl show <new list> --json`.
 
 ## Import and Export
 
