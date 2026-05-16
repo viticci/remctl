@@ -106,6 +106,24 @@ Important limits:
 - `--emoji` writes a Reminders emoji badge for standard emoji such as `🥶` or `📌`.
 - `list-edit`, `list-pin`, and `list-unpin` resolve by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
 
+## Groceries List Examples
+
+```bash
+remctl lists --json
+remctl show Groceries
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl list-edit "Shopping" --private --groceries --grocery-locale it_IT
+remctl list-edit "Shopping" --private --standard
+remctl add "Milk" -l Groceries --private --grocery --json
+remctl edit 23880 --private --grocery --json
+```
+
+Reminders' Groceries type is stored as private list metadata, not as a separate public EventKit list class. RemCTL reads the grocery columns from `ZREMCDBASELIST`, marks detected Groceries lists with `🥕` in human output, and returns `listType`, `isGroceries`, and `grocery.locale` / categorization flags in `lists --json`.
+
+Groceries writes use `REMListChangeItem.groceryContextChangeItem`: `list-create --private --groceries` creates a list with grocery metadata, `list-edit --private --groceries` converts an existing list, `list-edit --private --standard` clears the grocery flag, and `--grocery-locale` writes the locale identifier Reminders stores for grocery categorization.
+
+`add --private --grocery` and `edit --private --grocery` verify automatic grocery sorting for the target reminder IDs. The target list must already be a detected Groceries list, and RemCTL fails before writing if it is not. RemCTL first polls the local section membership table because Reminders often sorts new items immediately; if the item is still unsectioned, RemCTL falls back to ReminderKit's explicit grocery categorizer. The JSON result includes `verifiedSections` and `source: "reminders_auto"` when the automatic sorter already handled it.
+
 ## Smart List Examples
 
 ```bash
@@ -141,6 +159,8 @@ Examples of rejected commands:
 remctl add "Research" -l Projects --section "Research"
 remctl edit 23880 -t remctl
 remctl edit 23880 --urgent
+remctl add "Milk" -l Groceries --grocery
+remctl list-create "Groceries" --groceries
 ```
 
 These fail because they would otherwise look successful while silently dropping private metadata.
@@ -167,4 +187,4 @@ REMCTL_PRIVATE_PATH=/tmp/remctl-private remctl edit 23880 --private --url https:
 
 ## Agent Notes
 
-Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, so agents should not query SQLite directly for ordinary rich-link verification. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.
+Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, so agents should not query SQLite directly for ordinary rich-link verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.

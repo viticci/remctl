@@ -409,13 +409,33 @@ def color_by_list(text, list_name=None, db=None):
 
 # ── Queries ──────────────────────────────────────────────────────────────────
 
-def q_lists(db):
+GROCERY_LIST_MARKER = "🥕"
+
+
+def table_column_names(db, table_name):
+    return {row["name"] for row in db.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def list_select_columns(db):
     columns = ["Z_PK", "ZNAME", "ZCKIDENTIFIER"]
-    table_columns = {row["name"] for row in db.execute("PRAGMA table_info(ZREMCDBASELIST)").fetchall()}
-    if "ZISPINNEDBYCURRENTUSER" in table_columns:
-        columns.append("ZISPINNEDBYCURRENTUSER")
-    if "ZPINNEDDATE" in table_columns:
-        columns.append("ZPINNEDDATE")
+    table_columns = table_column_names(db, "ZREMCDBASELIST")
+    optional_columns = [
+        "ZISPINNEDBYCURRENTUSER",
+        "ZPINNEDDATE",
+        "ZSHOULDCATEGORIZEGROCERYITEMS",
+        "ZSHOULDAUTOCATEGORIZEITEMS",
+        "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST",
+        "ZGROCERYLOCALEID",
+        "ZAUTOCATEGORIZATIONLOCALCORRECTIONSCHECKSUM",
+    ]
+    columns.extend(column for column in optional_columns if column in table_columns)
+    if "ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA" in table_columns:
+        columns.append("length(ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA) AS ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA_LENGTH")
+    return columns
+
+
+def q_lists(db):
+    columns = list_select_columns(db)
     return db.execute(
         f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL AND ZNAME != '' "
@@ -470,6 +490,72 @@ def _row_has_key(row, key):
     except AttributeError:
         return False
 
+
+def _row_get(row, key, default=None):
+    return row[key] if _row_has_key(row, key) else default
+
+
+def is_grocery_list_row(row):
+    return bool(_row_get(row, "ZSHOULDCATEGORIZEGROCERYITEMS", 0))
+
+
+def grocery_list_payload(row):
+    if not any(
+        _row_has_key(row, key)
+        for key in (
+            "ZSHOULDCATEGORIZEGROCERYITEMS",
+            "ZSHOULDAUTOCATEGORIZEITEMS",
+            "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST",
+            "ZGROCERYLOCALEID",
+            "ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA_LENGTH",
+        )
+    ):
+        return None
+
+    payload = {
+        "shouldCategorizeItems": bool(_row_get(row, "ZSHOULDCATEGORIZEGROCERYITEMS", 0)),
+        "shouldAutoCategorizeItems": bool(_row_get(row, "ZSHOULDAUTOCATEGORIZEITEMS", 0)),
+        "shouldSuggestConversion": bool(_row_get(row, "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST", 0)),
+    }
+    locale = _row_get(row, "ZGROCERYLOCALEID")
+    if locale:
+        payload["locale"] = locale
+    corrections_length = _row_get(row, "ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA_LENGTH")
+    if corrections_length is not None:
+        payload["localCorrectionsLength"] = corrections_length
+    corrections_checksum = _row_get(row, "ZAUTOCATEGORIZATIONLOCALCORRECTIONSCHECKSUM")
+    if corrections_checksum:
+        payload["localCorrectionsChecksum"] = corrections_checksum
+    return payload
+
+
+def list_to_dict(row):
+    is_groceries = is_grocery_list_row(row)
+    item = {
+        "id": _row_value(row, "Z_PK"),
+        "title": _row_value(row, "ZNAME"),
+        "listType": "groceries" if is_groceries else "standard",
+        "isGroceries": is_groceries,
+    }
+    object_uuid = _row_value(row, "ZCKIDENTIFIER")
+    if object_uuid:
+        item["objectUUID"] = object_uuid
+    grocery = grocery_list_payload(row)
+    if grocery and (is_groceries or any(grocery.values())):
+        item["grocery"] = grocery
+    if _row_has_key(row, "ZISPINNEDBYCURRENTUSER"):
+        item["pinned"] = bool(row["ZISPINNEDBYCURRENTUSER"])
+    if _row_has_key(row, "ZPINNEDDATE") and row["ZPINNEDDATE"] is not None:
+        item["pinnedDate"] = row["ZPINNEDDATE"]
+    return item
+
+
+def format_list_title(row, db=None, *, color=True):
+    title = _row_value(row, "ZNAME")
+    rendered = color_list_name(title, db) if color else title
+    return f"{rendered} {GROCERY_LIST_MARKER}" if is_grocery_list_row(row) else rendered
+
+
 def normalize_list_lookup_name(name):
     if not name:
         return ""
@@ -489,18 +575,24 @@ def normalize_list_lookup_name(name):
     return "".join(parts).strip()
 
 def list_ref_payload(row, *, requested=None, method="exact"):
-    return {
+    payload = {
         "id": _row_value(row, "Z_PK"),
         "title": _row_value(row, "ZNAME"),
         "objectUUID": _row_value(row, "ZCKIDENTIFIER"),
         "requested": requested,
         "method": method,
     }
+    payload["isGroceries"] = is_grocery_list_row(row)
+    grocery = grocery_list_payload(row)
+    if grocery and (payload["isGroceries"] or any(grocery.values())):
+        payload["grocery"] = grocery
+    return payload
 
 def resolve_list_ref(db, name=None, list_id=None):
     if list_id is not None:
+        columns = list_select_columns(db)
         row = db.execute(
-            "SELECT Z_PK, ZNAME, ZCKIDENTIFIER FROM ZREMCDBASELIST "
+            f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
             "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
             "AND ZNAME IS NOT NULL AND ZNAME != ''",
             (list_id,),
@@ -590,6 +682,16 @@ def q_list_exact_name_count(db, name):
         (name,),
     ).fetchone()
     return row["count"] if row else 0
+
+
+def q_list_by_pk(db, list_pk):
+    columns = list_select_columns(db)
+    return db.execute(
+        f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
+        "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
+        "AND ZNAME IS NOT NULL AND ZNAME != ''",
+        (list_pk,),
+    ).fetchone()
 
 _RECURRENCE_COLS = """
     (SELECT rr.ZFREQUENCY FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND rr.ZMARKEDFORDELETION = 0 AND rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_frequency,
@@ -1272,7 +1374,7 @@ def private_call_result(data, timeout=30):
 def private_call(data):
     """Call remctl-private with JSON data. Returns parsed JSON response."""
     result = private_call_result(data)
-    if result and result["returncode"] == 0 and isinstance(result["payload"], dict):
+    if result and isinstance(result["payload"], dict):
         return result["payload"]
     return None
 
@@ -1628,6 +1730,54 @@ def validate_list_appearance_args(a):
             sys.exit(1)
     color = getattr(a, "color", None)
     validate_list_color(color, private=private_metadata_enabled(a))
+    validate_list_grocery_args(a)
+
+
+GROCERY_LOCALE_RE = re.compile(r"^[A-Za-z]{2,3}(?:[_-][A-Za-z0-9]{2,8})?$")
+DEFAULT_GROCERY_LOCALE_ID = "en_US"
+
+
+def list_grocery_changes_from_args(a):
+    return any([
+        bool(getattr(a, "groceries", False)),
+        bool(getattr(a, "standard", False)),
+        getattr(a, "grocery_locale", None),
+    ])
+
+
+def normalize_grocery_locale(value):
+    if value is None:
+        return None
+    locale_id = str(value).strip()
+    if not locale_id:
+        print("Error: --grocery-locale cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+    locale_id = locale_id.replace("-", "_")
+    if not GROCERY_LOCALE_RE.match(locale_id):
+        print("Error: --grocery-locale must look like en_US or it_IT.", file=sys.stderr)
+        sys.exit(1)
+    parts = locale_id.split("_", 1)
+    if len(parts) == 2:
+        return f"{parts[0].lower()}_{parts[1].upper()}"
+    return parts[0].lower()
+
+
+def validate_list_grocery_args(a):
+    if getattr(a, "groceries", False) and getattr(a, "standard", False):
+        print("Error: pass either --groceries or --standard, not both.", file=sys.stderr)
+        sys.exit(1)
+    if getattr(a, "standard", False) and getattr(a, "grocery_locale", None):
+        print("Error: --grocery-locale cannot be combined with --standard.", file=sys.stderr)
+        sys.exit(1)
+    if list_grocery_changes_from_args(a) and not private_metadata_enabled(a):
+        print(
+            "Error: grocery list metadata requires --private. "
+            "Example: remctl list-create \"Groceries\" --private --groceries --grocery-locale en_US",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if getattr(a, "grocery_locale", None):
+        normalize_grocery_locale(a.grocery_locale)
 
 def list_private_appearance_payload(a, *, include_public_color_names=True):
     payload = {}
@@ -1642,6 +1792,13 @@ def list_private_appearance_payload(a, *, include_public_color_names=True):
         payload["symbol"] = a.symbol.strip()
     if getattr(a, "emoji", None):
         payload["emoji"] = a.emoji.strip()
+    if getattr(a, "groceries", False):
+        payload["shouldCategorizeGroceryItems"] = True
+        payload["groceryLocaleID"] = normalize_grocery_locale(getattr(a, "grocery_locale", None)) or DEFAULT_GROCERY_LOCALE_ID
+    elif getattr(a, "standard", False):
+        payload["shouldCategorizeGroceryItems"] = False
+    elif getattr(a, "grocery_locale", None):
+        payload["groceryLocaleID"] = normalize_grocery_locale(a.grocery_locale)
     return payload
 
 def list_appearance_changes_from_args(a):
@@ -1649,6 +1806,7 @@ def list_appearance_changes_from_args(a):
         getattr(a, "color", None),
         getattr(a, "symbol", None),
         getattr(a, "emoji", None),
+        list_grocery_changes_from_args(a),
     ])
 
 def apply_private_list_appearance(db, list_pk, a, *, exit_on_error=True, include_public_color_names=True):
@@ -1746,6 +1904,7 @@ def private_changes_from_args(a):
     return any([
         getattr(a, "url", None),
         getattr(a, "tags", None),
+        getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
@@ -1762,6 +1921,7 @@ def private_changes_from_args(a):
 
 def private_only_changes_from_args(a):
     return any([
+        getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
@@ -1778,11 +1938,96 @@ def private_only_changes_from_args(a):
 def refuse_private_args_without_opt_in(a):
     if private_only_changes_from_args(a) and not private_metadata_enabled(a):
         print(
-            "Error: section, subtask, image, urgent, flagged, and location writes require --private. "
-            "Example: remctl add \"Title\" -l Projects --private --section \"Research\"",
+            "Error: grocery, section, subtask, image, urgent, flagged, and location writes require --private. "
+            "Example: remctl add \"Milk\" -l Groceries --private --grocery",
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def require_grocery_list_target(db, list_pk):
+    row = q_list_by_pk(db, list_pk)
+    if not row:
+        print("Error: target list not found.", file=sys.stderr)
+        sys.exit(1)
+    if not is_grocery_list_row(row):
+        print(
+            f"Error: target list '{row['ZNAME']}' is not a Groceries list. "
+            "Use `remctl list-edit ... --private --groceries` first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return row
+
+
+def wait_for_grocery_section(list_pk, reminder_ckid, attempts=24, delay=0.25):
+    for _ in range(attempts):
+        db = open_db()
+        memberships = q_section_memberships(db, list_pk)
+        section = memberships.get(reminder_ckid)
+        if section:
+            return section
+        time.sleep(delay)
+    return None
+
+
+def apply_private_grocery_categorization(db, list_pk, reminder_ckids):
+    require_private_metadata(SimpleNamespace(private=True, private_metadata=False))
+    require_grocery_list_target(db, list_pk)
+    ckid = q_list_ckid(db, list_pk)
+    if not ckid:
+        print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    reminder_ckids = [ckid for ckid in reminder_ckids if ckid]
+    if not reminder_ckids:
+        print("Error: grocery categorization needs a stable reminder identifier.", file=sys.stderr)
+        sys.exit(1)
+
+    verified = []
+    pending = []
+    for reminder_ckid in reminder_ckids:
+        section = wait_for_grocery_section(list_pk, reminder_ckid)
+        verified.append({"id": reminder_ckid, "section": section})
+        if not section:
+            pending.append(reminder_ckid)
+
+    if not pending:
+        return {
+            "status": "updated",
+            "action": "categorize_grocery_items",
+            "source": "reminders_auto",
+            "verifiedSections": verified,
+        }
+
+    result = private_call({
+        "action": "categorize_grocery_items",
+        "listId": ckid,
+        "reminderIds": pending,
+    })
+    if result and result.get("status") == "updated":
+        result_verified = []
+        for reminder_ckid in reminder_ckids:
+            section = wait_for_grocery_section(list_pk, reminder_ckid)
+            result_verified.append({"id": reminder_ckid, "section": section})
+        result["verifiedSections"] = result_verified
+        return result
+
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    fallback_verified = []
+    for reminder_ckid in reminder_ckids:
+        section = wait_for_grocery_section(list_pk, reminder_ckid)
+        fallback_verified.append({"id": reminder_ckid, "section": section})
+    if any(item.get("section") for item in fallback_verified):
+        return {
+            "status": "updated",
+            "action": "categorize_grocery_items",
+            "source": "reminders_auto",
+            "warning": message,
+            "verifiedSections": fallback_verified,
+        }
+
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
@@ -1897,6 +2142,14 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "proximity": proximity,
             "address": getattr(a, "address", None),
         }))
+
+    if getattr(a, "grocery", False):
+        if db is None:
+            db = open_db()
+        if list_pk is None:
+            print("Error: --grocery requires a target list.", file=sys.stderr)
+            sys.exit(1)
+        results.append(apply_private_grocery_categorization(db, list_pk, [reminder_ckid]))
 
     return results
 
@@ -2492,6 +2745,25 @@ def osa(script):
         print(f"AppleScript error: {r.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return r.stdout.strip()
+
+
+def create_list_with_applescript(name):
+    rid = osa(
+        f'tell application "Reminders"\n'
+        f'set newList to make new list with properties {{name:"{esc(name)}"}}\n'
+        f'return id of newList\n'
+        f'end tell'
+    )
+    return {"status": "created", "id": rid, "fallback": "applescript"}
+
+
+def delete_list_with_applescript(name):
+    osa(
+        f'tell application "Reminders"\n'
+        f'delete list "{esc(name)}"\n'
+        f'end tell'
+    )
+    return {"status": "deleted", "fallback": "applescript"}
 
 def osa_by_id(list_name, rem_id, action):
     """Run AppleScript action on a reminder matched by its x-apple-reminder ID."""
@@ -3154,25 +3426,17 @@ def cmd_lists(a):
     db = open_db()
     rows = q_lists(db)
     if a.json:
-        payload = []
-        for r in rows:
-            item = {"id": r["Z_PK"], "title": r["ZNAME"]}
-            if _row_has_key(r, "ZISPINNEDBYCURRENTUSER"):
-                item["pinned"] = bool(r["ZISPINNEDBYCURRENTUSER"])
-            if _row_has_key(r, "ZPINNEDDATE") and r["ZPINNEDDATE"] is not None:
-                item["pinnedDate"] = r["ZPINNEDDATE"]
-            payload.append(item)
-        print(json.dumps(payload, indent=2))
+        print(json.dumps([list_to_dict(r) for r in rows], indent=2, ensure_ascii=False))
         return
     if getattr(a, 'format', None) == 'table':
-        data = [{"id": r["Z_PK"], "title": r["ZNAME"],
+        data = [{"id": r["Z_PK"], "title": format_list_title(r, color=False),
                  "list": "", "due": "", "pri": ""} for r in rows]
         print(fmt_table(data))
         return
     print(C.bold("Reminder Lists:"))
     for r in rows:
         secs = q_sections(db, r["Z_PK"])
-        list_name = color_list_name(r["ZNAME"], db)
+        list_name = format_list_title(r, db)
         sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
         pin_info = C.dim(" [pinned]") if _row_has_key(r, "ZISPINNEDBYCURRENTUSER") and r["ZISPINNEDBYCURRENTUSER"] else ""
         id_dim = C.dim(f"(id: {r['Z_PK']})")
@@ -3543,7 +3807,10 @@ def cmd_show(a):
     if not items:
         print(f"No {'active ' if not a.completed else ''}reminders in '{list_name}'")
         return
-    print(f"{C.bold(color_list_name(list_name, db))}:")
+    list_heading = color_list_name(list_name, db)
+    if list_ref.get("isGroceries"):
+        list_heading = f"{list_heading} {GROCERY_LIST_MARKER}"
+    print(f"{C.bold(list_heading)}:")
     if secs:
         sec_items, unsectioned = {}, []
         for item in items:
@@ -3595,6 +3862,11 @@ def cmd_add(a):
             if list_id is not None or wants_private:
                 raise
             target_list_name = getattr(a, "list", None)
+    if getattr(a, "grocery", False):
+        if target_list_pk is None:
+            print("Error: --grocery requires a target Groceries list via -l/--list or --list-id.", file=sys.stderr)
+            sys.exit(1)
+        require_grocery_list_target(db, target_list_pk)
 
     if a.tags and not wants_private:
         for t in a.tags.split(","):
@@ -3839,6 +4111,8 @@ def cmd_edit(a):
     if wants_private:
         require_private_metadata(a)
         validate_private_args(a)
+        if getattr(a, "grocery", False):
+            require_grocery_list_target(db, r["ZLIST"])
         if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
             print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
             sys.exit(1)
@@ -4406,7 +4680,6 @@ def cmd_overdue(a):
 def cmd_list_create(a):
     validate_list_appearance_args(a)
     private_payload_needed = bool(list_private_appearance_payload(a, include_public_color_names=False))
-    preflight_db = None
     if private_payload_needed:
         require_private_metadata(a)
         preflight_db = open_db()
@@ -4417,65 +4690,40 @@ def cmd_list_create(a):
                 file=sys.stderr,
             )
             sys.exit(1)
-    if not bridge_available():
-        print("Error: remctl-bridge required for list management", file=sys.stderr)
-        sys.exit(1)
+        request = {"action": "create_list", "name": a.name}
+        request.update(list_private_appearance_payload(a, include_public_color_names=True))
+        result = private_call(request)
+        if not result or result.get("status") != "created":
+            message = result.get("message") if isinstance(result, dict) else "private helper failed"
+            print(f"Error: Failed to create list '{a.name}': {message}", file=sys.stderr)
+            sys.exit(1)
+        if a.json:
+            print(json.dumps({"status": "created", "name": a.name, "private": result}, ensure_ascii=False))
+        else:
+            print(f"Created list: {a.name}")
+            details = []
+            if getattr(a, "color", None):
+                details.append(f"color={normalize_list_color(a.color)}")
+            if getattr(a, "symbol", None):
+                details.append(f"symbol={a.symbol}")
+            if getattr(a, "emoji", None):
+                details.append(f"emoji={a.emoji}")
+            if getattr(a, "groceries", False):
+                details.append(f"groceries locale={normalize_grocery_locale(getattr(a, 'grocery_locale', None)) or DEFAULT_GROCERY_LOCALE_ID}")
+            if details:
+                print(f"Applied private metadata: {', '.join(details)}")
+        return
     data = {"action": "create_list", "title": a.name}
     if hasattr(a, 'color') and a.color and is_supported_public_list_color(a.color):
         data["color"] = a.color
-    result = bridge_call(data)
+    result = bridge_call(data) if bridge_available() else None
+    if not result or result.get("status") != "created":
+        result = create_list_with_applescript(a.name)
     if result and result.get("status") == "created":
-        appearance_result = None
-        if private_payload_needed:
-            db = preflight_db or open_db()
-            list_ref = None
-            for _ in range(20):
-                list_ref = resolve_list_ref(db, name=a.name)
-                if list_ref and not list_ref.get("error"):
-                    break
-                time.sleep(0.2)
-            if not list_ref or list_ref.get("error"):
-                _print_list_resolution_error(a.name, list_ref)
-                sys.exit(1)
-            appearance_result = apply_private_list_appearance(
-                db,
-                list_ref["id"],
-                a,
-                exit_on_error=False,
-                include_public_color_names=False,
-            )
-            if not appearance_result or appearance_result.get("status") != "updated":
-                rollback = bridge_call({"action": "delete_list", "title": a.name}) if bridge_available() else None
-                message = appearance_result.get("message") if isinstance(appearance_result, dict) else "private helper failed"
-                if rollback and rollback.get("status") == "deleted":
-                    print(
-                        f"Error: private list appearance failed after creation, so the new list was deleted: {message}",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"Error: private list appearance failed after creation: {message}. "
-                        f"Delete the new list manually if it should not remain: {a.name}",
-                        file=sys.stderr,
-                    )
-                sys.exit(1)
         if a.json:
-            payload = {"status": "created", "name": a.name}
-            if appearance_result:
-                payload["private"] = appearance_result
-            print(json.dumps(payload))
+            print(json.dumps({"status": "created", "name": a.name}))
         else:
             print(f"Created list: {a.name}")
-            if appearance_result:
-                details = []
-                if getattr(a, "color", None):
-                    details.append(f"color={normalize_list_color(a.color)}")
-                if getattr(a, "symbol", None):
-                    details.append(f"symbol={a.symbol}")
-                if getattr(a, "emoji", None):
-                    details.append(f"emoji={a.emoji}")
-                if details:
-                    print(f"Updated private appearance: {', '.join(details)}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to create list '{a.name}'" + (f": {message}" if message else ""), file=sys.stderr)
@@ -4483,8 +4731,8 @@ def cmd_list_create(a):
 
 def cmd_list_edit(a):
     validate_list_appearance_args(a)
-    if not (getattr(a, "new_name", None) or getattr(a, "color", None) or getattr(a, "symbol", None) or getattr(a, "emoji", None)):
-        print("Error: pass at least one of --new-name, --color, --symbol, or --emoji.", file=sys.stderr)
+    if not (getattr(a, "new_name", None) or getattr(a, "color", None) or getattr(a, "symbol", None) or getattr(a, "emoji", None) or list_grocery_changes_from_args(a)):
+        print("Error: pass at least one of --new-name, --color, --symbol, --emoji, --groceries, --standard, or --grocery-locale.", file=sys.stderr)
         sys.exit(1)
     require_private_metadata(a)
     db = open_db()
@@ -4582,7 +4830,9 @@ def cmd_list_delete(a):
             print("Cancelled.")
             return
     data = {"action": "delete_list", "title": target_name}
-    result = bridge_call(data)
+    result = bridge_call(data) if bridge_available() else None
+    if not result or result.get("status") != "deleted":
+        result = delete_list_with_applescript(target_name)
     if result and result.get("status") == "deleted":
         if a.json:
             print(json.dumps({"status": "deleted", "id": list_ref["id"], "name": target_name}))
@@ -4770,6 +5020,7 @@ _remctl() {
                 '--new-section[Create and assign to new section]:section:' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
+                '--grocery[Auto-categorize in a Groceries list]' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
@@ -4790,6 +5041,7 @@ _remctl() {
                 '--new-section[Create and assign to new section]:section:' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
+                '--grocery[Auto-categorize in the reminder Groceries list]' \
                 '--flagged[Set real private flag]' \
                 '--no-flagged[Clear real private flag]' \
                 '--urgent[Set private urgent state]' \
@@ -4905,6 +5157,31 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        list-create)
+            _arguments \
+                '--color[List color name; with --private also accepts #RRGGBB]:color:' \
+                '--private[Use private ReminderKit for list appearance and grocery metadata]' \
+                '--symbol[Official Reminders list symbol]:symbol:' \
+                '--emoji[Private Reminders list emoji badge]:emoji:' \
+                '--groceries[Create as a Reminders Groceries list]' \
+                '--grocery-locale[Groceries locale identifier]:locale:' \
+                '--json[JSON output]'
+            return
+            ;;
+        list-edit)
+            _arguments \
+                '--list-id[Edit a list by stable numeric ID]:id:' \
+                '--new-name[Rename the list through private ReminderKit]:name:' \
+                '--color[List color name or #RRGGBB]:color:' \
+                '--private[Required for list appearance and grocery metadata writes]' \
+                '--symbol[Official Reminders list symbol]:symbol:' \
+                '--emoji[Private Reminders list emoji badge]:emoji:' \
+                '--groceries[Convert to a Reminders Groceries list]' \
+                '--standard[Convert a Groceries list back to a standard list]' \
+                '--grocery-locale[Groceries locale identifier]:locale:' \
+                '--json[JSON output]'
+            return
+            ;;
         list-rename)
             _arguments \
                 '--list-id[Rename list by stable numeric ID]:id:' \
@@ -4940,10 +5217,10 @@ BASH_COMPLETION = '''_remctl() {
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
-        COMPREPLY=( $(compgen -W "--private --section --section-id --new-section --subtask --image --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --location-title --latitude --longitude --radius --proximity --address --title --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --location-title --latitude --longitude --radius --proximity --address --title --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -4961,7 +5238,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--html --preview --json" -- "$cur") )
         return
     elif [ "$cmd" = "list-create" ]; then
-        COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --groceries --grocery-locale --json" -- "$cur") )
         return
     elif [ "$cmd" = "smart-list-create" ]; then
         COMPREPLY=( $(compgen -W "--private --color --symbol --emoji --match --filter-json --flagged --priority --any-tag --date --date-today-include-past-due --date-on --date-before --date-after --date-range --time --include-list --include-list-id --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
@@ -4973,7 +5250,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--private --smart-list-id --force --json" -- "$cur") )
         return
     elif [ "$cmd" = "list-edit" ]; then
-        COMPREPLY=( $(compgen -W "--list-id --new-name --color --private --symbol --emoji --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--list-id --new-name --color --private --symbol --emoji --groceries --standard --grocery-locale --json" -- "$cur") )
         return
     elif [ "$cmd" = "list-pin" ] || [ "$cmd" = "list-unpin" ]; then
         COMPREPLY=( $(compgen -W "--private --list-id --json" -- "$cur") )
@@ -5048,6 +5325,8 @@ complete -c remctl -n "__fish_seen_subcommand_from list-create" -l color -d "Lis
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l private -d "Use private ReminderKit list appearance writes"
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Official Reminders list symbol name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l emoji -d "Private Reminders list emoji badge" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l groceries -d "Create as a Reminders Groceries list"
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l grocery-locale -d "Groceries locale identifier" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l private -d "Use private ReminderKit smart-list creation"
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l color -d "Smart-list color name or #RRGGBB" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l symbol -d "Official Reminders list symbol" -r
@@ -5088,6 +5367,9 @@ complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l color -d "List 
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l private -d "Required for list appearance writes"
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l symbol -d "Official Reminders list symbol name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l emoji -d "Private Reminders list emoji badge" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l groceries -d "Convert to a Reminders Groceries list"
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l standard -d "Convert a Groceries list back to a standard list"
+complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l grocery-locale -d "Groceries locale identifier" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l private -d "Use private ReminderKit list pinning"
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l list-id -d "Target list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l json -d "JSON output"
@@ -5101,6 +5383,7 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign
 complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l image -d "Add private image attachment" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l grocery -d "Auto-categorize in a Groceries list"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, web rich link with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -s t -l tags -d "Tags, synced with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l list-id -d "Target list by stable numeric ID" -r
@@ -5110,6 +5393,7 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l section-id -d "Assig
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Create and assign to new section" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l image -d "Add private image attachment" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l grocery -d "Auto-categorize in the reminder Groceries list"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l flagged -d "Set real private flag"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-flagged -d "Clear real private flag"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l urgent -d "Set private urgent state"
@@ -5809,6 +6093,7 @@ def main():
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
     c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/subtasks/images")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in a Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the target list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
     c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
@@ -5850,6 +6135,7 @@ def main():
     c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
+    c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in its Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
     c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list and assign this reminder")
@@ -5916,9 +6202,11 @@ def main():
     c = sub.add_parser("list-create", help="Create a new list")
     c.add_argument("name")
     c.add_argument("--color", help="List color name; with --private also accepts #RRGGBB")
-    c.add_argument("--private", action="store_true", help="Use private ReminderKit for list symbol/emoji/exact color")
+    c.add_argument("--private", action="store_true", help="Use private ReminderKit for list symbol/emoji/exact color/grocery metadata")
     c.add_argument("--symbol", help="Official Reminders list symbol name, e.g. education3; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge, e.g. 📌")
+    c.add_argument("--groceries", action="store_true", help="Create as a Reminders Groceries list")
+    c.add_argument("--grocery-locale", help="Groceries locale identifier, e.g. en_US or it_IT")
     js(c)
 
     c = sub.add_parser(
@@ -5995,7 +6283,10 @@ def main():
     c.add_argument("--color", help="List color name or #RRGGBB")
     c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge")
-    c.add_argument("--private", action="store_true", help="Required for list appearance writes")
+    c.add_argument("--groceries", action="store_true", help="Convert to a Reminders Groceries list")
+    c.add_argument("--standard", action="store_true", help="Convert a Groceries list back to a standard list")
+    c.add_argument("--grocery-locale", help="Groceries locale identifier, e.g. en_US or it_IT")
+    c.add_argument("--private", action="store_true", help="Required for list appearance and grocery metadata writes")
     js(c)
 
     c = sub.add_parser("list-pin", help="Pin a list in Reminders.app")

@@ -46,18 +46,48 @@ class CliTests(unittest.TestCase):
     def test_parse_due_rejects_invalid_clock_time(self):
         self.assertIsNone(self.remctl.parse_due("today at 25:00"))
 
-    def _list_db(self, names):
+    def test_private_call_returns_structured_error_payload(self):
+        with mock.patch.object(
+            self.remctl,
+            "private_call_result",
+            return_value={
+                "returncode": 1,
+                "stdout": '{"status":"error","message":"ReminderKit unavailable"}',
+                "stderr": "",
+                "payload": {"status": "error", "message": "ReminderKit unavailable"},
+            },
+        ):
+            self.assertEqual(
+                self.remctl.private_call({"action": "create_list"}),
+                {"status": "error", "message": "ReminderKit unavailable"},
+            )
+
+    def _list_db(self, names, grocery_locales=None):
+        grocery_locales = grocery_locales or {}
         db = sqlite3.connect(":memory:")
         db.row_factory = sqlite3.Row
         db.execute(
             "CREATE TABLE ZREMCDBASELIST ("
-            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER)"
+            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER, "
+            "ZISPINNEDBYCURRENTUSER INTEGER, ZPINNEDDATE REAL, "
+            "ZSHOULDCATEGORIZEGROCERYITEMS INTEGER, ZSHOULDAUTOCATEGORIZEITEMS INTEGER, "
+            "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST INTEGER, ZGROCERYLOCALEID TEXT, "
+            "ZAUTOCATEGORIZATIONLOCALCORRECTIONSCHECKSUM TEXT, ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA BLOB)"
         )
         for idx, name in enumerate(names, start=1):
+            grocery_locale = grocery_locales.get(name)
             db.execute(
-                "INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT) VALUES (?, ?, ?, 0, 3)",
-                (idx, name, f"CK-{idx}"),
+                "INSERT INTO ZREMCDBASELIST "
+                "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, "
+                "ZISPINNEDBYCURRENTUSER, ZPINNEDDATE, ZSHOULDCATEGORIZEGROCERYITEMS, "
+                "ZSHOULDAUTOCATEGORIZEITEMS, ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST, ZGROCERYLOCALEID) "
+                "VALUES (?, ?, ?, 0, 3, 0, NULL, ?, 0, 0, ?)",
+                (idx, name, f"CK-{idx}", 1 if grocery_locale else 0, grocery_locale),
             )
+        db.execute(
+            "CREATE TABLE ZREMCDBASESECTION ("
+            "Z_PK INTEGER PRIMARY KEY, ZDISPLAYNAME TEXT, ZLIST INTEGER, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER)"
+        )
         return db
 
     def test_list_resolution_matches_single_normalized_name(self):
@@ -90,8 +120,47 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result["title"], "Projects")
             self.assertEqual(result["objectUUID"], "CK-1")
             self.assertEqual(result["method"], "id")
+            self.assertFalse(result["isGroceries"])
         finally:
             db.close()
+
+    def test_lists_json_reports_grocery_metadata(self):
+        db = self._list_db(["Groceries", "Work"], grocery_locales={"Groceries": "en_US"})
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(SimpleNamespace(json=True))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        groceries = next(item for item in payload if item["title"] == "Groceries")
+        work = next(item for item in payload if item["title"] == "Work")
+        self.assertEqual(groceries["listType"], "groceries")
+        self.assertTrue(groceries["isGroceries"])
+        self.assertEqual(groceries["grocery"]["locale"], "en_US")
+        self.assertTrue(groceries["grocery"]["shouldCategorizeItems"])
+        self.assertFalse(groceries["grocery"]["shouldAutoCategorizeItems"])
+        self.assertEqual(work["listType"], "standard")
+        self.assertFalse(work["isGroceries"])
+        self.assertNotIn("grocery", work)
+
+    def test_lists_human_output_marks_groceries_with_carrot(self):
+        db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(SimpleNamespace(json=False, format=None))
+        finally:
+            db.close()
+
+        output = stdout.getvalue()
+        self.assertIn("Groceries", output)
+        self.assertIn("🥕", output)
 
     def test_list_symbols_reports_official_reminders_emblems(self):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -142,6 +211,70 @@ class CliTests(unittest.TestCase):
             {"action": "create_list", "title": "Project X", "color": "blue"},
         )
 
+    def test_list_create_groceries_uses_private_helper(self):
+        db = self._list_db(["Groceries"], grocery_locales={})
+        args = SimpleNamespace(
+            name="Groceries",
+            color=None,
+            private=True,
+            symbol=None,
+            emoji=None,
+            groceries=True,
+            standard=False,
+            grocery_locale="it_IT",
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=0),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "created"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_list_create(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "create_list",
+                "name": "Groceries",
+                "shouldCategorizeGroceryItems": True,
+                "groceryLocaleID": "it_IT",
+            },
+        )
+        self.assertEqual(json.loads(stdout.getvalue())["private"]["status"], "created")
+
+    def test_list_create_groceries_surfaces_private_helper_error(self):
+        db = self._list_db(["Work"])
+        args = SimpleNamespace(
+            name="Groceries",
+            color=None,
+            private=True,
+            symbol=None,
+            emoji=None,
+            groceries=True,
+            standard=False,
+            grocery_locale="en_US",
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=0),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "error", "message": "ReminderKit unavailable"}),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_list_create(args)
+        finally:
+            db.close()
+
+        self.assertIn("ReminderKit unavailable", stderr.getvalue())
+
     def test_list_create_rejects_symbol_without_private_before_bridge(self):
         args = SimpleNamespace(name="Project X", color=None, private=False, symbol="education3", emoji=None, json=True)
         with (
@@ -174,6 +307,9 @@ class CliTests(unittest.TestCase):
             private=True,
             symbol="education3",
             emoji=None,
+            groceries=False,
+            standard=False,
+            grocery_locale=None,
             json=True,
         )
         try:
@@ -195,6 +331,70 @@ class CliTests(unittest.TestCase):
                 "symbol": "education3",
             },
         )
+
+    def test_list_edit_can_convert_groceries_and_standard(self):
+        db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
+        groceries_args = SimpleNamespace(
+            name="Groceries",
+            list_id=None,
+            new_name=None,
+            color=None,
+            private=True,
+            symbol=None,
+            emoji=None,
+            groceries=True,
+            standard=False,
+            grocery_locale=None,
+            json=True,
+        )
+        standard_args = SimpleNamespace(
+            name=None,
+            list_id=1,
+            new_name=None,
+            color=None,
+            private=True,
+            symbol=None,
+            emoji=None,
+            groceries=False,
+            standard=True,
+            grocery_locale=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as groceries_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_list_edit(groceries_args)
+            self.assertEqual(
+                groceries_call.call_args.args[0],
+                {
+                    "shouldCategorizeGroceryItems": True,
+                    "groceryLocaleID": "en_US",
+                    "action": "set_list_appearance",
+                    "listId": "CK-1",
+                },
+            )
+
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as standard_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_list_edit(standard_args)
+            self.assertEqual(
+                standard_call.call_args.args[0],
+                {
+                    "shouldCategorizeGroceryItems": False,
+                    "action": "set_list_appearance",
+                    "listId": "CK-1",
+                },
+            )
+        finally:
+            db.close()
 
     def test_list_pin_and_unpin_use_private_helper(self):
         db = self._list_db(["📌 Project X"])
@@ -240,6 +440,226 @@ class CliTests(unittest.TestCase):
         private_available.assert_not_called()
         private_call.assert_not_called()
         self.assertIn("--private", stderr.getvalue())
+
+    def test_add_grocery_rejects_without_private_before_bridge(self):
+        args = SimpleNamespace(
+            title="Milk",
+            list="Groceries",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            grocery=True,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            flagged=None,
+            urgent=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(args)
+
+        bridge_call.assert_not_called()
+        self.assertIn("--private", stderr.getvalue())
+
+    def test_add_grocery_reports_reminders_auto_categorization(self):
+        db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
+        args = SimpleNamespace(
+            title="Milk",
+            list="Groceries",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=True,
+            private_metadata=False,
+            grocery=True,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            flagged=None,
+            urgent=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        bridge_result = {"status": "created", "id": "REM-1"}
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                mock.patch.object(self.remctl, "wait_for_grocery_section", return_value="Dairy, Eggs & Cheese"),
+                mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_add(args)
+        finally:
+            db.close()
+
+        private_call.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["private"][0]["source"], "reminders_auto")
+        self.assertEqual(payload["private"][0]["verifiedSections"][0]["section"], "Dairy, Eggs & Cheese")
+
+    def test_add_grocery_falls_back_to_private_categorizer_when_needed(self):
+        db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
+        args = SimpleNamespace(
+            title="Milk",
+            list="Groceries",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=True,
+            private_metadata=False,
+            grocery=True,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            flagged=None,
+            urgent=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        bridge_result = {"status": "created", "id": "REM-1"}
+        section_results = iter([None, "Dairy, Eggs & Cheese"])
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                mock.patch.object(self.remctl, "wait_for_grocery_section", side_effect=lambda *_args, **_kwargs: next(section_results)),
+                mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_add(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            private_call.call_args.args[0],
+            {
+                "action": "categorize_grocery_items",
+                "listId": "CK-1",
+                "reminderIds": ["REM-1"],
+            },
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["private"][0]["verifiedSections"][0]["section"], "Dairy, Eggs & Cheese")
+
+    def test_add_grocery_treats_helper_error_as_success_when_section_verified(self):
+        db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
+        section_results = iter([None, "Dairy, Eggs & Cheese"])
+        try:
+            result = None
+            with (
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "error", "message": "Couldn’t communicate with a helper application."}),
+                mock.patch.object(self.remctl, "wait_for_grocery_section", side_effect=lambda *_args, **_kwargs: next(section_results)),
+            ):
+                result = self.remctl.apply_private_grocery_categorization(db, 1, ["REM-1"])
+        finally:
+            db.close()
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["source"], "reminders_auto")
+        self.assertIn("helper application", result["warning"])
+        self.assertEqual(result["verifiedSections"][0]["section"], "Dairy, Eggs & Cheese")
+
+    def test_add_grocery_rejects_standard_target_list(self):
+        db = self._list_db(["Work"])
+        args = SimpleNamespace(
+            title="Milk",
+            list="Work",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=True,
+            private_metadata=False,
+            grocery=True,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            flagged=None,
+            urgent=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_add(args)
+        finally:
+            db.close()
+
+        bridge_call.assert_not_called()
+        self.assertIn("not a Groceries list", stderr.getvalue())
 
     def test_list_rename_and_delete_use_resolved_bridge_contract_fields(self):
         db = self._list_db(["Old"])

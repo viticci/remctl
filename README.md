@@ -6,7 +6,7 @@ RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users an
 
 RemCTL reads the user's local iCloud Reminders database directly (with native macOS permission access) for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
 
-Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, subtasks, tags, image attachments, location-based alarms, list appearance metadata, and custom smart lists by using the native ReminderKit framework.
+Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, subtasks, tags, image attachments, location-based alarms, list appearance metadata, Groceries list metadata, and custom smart lists by using the native ReminderKit framework.
 
 As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 – without breaking iCloud sync.
 
@@ -77,6 +77,8 @@ remctl list-symbols
 remctl list-symbols --preview
 remctl list-create "Research" --color orange --private --symbol education3
 remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl add "Milk" -l Groceries --private --grocery
 remctl smart-lists --json
 remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
@@ -92,6 +94,22 @@ remctl info 23880 --json
 The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes.
 
 Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
+
+## Groceries Lists
+
+Reminders stores Groceries lists as normal lists with private grocery metadata. RemCTL reads those fields directly: `lists --json` reports `listType`, `isGroceries`, and the grocery locale flags, while human `lists` and `show` output mark detected Groceries lists with `🥕`.
+
+```bash
+remctl lists --json
+remctl show Groceries
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl list-edit "Shopping" --private --groceries --grocery-locale it_IT
+remctl list-edit "Shopping" --private --standard
+remctl add "Milk" -l Groceries --private --grocery
+remctl edit 23880 --private --grocery
+```
+
+Groceries writes require `--private` because Apple exposes the list type, locale, and item categorization through ReminderKit, not EventKit. `add --private --grocery` creates the reminder normally, waits for Reminders' automatic grocery sorter, verifies the resulting section membership from the local database, and only falls back to ReminderKit's explicit categorizer if the item is not sorted yet.
 
 ## Smart Lists
 
@@ -127,6 +145,8 @@ remctl edit 23880 --private --image ~/Desktop/mockup.png --flagged --urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
 remctl list-edit Projects --private --color '#FF8D28' --symbol education3
 remctl list-edit Projects --private --emoji 📌
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl add "Milk" -l Groceries --private --grocery
 remctl list-pin "Project X" --private
 remctl list-unpin --list-id 144 --private
 remctl smart-list-create "Flagged Review" --private --flagged
@@ -137,7 +157,7 @@ remctl smart-list-edit "Priority or Today" --private --priority high --color red
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list appearance and pin state, smart-list appearance metadata, and experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters. `smart-lists` is read-only and safe; `smart-list-create`, `smart-list-edit`, and `smart-list-delete` require `--private`, and filter writes reject unknown or known non-materializing shapes before writing. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges on both lists and smart lists. `list-pin` and `list-unpin` also require `--private` and save through ReminderKit. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
+Supported private metadata includes synced web rich links, synced tags, section assignment and creation, rich subtasks with per-child notes/due/URL/tags/images, image attachments, real flag state, urgent state, location alarms, list appearance and pin state, Groceries list creation/conversion/locale metadata, Groceries categorization verification, smart-list appearance metadata, and experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters. `smart-lists` is read-only and safe; `smart-list-create`, `smart-list-edit`, and `smart-list-delete` require `--private`, and filter writes reject unknown or known non-materializing shapes before writing. `list-create --color` uses public EventKit for normal color names; `--private` enables exact `#RRGGBB` colors plus official list symbols or emoji badges on both lists and smart lists. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` use ReminderKit's private grocery context; `add/edit --private --grocery` verifies Reminders' automatic sorter first and falls back to the explicit private categorizer only when needed. `list-pin` and `list-unpin` also require `--private` and save through ReminderKit. `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet rendered from the native RemindersUICore badge assets with interactive official color swatches, or `list-symbols --html path/to/file.html` to write it without opening. Reminders stores built-in icons as private emblem names such as `education3`; `--symbol` is limited to those official names because arbitrary SF Symbol strings fall back to the default icon in Reminders. Use `--emoji` for custom standard emoji badges. If a section name is duplicated in the same list, RemCTL picks the single non-empty match when there is one; otherwise use `--section-id`.
 
 This is the major difference from ordinary EventKit-only Reminders CLIs, but it is still unsupported by Apple. Private-only flags fail before writing unless `--private` is present, generic file/PDF attachments are intentionally rejected, reminder metadata writes should be verified with `remctl info ID --json`, and smart-list writes should be verified with `remctl smart-lists --json` plus a UI/device check when sync behavior matters.
 
@@ -150,6 +170,7 @@ RemCTL output is designed for both humans and agents:
 - flagged reminders show `⚑`
 - macOS 26 urgent reminders show `⏰`
 - recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`
+- Groceries lists show `🥕` in list headings and list summaries
 - table output keeps a dedicated `Repeat` column when any row is recurring
 - every read command supports JSON output
 
@@ -198,6 +219,8 @@ remctl doctor --for-agent --json
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `info` includes private rich-link URLs, so agents should not need raw SQLite checks for ordinary rich-link verification.
 
 For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. Reminders.app currently materializes only one included-list filter at a time; RemCTL rejects repeated included lists and list exclusions before writing. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
+
+For Groceries automation, use `lists --json` to detect `listType: "groceries"` and `grocery.locale`, then use `add --private --grocery` or `edit --private --grocery` only against an existing Groceries list. Verify with `show <list> --json` and check the reminder's `section` after categorization.
 
 Agents should pass deterministic due dates, ideally `YYYY-MM-DD HH:MM` after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
 

@@ -23,6 +23,7 @@
 - (id)updateList:(id)list;
 - (id)updateSmartList:(id)smartList;
 - (id)addReminderWithTitle:(NSString *)title toReminderSubtaskContextChangeItem:(id)context;
+- (id)addListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem listObjectID:(id)objectID;
 - (id)addListSectionWithDisplayName:(NSString *)name toListSectionContextChangeItem:(id)context;
 - (id)addCustomSmartListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem smartListObjectID:(id)objectID;
 - (BOOL)saveSynchronouslyWithError:(NSError **)error;
@@ -34,6 +35,7 @@
 @end
 
 @interface REMAccountChangeItem : NSObject
+- (void)addListChangeItem:(id)listChangeItem;
 - (void)addSmartListChangeItem:(id)smartListChangeItem;
 @end
 
@@ -96,11 +98,20 @@
 @end
 
 @interface REMListChangeItem : NSObject
+- (id)remObjectID;
 - (id)sectionsContextChangeItem;
 - (id)appearanceContext;
+- (id)groceryContextChangeItem;
 - (void)setColor:(id)color;
 - (void)setIsPinned:(BOOL)pinned;
 - (void)setName:(NSString *)name;
+- (void)setParentOwnerID:(id)objectID;
+@end
+
+@interface REMListGroceryContextChangeItem : NSObject
+- (void)setShouldCategorizeGroceryItems:(BOOL)value;
+- (void)setGroceryLocaleID:(NSString *)localeID;
+- (void)categorizeGroceryItemsWithReminderIDs:(NSArray *)reminderIDs;
 @end
 
 @interface REMListAppearanceContextChangeItem : NSObject
@@ -233,6 +244,37 @@ static void applyListAppearance(id change, NSDictionary *cmd, NSMutableDictionar
             }
             details[@"emoji"] = emoji;
         }
+    }
+}
+
+static void applyListGroceryMetadata(REMListChangeItem *change, NSDictionary *cmd, NSMutableDictionary *details) {
+    BOOL hasCategorizeFlag = cmd[@"shouldCategorizeGroceryItems"] && cmd[@"shouldCategorizeGroceryItems"] != [NSNull null];
+    BOOL hasLocale = [cmd[@"groceryLocaleID"] isKindOfClass:[NSString class]] && [cmd[@"groceryLocaleID"] length] > 0;
+    if (!hasCategorizeFlag && !hasLocale) {
+        return;
+    }
+    if (![change respondsToSelector:@selector(groceryContextChangeItem)]) {
+        fail(@"ReminderKit list change item does not support grocery metadata");
+    }
+    id groceryContext = [change groceryContextChangeItem];
+    if (!groceryContext) {
+        fail(@"Could not create ReminderKit grocery context");
+    }
+    if (hasCategorizeFlag) {
+        if (![groceryContext respondsToSelector:@selector(setShouldCategorizeGroceryItems:)]) {
+            fail(@"ReminderKit grocery context does not support grocery list conversion");
+        }
+        BOOL enabled = [cmd[@"shouldCategorizeGroceryItems"] boolValue];
+        [(REMListGroceryContextChangeItem *)groceryContext setShouldCategorizeGroceryItems:enabled];
+        details[@"shouldCategorizeGroceryItems"] = @(enabled);
+    }
+    if (hasLocale) {
+        if (![groceryContext respondsToSelector:@selector(setGroceryLocaleID:)]) {
+            fail(@"ReminderKit grocery context does not support grocery locale changes");
+        }
+        NSString *localeID = cmd[@"groceryLocaleID"];
+        [(REMListGroceryContextChangeItem *)groceryContext setGroceryLocaleID:localeID];
+        details[@"groceryLocaleID"] = localeID;
     }
 }
 
@@ -507,14 +549,65 @@ int main(int argc, const char * argv[]) {
             @"set_flagged",
             @"set_urgent",
             @"add_location_alarm",
+            @"create_list",
             @"set_list_appearance",
             @"set_list_pinned",
+            @"categorize_grocery_items",
             @"create_smart_list",
             @"update_smart_list",
             @"delete_smart_list",
         ]];
         if (![action isKindOfClass:[NSString class]] || ![allowedActions containsObject:action]) {
             fail(@"Unknown action");
+        }
+        if ([action isEqualToString:@"create_list"]) {
+            NSString *name = cmd[@"name"];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+                fail(@"name is required");
+            }
+            NSError *error = nil;
+            REMStore *store = [REMStore new];
+            REMAccount *account = [store fetchPrimaryActiveCloudKitAccountWithError:&error];
+            if (!account) {
+                account = [store fetchDefaultAccountWithError:&error];
+            }
+            if (!account) {
+                fail(error.localizedDescription ?: @"No active Reminders account found");
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id accountChange = [save updateAccount:account];
+            if (!accountChange) {
+                fail(@"Could not create ReminderKit account change item");
+            }
+            REMListChangeItem *change = [save addListWithName:name toAccountChangeItem:accountChange listObjectID:nil];
+            if (!change) {
+                fail(@"Could not create ReminderKit list change item");
+            }
+            if ([change respondsToSelector:@selector(setParentOwnerID:)]) {
+                [change setParentOwnerID:[account remObjectID]];
+            }
+            if ([accountChange respondsToSelector:@selector(addListChangeItem:)]) {
+                [accountChange addListChangeItem:change];
+            }
+            NSMutableDictionary *details = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"status": @"created",
+                @"action": action,
+                @"name": name,
+            }];
+            applyListAppearance(change, cmd, details, @"List");
+            applyListGroceryMetadata(change, cmd, details);
+
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit list save failed");
+            }
+            id objectID = [change remObjectID];
+            NSString *uuid = objectID && [objectID respondsToSelector:@selector(uuid)] ? [[objectID uuid] UUIDString] : @"";
+            NSString *url = objectID && [objectID respondsToSelector:@selector(urlRepresentation)] ? [[objectID urlRepresentation] absoluteString] : @"";
+            details[@"id"] = uuid ?: @"";
+            details[@"url"] = url ?: @"";
+            output(details);
+            return 0;
         }
         if ([action isEqualToString:@"create_smart_list"]) {
             NSString *name = cmd[@"name"];
@@ -718,6 +811,7 @@ int main(int argc, const char * argv[]) {
                 details[@"name"] = newName;
             }
             applyListAppearance(change, cmd, details, @"List");
+            applyListGroceryMetadata(change, cmd, details);
 
             if (![save saveSynchronouslyWithError:&error]) {
                 fail(error.localizedDescription ?: @"ReminderKit list save failed");
@@ -761,6 +855,62 @@ int main(int argc, const char * argv[]) {
                 @"action": action,
                 @"listId": listID,
                 @"pinned": @([pinned boolValue]),
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"categorize_grocery_items"]) {
+            NSString *listID = cmd[@"listId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            NSArray<NSString *> *reminderIDs = stringArray(cmd[@"reminderIds"], @"reminderIds");
+            if (reminderIDs.count == 0) {
+                fail(@"At least one reminder ID is required");
+            }
+            NSURL *objectURL = listURL(listID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit list object ID");
+            }
+            REMStore *store = [REMStore new];
+            id list = [store fetchListWithObjectID:objectID error:&error];
+            if (!list) {
+                fail(error.localizedDescription ?: @"List not found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListChangeItem *change = [save updateList:list];
+            if (!change) {
+                fail(@"Could not create ReminderKit list change item");
+            }
+            if (![change respondsToSelector:@selector(groceryContextChangeItem)]) {
+                fail(@"ReminderKit list change item does not support grocery categorization");
+            }
+            id groceryContext = [change groceryContextChangeItem];
+            if (!groceryContext || ![groceryContext respondsToSelector:@selector(categorizeGroceryItemsWithReminderIDs:)]) {
+                fail(@"ReminderKit grocery context does not support item categorization");
+            }
+            NSMutableArray *uuids = [NSMutableArray array];
+            for (NSString *reminderID in reminderIDs) {
+                NSURL *reminderObjectURL = reminderURL(reminderID);
+                id reminderObjectID = [REMObjectID objectIDWithURL:reminderObjectURL];
+                if (!reminderObjectID || ![reminderObjectID respondsToSelector:@selector(uuid)]) {
+                    fail([NSString stringWithFormat:@"Could not build ReminderKit reminder object ID: %@", reminderID]);
+                }
+                [uuids addObject:[reminderObjectID uuid]];
+            }
+            @try {
+                [(REMListGroceryContextChangeItem *)groceryContext categorizeGroceryItemsWithReminderIDs:uuids];
+            } @catch (NSException *exception) {
+                fail([NSString stringWithFormat:@"ReminderKit grocery categorization failed: %@", exception.reason ?: exception.name]);
+            }
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit grocery categorization save failed");
+            }
+            output(@{
+                @"status": @"updated",
+                @"action": action,
+                @"listId": listID,
+                @"remindersCategorized": @(reminderIDs.count),
             });
             return 0;
         }

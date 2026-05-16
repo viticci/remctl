@@ -72,6 +72,8 @@ remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"]}'
 remctl edit 23880 --private --flagged --urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl add "Milk" -l Groceries --private --grocery
 remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "High Priority" --private --priority high
 remctl smart-list-delete "Flagged Review" --private --force
@@ -93,7 +95,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, location alarms, list appearance metadata, list pin state, and custom smart-list creation/editing/deletion for verified materializing Reminders filters. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, location alarms, list appearance metadata, list pin state, Groceries list metadata and categorization verification, and custom smart-list creation/editing/deletion for verified materializing Reminders filters. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
@@ -132,6 +134,11 @@ remctl list-symbols --html ~/Desktop/remctl-list-symbols.html
 remctl list-create "Project X" --color blue
 remctl list-create "Project X" --color orange --private --symbol education3
 remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
+remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl list-edit "Shopping" --private --groceries --grocery-locale it_IT
+remctl list-edit "Shopping" --private --standard
+remctl add "Milk" -l Groceries --private --grocery
+remctl edit 23880 --private --grocery
 remctl list-edit "Project X" --private --color '#FF8D28' --symbol education3
 remctl list-edit --list-id 144 --private --emoji 📌
 remctl list-pin "Project X" --private
@@ -144,7 +151,9 @@ remctl list-delete --list-id 144 --force
 
 `list-create --color NAME` uses EventKit and supports Reminders color names such as `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, and `cyan`.
 
-List symbols, emoji badges, and pin state are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance editor; `list-pin` and `list-unpin` toggle the Reminders.app sidebar pin state. Use `--list-id` when duplicate or normalized names could match more than one list. With `--private`, `--color` also accepts `#RRGGBB`.
+List symbols, emoji badges, Groceries mode, and pin state are private Reminders metadata and require `--private`. `list-edit` is the exact-target appearance and list-type editor; `list-pin` and `list-unpin` toggle the Reminders.app sidebar pin state. Use `--list-id` when duplicate or normalized names could match more than one list. With `--private`, `--color` also accepts `#RRGGBB`.
+
+Groceries lists are detected from private list columns. Human `lists` and `show` output marks them with `🥕`; `lists --json` includes `listType`, `isGroceries`, and `grocery` locale/categorization fields. Use `list-create --private --groceries --grocery-locale en_US` for new Groceries lists, `list-edit --private --groceries` or `--standard` to convert existing lists, and `add/edit --private --grocery` to verify Reminders' automatic grocery sections, with an explicit ReminderKit categorizer fallback when needed.
 
 `list-symbols` prints the 71 official Reminders emblem names bundled in RemindersUICore. The terminal preview column is an approximate Unicode fallback, not the native icon. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet from the native badge assets with interactive official color swatches, or `list-symbols --html PATH` to write that contact sheet without opening it. Reminders stores picker icons as private emblem names, not public SF Symbol names. For example, Reminders stores the pencil/ruler picker icon as `education3`. `--symbol` is intentionally restricted to official names because arbitrary SF Symbol strings can be accepted by ReminderKit but render as the default list icon in Reminders. Use `--emoji` for custom standard emoji badges.
 
@@ -271,3 +280,5 @@ remctl info <numericId> --json
 `add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, so raw SQLite verification should not be needed for normal rich-link tasks.
 
 If an agent supplies an invalid due date, RemCTL creates nothing and exits with a structured `invalid_due_date` error on stderr. Retry the same `add` command with one of the provided examples or a normalized `YYYY-MM-DD HH:MM` value; do not create first and patch the due date afterward.
+
+For Groceries automation, detect eligible lists with `remctl lists --json` and `listType == "groceries"`. After `add --private --grocery`, verify with `remctl show <list> --json` and check that the reminder has a non-empty `section` once categorization completes.
