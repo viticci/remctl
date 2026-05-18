@@ -24,10 +24,10 @@ Verified on macOS/iCloud sync:
 - subtasks: `--private --subtask "Follow up"` or rich JSON objects with child metadata
 - image attachments: `--private --image ~/Desktop/mockup.png`
 - real flag state: `edit ID --private --flagged` or `add ... --private -f`
-- urgent state: `edit ID --private --urgent`
+- urgent state: `add "Leave now" --private --urgent` or `edit ID --private --urgent`
 - location alarms: `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090`
 - list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
-- list pin state: `list-pin "Project X" --private`, `list-unpin --list-id 144 --private`
+- list and smart-list pin state: `list-pin "Project X" --private`, `list-pin "Flagged" --private`, `list-unpin --smart-list-id 4 --private`
 - custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
 - Reminders templates: `template-create "Packing Template" --from-list Packing --private`, `template-apply "Packing Template" --private`, and exact cleanup via `template-delete "Packing Template" --private --force`
 
@@ -95,7 +95,9 @@ remctl list-edit --list-id 144 --private --symbol education3
 remctl list-edit Projects --private --emoji 📌
 remctl list-rename --list-id 123 --new-name "Project Archive"
 remctl list-pin "Project X" --private
+remctl list-pin "Flagged" --private
 remctl list-unpin --list-id 144 --private
+remctl list-unpin --smart-list-id 4 --private
 ```
 
 List colors and badge emblems were reverse-engineered from `ZREMCDBASELIST`. `ZCOLOR` stores a `REMColor` keyed archive. `ZBADGEEMBLEM` stores either an emoji JSON string or a private Reminders emblem name. `list-symbols` prints the 71 official emblem names bundled in RemindersUICore; the terminal glyph column is approximate. Use `list-symbols --preview` or `list-symbols --html PATH` for a native-asset HTML contact sheet with interactive official color swatches. RemCTL writes those values through ReminderKit change items, not by editing the database.
@@ -106,7 +108,9 @@ Important limits:
 - `list-create --private --color '#RRGGBB'` and `list-edit --private --color '#RRGGBB'` use private ReminderKit for exact custom colors.
 - `--symbol` writes one of the official Reminders emblem names printed by `list-symbols`. Reminders' own picker uses private names such as `education3`; arbitrary SF Symbol strings are rejected because they fall back to the default icon in Reminders.
 - `--emoji` writes a Reminders emoji badge for standard emoji such as `🥶` or `📌`.
-- `list-edit`, `list-pin`, and `list-unpin` resolve by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
+- `list-edit` resolves by exact list name, then safe normalized matching; if a duplicate match is ambiguous, use `--list-id`.
+- `list-pin` and `list-unpin` can target regular lists or smart lists by name. If a name matches both, use `--list-id` or `--smart-list-id`.
+- Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. Smart-list rows can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL reports `pinned: true` when the smart-list pin date is positive.
 
 ## Groceries List Examples
 

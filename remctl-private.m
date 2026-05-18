@@ -10,6 +10,7 @@
 @interface REMStore : NSObject
 - (id)fetchReminderWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListWithObjectID:(id)objectID error:(NSError **)error;
+- (id)fetchSmartListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListSectionWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchCustomSmartListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchTemplateWithObjectID:(id)objectID error:(NSError **)error;
@@ -53,6 +54,7 @@
 - (id)customContext;
 - (void)setColor:(id)color;
 - (void)setFilterData:(NSData *)filterData;
+- (void)setIsPinned:(BOOL)pinned;
 - (void)setName:(NSString *)name;
 - (void)setParentOwnerID:(id)objectID;
 - (void)setSmartListType:(NSString *)smartListType;
@@ -573,6 +575,7 @@ int main(int argc, const char * argv[]) {
             @"create_list",
             @"set_list_appearance",
             @"set_list_pinned",
+            @"set_smart_list_pinned",
             @"categorize_grocery_items",
             @"create_smart_list",
             @"update_smart_list",
@@ -1017,6 +1020,51 @@ int main(int argc, const char * argv[]) {
                 @"status": @"updated",
                 @"action": action,
                 @"listId": listID,
+                @"pinned": @([pinned boolValue]),
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"set_smart_list_pinned"]) {
+            NSString *smartListID = cmd[@"smartListId"];
+            if (![smartListID isKindOfClass:[NSString class]] || smartListID.length == 0) {
+                fail(@"smartListId is required");
+            }
+            NSNumber *pinned = cmd[@"pinned"];
+            if (![pinned isKindOfClass:[NSNumber class]]) {
+                fail(@"pinned is required");
+            }
+            NSURL *objectURL = smartListURL(smartListID);
+            id objectID = [REMObjectID objectIDWithURL:objectURL];
+            if (!objectID) {
+                fail(@"Could not build ReminderKit smart list object ID");
+            }
+            REMStore *store = [REMStore new];
+            id smartList = nil;
+            if ([store respondsToSelector:@selector(fetchSmartListWithObjectID:error:)]) {
+                smartList = [store fetchSmartListWithObjectID:objectID error:&error];
+            }
+            if (!smartList) {
+                smartList = [store fetchCustomSmartListWithObjectID:objectID error:&error];
+            }
+            if (!smartList) {
+                fail(error.localizedDescription ?: @"Smart list not found");
+            }
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMSmartListChangeItem *change = [save updateSmartList:smartList];
+            if (!change) {
+                fail(@"Could not create ReminderKit smart list change item");
+            }
+            if (![change respondsToSelector:@selector(setIsPinned:)]) {
+                fail(@"ReminderKit smart list change item does not support pinning");
+            }
+            [change setIsPinned:[pinned boolValue]];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit smart list pin save failed");
+            }
+            output(@{
+                @"status": @"updated",
+                @"action": action,
+                @"smartListId": smartListID,
                 @"pinned": @([pinned boolValue]),
             });
             return 0;

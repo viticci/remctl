@@ -444,9 +444,21 @@ def q_lists(db):
     ).fetchall()
 
 def q_smart_lists(db):
+    table_columns = table_column_names(db, "ZREMCDBASELIST")
+    if "ZSMARTLISTTYPE" not in table_columns:
+        return []
+    columns = [
+        "Z_PK",
+        "ZNAME",
+        "ZCKIDENTIFIER",
+        "ZSMARTLISTTYPE",
+        "ZFILTERDATA",
+        "ZMINIMUMSUPPORTEDAPPVERSION",
+        "ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION",
+    ]
+    columns.extend(column for column in ("ZISPINNEDBYCURRENTUSER", "ZPINNEDDATE") if column in table_columns)
     return db.execute(
-        "SELECT Z_PK, ZNAME, ZCKIDENTIFIER, ZSMARTLISTTYPE, ZFILTERDATA, "
-        "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION FROM ZREMCDBASELIST "
+        f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND (Z_ENT = 4 OR ZSMARTLISTTYPE IS NOT NULL) "
         "ORDER BY COALESCE(ZNAME, ''), Z_PK"
     ).fetchall()
@@ -769,6 +781,82 @@ def resolve_required_list_target_or_die(db, *, name=None, list_id=None):
         sys.exit(1)
     return resolve_list_or_die(db, name=name, list_id=list_id)
 
+
+def smart_list_ref_payload(row, *, requested=None, method="exact"):
+    return {
+        "id": row["Z_PK"],
+        "title": smart_list_display_name(row),
+        "objectUUID": row["ZCKIDENTIFIER"],
+        "requested": requested,
+        "method": method,
+        "kind": "custom" if row["ZSMARTLISTTYPE"] == CUSTOM_SMART_LIST_TYPE else "built-in",
+        "smartListType": row["ZSMARTLISTTYPE"],
+    }
+
+
+def resolve_smart_list_ref(db, name=None, smart_list_id=None):
+    rows = q_smart_lists(db)
+    if smart_list_id is not None:
+        matches = [row for row in rows if row["Z_PK"] == smart_list_id]
+        return smart_list_ref_payload(matches[0], requested=str(smart_list_id), method="id") if matches else None
+
+    if not name:
+        return None
+
+    exact = [row for row in rows if smart_list_display_name(row) == name]
+    if len(exact) == 1:
+        return smart_list_ref_payload(exact[0], requested=name, method="exact")
+    if len(exact) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [smart_list_ref_payload(row) for row in exact]}
+
+    folded = str(name).casefold()
+    ci = [row for row in rows if smart_list_display_name(row).casefold() == folded]
+    if len(ci) == 1:
+        return smart_list_ref_payload(ci[0], requested=name, method="case_insensitive")
+    if len(ci) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [smart_list_ref_payload(row) for row in ci]}
+
+    normalized = normalize_list_lookup_name(name)
+    if not normalized:
+        return None
+    normalized_matches = [
+        row for row in rows
+        if normalize_list_lookup_name(smart_list_display_name(row)) == normalized
+    ]
+    if len(normalized_matches) == 1:
+        return smart_list_ref_payload(normalized_matches[0], requested=name, method="normalized")
+    if len(normalized_matches) > 1:
+        return {
+            "error": "ambiguous",
+            "requested": name,
+            "candidates": [smart_list_ref_payload(row) for row in normalized_matches],
+        }
+    return None
+
+
+def _print_smart_list_resolution_error(requested, result=None):
+    if result and result.get("error") == "ambiguous":
+        options = ", ".join(
+            f"{candidate['id']} ({candidate['title']})"
+            for candidate in result.get("candidates", [])
+        )
+        print(
+            f"Error: multiple smart lists match {requested!r}. Use the exact smart-list name or --smart-list-id with one of: {options}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Error: smart list not found: {requested}", file=sys.stderr)
+
+
+def resolve_smart_list_or_die(db, name=None, smart_list_id=None):
+    result = resolve_smart_list_ref(db, name=name, smart_list_id=smart_list_id)
+    if result and not result.get("error"):
+        return result
+    requested = f"id {smart_list_id}" if smart_list_id is not None else name
+    _print_smart_list_resolution_error(requested, result)
+    sys.exit(1)
+
+
 def q_list_pk(db, name):
     result = resolve_list_ref(db, name=name)
     return result["id"] if result and not result.get("error") else None
@@ -778,6 +866,15 @@ def q_list_ckid(db, list_pk):
         "SELECT ZCKIDENTIFIER FROM ZREMCDBASELIST "
         "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3",
         (list_pk,),
+    ).fetchone()
+    return row["ZCKIDENTIFIER"] if row and row["ZCKIDENTIFIER"] else None
+
+
+def q_smart_list_ckid(db, smart_list_pk):
+    row = db.execute(
+        "SELECT ZCKIDENTIFIER FROM ZREMCDBASELIST "
+        "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND (Z_ENT = 4 OR ZSMARTLISTTYPE IS NOT NULL)",
+        (smart_list_pk,),
     ).fetchone()
     return row["ZCKIDENTIFIER"] if row and row["ZCKIDENTIFIER"] else None
 
@@ -2169,6 +2266,20 @@ def apply_private_list_pinned(db, list_pk, a, pinned):
     sys.exit(1)
 
 
+def apply_private_smart_list_pinned(db, smart_list_pk, a, pinned):
+    require_private_metadata(a)
+    ckid = q_smart_list_ckid(db, smart_list_pk)
+    if not ckid:
+        print("Error: target smart list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    result = private_call({"action": "set_smart_list_pinned", "smartListId": ckid, "pinned": bool(pinned)})
+    if result and result.get("status") == "updated":
+        return result
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def normalize_section_id(value):
     if not value:
         return None
@@ -3386,6 +3497,11 @@ def smart_list_display_name(row):
 def smart_list_to_dict(row):
     filter_data = row["ZFILTERDATA"]
     decoded = decode_smart_list_filter_blob(filter_data)
+    pinned_date = None
+    try:
+        pinned_date = row["ZPINNEDDATE"]
+    except (IndexError, KeyError):
+        pinned_date = None
     payload = {
         "id": row["Z_PK"],
         "objectUUID": row["ZCKIDENTIFIER"],
@@ -3404,6 +3520,16 @@ def smart_list_to_dict(row):
         payload["minimumSupportedVersion"] = minimum_version
     if effective_minimum_version is not None:
         payload["effectiveMinimumSupportedVersion"] = effective_minimum_version
+    if _row_has_key(row, "ZISPINNEDBYCURRENTUSER") or pinned_date is not None:
+        is_pinned = bool(_row_get(row, "ZISPINNEDBYCURRENTUSER", False))
+        if not is_pinned and pinned_date is not None:
+            try:
+                is_pinned = float(pinned_date) > 0
+            except (TypeError, ValueError):
+                is_pinned = False
+        payload["pinned"] = is_pinned
+    if pinned_date is not None:
+        payload["pinnedDate"] = pinned_date
     if decoded["summary"] is not None:
         payload["filter"] = decoded["summary"]
     if decoded["encoding"]:
@@ -3433,7 +3559,8 @@ def cmd_smart_lists(a):
         if summary and not summary.get("supported", True):
             desc = f"{desc}: {', '.join(summary.get('keys', [])) or 'unknown keys'}"
         id_details = C.dim(f"(id: {item['id']}, {kind})")
-        print(f"  {item['name']} {id_details}")
+        pin_info = C.dim(" [pinned]") if item.get("pinned") else ""
+        print(f"  {item['name']} {id_details}{pin_info}")
         print(f"    {smart_type} · filter bytes: {length} · {desc}")
     print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
 
@@ -5275,23 +5402,63 @@ def cmd_list_edit(a):
 
 def _cmd_list_pin_state(a, pinned):
     require_private_metadata(a)
+    if getattr(a, "list_id", None) is not None and getattr(a, "smart_list_id", None) is not None:
+        print("Error: pass either --list-id or --smart-list-id, not both.", file=sys.stderr)
+        sys.exit(1)
     db = open_db()
-    list_ref = resolve_required_list_target_or_die(
-        db,
-        name=getattr(a, "name", None),
-        list_id=getattr(a, "list_id", None),
-    )
-    result = apply_private_list_pinned(db, list_ref["id"], a, pinned)
+    smart_list_id = getattr(a, "smart_list_id", None)
+    name = getattr(a, "name", None)
+    if smart_list_id is not None:
+        target_kind = "smart-list"
+        target_ref = resolve_smart_list_or_die(db, smart_list_id=smart_list_id)
+        result = apply_private_smart_list_pinned(db, target_ref["id"], a, pinned)
+    elif getattr(a, "list_id", None) is not None:
+        target_kind = "list"
+        target_ref = resolve_list_or_die(db, list_id=a.list_id)
+        result = apply_private_list_pinned(db, target_ref["id"], a, pinned)
+    elif name:
+        list_ref = resolve_list_ref(db, name=name)
+        smart_ref = resolve_smart_list_ref(db, name=name)
+        list_ok = list_ref and not list_ref.get("error")
+        smart_ok = smart_ref and not smart_ref.get("error")
+        if list_ref and list_ref.get("error"):
+            _print_list_resolution_error(name, list_ref)
+            sys.exit(1)
+        if smart_ref and smart_ref.get("error"):
+            _print_smart_list_resolution_error(name, smart_ref)
+            sys.exit(1)
+        if list_ok and smart_ok:
+            print(
+                f"Error: {name!r} matches both a list and a smart list. Use --list-id or --smart-list-id.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if list_ok:
+            target_kind = "list"
+            target_ref = list_ref
+            result = apply_private_list_pinned(db, target_ref["id"], a, pinned)
+        elif smart_ok:
+            target_kind = "smart-list"
+            target_ref = smart_ref
+            result = apply_private_smart_list_pinned(db, target_ref["id"], a, pinned)
+        else:
+            print(f"Error: list or smart list not found: {name}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("Error: pass a list/smart-list name, --list-id, or --smart-list-id.", file=sys.stderr)
+        sys.exit(1)
     status = "pinned" if pinned else "unpinned"
     if a.json:
         print(json.dumps({
             "status": status,
-            "id": list_ref["id"],
-            "name": list_ref["title"],
+            "kind": target_kind,
+            "id": target_ref["id"],
+            "name": target_ref["title"],
             "private": result,
         }, ensure_ascii=False))
     else:
-        print(f"{status.capitalize()} list: {list_ref['title']}")
+        label = "smart list" if target_kind == "smart-list" else "list"
+        print(f"{status.capitalize()} {label}: {target_ref['title']}")
 
 
 def cmd_list_pin(a):
@@ -5517,8 +5684,8 @@ _remctl() {
         'template-apply:Create a list from a saved Reminders template'
         'template-delete:Delete a saved Reminders template'
         'list-edit:Edit private list appearance'
-        'list-pin:Pin a list in Reminders'
-        'list-unpin:Unpin a list in Reminders'
+        'list-pin:Pin a list or smart list in Reminders'
+        'list-unpin:Unpin a list or smart list in Reminders'
         'list-rename:Rename a list'
         'list-delete:Delete a list'
         'onboard:Prompt for macOS permissions and verify readiness'
@@ -5556,6 +5723,8 @@ _remctl() {
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--grocery[Auto-categorize in a Groceries list]' \
+                '--urgent[Set private urgent state]' \
+                '--no-urgent[Clear private urgent state]' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
@@ -5752,6 +5921,7 @@ _remctl() {
             _arguments \
                 '--private[Use private ReminderKit list pinning]' \
                 '--list-id[Target list by stable numeric ID]:id:' \
+                '--smart-list-id[Target smart list by stable numeric ID]:id:' \
                 '--json[JSON output]'
             return
             ;;
@@ -5776,7 +5946,7 @@ BASH_COMPLETION = '''_remctl() {
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --urgent --no-urgent --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --location-title --latitude --longitude --radius --proximity --address --title --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
@@ -5827,7 +5997,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--list-id --new-name --color --private --symbol --emoji --groceries --standard --grocery-locale --json" -- "$cur") )
         return
     elif [ "$cmd" = "list-pin" ] || [ "$cmd" = "list-unpin" ]; then
-        COMPREPLY=( $(compgen -W "--private --list-id --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --list-id --smart-list-id --json" -- "$cur") )
         return
     elif [ "$cmd" = "list-rename" ]; then
         COMPREPLY=( $(compgen -W "--list-id --new-name --json" -- "$cur") )
@@ -5879,8 +6049,8 @@ complete -c remctl -n "__fish_use_subcommand" -a template-create -d "Create a pr
 complete -c remctl -n "__fish_use_subcommand" -a template-apply -d "Create a list from a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a template-delete -d "Delete a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a list-edit -d "Edit private list appearance"
-complete -c remctl -n "__fish_use_subcommand" -a list-pin -d "Pin a list in Reminders"
-complete -c remctl -n "__fish_use_subcommand" -a list-unpin -d "Unpin a list in Reminders"
+complete -c remctl -n "__fish_use_subcommand" -a list-pin -d "Pin a list or smart list in Reminders"
+complete -c remctl -n "__fish_use_subcommand" -a list-unpin -d "Unpin a list or smart list in Reminders"
 complete -c remctl -n "__fish_use_subcommand" -a list-rename -d "Rename a list"
 complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
 complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Prompt for macOS permissions and verify readiness"
@@ -5966,6 +6136,7 @@ complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l standard -d "Co
 complete -c remctl -n "__fish_seen_subcommand_from list-edit" -l grocery-locale -d "Groceries locale identifier" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l private -d "Use private ReminderKit list pinning"
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l list-id -d "Target list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l smart-list-id -d "Target smart list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-pin list-unpin" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from list-rename" -l list-id -d "Rename list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-rename" -l new-name -d "New list name" -r
@@ -5978,6 +6149,8 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Creat
 complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l image -d "Add private image attachment" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l grocery -d "Auto-categorize in a Groceries list"
+complete -c remctl -n "__fish_seen_subcommand_from add" -l urgent -d "Set private urgent state"
+complete -c remctl -n "__fish_seen_subcommand_from add" -l no-urgent -d "Clear private urgent state"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, web rich link with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -s t -l tags -d "Tags, synced with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l list-id -d "Target list by stable numeric ID" -r
@@ -6686,6 +6859,7 @@ def main():
             "  remctl add \"Research\" -l Projects --private --url https://example.com -t remctl --section Research\n"
             "  remctl add \"Research\" -l Projects --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8\n"
             "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
+            "  remctl add \"Leave now\" -l Work --private --urgent\n"
             "  remctl add \"Launch assets\" -l Projects --private --subtask '{\"title\":\"Export PNG\",\"notes\":\"Use final crop\",\"due\":\"tomorrow\",\"url\":\"https://example.com\",\"tags\":[\"media\"]}'\n"
             "\n"
             "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
@@ -6712,6 +6886,7 @@ def main():
     c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
     c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
     c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
+    c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     js(c)
 
     c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
@@ -6962,15 +7137,17 @@ def main():
     c.add_argument("--private", action="store_true", help="Required for list appearance and grocery metadata writes")
     js(c)
 
-    c = sub.add_parser("list-pin", help="Pin a list in Reminders.app")
-    c.add_argument("name", nargs="?", help="List name to pin")
+    c = sub.add_parser("list-pin", help="Pin a list or smart list in Reminders.app")
+    c.add_argument("name", nargs="?", help="List or smart-list name to pin")
     c.add_argument("--list-id", type=int, help="Pin a list by stable numeric ID")
+    c.add_argument("--smart-list-id", type=int, help="Pin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
     js(c)
 
-    c = sub.add_parser("list-unpin", help="Unpin a list in Reminders.app")
-    c.add_argument("name", nargs="?", help="List name to unpin")
+    c = sub.add_parser("list-unpin", help="Unpin a list or smart list in Reminders.app")
+    c.add_argument("name", nargs="?", help="List or smart-list name to unpin")
     c.add_argument("--list-id", type=int, help="Unpin a list by stable numeric ID")
+    c.add_argument("--smart-list-id", type=int, help="Unpin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
     js(c)
 

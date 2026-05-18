@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 import uuid
@@ -580,8 +581,8 @@ class CliTests(unittest.TestCase):
 
     def test_list_pin_and_unpin_use_private_helper(self):
         db = self._list_db(["📌 Project X"])
-        pin_args = SimpleNamespace(name="Project X", list_id=None, private=True, json=True)
-        unpin_args = SimpleNamespace(name=None, list_id=1, private=True, json=True)
+        pin_args = SimpleNamespace(name="Project X", list_id=None, smart_list_id=None, private=True, json=True)
+        unpin_args = SimpleNamespace(name=None, list_id=1, smart_list_id=None, private=True, json=True)
         try:
             with (
                 mock.patch.object(self.remctl, "open_db", return_value=db),
@@ -610,7 +611,7 @@ class CliTests(unittest.TestCase):
             db.close()
 
     def test_list_pin_rejects_without_private_before_helper(self):
-        args = SimpleNamespace(name="Project X", list_id=None, private=False, json=True)
+        args = SimpleNamespace(name="Project X", list_id=None, smart_list_id=None, private=False, json=True)
         with (
             mock.patch.object(self.remctl, "private_available") as private_available,
             mock.patch.object(self.remctl, "private_call") as private_call,
@@ -621,6 +622,57 @@ class CliTests(unittest.TestCase):
 
         private_available.assert_not_called()
         private_call.assert_not_called()
+        self.assertIn("--private", stderr.getvalue())
+
+    def test_add_help_exposes_urgent_creation_flag(self):
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "add", "--help"]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--urgent", stdout.getvalue())
+
+    def test_add_urgent_rejects_without_private_before_bridge(self):
+        args = SimpleNamespace(
+            title="Leave now",
+            list="Work",
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            urgent=True,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(args)
+
+        bridge_call.assert_not_called()
         self.assertIn("--private", stderr.getvalue())
 
     def test_add_grocery_rejects_without_private_before_bridge(self):
@@ -881,27 +933,28 @@ class CliTests(unittest.TestCase):
             "CREATE TABLE ZREMCDBASELIST ("
             "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, "
             "Z_ENT INTEGER, ZSMARTLISTTYPE TEXT, ZFILTERDATA BLOB, "
-            "ZMINIMUMSUPPORTEDAPPVERSION INTEGER, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER)"
+            "ZMINIMUMSUPPORTEDAPPVERSION INTEGER, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER, "
+            "ZISPINNEDBYCURRENTUSER INTEGER, ZPINNEDDATE REAL)"
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
             "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
-            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
-            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?)",
-            (1, None, "BUILTIN-1", "com.apple.reminders.smartlist.flagged", None, 0, 0),
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION, ZISPINNEDBYCURRENTUSER, ZPINNEDDATE) "
+            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?, ?, ?)",
+            (1, None, "BUILTIN-1", "com.apple.reminders.smartlist.flagged", None, 0, 0, 1, 123.0),
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
             "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
-            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
-            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?)",
-            (2, "High Priority", "CUSTOM-1", self.remctl.CUSTOM_SMART_LIST_TYPE, b'{"priorities":["high"]}', 20220430, 20220430),
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION, ZISPINNEDBYCURRENTUSER, ZPINNEDDATE) "
+            "VALUES (?, ?, ?, 0, 4, ?, ?, ?, ?, ?, ?)",
+            (2, "High Priority", "CUSTOM-1", self.remctl.CUSTOM_SMART_LIST_TYPE, b'{"priorities":["high"]}', 20220430, 20220430, None, 456.0),
         )
         db.execute(
             "INSERT INTO ZREMCDBASELIST "
             "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE, ZFILTERDATA, "
-            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION) "
-            "VALUES (?, ?, ?, 0, 3, NULL, NULL, NULL, NULL)",
+            "ZMINIMUMSUPPORTEDAPPVERSION, ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION, ZISPINNEDBYCURRENTUSER, ZPINNEDDATE) "
+            "VALUES (?, ?, ?, 0, 3, NULL, NULL, NULL, NULL, 0, NULL)",
             (10, "Reminders", "LIST-1"),
         )
         return db
@@ -921,11 +974,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[0]["kind"], "built-in")
         self.assertEqual(payload[0]["name"], "Flagged")
         self.assertEqual(payload[0]["filterLength"], 0)
+        self.assertTrue(payload[0]["pinned"])
+        self.assertEqual(payload[0]["pinnedDate"], 123.0)
         self.assertEqual(payload[1]["kind"], "custom")
+        self.assertTrue(payload[1]["pinned"])
+        self.assertEqual(payload[1]["pinnedDate"], 456.0)
         self.assertEqual(payload[1]["minimumSupportedVersion"], 20220430)
         self.assertEqual(payload[1]["effectiveMinimumSupportedVersion"], 20220430)
         self.assertEqual(payload[1]["filter"]["kind"], "priority")
         self.assertEqual(payload[1]["filterJSON"], {"priorities": ["high"]})
+
+    def test_list_pin_supports_smart_list_by_name_and_id(self):
+        db = self._smart_list_db()
+        pin_args = SimpleNamespace(name="Flagged", list_id=None, smart_list_id=None, private=True, json=True)
+        unpin_args = SimpleNamespace(name=None, list_id=None, smart_list_id=2, private=True, json=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": True}) as pin_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_list_pin(pin_args)
+            self.assertEqual(
+                pin_call.call_args.args[0],
+                {"action": "set_smart_list_pinned", "smartListId": "BUILTIN-1", "pinned": True},
+            )
+            self.assertEqual(json.loads(stdout.getvalue())["kind"], "smart-list")
+
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": False}) as unpin_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_list_unpin(unpin_args)
+            self.assertEqual(
+                unpin_call.call_args.args[0],
+                {"action": "set_smart_list_pinned", "smartListId": "CUSTOM-1", "pinned": False},
+            )
+        finally:
+            db.close()
 
     def test_smart_list_create_rejects_without_private_before_helper(self):
         args = SimpleNamespace(name="Nope", private=False, flagged=True, priority=None, json=True)
