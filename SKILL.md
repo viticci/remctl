@@ -16,6 +16,28 @@ RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreDat
 - For private reminder metadata, use regular `add` or `edit` with `--private`; for private list appearance, Groceries mode, or regular/smart-list pin state, use `list-create --private`, `list-edit --private`, `list-pin --private`, or `list-unpin --private`; for custom smart lists, use `smart-list-create`, `smart-list-edit`, or `smart-list-delete` with `--private`; for Reminders templates, use `template-create`, `template-apply`, or `template-delete` with `--private`. Do not use raw database mutation.
 - After changing repo code, reinstall before testing the user-facing command: `./install.sh && hash -r`.
 
+## Agent Routing
+
+Start by deciding the write path. Public EventKit writes are stable and do not need `--private`. Private ReminderKit writes are unsupported, explicit, and required for Reminders-only metadata that EventKit cannot save.
+
+| User intent | Command path | Private? | Verify with |
+| --- | --- | --- | --- |
+| Read due items, lists, reminders, tags, sections, subtasks | `today`, `upcoming`, `overdue`, `lists`, `show`, `search`, `info`, `tags`, `sections`, `subtasks` | No | same command with `--json` |
+| Create/edit ordinary reminder fields | `add`, `edit`, `done`, `undone`, `delete` | No | `info <id> --json` or `show <list> --json` |
+| Due date, priority, notes, recurrence, EventKit alarm | `add` or `edit` with `-d`, `-p`, `-n`, `--recurrence`, `--alarm` | No | `info <id> --json`; recurrence appears as `recurrence` |
+| Synced rich URL, real tags, section, subtask, image, real flag, urgent, Early Reminder, location alarm | `add --private` or `edit --private` | Yes | `info <id> --json`; UI/device check when sync matters |
+| List appearance, Groceries metadata, list or smart-list pin state | `list-create --private`, `list-edit --private`, `list-pin --private`, `list-unpin --private` | Yes | `lists --json` for lists, `smart-lists --json` for smart-list pinning |
+| Custom smart list create/edit/delete | `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Yes | `smart-lists --json` |
+| Saved Reminders templates | `templates`, `template-info`, `template-create`, `template-apply`, `template-delete` | Reads no; writes yes | `templates --json`, `template-info`, then `show <new list> --json` after apply |
+
+High-value guardrails:
+
+- Do not use `--private` for normal recurrence or normal `--alarm`; those are EventKit features.
+- Do use `--private --early-reminder` for Reminders' Early Reminder menu values; this is separate from EventKit alarms.
+- Do not verify smart-list pinning with `lists --json`; use `smart-lists --json`.
+- Do not promise template link creation or editing individual saved reminders inside a template.
+- Do not create multi-list aggregate smart lists with list filters; Reminders.app materializes only one included list through this write path.
+
 ## Common Commands
 
 ```bash
@@ -48,7 +70,7 @@ remctl list-delete --list-id 123 --force --json
 ## Syntax Rules
 
 - Use nouns for read-only inspectors: `lists`, `smart-lists`, `templates`, `today`, `stats`.
-- Use verb-style commands for writes: `add`, `edit`, `delete`, `list-create`, `smart-list-edit`.
+- Use verb-style commands for writes: `add`, `edit`, `delete`, `list-create`, `smart-list-create`, `smart-list-edit`, `template-create`.
 - List-management commands use the `list-*` prefix; custom smart-list writes use the `smart-list-*` prefix; template writes use the `template-*` prefix.
 - Use `--json` on subcommands for automation. Global `--format json` is equivalent for commands with JSON output; global `--format table` is for human-readable table views.
 - `export --format json|csv` chooses an export file format, not the display style.
