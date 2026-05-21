@@ -2751,6 +2751,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["url"], "https://example.com/shortcuts-playground-plugin")
         self.assertEqual(payload["section"], "Playground")
 
+    def test_q_attachments_reads_current_image_attachment_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE ZREMCDSAVEDATTACHMENT ("
+            "ZFILENAME TEXT, ZUTI TEXT, ZATTACHMENTTYPERAWVALUE TEXT, "
+            "ZREMINDER INTEGER, ZMARKEDFORDELETION INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE ZREMCDOBJECT ("
+            "ZFILENAME TEXT, ZUTI TEXT, ZWIDTH INTEGER, ZHEIGHT INTEGER, "
+            "ZREMINDER2 INTEGER, ZMARKEDFORDELETION INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO ZREMCDOBJECT VALUES "
+            "('first.png', 'public.png', 512, 512, 42, 0), "
+            "('second.png', 'public.png', 512, 512, 42, 0), "
+            "('deleted.png', 'public.png', 512, 512, 42, 1), "
+            "(NULL, 'public.url', NULL, NULL, 42, 0)"
+        )
+
+        attachments = [dict(row) for row in self.remctl.q_attachments(conn, 42)]
+        conn.close()
+
+        self.assertEqual(
+            attachments,
+            [
+                {"ZFILENAME": "first.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image"},
+                {"ZFILENAME": "second.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image"},
+            ],
+        )
+
     def test_reminder_id_uses_list_color_when_database_colors_are_available(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

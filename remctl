@@ -1265,7 +1265,13 @@ def q_section_member_counts(db, list_pk):
 def q_attachments(db, pk):
     return db.execute(
         "SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
-        "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0", (pk,)
+        "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0 "
+        "UNION ALL "
+        "SELECT ZFILENAME, ZUTI, "
+        "CASE WHEN ZWIDTH IS NOT NULL OR ZHEIGHT IS NOT NULL THEN 'image' ELSE 'file' END AS ZATTACHMENTTYPERAWVALUE "
+        "FROM ZREMCDOBJECT "
+        "WHERE ZREMINDER2 = ? AND ZFILENAME IS NOT NULL AND ZFILENAME != '' AND ZMARKEDFORDELETION = 0 "
+        "ORDER BY ZFILENAME", (pk, pk)
     ).fetchall()
 
 def q_rich_links(db, pk):
