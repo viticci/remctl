@@ -133,6 +133,11 @@ if command -v swiftc &>/dev/null; then
         "$SCRIPT_DIR/remctl-permissions.swift" 2>/dev/null; then
         chmod +x "$BIN_DIR/remctl-permissions"
         echo -e "  ${GREEN}✓${RESET} remctl-permissions → $BIN_DIR/remctl-permissions"
+        if [[ -f "$SCRIPT_DIR/assets/remctl-permissions-icon.png" ]]; then
+            cp "$SCRIPT_DIR/assets/remctl-permissions-icon.png" "$BIN_DIR/remctl-permissions-icon.png"
+            chmod 644 "$BIN_DIR/remctl-permissions-icon.png"
+            echo -e "  ${GREEN}✓${RESET} remctl-permissions-icon.png → $BIN_DIR/remctl-permissions-icon.png"
+        fi
     else
         echo -e "  ${YELLOW}⚠${RESET} remctl-permissions did not compile — guided permission UI unavailable"
         echo -e "    ${DIM}remctl will still print manual Full Disk Access steps${RESET}"

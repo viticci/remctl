@@ -86,6 +86,39 @@ func revealInFinder(_ path: String) {
     NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
 }
 
+func siblingResourceURL(named filename: String) -> URL? {
+    guard let rawExecutable = CommandLine.arguments.first, !rawExecutable.isEmpty else {
+        return nil
+    }
+    let executableURL: URL
+    if rawExecutable.hasPrefix("/") {
+        executableURL = URL(fileURLWithPath: rawExecutable)
+    } else {
+        executableURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(rawExecutable)
+    }
+    let candidate = executableURL.deletingLastPathComponent().appendingPathComponent(filename)
+    return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+}
+
+func applyApplicationIcon() {
+    guard let iconURL = siblingResourceURL(named: "remctl-permissions-icon.png"),
+          let image = NSImage(contentsOf: iconURL) else {
+        return
+    }
+    NSApp.applicationIconImage = image
+}
+
+func applicationIconImage() -> NSImage? {
+    if let image = NSApp.applicationIconImage {
+        return image
+    }
+    guard let iconURL = siblingResourceURL(named: "remctl-permissions-icon.png") else {
+        return nil
+    }
+    return NSImage(contentsOf: iconURL)
+}
+
 func remindersStoreReadable() -> Bool {
     let storesURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Group Containers/group.com.apple.reminders/Container_v1/Stores")
@@ -108,6 +141,49 @@ func isPythonExecutable(_ path: String) -> Bool {
     return name.hasPrefix("python") && FileManager.default.isExecutableFile(atPath: path)
 }
 
+func pythonFrameworkRoot(for path: String) -> URL? {
+    let url = URL(fileURLWithPath: path).standardizedFileURL
+    let components = url.pathComponents
+    guard let frameworkIndex = components.firstIndex(of: "Python.framework"),
+          frameworkIndex + 2 < components.count,
+          components[frameworkIndex + 1] == "Versions" else {
+        return nil
+    }
+    var root = URL(fileURLWithPath: "/")
+    for component in components[1...(frameworkIndex + 2)] {
+        root.appendPathComponent(component)
+    }
+    return root
+}
+
+func pythonIcon(for path: String) -> NSImage? {
+    let candidates: [URL]
+    if let frameworkRoot = pythonFrameworkRoot(for: path) {
+        candidates = [
+            frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/Resources/PythonInterpreter.icns"),
+            frameworkRoot.appendingPathComponent("Resources/Python.app/Contents/Resources/PythonApplet.icns"),
+        ]
+    } else {
+        candidates = [
+            URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/Resources/PythonInterpreter.icns"),
+            URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/Current/Resources/Python.app/Contents/Resources/PythonApplet.icns"),
+        ]
+    }
+    for candidate in candidates where FileManager.default.fileExists(atPath: candidate.path) {
+        if let image = NSImage(contentsOf: candidate) {
+            return image
+        }
+    }
+    return nil
+}
+
+func targetIcon(for target: PermissionTarget) -> NSImage {
+    if isPythonExecutable(target.path), let image = pythonIcon(for: target.path) {
+        return image
+    }
+    return NSWorkspace.shared.icon(forFile: target.path)
+}
+
 func pythonTargetCanReadRemindersStore(_ path: String) -> Bool {
     let script = """
 import glob
@@ -125,6 +201,7 @@ sys.exit(0 if ok else 2)
     let process = Process()
     process.executableURL = URL(fileURLWithPath: path)
     process.arguments = ["-c", script]
+    process.standardInput = FileHandle.nullDevice
     process.standardOutput = Pipe()
     process.standardError = Pipe()
     do {
@@ -188,7 +265,7 @@ final class TargetRowView: NSView, NSDraggingSource {
         layer?.borderColor = NSColor.separatorColor.cgColor
         layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
 
-        let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: target.path))
+        let icon = NSImageView(image: targetIcon(for: target))
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.imageScaling = .scaleProportionallyUpOrDown
 
@@ -196,6 +273,8 @@ final class TargetRowView: NSView, NSDraggingSource {
         let subtitleField = label(target.subtitle, font: .systemFont(ofSize: 12), color: .secondaryLabelColor, lines: 2)
         let pathField = label(target.path, font: .monospacedSystemFont(ofSize: 11, weight: .regular), color: .tertiaryLabelColor, lines: 1)
         pathField.lineBreakMode = .byTruncatingMiddle
+        subtitleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusField.font = .systemFont(ofSize: 12, weight: .semibold)
         statusField.textColor = .secondaryLabelColor
         statusField.lineBreakMode = .byTruncatingTail
@@ -207,6 +286,7 @@ final class TargetRowView: NSView, NSDraggingSource {
         textStack.spacing = 3
         textStack.alignment = .leading
         textStack.translatesAutoresizingMaskIntoConstraints = false
+        textStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let copyButton = ActionButton(title: "Copy Path") { _ in
             copyPath(target.path)
@@ -242,6 +322,7 @@ final class TargetRowView: NSView, NSDraggingSource {
 
             textStack.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
             textStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            textStack.widthAnchor.constraint(lessThanOrEqualToConstant: 300),
             textStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingStack.leadingAnchor, constant: -12),
 
             trailingStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
@@ -259,7 +340,7 @@ final class TargetRowView: NSView, NSDraggingSource {
         copyPath(target.path)
         let url = NSURL(fileURLWithPath: target.path)
         let item = NSDraggingItem(pasteboardWriter: url)
-        let dragImage = NSWorkspace.shared.icon(forFile: target.path)
+        let dragImage = targetIcon(for: target)
         dragImage.size = NSSize(width: 64, height: 64)
         item.setDraggingFrame(NSRect(x: 0, y: 0, width: 64, height: 64), contents: dragImage)
         beginDraggingSession(with: [item], event: event, source: self)
@@ -298,6 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        applyApplicationIcon()
         buildWindow()
         if options.autoOpenSettings {
             openFullDiskAccessSettings()
@@ -322,15 +404,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let content = NSView()
         content.translatesAutoresizingMaskIntoConstraints = false
 
-        let titleField = label(options.title, font: .boldSystemFont(ofSize: 24), lines: 1)
-        let subtitleField = label(options.subtitle, font: .systemFont(ofSize: 14), color: .secondaryLabelColor, lines: 2)
+        let headerIcon = NSImageView(image: applicationIconImage() ?? NSImage(size: NSSize(width: 72, height: 72)))
+        headerIcon.translatesAutoresizingMaskIntoConstraints = false
+        headerIcon.imageScaling = .scaleProportionallyUpOrDown
 
-        let instructions = label(
-            "1. Click Open Full Disk Access. 2. Click + in System Settings. 3. Drag each target row into the picker, or press Command-Shift-G and paste the copied path. 4. When rows are verified, run Doctor.",
-            font: .systemFont(ofSize: 13),
-            color: .secondaryLabelColor,
-            lines: 3
-        )
+        let titleField = label(options.title, font: .boldSystemFont(ofSize: 24), lines: 1)
+        titleField.alignment = .center
+        let subtitleField = label(options.subtitle, font: .systemFont(ofSize: 14), color: .secondaryLabelColor, lines: 2)
+        subtitleField.alignment = .center
+        subtitleField.preferredMaxLayoutWidth = 500
+        subtitleField.widthAnchor.constraint(lessThanOrEqualToConstant: 500).isActive = true
 
         let openButton = ActionButton(title: "Open Full Disk Access") { _ in
             openFullDiskAccessSettings()
@@ -349,12 +432,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let topButtons = NSStackView(views: [openButton, checkButton, quitButton])
         topButtons.orientation = .horizontal
         topButtons.spacing = 8
-        topButtons.alignment = .trailing
+        topButtons.alignment = .centerY
+        topButtons.translatesAutoresizingMaskIntoConstraints = false
 
-        let header = NSStackView(views: [titleField, subtitleField, instructions, topButtons])
+        let buttonRow = NSView()
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.addSubview(topButtons)
+        NSLayoutConstraint.activate([
+            topButtons.centerXAnchor.constraint(equalTo: buttonRow.centerXAnchor),
+            topButtons.topAnchor.constraint(equalTo: buttonRow.topAnchor),
+            topButtons.bottomAnchor.constraint(equalTo: buttonRow.bottomAnchor),
+        ])
+
+        let header = NSStackView(views: [headerIcon, titleField, subtitleField, buttonRow])
         header.orientation = .vertical
         header.spacing = 8
-        header.alignment = .leading
+        header.alignment = .centerX
+        header.translatesAutoresizingMaskIntoConstraints = false
 
         targetRows = options.targets.map { target in
             TargetRowView(target: target) { [weak self] message in
@@ -388,7 +482,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         commandsStack.spacing = 8
         commandsStack.alignment = .leading
 
-        let mainStack = NSStackView(views: [header, targetsStack, commandsStack, outputScroll])
+        let headerContainer = NSView()
+        headerContainer.translatesAutoresizingMaskIntoConstraints = false
+        headerContainer.addSubview(header)
+
+        let mainStack = NSStackView(views: [headerContainer, targetsStack, commandsStack, outputScroll])
         mainStack.orientation = .vertical
         mainStack.spacing = 16
         mainStack.alignment = .width
@@ -400,10 +498,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mainStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
             mainStack.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
             mainStack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
+            header.centerXAnchor.constraint(equalTo: headerContainer.centerXAnchor),
+            header.topAnchor.constraint(equalTo: headerContainer.topAnchor),
+            header.bottomAnchor.constraint(equalTo: headerContainer.bottomAnchor),
+            header.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            headerIcon.widthAnchor.constraint(equalToConstant: 72),
+            headerIcon.heightAnchor.constraint(equalToConstant: 72),
+            buttonRow.widthAnchor.constraint(equalTo: header.widthAnchor),
         ])
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -471,6 +576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             process.arguments = ["-lc", command.command]
             process.environment = self.commandEnvironment()
             let pipe = Pipe()
+            process.standardInput = FileHandle.nullDevice
             process.standardOutput = pipe
             process.standardError = pipe
             do {
