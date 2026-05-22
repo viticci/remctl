@@ -4706,6 +4706,7 @@ def cmd_list_symbols(a):
     print(C.bold(f"Official Reminders list symbols ({len(rows)}):"))
     print(C.dim("Use these with: remctl list-create \"Name\" --private --symbol <name>"))
     print(C.dim("The left column is an approximate text fallback, not native Reminders/SF Symbol rendering."))
+    print(C.dim("Tip: run `remctl list-symbols --preview` to open the native badge preview in your browser."))
     width = max(len(row["name"]) for row in rows)
     print(f"  {C.dim('approx'):<2}  {C.dim('name'):<{width}}  {C.dim('asset')}")
     for row in rows:
@@ -5039,12 +5040,24 @@ def cmd_edit(a):
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
+    target_list_ref = None
+    target_list_name = getattr(a, "list", None)
+    target_list_id = getattr(a, "list_id", None)
+    target_list_pk = r["ZLIST"]
+    if target_list_name or target_list_id is not None:
+        target_list_ref = resolve_required_list_target_or_die(
+            db,
+            name=target_list_name,
+            list_id=target_list_id,
+        )
+        target_list_name = target_list_ref["title"]
+        target_list_pk = target_list_ref["id"]
     wants_private = private_metadata_enabled(a) and private_changes_from_args(a)
     if wants_private:
         require_private_metadata(a)
         validate_private_args(a)
         if getattr(a, "grocery", False):
-            require_grocery_list_target(db, r["ZLIST"])
+            require_grocery_list_target(db, target_list_pk)
         if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
             print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
             sys.exit(1)
@@ -5092,6 +5105,9 @@ def cmd_edit(a):
         data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
+        if target_list_ref:
+            data["list"] = target_list_name
+            has_changes = True
         # Merge url into notes to keep URL-append semantics identical across
         # bridge and AppleScript paths.
         notes_body = a.notes
@@ -5117,15 +5133,26 @@ def cmd_edit(a):
                     r["ZCKIDENTIFIER"],
                     a,
                     db=db,
-                    list_pk=r["ZLIST"],
+                    list_pk=target_list_pk,
                 ) if wants_private else []
                 if a.json:
                     payload = {"status": "updated", "id": a.id}
+                    if target_list_ref:
+                        payload["list"] = target_list_name
+                        if target_list_ref.get("method") != "exact":
+                            payload["resolvedList"] = {
+                                "requested": target_list_ref.get("requested"),
+                                "title": target_list_ref["title"],
+                                "id": target_list_ref["id"],
+                                "method": target_list_ref["method"],
+                            }
                     if private_results:
                         payload["private"] = private_results
                     print(json.dumps(payload))
                 else:
                     print(f"Updated #{a.id}")
+                    if target_list_ref:
+                        print(f"List: {target_list_name}")
                     if private_results:
                         print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
                 return
@@ -5134,7 +5161,7 @@ def cmd_edit(a):
                 r["ZCKIDENTIFIER"],
                 a,
                 db=db,
-                list_pk=r["ZLIST"],
+                list_pk=target_list_pk,
             )
             if a.json:
                 print(json.dumps({"status": "updated", "id": a.id, "private": private_results}, indent=2))
@@ -5147,6 +5174,7 @@ def cmd_edit(a):
     has_bridge_only = (
         (hasattr(a, 'recurrence') and a.recurrence) or
         (hasattr(a, 'alarm') and a.alarm) or wants_private
+        or target_list_ref
     )
     has_applescript_fields = bool(
         a.title or a.notes or a.due or a.priority
@@ -6064,6 +6092,8 @@ _remctl() {
                 '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
                 '--address[Location alarm address label]:address:' \
                 '--title[New title]:title:' \
+                '(-l --list)'{-l,--list}'[Move to list]:list:' \
+                '--list-id[Move to list by stable numeric ID]:id:' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Synced tags with --private]:tags:' \
                 '(-n --notes)'{-n,--notes}'[Notes]:notes:' \
@@ -6256,7 +6286,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --urgent --no-urgent --early-reminder --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --address --title --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --address --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -6480,6 +6510,8 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l longitude -d "Locati
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l radius -d "Location alarm radius" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Location trigger" -a "arriving leaving"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l address -d "Location alarm address label" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
 '''
 
@@ -7087,6 +7119,50 @@ def cmd_setup(a):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+def format_command_columns(commands, width=88):
+    commands = sorted(commands)
+    lines = []
+    current = ""
+    for command in commands:
+        token = command if not current else f", {command}"
+        if current and len(current) + len(token) > width:
+            lines.append(current)
+            current = command
+        else:
+            current += token
+    if current:
+        lines.append(current)
+    return lines
+
+
+def first_command_token(argv):
+    skip_value_for = {"--format"}
+    iterator = iter(argv)
+    for token in iterator:
+        if token in {"-h", "--help", "--version"}:
+            return None
+        if token in skip_value_for:
+            next(iterator, None)
+            continue
+        if token.startswith("--format="):
+            continue
+        if token == "--no-color":
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def suggest_command(command, choices):
+    if command == "symbols" and "list-symbols" in choices:
+        return "list-symbols"
+    suffix_matches = [choice for choice in choices if choice.endswith(f"-{command}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(
         prog="remctl",
@@ -7119,7 +7195,7 @@ def main():
     p.add_argument("--format", choices=["plain", "table", "json"], default="plain",
                    help="Output format")
 
-    sub = p.add_subparsers(dest="cmd")
+    sub = p.add_subparsers(dest="cmd", metavar="command")
 
     def js(c): c.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     def vb(c): c.add_argument("-v", "--verbose", action="store_true")
@@ -7213,6 +7289,8 @@ def main():
         epilog=(
             "Examples:\n"
             "  remctl edit 23880 -d clear\n"
+            "  remctl edit 23880 -l Work\n"
+            "  remctl edit 23880 --list-id 156\n"
             "  remctl edit 23880 --private --url https://example.com -t remctl\n"
             "  remctl edit 23880 --private --section Research --subtask \"Follow up\"\n"
             "  remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8\n"
@@ -7227,6 +7305,8 @@ def main():
         formatter_class=HelpFormatter,
     )
     c.add_argument("id", type=int); c.add_argument("--title")
+    c.add_argument("-l", "--list", help="Move to a list by name through the normal EventKit bridge")
+    c.add_argument("--list-id", type=int, help="Move to a list by stable numeric ID through the normal EventKit bridge")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD or 'clear'")
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
@@ -7580,6 +7660,17 @@ def main():
     c.add_argument("shell", nargs="?", default="zsh", choices=["bash", "zsh", "fish"], help="Shell type")
 
     # --- Parse ---
+    command_token = first_command_token(sys.argv[1:])
+    if command_token and command_token not in sub.choices:
+        print(f"remctl: error: unknown command: {command_token!r}", file=sys.stderr)
+        suggestion = suggest_command(command_token, sub.choices)
+        if suggestion:
+            print(f"Did you mean: remctl {suggestion}", file=sys.stderr)
+        print("Available commands:", file=sys.stderr)
+        for line in format_command_columns(sub.choices):
+            print(f"  {line}", file=sys.stderr)
+        print("Run `remctl <command> --help` for command-specific options.", file=sys.stderr)
+        sys.exit(2)
     a = p.parse_args()
 
     # Set up color

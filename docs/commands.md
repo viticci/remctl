@@ -95,7 +95,7 @@ RemCTL uses nouns for read-only inspectors (`lists`, `smart-lists`, `templates`,
 
 Use `--json` on subcommands when scripting. The global `--format json` is equivalent for commands with JSON output; `--format table` is for human-readable tabular views. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
-List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
+List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
 
 List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that ignores decorative punctuation and emoji. If more than one list matches, RemCTL fails before writing and prints the candidate IDs; pass `--list-id` to target one explicitly.
 
@@ -104,6 +104,20 @@ List names are resolved conservatively: exact match first, then case-insensitive
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
 `--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+
+`edit` covers these existing-reminder surfaces:
+
+| Surface | Command | Private? | Notes |
+| --- | --- | --- | --- |
+| Title, notes, due date, priority | `edit --title`, `-n`, `-d`, `-p` | No | EventKit bridge with AppleScript fallback for ordinary fields |
+| Move to another list | `edit -l LIST` or `edit --list-id ID` | No | EventKit bridge; use `--list-id` for exact agent targeting |
+| Recurrence and normal alarms | `edit --recurrence`, `edit --alarm` | No | EventKit bridge only; verify in `info --json` |
+| Notes URL fallback | `edit --url URL` | No | Appends the URL to notes, not a rich attachment |
+| Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
+| Section assignment or creation | `edit --private --section`, `--section-id`, `--new-section` | Yes | If combined with `-l/--list`, section resolution uses the destination list |
+| Subtasks | `edit --private --subtask ...` | Yes | Additive; rich JSON subtasks can include public and private child metadata |
+| Image attachments | `edit --private --image PATH` | Yes | Additive; generic files/PDFs are rejected, and existing images are not removed/replaced |
+| Real flagged, urgent, Early Reminder, location alarm, Groceries categorization | `edit --private --flagged`, `--urgent`, `--early-reminder`, location fields, `--grocery` | Yes | Private ReminderKit metadata; verify with `info --json` or `show <list> --json` for Groceries sectioning |
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
@@ -139,6 +153,8 @@ remctl undone 23880
 remctl edit 23880 --title "New title"
 remctl edit 23880 -d "next friday" -p medium
 remctl edit 23880 -d clear
+remctl edit 23880 -l Work
+remctl edit 23880 --list-id 156
 remctl edit 23880 --recurrence "weekly mon,wed"
 remctl flag 23880
 remctl unflag 23880

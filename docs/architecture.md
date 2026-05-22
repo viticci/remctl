@@ -49,12 +49,12 @@ RemCTL opens the database read-only. It never writes to SQLite.
 
 Writes go through Apple-supported APIs:
 
-1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, complete, delete, recurrence, alarms, URLs appended to notes, and list management.
+1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, moving reminders between lists, complete, delete, recurrence, alarms, URLs appended to notes, and list management.
 2. AppleScript is a fallback for operations that still need Reminders.app automation behavior.
 
 There is also an explicitly unsupported opt-in helper:
 
-3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata such as exact colors, private emblem names, and emoji badges, list and smart-list pin state, Groceries list metadata and categorization verification, experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. For rich subtasks, `remctl-private` creates the child and applies private child metadata, then `remctl-bridge` applies public child fields such as notes and due dates. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
+3. `remctl-private` writes selected private metadata through Apple's private ReminderKit framework. It is gated by `--private`, never writes SQLite directly, and is intentionally excluded from normal write behavior. Verified private writes include web rich URL attachments, hashtag labels, section assignment/creation, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata such as exact colors, private emblem names, and emoji badges, list and smart-list pin state, Groceries list metadata and categorization verification, experimental custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Rich URL and image edit writes are additive; RemCTL does not remove or replace existing rich links/images. For rich subtasks, `remctl-private` creates the child and applies private child metadata, then `remctl-bridge` applies public child fields such as notes and due dates. Generic file/PDF attachments are rejected because Reminders does not reliably show them even when private rows sync.
 
 The bridge is detected next to the installed CLI. Override it with:
 
