@@ -27,7 +27,7 @@ Start by deciding the write path. Public EventKit writes are stable and do not n
 | Due date, priority, notes, recurrence, EventKit alarm | `add` or `edit` with `-d`, `-p`, `-n`, `--recurrence`, `--alarm` | No | `info <id> --json`; recurrence appears as `recurrence` |
 | Move an existing reminder to another list | `edit <id> -l LIST` or `edit <id> --list-id ID` | No | `info <id> --json` or `show <destination> --json` |
 | Synced rich URL, real tags, section, subtask, image, real flag, urgent, Early Reminder, location alarm | `add --private` or `edit --private` | Yes | `info <id> --json`; UI/device check when sync matters |
-| List appearance, Groceries metadata, list or smart-list pin state | `list-create --private`, `list-edit --private`, `list-pin --private`, `list-unpin --private` | Yes | `lists --json` for lists, `smart-lists --json` for smart-list pinning |
+| List appearance, Groceries metadata, list or smart-list pin state | `list-create --private`, `list-edit --private`, `list-pin --private`, `list-unpin --private` | Yes | `lists --json` for list color/badge/Groceries/pin state, `smart-lists --json` for smart-list appearance/pin state |
 | Custom smart list create/edit/delete | `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Yes | `smart-lists --json` |
 | Saved Reminders templates | `templates`, `template-info`, `template-create`, `template-apply`, `template-delete` | Reads no; writes yes | `templates --json`, `template-info`, then `show <new list> --json` after apply |
 
@@ -35,6 +35,7 @@ High-value guardrails:
 
 - Do not use `--private` for normal recurrence or normal `--alarm`; those are EventKit features.
 - Do use `--private --early-reminder` for Reminders' Early Reminder menu values; this is separate from EventKit alarms.
+- Location alarms use the `edit --private --location-*` guardrail but are saved through the EventKit bridge as structured-location alarms; verify them in `info --json` under `alarms`.
 - Do not verify smart-list pinning with `lists --json`; use `smart-lists --json`.
 - Do not promise template link creation or editing individual saved reminders inside a template.
 - Do not create multi-list aggregate smart lists with list filters; Reminders.app materializes only one included list through this write path.
@@ -149,11 +150,12 @@ Private metadata rules:
 - `edit -l/--list` and `edit --list-id` move reminders through the normal EventKit bridge; they do not require `--private`.
 - `--section` resolves by name; if duplicates exist in the same list, RemCTL uses the single non-empty match when possible. Use `--section-id` for exact assignment.
 - `--early-reminder` writes Reminders' private Early Reminder due-date delta alert. It accepts `15m`, `1h`, `2d`, `1w`, `1mo`, or `clear`; non-clear values require a due date and must be verified with `remctl info ID --json`.
+- `--location-title` with `--latitude` and `--longitude` requires `--private` as a guardrail, but RemCTL persists it through EventKit structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS.
 - `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, `--early-reminder`, and location alarm fields require `--private` and should fail before writing if omitted.
 - Rich-link and image attachment edits are additive. RemCTL can add synced rich links and images; it does not remove or replace existing rich links/images.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
-- `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` write Reminders' private Groceries list metadata and locale. `list-pin` and `list-unpin` require `--private` and save regular list or smart-list pin state through ReminderKit. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
+- `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges; verify those via `color`, `badge`, and `badgeEmblem` in `lists --json` or `smart-lists --json`. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` write Reminders' private Groceries list metadata and locale. `list-pin` and `list-unpin` require `--private` and save regular list or smart-list pin state through ReminderKit. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
 - Groceries lists are visible in `lists --json` as `listType: "groceries"`, `isGroceries: true`, and `grocery.locale`; human list headings show `🥕`. Use `add --private --grocery` or `edit --private --grocery` only against detected Groceries lists. RemCTL first verifies Reminders' automatic grocery sorting and reports `source: "reminders_auto"` when the item is already sectioned; it falls back to the private categorizer only for unsectioned items.
 - `smart-lists` is read-only and safe. `smart-list-create`, `smart-list-edit`, and `smart-list-delete` use unsupported private ReminderKit APIs and require `--private`; filter writes support the Reminders.app filters that currently materialize through this write path.
 - Verify smart-list pinning with `smart-lists --json`, not `lists --json`. On macOS 26, smart-list pinning can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL reports `pinned: true` from a positive smart-list `pinnedDate`.
@@ -224,7 +226,7 @@ remctl add "Title" -l Projects --private --section "Section" -d "YYYY-MM-DD HH:M
 remctl info <numericId> --json
 ```
 
-`info --json` includes section, actual due date, optional display/alert date, tags, subtasks, parent and subtask attachments, EventKit alarms, private location alarms, Early Reminders, deep link, and private rich-link `url` when present. Avoid raw SQLite checks unless the CLI output lacks a field you need.
+`info --json` includes section, actual due date, optional display/alert date, tags, subtasks, parent and subtask attachments, EventKit alarms, location alarms, Early Reminders, deep link, and private rich-link `url` when present. Avoid raw SQLite checks unless the CLI output lacks a field you need.
 
 ## Permissions
 
@@ -249,6 +251,8 @@ swiftc -O -framework EventKit -framework Foundation -o /tmp/remctl-bridge-check 
 swiftc -O -framework AppKit -framework Foundation -o /tmp/remctl-permissions-check remctl-permissions.swift
 clang -fobjc-arc -O -F/System/Library/PrivateFrameworks -framework Foundation -framework AppKit -framework ReminderKit -o /tmp/remctl-private-check remctl-private.m
 git diff --check
+swiftc -O -framework EventKit -framework Foundation -o remctl-bridge remctl-bridge.swift
+python3 scripts/live_private_matrix.py
 ./install.sh --bootstrap
 remctl doctor --for-agent --json
 ```

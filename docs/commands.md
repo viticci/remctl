@@ -103,7 +103,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 `edit` covers these existing-reminder surfaces:
 
@@ -117,7 +117,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 | Section assignment or creation | `edit --private --section`, `--section-id`, `--new-section` | Yes | If combined with `-l/--list`, section resolution uses the destination list |
 | Subtasks | `edit --private --subtask ...` | Yes | Additive; rich JSON subtasks can include public and private child metadata |
 | Image attachments | `edit --private --image PATH` | Yes | Additive; generic files/PDFs are rejected, and existing images are not removed/replaced |
-| Real flagged, urgent, Early Reminder, location alarm, Groceries categorization | `edit --private --flagged`, `--urgent`, `--early-reminder`, location fields, `--grocery` | Yes | Private ReminderKit metadata; verify with `info --json` or `show <list> --json` for Groceries sectioning |
+| Real flagged, urgent, Early Reminder, location alarm, Groceries categorization | `edit --private --flagged`, `--urgent`, `--early-reminder`, location fields, `--grocery` | Yes | Private ReminderKit metadata except location alarms, which use EventKit structured-location alarms; verify with `info --json` or `show <list> --json` for Groceries sectioning |
 
 See [private-metadata.md](private-metadata.md) for risks, guardrails, and verification notes.
 
@@ -143,7 +143,7 @@ remctl edit 23880 --private --early-reminder clear
 
 Early Reminders are private ReminderKit due-date delta alerts, not EventKit alarms. They require `--private`; setting one requires an existing or newly supplied due date. Accepted values are `15m`, `1h`, `2d`, `1w`, `1mo`, and equivalent words such as `15 minutes`; `clear`, `none`, `off`, or `never` removes existing Early Reminders. JSON readback includes `earlyReminder` and `earlyReminders` with fields such as `unit`, `count`, `value`, `direction`, and `label`.
 
-Location alarms are normal reminder alarms with private ReminderKit location triggers. `edit --private --location-title ... --latitude ... --longitude ...` verifies through `info --json` in the same `alarms` array with `type: "location"` and a `location` object containing title, coordinates, radius, address when present, and `proximity`.
+Location alarms are normal reminder alarms saved through EventKit structured-location alarms. RemCTL still requires `--private` for the location command surface so agents do not treat it as an ordinary alarm. `edit --private --location-title ... --latitude ... --longitude ...` verifies through `info --json` in the same `alarms` array with `type: "location"` and a `location` object containing title, coordinates, radius, and `proximity`. `--address` is not supported.
 
 ## Editing
 
@@ -362,8 +362,10 @@ remctl add "Title" -l Projects --private --section "Section" -d "2026-05-12 15:0
 remctl info <numericId> --json
 ```
 
-`add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, private location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks.
+`add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks.
 
 If an agent supplies an invalid due date, RemCTL creates nothing and exits with a structured `invalid_due_date` error on stderr. Retry the same `add` command with one of the provided examples or a normalized `YYYY-MM-DD HH:MM` value; do not create first and patch the due date afterward.
 
 For Groceries automation, detect eligible lists with `remctl lists --json` and `listType == "groceries"`. After `add --private --grocery`, verify with `remctl show <list> --json` and check that the reminder has a non-empty `section` once categorization completes.
+
+For live release verification of private surfaces, run `python3 scripts/live_private_matrix.py` from the repo after compiling the local helpers. It creates disposable Reminders lists, reminders, smart lists, and templates; verifies them through RemCTL JSON output; and cleans up unless `--keep` is passed.

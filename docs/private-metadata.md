@@ -1,6 +1,6 @@
 # Private Metadata Writes
 
-RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`.
+RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`. Location alarms remain behind the private command guardrail because agents should treat them as Reminders-only metadata, but RemCTL saves them with EventKit structured-location alarms because that path materializes reliably on current macOS.
 
 This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private list appearance and pinning commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
 
@@ -26,7 +26,7 @@ Verified on macOS/iCloud sync:
 - real flag state: `edit ID --private --flagged` or `add ... --private -f`
 - urgent state: `add "Leave now" --private --urgent` or `edit ID --private --urgent`
 - Early Reminders: `add "Leave early" -d "today 14:00" --private --early-reminder 15m`, `edit ID --private --early-reminder 1h`, or `edit ID --private --early-reminder clear`
-- location alarms: `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090`
+- location alarms: `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090` (guarded by `--private`, saved through `remctl-bridge`)
 - list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
 - list and smart-list pin state: `list-pin "Project X" --private`, `list-pin "Flagged" --private`, `list-unpin --smart-list-id 4 --private`
 - custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
@@ -81,7 +81,7 @@ remctl edit 23880 --private --no-flagged --no-urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --proximity arriving
 ```
 
-`--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`, `address`). Public fields such as notes and due dates are applied through `remctl-bridge`; private fields such as rich links, tags, and Early Reminders are applied through `remctl-private`.
+`--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`). `address` is not supported for location alarms. Public fields such as notes, due dates, and location alarms are applied through `remctl-bridge`; private fields such as rich links, tags, and Early Reminders are applied through `remctl-private`.
 
 Subtask due dates use the same parser as parent reminders. Invalid parent or subtask due dates fail before RemCTL creates or edits anything, so private metadata is not silently dropped onto a partially-created reminder.
 
@@ -207,7 +207,7 @@ These fail because they would otherwise look successful while silently dropping 
 
 Moving a reminder to another list is not private metadata: use `remctl edit ID -l LIST` or `remctl edit ID --list-id ID` through the normal EventKit bridge. If a move is combined with `--private --section` or `--private --grocery`, RemCTL validates the private metadata against the destination list.
 
-`--private --url` and subtask `url`/`urls` accept `http` and `https` URLs. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving.
+`--private --url` and subtask `url`/`urls` accept `http` and `https` URLs. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving, then write through the EventKit bridge as structured-location alarms. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
 
 ## Installation and Doctor
 
@@ -229,4 +229,4 @@ REMCTL_PRIVATE_PATH=/tmp/remctl-private remctl edit 23880 --private --url https:
 
 ## Agent Notes
 
-Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, parent and subtask image attachments in `attachments`, normal and location alarms in `alarms`, Early Reminders in `earlyReminder`/`earlyReminders`, and keeps actual `dueDate` separate from Reminders' optional `displayDate`. Agents should not query SQLite directly for ordinary reminder metadata verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. For templates, verify with `remctl templates --json` or `remctl template-info`, then verify applied template lists with `remctl show <list> --json`. Do not ask RemCTL to mutate individual saved reminders inside a template; current support is whole-list template create/apply/delete. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.
+Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, parent and subtask image attachments in `attachments`, normal and location alarms in `alarms`, Early Reminders in `earlyReminder`/`earlyReminders`, and keeps actual `dueDate` separate from Reminders' optional `displayDate`. `lists --json` and `smart-lists --json` expose persisted `color`, `badge`, and `badgeEmblem` fields for appearance verification. Agents should not query SQLite directly for ordinary reminder metadata verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. For templates, verify with `remctl templates --json` or `remctl template-info`, then verify applied template lists with `remctl show <list> --json`. Do not ask RemCTL to mutate individual saved reminders inside a template; current support is whole-list template create/apply/delete. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.

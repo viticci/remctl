@@ -354,6 +354,29 @@ def parse_list_color(blob):
         pass
     return {"name": "blue", "hex": "#007AFF"}
 
+
+def parse_badge_emblem(value):
+    if not value:
+        return None
+    payload = {"raw": value}
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{"):
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                emoji = decoded.get("Emoji") or decoded.get("emoji")
+                emblem = decoded.get("Emblem") or decoded.get("emblem")
+                if emoji:
+                    payload["emoji"] = emoji
+                if emblem:
+                    payload["symbol"] = emblem
+        elif stripped:
+            payload["symbol"] = stripped
+    return payload
+
 def load_list_colors(db):
     """Load all list colors into a dict {list_name: (r, g, b)}."""
     colors = {}
@@ -423,6 +446,8 @@ def list_select_columns(db):
     columns = ["Z_PK", "ZNAME", "ZCKIDENTIFIER"]
     table_columns = table_column_names(db, "ZREMCDBASELIST")
     optional_columns = [
+        "ZBADGEEMBLEM",
+        "ZCOLOR",
         "ZISPINNEDBYCURRENTUSER",
         "ZPINNEDDATE",
         "ZSHOULDCATEGORIZEGROCERYITEMS",
@@ -458,6 +483,7 @@ def q_smart_lists(db):
         "ZMINIMUMSUPPORTEDAPPVERSION",
         "ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION",
     ]
+    columns.extend(column for column in ("ZBADGEEMBLEM", "ZCOLOR") if column in table_columns)
     columns.extend(column for column in ("ZISPINNEDBYCURRENTUSER", "ZPINNEDDATE") if column in table_columns)
     return db.execute(
         f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
@@ -660,6 +686,11 @@ def list_to_dict(row):
     object_uuid = _row_value(row, "ZCKIDENTIFIER")
     if object_uuid:
         item["objectUUID"] = object_uuid
+    if _row_has_key(row, "ZCOLOR") and row["ZCOLOR"]:
+        item["color"] = parse_list_color(row["ZCOLOR"])
+    if _row_has_key(row, "ZBADGEEMBLEM") and row["ZBADGEEMBLEM"]:
+        item["badge"] = parse_badge_emblem(row["ZBADGEEMBLEM"])
+        item["badgeEmblem"] = row["ZBADGEEMBLEM"]
     grocery = grocery_list_payload(row)
     if grocery and (is_groceries or any(grocery.values())):
         item["grocery"] = grocery
@@ -2195,7 +2226,8 @@ def parse_subtask_specs(values):
                 "proximity": 2 if proximity_text == "leaving" else 1,
             })
             if spec.get("address"):
-                normalized["address"] = str(spec["address"])
+                print("Error: subtask location address is not currently supported.", file=sys.stderr)
+                sys.exit(1)
 
         specs.append(normalized)
     return specs
@@ -2276,7 +2308,7 @@ def apply_subtask_private_metadata(subtask_id, spec):
             payload["count"] = early["count"]
         updates.append(private_action(payload))
     if "latitude" in spec or "longitude" in spec:
-        updates.append(private_action({
+        updates.append(private_location_action({
             "action": "add_location_alarm",
             "id": subtask_id,
             "title": spec.get("locationTitle") or "Location",
@@ -2320,6 +2352,9 @@ def validate_private_args(a):
     if latitude is not None or longitude is not None:
         if latitude is None or longitude is None:
             print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
+            sys.exit(1)
+        if getattr(a, "address", None):
+            print("Error: --address is not currently supported for location alarms.", file=sys.stderr)
             sys.exit(1)
         if latitude < -90 or latitude > 90:
             print("Error: --latitude must be between -90 and 90.", file=sys.stderr)
@@ -2367,13 +2402,102 @@ def early_reminder_identifiers_for_reminder(db, reminder_ckid):
     ]
 
 
+def location_alarm_exists(reminder_ckid, *, title=None, latitude=None, longitude=None):
+    try:
+        db = open_db()
+        row = q_reminder_by_identifier(db, reminder_ckid)
+        if not row:
+            return False
+        for alarm in alarm_rows_to_json(q_alarms(db, row["Z_PK"])):
+            if alarm.get("type") != "location":
+                continue
+            location = alarm.get("location", {})
+            if title and location.get("title") != title:
+                continue
+            if latitude is not None and abs(float(location.get("latitude")) - float(latitude)) > 0.0001:
+                continue
+            if longitude is not None and abs(float(location.get("longitude")) - float(longitude)) > 0.0001:
+                continue
+            return True
+    except (RemindersDBUnavailable, sqlite3.Error, TypeError, ValueError):
+        return False
+    return False
+
+
+IDEMPOTENT_PRIVATE_ACTIONS = {
+    "assign_section",
+    "set_flagged",
+    "set_urgent",
+    "set_early_reminder",
+}
+
+
 def private_action(data):
-    result = private_call(data)
+    attempts = 3 if data.get("action") in IDEMPOTENT_PRIVATE_ACTIONS else 1
+    result = None
+    for attempt in range(attempts):
+        result = private_call(data)
+        if result and result.get("status") == "updated":
+            return result
+        if not private_helper_error_is_transient(result) or attempt == attempts - 1:
+            break
+        time.sleep(0.5)
     if not result or result.get("status") != "updated":
         message = result.get("message") if isinstance(result, dict) else "private helper failed"
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
     return result
+
+
+def private_location_action(data):
+    if bridge_available():
+        bridge_payload = {
+            "action": "update",
+            "id": data.get("id"),
+            "locationTitle": data.get("title"),
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "radius": data.get("radius"),
+            "proximity": "leaving" if data.get("proximity") == 2 else "arriving",
+        }
+        result = bridge_call(bridge_payload)
+        if result and result.get("status") == "updated":
+            return {
+                "status": "updated",
+                "action": "add_location_alarm",
+                "source": "eventkit_bridge",
+                "locationTitle": data.get("title"),
+            }
+        message = result.get("message") if isinstance(result, dict) else "remctl-bridge failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    result = None
+    for attempt in range(3):
+        result = private_call(data)
+        if result and result.get("status") == "updated":
+            return result
+        if private_helper_error_is_transient(result):
+            for _ in range(8):
+                if location_alarm_exists(
+                    data.get("id"),
+                    title=data.get("title"),
+                    latitude=data.get("latitude"),
+                    longitude=data.get("longitude"),
+                ):
+                    return {
+                        "status": "updated",
+                        "action": "add_location_alarm",
+                        "verifiedAfterTransientError": True,
+                        "warning": result.get("message") if isinstance(result, dict) else "private helper failed",
+                    }
+                time.sleep(0.25)
+            if attempt < 2:
+                continue
+        break
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
 
 def validate_list_appearance_args(a):
     symbol = getattr(a, "symbol", None)
@@ -2692,11 +2816,31 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids):
             "verifiedSections": verified,
         }
 
-    result = private_call({
+    request = {
         "action": "categorize_grocery_items",
         "listId": ckid,
         "reminderIds": pending,
-    })
+    }
+    result = None
+    for attempt in range(3):
+        result = private_call(request)
+        if result and result.get("status") == "updated":
+            break
+        result_verified = []
+        for reminder_ckid in reminder_ckids:
+            section = wait_for_grocery_section(list_pk, reminder_ckid, attempts=8, delay=0.25)
+            result_verified.append({"id": reminder_ckid, "section": section})
+        if any(item.get("section") for item in result_verified):
+            return {
+                "status": "updated",
+                "action": "categorize_grocery_items",
+                "source": "reminders_auto",
+                "warning": result.get("message") if isinstance(result, dict) else "private helper failed",
+                "verifiedSections": result_verified,
+            }
+        if not private_helper_error_is_transient(result) or attempt == 2:
+            break
+        time.sleep(0.5)
     if result and result.get("status") == "updated":
         result_verified = []
         for reminder_ckid in reminder_ckids:
@@ -2842,7 +2986,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
             sys.exit(1)
         proximity = 2 if getattr(a, "proximity", "arriving") == "leaving" else 1
-        results.append(private_action({
+        results.append(private_location_action({
             "action": "add_location_alarm",
             "id": reminder_ckid,
             "title": getattr(a, "location_title", None) or "Location",
@@ -3832,6 +3976,11 @@ def smart_list_to_dict(row):
         "smartListType": row["ZSMARTLISTTYPE"],
         "filterLength": len(filter_data) if filter_data else 0,
     }
+    if _row_has_key(row, "ZCOLOR") and row["ZCOLOR"]:
+        payload["color"] = parse_list_color(row["ZCOLOR"])
+    if _row_has_key(row, "ZBADGEEMBLEM") and row["ZBADGEEMBLEM"]:
+        payload["badge"] = parse_badge_emblem(row["ZBADGEEMBLEM"])
+        payload["badgeEmblem"] = row["ZBADGEEMBLEM"]
     try:
         minimum_version = row["ZMINIMUMSUPPORTEDAPPVERSION"]
         effective_minimum_version = row["ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION"]
@@ -6123,7 +6272,6 @@ _remctl() {
                 '--longitude[Location alarm longitude]:longitude:' \
                 '--radius[Location alarm radius meters]:radius:' \
                 '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
-                '--address[Location alarm address label]:address:' \
                 '--title[New title]:title:' \
                 '(-l --list)'{-l,--list}'[Move to list]:list:' \
                 '--list-id[Move to list by stable numeric ID]:id:' \
@@ -6323,7 +6471,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --urgent --no-urgent --early-reminder --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --address --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -6548,7 +6696,6 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l latitude -d "Locatio
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l longitude -d "Location alarm longitude" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l radius -d "Location alarm radius" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Location trigger" -a "arriving leaving"
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l address -d "Location alarm address label" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
@@ -7347,7 +7494,8 @@ def main():
             "  remctl edit 23880 --private --location-title \"Apple Park\" --latitude 37.3349 --longitude -122.0090 --radius 200\n"
             "\n"
             "Without --private, --url is appended to notes. Synced tags, web rich links, sections, subtasks, images, "
-            "real flag state, urgent state, and location alarms require --private."
+            "real flag state, urgent state, and location alarms require --private. "
+            "Location alarms are saved through the EventKit bridge as structured-location alarms."
         ),
         formatter_class=HelpFormatter,
     )
@@ -7359,7 +7507,7 @@ def main():
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence (bridge only)")
     c.add_argument("--alarm", help="Alarm (bridge only)")
-    c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/subtasks/images/location alarms")
+    c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
     c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in its Groceries list")
@@ -7371,12 +7519,12 @@ def main():
     c.add_argument("--flagged", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set the real flagged state")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
-    c.add_argument("--location-title", help="Private metadata: location alarm title")
-    c.add_argument("--latitude", type=float, help="Private metadata: location alarm latitude")
-    c.add_argument("--longitude", type=float, help="Private metadata: location alarm longitude")
-    c.add_argument("--radius", type=float, default=100.0, help="Private metadata: location alarm radius in meters")
-    c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Private metadata: location alarm trigger direction")
-    c.add_argument("--address", help="Private metadata: location alarm address label")
+    c.add_argument("--location-title", help="Guarded metadata: location alarm title; saved through EventKit")
+    c.add_argument("--latitude", type=float, help="Guarded metadata: location alarm latitude; saved through EventKit")
+    c.add_argument("--longitude", type=float, help="Guarded metadata: location alarm longitude; saved through EventKit")
+    c.add_argument("--radius", type=float, default=100.0, help="Guarded metadata: location alarm radius in meters")
+    c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
+    c.add_argument("--address", help=argparse.SUPPRESS)
     js(c)
 
     c = sub.add_parser("delete", help="Delete a reminder")

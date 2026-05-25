@@ -110,6 +110,64 @@ class CliTests(unittest.TestCase):
         self.assertTrue(result["verifiedAfterTransientError"])
         self.assertEqual(private_call.call_count, 1)
 
+    def test_private_action_retries_idempotent_transient_helper_error(self):
+        transient = {
+            "status": "error",
+            "message": "Couldn’t communicate with a helper application.",
+        }
+        updated = {"status": "updated", "action": "set_flagged"}
+        with (
+            mock.patch.object(self.remctl, "private_call", side_effect=[transient, updated]) as private_call,
+            mock.patch.object(self.remctl.time, "sleep"),
+        ):
+            result = self.remctl.private_action({
+                "action": "set_flagged",
+                "id": "REMINDER-1",
+                "flagged": True,
+            })
+
+        self.assertEqual(result, updated)
+        self.assertEqual(private_call.call_count, 2)
+
+    def test_private_action_does_not_retry_additive_private_metadata(self):
+        transient = {
+            "status": "error",
+            "message": "Couldn’t communicate with a helper application.",
+        }
+        with (
+            mock.patch.object(self.remctl, "private_call", return_value=transient) as private_call,
+            mock.patch.object(sys, "stderr", new_callable=io.StringIO),
+        ):
+            with self.assertRaises(SystemExit):
+                self.remctl.private_action({
+                    "action": "add_private_metadata",
+                    "id": "REMINDER-1",
+                    "tags": ["remctl"],
+                })
+
+        self.assertEqual(private_call.call_count, 1)
+
+    def test_private_location_action_prefers_eventkit_bridge(self):
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", return_value={"status": "updated"}) as bridge_call,
+            mock.patch.object(self.remctl, "private_call") as private_call,
+        ):
+            result = self.remctl.private_location_action({
+                "action": "add_location_alarm",
+                "id": "REMINDER-1",
+                "title": "Apple Park",
+                "latitude": 37.3349,
+                "longitude": -122.0090,
+                "radius": 200,
+                "proximity": 1,
+            })
+
+        bridge_call.assert_called_once()
+        self.assertEqual(bridge_call.call_args.args[0]["locationTitle"], "Apple Park")
+        private_call.assert_not_called()
+        self.assertEqual(result["source"], "eventkit_bridge")
+
     def _list_db(self, names, grocery_locales=None):
         grocery_locales = grocery_locales or {}
         db = sqlite3.connect(":memory:")
@@ -117,6 +175,7 @@ class CliTests(unittest.TestCase):
         db.execute(
             "CREATE TABLE ZREMCDBASELIST ("
             "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER, "
+            "ZBADGEEMBLEM TEXT, ZCOLOR BLOB, "
             "ZISPINNEDBYCURRENTUSER INTEGER, ZPINNEDDATE REAL, "
             "ZSHOULDCATEGORIZEGROCERYITEMS INTEGER, ZSHOULDAUTOCATEGORIZEITEMS INTEGER, "
             "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST INTEGER, ZGROCERYLOCALEID TEXT, "
@@ -127,9 +186,10 @@ class CliTests(unittest.TestCase):
             db.execute(
                 "INSERT INTO ZREMCDBASELIST "
                 "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, "
+                "ZBADGEEMBLEM, ZCOLOR, "
                 "ZISPINNEDBYCURRENTUSER, ZPINNEDDATE, ZSHOULDCATEGORIZEGROCERYITEMS, "
                 "ZSHOULDAUTOCATEGORIZEITEMS, ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST, ZGROCERYLOCALEID) "
-                "VALUES (?, ?, ?, 0, 3, 0, NULL, ?, 0, 0, ?)",
+                "VALUES (?, ?, ?, 0, 3, NULL, NULL, 0, NULL, ?, 0, 0, ?)",
                 (idx, name, f"CK-{idx}", 1 if grocery_locale else 0, grocery_locale),
             )
         db.execute(
@@ -217,6 +277,21 @@ class CliTests(unittest.TestCase):
             self.assertFalse(result["isGroceries"])
         finally:
             db.close()
+
+    def test_list_to_dict_includes_private_appearance_fields(self):
+        row = {
+            "Z_PK": 1,
+            "ZNAME": "Projects",
+            "ZCKIDENTIFIER": "CK-1",
+            "ZBADGEEMBLEM": "{\"Emoji\" : \"\\ud83d\\udccc\"}",
+            "ZCOLOR": b"not-a-color",
+            "ZSHOULDCATEGORIZEGROCERYITEMS": 0,
+        }
+
+        payload = self.remctl.list_to_dict(row)
+
+        self.assertEqual(payload["badge"]["emoji"], "\U0001f4cc")
+        self.assertEqual(payload["color"]["hex"], "#007AFF")
 
     def test_lists_json_reports_grocery_metadata(self):
         db = self._list_db(["Groceries", "Work"], grocery_locales={"Groceries": "en_US"})

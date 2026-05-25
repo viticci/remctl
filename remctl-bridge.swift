@@ -1,5 +1,6 @@
 import Foundation
 import EventKit
+import CoreLocation
 
 // MARK: - JSON Models
 
@@ -16,6 +17,11 @@ struct Command: Decodable {
     let flagged: Bool?
     let recurrence: RecurrenceSpec?
     let alarm: String?
+    let locationTitle: String?
+    let latitude: Double?
+    let longitude: Double?
+    let radius: Double?
+    let proximity: String?
     let color: String?
 }
 
@@ -247,6 +253,21 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
 
     if let alarmStr = cmd.alarm, let alarm = parseAlarm(alarmStr) {
         reminder.alarms = [alarm]
+    }
+
+    if let latitude = cmd.latitude, let longitude = cmd.longitude {
+        let location = EKStructuredLocation(title: cmd.locationTitle ?? "Location")
+        location.geoLocation = CLLocation(latitude: latitude, longitude: longitude)
+        location.radius = cmd.radius ?? 100.0
+        let alarm = EKAlarm()
+        alarm.structuredLocation = location
+        let proximityValue = (cmd.proximity == "leaving" || cmd.proximity == "leave")
+            ? EKAlarmProximity.leave
+            : EKAlarmProximity.enter
+        alarm.proximity = proximityValue
+        var alarms = reminder.alarms ?? []
+        alarms.append(alarm)
+        reminder.alarms = alarms
     }
 }
 
