@@ -645,6 +645,54 @@ def is_grocery_list_row(row):
     return bool(_row_get(row, "ZSHOULDCATEGORIZEGROCERYITEMS", 0))
 
 
+GROCERY_CATEGORY_EMOJI = {
+    "Baby Care": "🍼",
+    "Bakery": "🥐",
+    "Baking Items": "🧁",
+    "Beverages": "🧃",
+    "Breads & Cereals": "🍞",
+    "Canned Foods & Soups": "🥫",
+    "Coffee & Tea": "☕",
+    "Dairy, Eggs & Cheese": "🥛",
+    "Deli": "🥪",
+    "Frozen Foods": "🧊",
+    "Household Items": "🧻",
+    "Meat": "🥩",
+    "Oils & Dressings": "🫒",
+    "Pasta, Rice & Beans": "🍝",
+    "Personal Care & Health": "🧴",
+    "Pet Care": "🐾",
+    "Produce": "🥬",
+    "Sauces & Condiments": "🍯",
+    "Seafood": "🦐",
+    "Snacks & Candy": "🍿",
+    "Spices & Seasonings": "🌶️",
+    "Wine, Beer & Spirits": "🍷",
+}
+
+
+def grocery_category_emoji(section_name):
+    if not section_name:
+        return None
+    normalized = html_lib.unescape(str(section_name)).strip()
+    return GROCERY_CATEGORY_EMOJI.get(normalized)
+
+
+def format_grocery_section_name(section_name, *, is_groceries=False):
+    if not is_groceries:
+        return section_name
+    display_name = html_lib.unescape(str(section_name)).strip()
+    emoji = grocery_category_emoji(section_name)
+    return f"{emoji} {display_name}" if emoji else display_name
+
+
+def add_grocery_section_metadata(item):
+    emoji = grocery_category_emoji(item.get("section"))
+    if emoji:
+        item["sectionEmoji"] = emoji
+    return item
+
+
 def grocery_list_payload(row):
     if not any(
         _row_has_key(row, key)
@@ -4909,9 +4957,16 @@ def cmd_show(a):
     secs = q_sections(db, pk)
     memberships = q_section_memberships(db, pk) if secs else {}
     if a.json:
+        payload = [
+            to_dict(i, db, section=memberships.get(i["ZCKIDENTIFIER"]), _sc=sc, _ht=ht)
+            for i in items
+        ]
+        if list_ref.get("isGroceries"):
+            payload = [add_grocery_section_metadata(item) for item in payload]
         print(json.dumps(
-            [to_dict(i, db, section=memberships.get(i["ZCKIDENTIFIER"]), _sc=sc, _ht=ht) for i in items],
-            indent=2
+            payload,
+            indent=2,
+            ensure_ascii=False,
         ))
         return
     if getattr(a, 'format', None) == 'table':
@@ -4936,7 +4991,8 @@ def cmd_show(a):
             print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
         for sn in [s["ZDISPLAYNAME"] for s in secs]:
             if sn in sec_items:
-                print(f"\n  {C.bold(f'[{sn}]')}")
+                heading = format_grocery_section_name(sn, is_groceries=bool(list_ref.get("isGroceries")))
+                print(f"\n  {C.bold(f'[{heading}]')}")
                 for item in sec_items[sn]:
                     print(fmt(item, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
     else:

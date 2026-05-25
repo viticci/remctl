@@ -104,7 +104,7 @@ Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the c
 
 ## Groceries Lists
 
-Reminders stores Groceries lists as normal lists with private grocery metadata. RemCTL reads those fields directly: `lists --json` reports `listType`, `isGroceries`, and the grocery locale flags, while human `lists` and `show` output mark detected Groceries lists with `🥕`.
+Reminders stores Groceries lists as normal lists with private grocery metadata. RemCTL reads those fields directly: `lists --json` reports `listType`, `isGroceries`, and the grocery locale flags, while human `lists` and `show` output mark detected Groceries lists with `🥕`. When `show` prints Groceries sections, known Reminders grocery categories get matching leading emoji such as `🥛 Dairy, Eggs & Cheese`, `🥬 Produce`, and `🧻 Household Items`; `show --json` includes `sectionEmoji` for the same categories.
 
 ```bash
 remctl lists --json

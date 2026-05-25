@@ -331,6 +331,134 @@ class CliTests(unittest.TestCase):
         self.assertIn("Groceries", output)
         self.assertIn("🥕", output)
 
+    def _show_row(self, pk, title, ckid):
+        return {
+            "Z_PK": pk,
+            "ZTITLE": title,
+            "ZNOTES": None,
+            "ZCOMPLETED": 0,
+            "ZFLAGGED": 0,
+            "ZPRIORITY": 0,
+            "ZISURGENTSTATEENABLEDFORCURRENTUSER": 0,
+            "ZDUEDATE": None,
+            "ZDISPLAYDATEDATE": None,
+            "ZALLDAY": None,
+            "ZCOMPLETIONDATE": None,
+            "ZCREATIONDATE": None,
+            "ZPARENTREMINDER": None,
+            "ZLIST": 1,
+            "ZICSURL": None,
+            "ZCKIDENTIFIER": ckid,
+            "list_name": "Groceries",
+            "recurrence_frequency": None,
+            "recurrence_interval": None,
+            "recurrence_count": None,
+            "recurrence_end_date": None,
+            "recurrence_days_of_week": None,
+            "recurrence_days_of_month": None,
+            "recurrence_months_of_year": None,
+            "recurrence_days_of_year": None,
+            "recurrence_weeks_of_year": None,
+            "recurrence_set_positions": None,
+            "ZDUEDATEDELTAALERTSDATA": None,
+        }
+
+    def test_show_human_output_marks_grocery_sections_with_matching_emoji(self):
+        rows = [
+            self._show_row(1, "Milk", "REM-1"),
+            self._show_row(2, "Trash bags", "REM-2"),
+        ]
+
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 1, "title": "Groceries", "isGroceries": True},
+            ),
+            mock.patch.object(self.remctl, "q_reminders", return_value=rows),
+            mock.patch.object(
+                self.remctl,
+                "q_sections",
+                return_value=[
+                    {"ZDISPLAYNAME": "Dairy, Eggs &amp; Cheese"},
+                    {"ZDISPLAYNAME": "Household Items"},
+                ],
+            ),
+            mock.patch.object(
+                self.remctl,
+                "q_section_memberships",
+                return_value={
+                    "REM-1": "Dairy, Eggs &amp; Cheese",
+                    "REM-2": "Household Items",
+                },
+            ),
+            mock.patch.object(
+                self.remctl,
+                "preload_extras",
+                return_value=({1: 0, 2: 0}, {1: [], 2: []}),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_show(
+                SimpleNamespace(
+                    list="Groceries",
+                    list_id=None,
+                    completed=False,
+                    json=False,
+                    format=None,
+                    verbose=False,
+                )
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("[🥛 Dairy, Eggs & Cheese]", output)
+        self.assertIn("[🧻 Household Items]", output)
+
+    def test_show_json_includes_grocery_section_emoji(self):
+        rows = [self._show_row(1, "Milk", "REM-1")]
+
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 1, "title": "Groceries", "isGroceries": True},
+            ),
+            mock.patch.object(self.remctl, "q_reminders", return_value=rows),
+            mock.patch.object(
+                self.remctl,
+                "q_sections",
+                return_value=[{"ZDISPLAYNAME": "Dairy, Eggs & Cheese"}],
+            ),
+            mock.patch.object(
+                self.remctl,
+                "q_section_memberships",
+                return_value={"REM-1": "Dairy, Eggs & Cheese"},
+            ),
+            mock.patch.object(self.remctl, "q_rich_link", return_value=None),
+            mock.patch.object(
+                self.remctl,
+                "preload_extras",
+                return_value=({1: 0}, {1: []}),
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_show(
+                SimpleNamespace(
+                    list="Groceries",
+                    list_id=None,
+                    completed=False,
+                    json=True,
+                    format=None,
+                    verbose=False,
+                )
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["section"], "Dairy, Eggs & Cheese")
+        self.assertEqual(payload[0]["sectionEmoji"], "🥛")
+
     def test_templates_json_reports_counts_and_existing_public_link(self):
         db = self._template_db()
         try:

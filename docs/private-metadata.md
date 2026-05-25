@@ -130,7 +130,7 @@ remctl add "Milk" -l Groceries --private --grocery --json
 remctl edit 23880 --private --grocery --json
 ```
 
-Reminders' Groceries type is stored as private list metadata, not as a separate public EventKit list class. RemCTL reads the grocery columns from `ZREMCDBASELIST`, marks detected Groceries lists with `🥕` in human output, and returns `listType`, `isGroceries`, and `grocery.locale` / categorization flags in `lists --json`.
+Reminders' Groceries type is stored as private list metadata, not as a separate public EventKit list class. RemCTL reads the grocery columns from `ZREMCDBASELIST`, marks detected Groceries lists with `🥕` in human output, decorates known Groceries section headings with matching category emoji, and returns `listType`, `isGroceries`, and `grocery.locale` / categorization flags in `lists --json`. `show --json` includes `sectionEmoji` when a reminder belongs to a known Groceries category.
 
 Groceries writes use `REMListChangeItem.groceryContextChangeItem`: `list-create --private --groceries` creates a list with grocery metadata, `list-edit --private --groceries` converts an existing list, `list-edit --private --standard` clears the grocery flag, and `--grocery-locale` writes the locale identifier Reminders stores for grocery categorization.
 
