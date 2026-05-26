@@ -93,7 +93,7 @@ remctl add "Annual review" --recurrence yearly --json
 remctl edit 23880 --recurrence "weekly mon,wed" --json
 ```
 
-Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
+Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; use `edit ID --alarm clear --json` to remove normal alarms. Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
 
 ## Private Metadata
 
@@ -215,7 +215,7 @@ remctl template-delete "Packing Template" --private --force --json
 - `add` and `edit` are atomic for due dates: if `-d/--due` is present and cannot be parsed, RemCTL exits before writing. With `--json`, parse failures are structured `invalid_due_date` errors on stderr with accepted examples. Retry with a corrected date instead of creating first and patching later.
 - Accepted dependency-free due-date forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
 - `dueDate` in JSON is the actual Reminders due date from `ZDUEDATE`. If Reminders stores a separate UI/alert display date, RemCTL reports it separately as `displayDate`.
-- For ordinary rescheduling, use `remctl edit ID -d "YYYY-MM-DD HH:MM" --json` first. When a reminder has a single absolute alarm/display time equal to the old due time, RemCTL carries that alarm forward so Reminders.app does not keep showing the old time.
+- For ordinary rescheduling, use `remctl edit ID -d "YYYY-MM-DD HH:MM" --json` first. When a reminder has a single absolute alarm/display time equal to the old due time, RemCTL carries that alarm forward so Reminders.app does not keep showing the old time. `edit ID -d clear --json` also removes a single matching absolute alarm/display time so the item does not stay visible under the old time.
 - When debugging due-date or alarm mismatches, compare `dueDate`, `displayDate`, and `alarms` before assuming the CLI or UI is wrong.
 
 Fast create path for agents:

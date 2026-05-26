@@ -230,6 +230,7 @@ RemCTL output is designed for both humans and agents:
 - macOS 26 urgent reminders show `⏰`
 - `info --json` reports the actual due date as `dueDate`; if Reminders stores a separate display/alert date, it appears as `displayDate`
 - `edit -d` carries a single absolute alarm forward when it matches the old due/display time, keeping Reminders.app's visible time aligned for ordinary reschedules
+- `edit -d clear` removes a single matching absolute alarm/display time; `edit --alarm clear` removes normal alarms explicitly
 - normal EventKit alarms and location alarms appear in `info --json` as `alarms`
 - Early Reminders appear in verbose/info JSON as labels such as `15 minutes before`
 - recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`
@@ -327,6 +328,7 @@ remctl doctor
 | `remctl_runtime.py` | Shared paths, config, date windows, safety helpers |
 | `remctl_serialization.py` | Shared reminder JSON serialization |
 | `remctl_smart_lists.py` | Smart-list filter decoding and safe v1 encoding |
+| `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
 | `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |
 | `install.sh` | Copy-based installer and bootstrap script |
 

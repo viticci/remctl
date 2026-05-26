@@ -17,6 +17,7 @@ struct Command: Decodable {
     let flagged: Bool?
     let recurrence: RecurrenceSpec?
     let alarm: String?
+    let clearAlarms: Bool?
     let locationTitle: String?
     let latitude: Double?
     let longitude: Double?
@@ -249,6 +250,10 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
 
     if let spec = cmd.recurrence, let rule = buildRecurrenceRule(spec) {
         reminder.recurrenceRules = [rule]
+    }
+
+    if cmd.clearAlarms == true {
+        reminder.alarms = []
     }
 
     if let alarmStr = cmd.alarm, let alarm = parseAlarm(alarmStr) {

@@ -2936,6 +2936,59 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["due"], "2026-05-26T16:00:00")
         self.assertEqual(payload["alarm"], "2026-05-26T16:00:00")
 
+    def test_cmd_edit_due_date_requires_bridge_when_matching_alarm_must_move(self):
+        from datetime import datetime
+
+        old_due = datetime(2026, 5, 26, 15, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder.update({
+            "Z_PK": 1,
+            "ZDUEDATE": self.remctl.to_ts(old_due),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+        })
+        alarm_rows = [{
+            "alarm_id": 7,
+            "time_interval": None,
+            "latitude": None,
+            "longitude": None,
+            "date_components": json.dumps({
+                "year": 2026,
+                "month": 5,
+                "day": 26,
+                "hour": 15,
+                "minute": 0,
+                "second": 0,
+                "timeZone": {"identifier": "Europe/Rome"},
+            }),
+        }]
+
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            with self.assertRaises(SystemExit):
+                self.remctl.cmd_edit(SimpleNamespace(
+                    id=1,
+                    json=True,
+                    title=None,
+                    notes=None,
+                    priority=None,
+                    due="2026-05-26 16:00",
+                    url=None,
+                    recurrence=None,
+                    alarm=None,
+                ))
+
+        bridge_call.assert_not_called()
+        osa_try.assert_not_called()
+        self.assertIn("requires remctl-bridge", stderr.getvalue())
+
     def test_cmd_edit_due_date_does_not_carry_custom_absolute_alarm(self):
         from datetime import datetime
 
@@ -2988,16 +3041,16 @@ class CliTests(unittest.TestCase):
 
         self.assertNotIn("alarm", bridge_call.call_args.args[0])
 
-    def test_cmd_edit_due_date_repairs_stale_display_alarm_on_retry(self):
+    def test_cmd_edit_due_date_noop_preserves_custom_absolute_alarm(self):
         from datetime import datetime
 
         current_due = datetime(2026, 5, 26, 16, 0, 0)
-        stale_display = datetime(2026, 5, 26, 15, 0, 0)
+        custom_alarm = datetime(2026, 5, 26, 15, 0, 0)
         reminder = dict(self._FAKE_REMINDER)
         reminder.update({
             "Z_PK": 1,
             "ZDUEDATE": self.remctl.to_ts(current_due),
-            "ZDISPLAYDATEDATE": self.remctl.to_ts(stale_display),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(custom_alarm),
         })
         alarm_rows = [{
             "alarm_id": 7,
@@ -3042,7 +3095,82 @@ class CliTests(unittest.TestCase):
         self.assertEqual(bridge_call.call_count, 2)
         final_payload = bridge_call.call_args_list[-1].args[0]
         self.assertEqual(final_payload["due"], "2026-05-26T16:00:00")
-        self.assertEqual(final_payload["alarm"], "2026-05-26T16:00:00")
+        self.assertNotIn("alarm", final_payload)
+
+    def test_cmd_edit_due_clear_clears_matching_absolute_alarm(self):
+        from datetime import datetime
+
+        old_due = datetime(2026, 5, 26, 15, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder.update({
+            "Z_PK": 1,
+            "ZDUEDATE": self.remctl.to_ts(old_due),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+        })
+        alarm_rows = [{
+            "alarm_id": 7,
+            "time_interval": None,
+            "latitude": None,
+            "longitude": None,
+            "date_components": json.dumps({
+                "year": 2026,
+                "month": 5,
+                "day": 26,
+                "hour": 15,
+                "minute": 0,
+                "second": 0,
+                "timeZone": {"identifier": "Europe/Rome"},
+            }),
+        }]
+
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(SimpleNamespace(
+                id=1,
+                json=True,
+                title=None,
+                notes=None,
+                priority=None,
+                due="clear",
+                url=None,
+                recurrence=None,
+                alarm=None,
+            ))
+
+        payload = bridge_call.call_args.args[0]
+        self.assertIsNone(payload["due"])
+        self.assertTrue(payload["clearAlarms"])
+
+    def test_cmd_edit_alarm_clear_routes_through_bridge(self):
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due=None, url=None, recurrence=None, alarm="clear",
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        payload = bridge_call.call_args.args[0]
+        self.assertTrue(payload["clearAlarms"])
+        self.assertNotIn("alarm", payload)
 
     def test_cmd_edit_moves_reminder_to_list_through_eventkit_bridge(self):
         reminder = self._FAKE_REMINDER

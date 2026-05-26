@@ -1529,12 +1529,25 @@ def should_carry_absolute_alarm_to_new_due(db, reminder, new_due, explicit_alarm
         return False
     alarm_dt = _parse_alarm_iso_datetime(absolute_alarms[0].get("date"))
     old_due = ts(_row_get(reminder, "ZDUEDATE"))
-    if _same_datetime_second(alarm_dt, old_due):
-        return True
+    return _same_datetime_second(alarm_dt, old_due)
+
+def should_clear_matching_absolute_alarm(db, reminder):
+    if db is None:
+        return False
+    reminder_pk = _row_get(reminder, "Z_PK")
+    if not reminder_pk:
+        return False
+    try:
+        alarms = alarm_rows_to_json(q_alarms(db, reminder_pk))
+    except Exception:
+        return False
+    absolute_alarms = [alarm for alarm in alarms if alarm.get("type") == "absolute"]
+    if len(alarms) != 1 or len(absolute_alarms) != 1:
+        return False
+    alarm_dt = _parse_alarm_iso_datetime(absolute_alarms[0].get("date"))
+    old_due = ts(_row_get(reminder, "ZDUEDATE"))
     old_display = ts(_row_get(reminder, "ZDISPLAYDATEDATE"))
-    if _same_datetime_second(old_due, new_due) and _same_datetime_second(alarm_dt, old_display):
-        return True
-    return False
+    return any(_same_datetime_second(alarm_dt, candidate) for candidate in (old_due, old_display))
 
 def hydrate_reminder_detail(db, payload, reminder_id):
     attachments = attachment_rows_to_json(q_attachments(db, reminder_id))
@@ -3983,6 +3996,9 @@ def parse_alarm(spec):
             pass
     return None
 
+def alarm_clear_requested(value):
+    return str(value).strip().lower() in {"clear", "none", "off", "remove", "delete"}
+
 EARLY_REMINDER_CLEAR_VALUES = {"clear", "none", "off", "never", "0", "0m", "0min"}
 EARLY_REMINDER_UNIT_CODES = {
     "m": 0,
@@ -5357,6 +5373,15 @@ def cmd_edit(a):
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
     if early_reminder_requires_due_date(a) and dt is None and not r["ZDUEDATE"]:
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
+    parsed_alarm = None
+    clear_alarm = False
+    if getattr(a, "alarm", None):
+        clear_alarm = alarm_clear_requested(a.alarm)
+        if not clear_alarm:
+            parsed_alarm = parse_alarm(a.alarm)
+            if parsed_alarm is None:
+                print(f"Error: could not parse alarm {a.alarm!r}. Use 15m, 1h, 1d, an absolute date, or clear.", file=sys.stderr)
+                sys.exit(1)
 
     # Auto double-tap: if Reminders' displayed due date already equals the
     # requested target, AppleScript treats it as a no-op and pushes only
@@ -5372,6 +5397,11 @@ def cmd_edit(a):
         r,
         dt,
         explicit_alarm=bool(getattr(a, "alarm", None)),
+    )
+    clear_matching_absolute_alarm = (
+        a.due == "clear"
+        and not clear_alarm
+        and should_clear_matching_absolute_alarm(db, r)
     )
 
     # Bridge-first for speed (post-2026-04-17 bridge fix: reminder.timeZone
@@ -5407,12 +5437,16 @@ def cmd_edit(a):
             data["priority"] = pm[a.priority.lower()]; has_changes = True
         if a.due == "clear":
             data["due"] = None; has_changes = True
+            if clear_matching_absolute_alarm:
+                data["clearAlarms"] = True
         elif dt is not None:
             data["due"] = dt.isoformat(); has_changes = True
         if hasattr(a, 'recurrence') and a.recurrence:
             data["recurrence"] = parse_recurrence(a.recurrence); has_changes = True
-        if hasattr(a, 'alarm') and a.alarm:
-            data["alarm"] = parse_alarm(a.alarm); has_changes = True
+        if clear_alarm:
+            data["clearAlarms"] = True; has_changes = True
+        elif parsed_alarm:
+            data["alarm"] = parsed_alarm; has_changes = True
         elif carry_absolute_alarm:
             data["alarm"] = dt.isoformat(); has_changes = True
         if has_changes:
@@ -5458,6 +5492,10 @@ def cmd_edit(a):
                 print(f"Updated #{a.id}")
                 print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
             return
+
+    if carry_absolute_alarm or clear_matching_absolute_alarm:
+        print("Error: this edit requires remctl-bridge to keep due/display/alarm state aligned.", file=sys.stderr)
+        sys.exit(1)
 
     # AppleScript fallback for when bridge isn't available.
     has_bridge_only = (
@@ -7613,7 +7651,7 @@ def main():
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence (bridge only)")
-    c.add_argument("--alarm", help="Alarm (bridge only)")
+    c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, ISO datetime, or clear (bridge only)")
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
