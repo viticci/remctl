@@ -34,6 +34,9 @@ High-value guardrails:
 - Do not use `--private` for normal recurrence or normal `--alarm`; those are EventKit features.
 - Do use `--private --early-reminder` for Reminders' Early Reminder menu values; this is separate from EventKit alarms.
 - Location alarms use the `edit --private --location-*` guardrail but are saved through the EventKit bridge as structured-location alarms; verify them in `info --json` under `alarms`.
+- Private rich URLs require public `http` or `https` hosts; loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts fail before writing. Non-private `--url` is only a notes fallback.
+- Human output strips terminal control characters from Reminders text; use JSON when exact raw values matter.
+- Invalid due dates, recurrence, normal alarms, priorities, and location payloads fail before writing. `upcoming DAYS` accepts 1 through 3650 days.
 - Do not verify smart-list pinning with `lists --json`; use `smart-lists --json`.
 - Do not promise template link creation or editing individual saved reminders inside a template.
 - Do not create multi-list aggregate smart lists with list filters; Reminders.app materializes only one included list through this write path.
@@ -93,7 +96,7 @@ remctl add "Annual review" --recurrence yearly --json
 remctl edit 23880 --recurrence "weekly mon,wed" --json
 ```
 
-Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; use `edit ID --alarm clear --json` to remove normal alarms. Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
+Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify recurrence readback. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; invalid recurrence, alarm, and priority values fail before writing. Recurring reminders include a stable `recurrence` object in JSON and a repeat badge in human/table output. Relative alarms such as `--alarm 15m` are EventKit alarms and verify in `info --json` under `alarms`; use `edit ID --alarm clear --json` to remove normal alarms. Early Reminders are separate private due-date delta alerts and require `--private --early-reminder`.
 
 ## Private Metadata
 
@@ -143,13 +146,13 @@ remctl template-delete "Packing Template" --private --force --json
 
 Private metadata rules:
 
-- `--private --url` creates a synced web rich link. Without `--private`, `--url` is appended to notes.
+- `--private --url` creates a synced web rich link and must resolve to a public `http` or `https` host. Without `--private`, `--url` is appended to notes.
 - `--private -t/--tags` creates real synced tags. On `add` without `--private`, tags are inline title hashtags. On `edit`, tags require `--private`.
 - `edit -l/--list` and `edit --list-id` move reminders through the normal EventKit bridge; they do not require `--private`.
 - `--section` resolves by name; if duplicates exist in the same list, RemCTL uses the single non-empty match when possible. Use `--section-id` for exact assignment.
 - `--early-reminder` writes Reminders' private Early Reminder due-date delta alert. It accepts `15m`, `1h`, `2d`, `1w`, `1mo`, or `clear`; non-clear values require a due date and must be verified with `remctl info ID --json`.
 - `--location-title` with `--latitude` and `--longitude` requires `--private` as a guardrail, but RemCTL persists it through EventKit structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS.
-- `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields.
+- `--subtask` accepts either a plain child title or a JSON object with child metadata: `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields. Rich subtask URLs follow the same public-host rule as parent private URLs.
 - `--section`, `--new-section`, `--subtask`, `--image`, `--flagged`, `--urgent`, `--early-reminder`, and location alarm fields require `--private` and should fail before writing if omitted.
 - Rich-link and image attachment edits are additive. RemCTL can add synced rich links and images; it does not remove or replace existing rich links/images.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.

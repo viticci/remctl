@@ -139,15 +139,18 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
     }
 
     let interval = spec.interval ?? 1
+    guard interval > 0 else { return nil }
 
     var daysOfWeek: [EKRecurrenceDayOfWeek]?
     if let days = spec.daysOfWeek {
         // Input: 1=Sun, 2=Mon ... 7=Sat → EKWeekday raw values match
-        daysOfWeek = days.compactMap { EKWeekday(rawValue: $0) }.map { EKRecurrenceDayOfWeek($0) }
+        guard !days.isEmpty, days.allSatisfy({ 1...7 ~= $0 }) else { return nil }
+        daysOfWeek = days.map { EKRecurrenceDayOfWeek(EKWeekday(rawValue: $0)!) }
     }
 
     var daysOfMonth: [NSNumber]?
     if let days = spec.daysOfMonth {
+        guard !days.isEmpty, days.allSatisfy({ 1...31 ~= $0 }) else { return nil }
         daysOfMonth = days.map { NSNumber(value: $0) }
     }
 
@@ -218,16 +221,20 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
     // successful but CloudKit silently ignored the dueDate field
     // (observed 2026-04-17, verified against AppleScript-authored pushes).
     if cmd.due != nil {
-        if let dueStr = cmd.due, !dueStr.isEmpty, let date = parseISO(dueStr) {
-            reminder.dueDateComponents = Calendar.current.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second], from: date)
-            reminder.timeZone = TimeZone.current
+        guard let dueStr = cmd.due, !dueStr.isEmpty, let date = parseISO(dueStr) else {
+            fail("Invalid due date")
         }
+        reminder.dueDateComponents = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second], from: date)
+        reminder.timeZone = TimeZone.current
     }
     // If due was explicitly null in JSON, the Decodable will still decode it;
     // we handle clearing via the raw JSON check below.
 
-    if let p = cmd.priority { reminder.priority = p }
+    if let p = cmd.priority {
+        guard 0...9 ~= p else { fail("Invalid priority") }
+        reminder.priority = p
+    }
 
     // Apply notes first, then URL.
     // EKReminder.url (EventKit) does NOT map to the ZICSURL field that Reminders.app
@@ -248,7 +255,8 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
         else if !f && reminder.priority == 1 { reminder.priority = 0 }
     }
 
-    if let spec = cmd.recurrence, let rule = buildRecurrenceRule(spec) {
+    if let spec = cmd.recurrence {
+        guard let rule = buildRecurrenceRule(spec) else { fail("Invalid recurrence") }
         reminder.recurrenceRules = [rule]
     }
 
@@ -256,16 +264,29 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
         reminder.alarms = []
     }
 
-    if let alarmStr = cmd.alarm, let alarm = parseAlarm(alarmStr) {
+    if let alarmStr = cmd.alarm {
+        guard let alarm = parseAlarm(alarmStr) else { fail("Invalid alarm") }
         reminder.alarms = [alarm]
     }
 
-    if let latitude = cmd.latitude, let longitude = cmd.longitude {
+    if cmd.latitude != nil || cmd.longitude != nil {
+        guard let latitude = cmd.latitude, let longitude = cmd.longitude else {
+            fail("Location alarms require latitude and longitude")
+        }
+        guard (-90.0...90.0).contains(latitude), (-180.0...180.0).contains(longitude) else {
+            fail("Invalid location coordinates")
+        }
+        let radius = cmd.radius ?? 100.0
+        guard radius > 0, radius <= 100_000 else { fail("Invalid location radius") }
         let location = EKStructuredLocation(title: cmd.locationTitle ?? "Location")
         location.geoLocation = CLLocation(latitude: latitude, longitude: longitude)
-        location.radius = cmd.radius ?? 100.0
+        location.radius = radius
         let alarm = EKAlarm()
         alarm.structuredLocation = location
+        if let proximity = cmd.proximity,
+           !["enter", "arriving", "leave", "leaving"].contains(proximity) {
+            fail("Invalid location proximity")
+        }
         let proximityValue = (cmd.proximity == "leaving" || cmd.proximity == "leave")
             ? EKAlarmProximity.leave
             : EKAlarmProximity.enter

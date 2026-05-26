@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.0.2
+"""remctl — Power-user Reminders CLI v1.0.3
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -14,6 +14,7 @@ from urllib.parse import quote, urlparse
 
 from remctl_runtime import (
     due_today_window,
+    is_safe_remote_url,
     resolve_binary_path,
     resolve_config_dir,
     resolve_store_dir,
@@ -43,7 +44,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
@@ -116,6 +117,16 @@ class C:
     @staticmethod
     def rgb(r, g, b, t):
         return f"\033[38;2;{r};{g};{b}m{t}\033[0m" if C.enabled else str(t)
+
+
+TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def safe_display(value):
+    """Return text safe to print in a terminal while preserving JSON/raw data."""
+    if value is None:
+        return ""
+    return TERMINAL_CONTROL_RE.sub(" ", str(value))
 
 # ── Splash Screen ────────────────────────────────────────────────────────────
 
@@ -404,14 +415,16 @@ def get_list_colors(db):
 
 def color_list_name(name, db=None):
     """Return the list name colored by its Reminders color."""
+    original_name = name
+    display_name = safe_display(name or "(none)")
     if not name or not C.enabled:
-        return name or "(none)"
+        return display_name
     if db:
         colors = get_list_colors(db)
-        if name in colors:
-            r, g, b = colors[name]
-            return C.rgb(r, g, b, name)
-    return C.cyan(name)
+        if original_name in colors:
+            r, g, b = colors[original_name]
+            return C.rgb(r, g, b, display_name)
+    return C.cyan(display_name)
 
 
 def color_for_list_name(name, db=None):
@@ -1815,11 +1828,11 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
     pri_val = _priority_value_from_item(r)
     sc = _subtask_count_from_item(r, db=db, _sc=_sc)
     tags = _tags_from_item(r, db=db, _ht=_ht)
-    tag_str = " " + " ".join(f"#{t}" for t in tags) if tags else ""
+    tag_str = " " + " ".join(f"#{safe_display(t)}" for t in tags) if tags else ""
     sub_str = f" [{sc} subtask{'s' if sc != 1 else ''}]" if sc > 0 else ""
     pri_str = f" {_color_priority(pri_val)}" if PRI.get(pri_val, "") else ""
     id_str = reminder_id_from_item(r, db)
-    title = (r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)"
+    title = safe_display((r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)")
     due_str = fmt_due(r["ZDUEDATE"] if _item_has(r, "ZDUEDATE") else _item_get(r, "dueDate"))
     repeat_badge = recurrence_badge(r)
     recur_str = f" {repeat_badge}" if repeat_badge else ""
@@ -1836,10 +1849,10 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
             parts.append(f"{indent}    List: {color_list_name(list_name, db)}")
         notes = r["ZNOTES"] if _item_has(r, "ZNOTES") else _item_get(r, "notes")
         if notes:
-            parts.append(f"{indent}    Notes: {C.dim(str(notes)[:200])}")
+            parts.append(f"{indent}    Notes: {C.dim(safe_display(notes)[:200])}")
         url = _url_from_item(r)
         if url:
-            parts.append(f"{indent}    URL: {C.dim(url)}")
+            parts.append(f"{indent}    URL: {C.dim(safe_display(url))}")
         recurrence = recurrence_summary(_recurrence_from_item(r))
         if recurrence:
             parts.append(f"{indent}    Repeats: {C.magenta(recurrence)}")
@@ -1985,13 +1998,15 @@ def reminders_to_table_data(items, db=None):
                 due_str = dt.strftime("%Y-%m-%d")
         pri_val = _priority_value_from_item(r)
         pri_str = _color_priority(pri_val) if PRI.get(pri_val, "") else ""
-        title = (r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)"
+        title = safe_display((r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)")
         markers = _state_markers(r)
         if markers:
             title = f"{markers} {title}"
         list_name = _list_name_from_item(r) or ""
         if db and C.enabled:
             list_name = color_list_name(list_name, db)
+        else:
+            list_name = safe_display(list_name)
         repeat = recurrence_summary(_recurrence_from_item(r))
         data.append({
             "id": reminder_id_from_item(r, db),
@@ -2252,7 +2267,15 @@ def parse_subtask_specs(values):
             normalized["alarm"] = alarm
 
         if spec.get("recurrence"):
-            normalized["recurrence"] = parse_recurrence(str(spec["recurrence"]))
+            recurrence = parse_recurrence(str(spec["recurrence"]))
+            if recurrence is None:
+                print(
+                    "Error: subtask recurrence must be daily, weekly, monthly, yearly, "
+                    "'weekly mon,wed,fri', or 'monthly 1,15'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            normalized["recurrence"] = recurrence
 
         early_value = spec.get("earlyReminder", spec.get("early_reminder"))
         if early_value is not None:
@@ -2272,6 +2295,9 @@ def parse_subtask_specs(values):
         for url in urls:
             if not is_web_url(url):
                 print("Error: --private --subtask url requires an http or https URL.", file=sys.stderr)
+                sys.exit(1)
+            if not is_safe_remote_url(url):
+                print("Error: --private --subtask url must resolve to a public http or https host.", file=sys.stderr)
                 sys.exit(1)
         if urls:
             normalized["urls"] = urls
@@ -2436,6 +2462,9 @@ def validate_private_args(a):
     url = getattr(a, "url", None)
     if url and not is_web_url(url):
         print("Error: --private --url requires an http or https URL.", file=sys.stderr)
+        sys.exit(1)
+    if url and not is_safe_remote_url(url):
+        print("Error: --private --url must resolve to a public http or https host.", file=sys.stderr)
         sys.exit(1)
 
     early_reminder = getattr(a, "early_reminder", None)
@@ -3961,17 +3990,53 @@ def parse_due(s):
 
 def parse_recurrence(spec):
     """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15'."""
+    if not spec:
+        return None
     parts = spec.lower().split()
+    if not parts:
+        return None
     freq = parts[0]
+    if freq not in {"daily", "weekly", "monthly", "yearly"}:
+        return None
     result = {"frequency": freq, "interval": 1}
     if freq == "weekly" and len(parts) > 1:
+        if len(parts) != 2:
+            return None
         day_map = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
-        days = [day_map[d.strip()] for d in parts[1].split(",") if d.strip() in day_map]
+        tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
+        if not tokens or any(token not in day_map for token in tokens):
+            return None
+        days = [day_map[token] for token in tokens]
         if days: result["daysOfWeek"] = days
     elif freq == "monthly" and len(parts) > 1:
-        days = [int(d) for d in parts[1].split(",") if d.strip().isdigit()]
+        if len(parts) != 2:
+            return None
+        tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
+        if not tokens or not all(token.isdigit() for token in tokens):
+            return None
+        days = [int(token) for token in tokens]
+        if any(day < 1 or day > 31 for day in days):
+            return None
         if days: result["daysOfMonth"] = days
+    elif len(parts) > 1:
+        return None
     return result
+
+
+def fail_invalid_recurrence(value):
+    print(
+        f"Error: could not parse recurrence {value!r}. Use daily, weekly, "
+        "'weekly mon,wed,fri', 'monthly 1,15', monthly, or yearly.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def recurrence_or_die(value):
+    recurrence = parse_recurrence(value)
+    if recurrence is None:
+        fail_invalid_recurrence(value)
+    return recurrence
 
 def parse_alarm(spec):
     """Normalize alarm spec for the Swift bridge.
@@ -4133,12 +4198,12 @@ def cmd_smart_lists(a):
         smart_type = item["smartListType"] or "(none)"
         length = item["filterLength"]
         summary = item.get("filter", {})
-        desc = summary.get("description") or "No filter data"
+        desc = safe_display(summary.get("description") or "No filter data")
         if summary and not summary.get("supported", True):
-            desc = f"{desc}: {', '.join(summary.get('keys', [])) or 'unknown keys'}"
+            desc = f"{desc}: {safe_display(', '.join(summary.get('keys', [])) or 'unknown keys')}"
         id_details = C.dim(f"(id: {item['id']}, {kind})")
         pin_info = C.dim(" [pinned]") if item.get("pinned") else ""
-        print(f"  {item['name']} {id_details}{pin_info}")
+        print(f"  {safe_display(item['name'])} {id_details}{pin_info}")
         print(f"    {smart_type} · filter bytes: {length} · {desc}")
     print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
 
@@ -4160,7 +4225,7 @@ def cmd_templates(a):
             bits.append(f"{item['sectionCount']} section{'s' if item['sectionCount'] != 1 else ''}")
         if item.get("publicLink"):
             bits.append("shared")
-        print(f"  {item['name']} {C.dim('(' + ', '.join(bits) + ')')}")
+        print(f"  {safe_display(item['name'])} {C.dim('(' + ', '.join(bits) + ')')}")
     print(f"\n{len(payload)} template{'s' if len(payload) != 1 else ''}")
 
 
@@ -4176,7 +4241,7 @@ def cmd_template_info(a):
     if a.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
-    print(C.bold(payload["name"]))
+    print(C.bold(safe_display(payload["name"])))
     print(f"ID: {payload['id']}")
     if payload.get("objectUUID"):
         print(f"Object UUID: {payload['objectUUID']}")
@@ -4189,18 +4254,24 @@ def cmd_template_info(a):
     if payload.get("sections"):
         print("\nSections:")
         for section in payload["sections"]:
-            print(f"  {section['name']} {C.dim('(id: ' + str(section['id']) + ')')}")
+            print(f"  {safe_display(section['name'])} {C.dim('(id: ' + str(section['id']) + ')')}")
     if payload.get("items"):
         print("\nSaved Reminders:")
         for item in payload["items"]:
-            tags = f" #{' #'.join(item.get('tags', []))}" if item.get("tags") else ""
+            tags = f" #{' #'.join(safe_display(tag) for tag in item.get('tags', []))}" if item.get("tags") else ""
             priority = f" {PRI.get({'high': 1, 'medium': 5, 'low': 9}.get(item.get('priority'), 0), '')}".rstrip()
-            print(f"  - {item['title']}{priority}{tags}")
+            print(f"  - {safe_display(item['title'])}{priority}{tags}")
 
 
 def cmd_template_create(a):
     if not private_metadata_enabled(a):
         print("Error: template-create requires --private.", file=sys.stderr)
+        sys.exit(1)
+    if getattr(a, "from_list", None) and getattr(a, "from_list_id", None) is not None:
+        print("Error: pass either --from-list or --from-list-id, not both.", file=sys.stderr)
+        sys.exit(1)
+    if not getattr(a, "from_list", None) and getattr(a, "from_list_id", None) is None:
+        print("Error: pass --from-list or --from-list-id.", file=sys.stderr)
         sys.exit(1)
     require_private_metadata(a)
     db = open_db()
@@ -4257,8 +4328,8 @@ def cmd_template_create(a):
     if a.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        print(f"Created template: {a.name}")
-        print(f"Source list: {list_ref['title']}")
+        print(f"Created template: {safe_display(a.name)}")
+        print(f"Source list: {safe_display(list_ref['title'])}")
 
 
 def cmd_template_apply(a):
@@ -4299,7 +4370,7 @@ def cmd_template_apply(a):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         name = payload.get("list", {}).get("title") or result.get("name") or ref["name"]
-        print(f"Created list from template: {name}")
+        print(f"Created list from template: {safe_display(name)}")
 
 
 def cmd_template_delete(a):
@@ -4314,7 +4385,7 @@ def cmd_template_delete(a):
         template_id=getattr(a, "template_id", None),
     )
     if not a.force:
-        ans = input(f"Delete template '{ref['name']}'? [y/N] ")
+        ans = input(f"Delete template '{safe_display(ref['name'])}'? [y/N] ")
         if ans.strip().lower() not in ("y", "yes"):
             print("Aborted.")
             return
@@ -4333,7 +4404,7 @@ def cmd_template_delete(a):
             "private": result,
         }, ensure_ascii=False))
     else:
-        print(f"Deleted template: {ref['name']}")
+        print(f"Deleted template: {safe_display(ref['name'])}")
 
 def _smart_list_csv_values(*values):
     result = []
@@ -4525,10 +4596,10 @@ def cmd_smart_list_create(a):
             "private": result,
         }, ensure_ascii=False))
     else:
-        print(f"Created smart list: {a.name}")
+        print(f"Created smart list: {safe_display(a.name)}")
         summary = decode_smart_list_filter_blob(filter_data)["summary"]
         if summary:
-            print(f"Filter: {summary['description']}")
+            print(f"Filter: {safe_display(summary['description'])}")
 
 def cmd_smart_list_edit(a):
     if not private_metadata_enabled(a):
@@ -4589,10 +4660,10 @@ def cmd_smart_list_edit(a):
             payload["filter"] = decode_smart_list_filter_blob(filter_data)["summary"]
         print(json.dumps(payload, ensure_ascii=False))
     else:
-        print(f"Updated smart list: {smart_list_display_name(row)}")
+        print(f"Updated smart list: {safe_display(smart_list_display_name(row))}")
         summary = decode_smart_list_filter_blob(filter_data)["summary"] if filter_data is not None else None
         if summary:
-            print(f"Filter: {summary['description']}")
+            print(f"Filter: {safe_display(summary['description'])}")
 
 def cmd_smart_list_delete(a):
     if not private_metadata_enabled(a):
@@ -4617,7 +4688,7 @@ def cmd_smart_list_delete(a):
     row = matches[0]
     name = smart_list_display_name(row)
     if not a.force:
-        ans = input(f"Delete custom smart list '{name}'? [y/N] ")
+        ans = input(f"Delete custom smart list '{safe_display(name)}'? [y/N] ")
         if ans.strip().lower() not in ("y", "yes"):
             print("Aborted.")
             return
@@ -4639,7 +4710,7 @@ def cmd_smart_list_delete(a):
             "private": result,
         }, ensure_ascii=False))
     else:
-        print(f"Deleted smart list: {name}")
+        print(f"Deleted smart list: {safe_display(name)}")
 
 def cmd_lists(a):
     db = open_db()
@@ -5032,7 +5103,7 @@ def cmd_show(a):
         print(fmt_table(reminders_to_table_data(items, db)))
         return
     if not items:
-        print(f"No {'active ' if not a.completed else ''}reminders in '{list_name}'")
+        print(f"No {'active ' if not a.completed else ''}reminders in '{safe_display(list_name)}'")
         return
     list_heading = color_list_name(list_name, db)
     if list_ref.get("isGroceries"):
@@ -5050,7 +5121,7 @@ def cmd_show(a):
             print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
         for sn in [s["ZDISPLAYNAME"] for s in secs]:
             if sn in sec_items:
-                heading = format_grocery_section_name(sn, is_groceries=bool(list_ref.get("isGroceries")))
+                heading = safe_display(format_grocery_section_name(sn, is_groceries=bool(list_ref.get("isGroceries"))))
                 print(f"\n  {C.bold(f'[{heading}]')}")
                 for item in sec_items[sn]:
                     print(fmt(item, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
@@ -5066,6 +5137,22 @@ def cmd_add(a):
     dt = parse_due(a.due)
     if a.due and not dt:
         fail_invalid_due_date(a.due, json_mode=getattr(a, "json", False))
+    parsed_recurrence = None
+    if hasattr(a, 'recurrence') and a.recurrence:
+        parsed_recurrence = recurrence_or_die(a.recurrence)
+    parsed_alarm = None
+    if hasattr(a, 'alarm') and a.alarm:
+        parsed_alarm = parse_alarm(a.alarm)
+        if parsed_alarm is None:
+            print(f"Error: could not parse alarm {a.alarm!r}. Use 15m, 1h, 1d, or an absolute date.", file=sys.stderr)
+            sys.exit(1)
+    pm = {"high": 1, "h": 1, "medium": 5, "med": 5, "m": 5, "low": 9, "l": 9, "none": 0}
+    priority_value = None
+    if a.priority:
+        priority_value = pm.get(a.priority.lower())
+        if priority_value is None:
+            print("Error: priority must be high, medium, low, or none.", file=sys.stderr)
+            sys.exit(1)
     if early_reminder_requires_due_date(a) and dt is None:
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
     if wants_private and not bridge_available():
@@ -5104,22 +5191,20 @@ def cmd_add(a):
             h = t if t.startswith("#") else f"#{t}"
             if h not in title:
                 title += f" {h}"
-    pm = {"high": 1, "h": 1, "medium": 5, "med": 5, "m": 5, "low": 9, "l": 9}
-
     # Try bridge first
     if bridge_available():
         data = {"action": "create", "title": title}
         if target_list_name: data["list"] = target_list_name
         if a.notes: data["notes"] = a.notes
         if dt: data["due"] = dt.isoformat()
-        if a.priority and a.priority.lower() in pm:
-            data["priority"] = pm[a.priority.lower()]
+        if priority_value is not None:
+            data["priority"] = priority_value
         if a.flag and not wants_private: data["flagged"] = True
         if hasattr(a, 'url') and a.url and not wants_private: data["url"] = a.url
-        if hasattr(a, 'recurrence') and a.recurrence:
-            data["recurrence"] = parse_recurrence(a.recurrence)
-        if hasattr(a, 'alarm') and a.alarm:
-            data["alarm"] = parse_alarm(a.alarm)
+        if parsed_recurrence is not None:
+            data["recurrence"] = parsed_recurrence
+        if parsed_alarm is not None:
+            data["alarm"] = parsed_alarm
         result = bridge_call(data)
         if result and result.get("status") == "created":
             private_results = []
@@ -5154,9 +5239,9 @@ def cmd_add(a):
                     payload["private"] = private_results
                 print(json.dumps(payload))
             else:
-                print(f"Created: {title}")
+                print(f"Created: {safe_display(title)}")
                 if list_resolution and list_resolution.get("method") != "exact":
-                    print(f"List: {list_resolution['title']} (resolved from {list_resolution['requested']})")
+                    print(f"List: {safe_display(list_resolution['title'])} (resolved from {safe_display(list_resolution['requested'])})")
                 if created_row:
                     print(f"ID: #{created_row['Z_PK']}")
                 if private_results:
@@ -5179,8 +5264,8 @@ def cmd_add(a):
     lst = f'tell list "{esc(target_list_name)}"' if target_list_name else "tell default list"
     s = f'tell application "Reminders"\n{lst}\nset r to make new reminder with properties {{name:"{esc(title)}"}}\n'
     if a.notes: s += f'set body of r to "{esc(a.notes)}"\n'
-    if a.priority and a.priority.lower() in pm:
-        s += f"set priority of r to {pm[a.priority.lower()]}\n"
+    if priority_value is not None:
+        s += f"set priority of r to {priority_value}\n"
     if a.flag: s += "set flagged of r to true\n"
     if dt: s += as_date_assign(dt) + "\n"
     s += "return id of r\nend tell\nend tell"
@@ -5188,7 +5273,7 @@ def cmd_add(a):
     if a.json:
         print(json.dumps({"status": "created", "id": rid, "title": title}))
     else:
-        print(f"Created: {title}")
+        print(f"Created: {safe_display(title)}")
 
 def _rem_id(r):
     """Build the x-apple-reminder:// ID that AppleScript uses for matching."""
@@ -5209,7 +5294,7 @@ def _bridge_write(action, pk, db, extra=None):
 
 
 def _refuse_unsafe_title_fallback(reminder, operation, reason):
-    title = reminder["ZTITLE"] or "(untitled)"
+    title = safe_display(reminder["ZTITLE"] or "(untitled)")
     try:
         reminder_id = reminder["Z_PK"]
     except Exception:
@@ -5237,7 +5322,7 @@ def cmd_done(a):
             if a.json:
                 print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
             else:
-                print(f"Completed: {r['ZTITLE']}")
+                print(f"Completed: {safe_display(r['ZTITLE'])}")
             return
 
     # AppleScript fallback
@@ -5246,7 +5331,7 @@ def cmd_done(a):
         if a.json:
             print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
         else:
-            print(f"Completed: {r['ZTITLE']}")
+            print(f"Completed: {safe_display(r['ZTITLE'])}")
         return
     if not rid:
         _refuse_unsafe_title_fallback(r, "complete it", "The reminder has no stable identifier")
@@ -5271,7 +5356,7 @@ def cmd_undone(a):
             if a.json:
                 print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
             else:
-                print(f"Uncompleted: {r['ZTITLE']}")
+                print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
             return
 
     rid = _rem_id(r)
@@ -5279,7 +5364,7 @@ def cmd_undone(a):
         if a.json:
             print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
         else:
-            print(f"Uncompleted: {r['ZTITLE']}")
+            print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
         return
     if not rid:
         _refuse_unsafe_title_fallback(r, "uncomplete it", "The reminder has no stable identifier")
@@ -5296,7 +5381,7 @@ def cmd_delete(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
     if not a.force:
-        ans = input(f"Delete '{r['ZTITLE']}' from {r['list_name']}? [y/N] ")
+        ans = input(f"Delete '{safe_display(r['ZTITLE'])}' from {safe_display(r['list_name'])}? [y/N] ")
         if not ans.lower().startswith("y"):
             print("Cancelled.")
             return
@@ -5309,7 +5394,7 @@ def cmd_delete(a):
             if a.json:
                 print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
             else:
-                print(f"Deleted: {r['ZTITLE']}")
+                print(f"Deleted: {safe_display(r['ZTITLE'])}")
             return
 
     rid = _rem_id(r)
@@ -5317,7 +5402,7 @@ def cmd_delete(a):
         if a.json:
             print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
         else:
-            print(f"Deleted: {r['ZTITLE']}")
+            print(f"Deleted: {safe_display(r['ZTITLE'])}")
         return
     if not rid:
         _refuse_unsafe_title_fallback(r, "delete it", "The reminder has no stable identifier")
@@ -5360,6 +5445,15 @@ def cmd_edit(a):
             sys.exit(1)
 
     pm = {"high": 1, "medium": 5, "low": 9, "none": 0}
+    priority_value = None
+    if a.priority:
+        priority_value = pm.get(a.priority.lower())
+        if priority_value is None:
+            print("Error: priority must be high, medium, low, or none.", file=sys.stderr)
+            sys.exit(1)
+    parsed_recurrence = None
+    if hasattr(a, 'recurrence') and a.recurrence:
+        parsed_recurrence = recurrence_or_die(a.recurrence)
 
     # Parse due date exactly once, up front. Warn loudly if an unparseable
     # string was given so the user doesn't silently get a no-op write that
@@ -5433,16 +5527,16 @@ def cmd_edit(a):
         if notes_body is not None:
             data["notes"] = notes_body
             has_changes = True
-        if a.priority and a.priority.lower() in pm:
-            data["priority"] = pm[a.priority.lower()]; has_changes = True
+        if priority_value is not None:
+            data["priority"] = priority_value; has_changes = True
         if a.due == "clear":
             data["due"] = None; has_changes = True
             if clear_matching_absolute_alarm:
                 data["clearAlarms"] = True
         elif dt is not None:
             data["due"] = dt.isoformat(); has_changes = True
-        if hasattr(a, 'recurrence') and a.recurrence:
-            data["recurrence"] = parse_recurrence(a.recurrence); has_changes = True
+        if parsed_recurrence is not None:
+            data["recurrence"] = parsed_recurrence; has_changes = True
         if clear_alarm:
             data["clearAlarms"] = True; has_changes = True
         elif parsed_alarm:
@@ -5475,7 +5569,7 @@ def cmd_edit(a):
                 else:
                     print(f"Updated #{a.id}")
                     if target_list_ref:
-                        print(f"List: {target_list_name}")
+                        print(f"List: {safe_display(target_list_name)}")
                     if private_results:
                         print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
                 return
@@ -5517,8 +5611,8 @@ def cmd_edit(a):
             notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
         if notes_body:
             parts.append(f'set body of r to "{esc(notes_body)}"')
-        if a.priority and a.priority.lower() in pm:
-            parts.append(f"set priority of r to {pm[a.priority.lower()]}")
+        if priority_value is not None:
+            parts.append(f"set priority of r to {priority_value}")
         if a.due == "clear":
             parts.append("set due date of r to missing value")
         elif dt is not None:
@@ -5557,9 +5651,9 @@ def cmd_search(a):
         print(fmt_table(reminders_to_table_data(items, db)))
         return
     if not items:
-        print(f"No reminders matching '{a.query}'")
+        print(f"No reminders matching '{safe_display(a.query)}'")
         return
-    print(f"Search: {C.bold(a.query)}")
+    print(f"Search: {C.bold(safe_display(a.query))}")
     for i in items:
         print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht))
     print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
@@ -5644,7 +5738,7 @@ def cmd_tags(a):
         return
     print(C.bold("Tags:"))
     for r in rows:
-        print(f"  {C.magenta('#' + r['ZNAME'])}")
+        print(f"  {C.magenta('#' + safe_display(r['ZNAME']))}")
     print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
 
 def cmd_subtasks(a):
@@ -5661,7 +5755,7 @@ def cmd_subtasks(a):
         d["subtasks"] = [to_dict(s, db, _sc=sc, _ht=ht) for s in subs]
         print(json.dumps(d, indent=2))
         return
-    print(f"Parent: {parent['ZTITLE']}")
+    print(f"Parent: {safe_display(parent['ZTITLE'])}")
     if not subs:
         print("  No subtasks")
     else:
@@ -5694,9 +5788,9 @@ def cmd_info(a):
         print(json.dumps(d, indent=2))
         return
     print(f"{C.bold('Reminder')} {reminder_id_text(r['Z_PK'], r['list_name'], db)}")
-    print(f"  Title:     {r['ZTITLE']}")
+    print(f"  Title:     {safe_display(r['ZTITLE'])}")
     print(f"  List:      {color_list_name(r['list_name'], db)}")
-    if sec: print(f"  Section:   {C.bold(sec)}")
+    if sec: print(f"  Section:   {C.bold(safe_display(sec))}")
     status_str = C.green("Completed") if r["ZCOMPLETED"] else C.yellow("Active")
     print(f"  Status:    {status_str}")
     pri_val = r["ZPRIORITY"] or 0
@@ -5722,15 +5816,15 @@ def cmd_info(a):
         print(f"  Created:   {ts(r['ZCREATIONDATE']).strftime('%b %d, %Y at %I:%M %p')}")
     if r["ZCOMPLETIONDATE"]:
         print(f"  Completed: {ts(r['ZCOMPLETIONDATE']).strftime('%b %d, %Y at %I:%M %p')}")
-    if r["ZNOTES"]: print(f"  Notes:     {r['ZNOTES']}")
-    if r["ZICSURL"] or rich_url: print(f"  URL:       {r['ZICSURL'] or rich_url}")
+    if r["ZNOTES"]: print(f"  Notes:     {safe_display(r['ZNOTES'])}")
+    if r["ZICSURL"] or rich_url: print(f"  URL:       {safe_display(r['ZICSURL'] or rich_url)}")
     if tags:
-        tag_str = ", ".join(C.magenta('#' + t['ZNAME']) for t in tags)
+        tag_str = ", ".join(C.magenta('#' + safe_display(t['ZNAME'])) for t in tags)
         print(f"  Tags:      {tag_str}")
     pp = r["ZPARENTREMINDER"]
     if pp:
         p = q_reminder(db, pp)
-        print(f"  Parent:    #{pp}" + (f" ({p['ZTITLE']})" if p else ""))
+        print(f"  Parent:    #{pp}" + (f" ({safe_display(p['ZTITLE'])})" if p else ""))
     if subs:
         print(f"  Subtasks ({len(subs)}):")
         sub_pks = [s["Z_PK"] for s in subs]
@@ -5740,7 +5834,7 @@ def cmd_info(a):
     if atts:
         print(f"  Attachments ({len(atts)}):")
         for a2 in atts:
-            print(f"    - {a2['ZFILENAME'] or 'untitled'} ({a2['ZATTACHMENTTYPERAWVALUE'] or '?'})")
+            print(f"    - {safe_display(a2['ZFILENAME'] or 'untitled')} ({safe_display(a2['ZATTACHMENTTYPERAWVALUE'] or '?')})")
     if alarms:
         print(f"  Alarms ({len(alarms)}):")
         for alarm in alarm_rows_to_json(alarms):
@@ -5748,7 +5842,7 @@ def cmd_info(a):
             if alarm.get("type") == "location":
                 location = alarm.get("location", {})
                 label = f"{location.get('title', 'Location')} ({location.get('proximity')})"
-            print(f"    - {label}")
+            print(f"    - {safe_display(label)}")
     if r["ZCKIDENTIFIER"]:
         link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
         print(f"  Deep link: {C.dim(link)}")
@@ -5772,7 +5866,7 @@ def cmd_sections(a):
             if cur: print()
             print(f"{C.bold(color_list_name(ln, db))}:")
             cur = ln
-        print(f"  - {r['ZDISPLAYNAME']}")
+        print(f"  - {safe_display(r['ZDISPLAYNAME'])}")
     print(f"\n{len(rows)} section{'s' if len(rows) != 1 else ''}")
 
 def cmd_stats(a):
@@ -5837,7 +5931,7 @@ def cmd_link(a):
         print(json.dumps([{k: v for k, v in item.items() if not k.startswith("_")} for item in results], indent=2))
     else:
         for item in results:
-            print(f"{reminder_id_text(item['id'], item.get('_list_name'), db)} {item['title']}")
+            print(f"{reminder_id_text(item['id'], item.get('_list_name'), db)} {safe_display(item['title'])}")
             print(f"  {C.dim(item['link'])}")
 
 def cmd_open(a):
@@ -5876,7 +5970,7 @@ def cmd_flag(a):
         if a.json:
             print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
-            print(f"Flagged: {r['ZTITLE']}")
+            print(f"Flagged: {safe_display(r['ZTITLE'])}")
         return
 
     if bridge_available() and r["ZCKIDENTIFIER"]:
@@ -5886,7 +5980,7 @@ def cmd_flag(a):
             if a.json:
                 print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
             else:
-                print(f"Flagged: {r['ZTITLE']}")
+                print(f"Flagged: {safe_display(r['ZTITLE'])}")
             return
     if not rid:
         _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
@@ -5910,7 +6004,7 @@ def cmd_unflag(a):
         if a.json:
             print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
-            print(f"Unflagged: {r['ZTITLE']}")
+            print(f"Unflagged: {safe_display(r['ZTITLE'])}")
         return
 
     if bridge_available() and r["ZCKIDENTIFIER"]:
@@ -5920,7 +6014,7 @@ def cmd_unflag(a):
             if a.json:
                 print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
             else:
-                print(f"Unflagged: {r['ZTITLE']}")
+                print(f"Unflagged: {safe_display(r['ZTITLE'])}")
             return
     if not rid:
         _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
@@ -5931,8 +6025,13 @@ def cmd_unflag(a):
     )
 
 def cmd_upcoming(a):
+    days = getattr(a, "days", None)
+    if days is None:
+        days = 7
+    if days < 1 or days > 3650:
+        print("Error: upcoming days must be between 1 and 3650.", file=sys.stderr)
+        sys.exit(1)
     db = open_db()
-    days = a.days if hasattr(a, 'days') and a.days else 7
     items = q_upcoming(db, days=days)
     pks = [i["Z_PK"] for i in items]
     sc, ht = preload_extras(db, pks)
@@ -6006,7 +6105,7 @@ def cmd_list_create(a):
         if a.json:
             print(json.dumps({"status": "created", "name": a.name, "private": result}, ensure_ascii=False))
         else:
-            print(f"Created list: {a.name}")
+            print(f"Created list: {safe_display(a.name)}")
             details = []
             if getattr(a, "color", None):
                 details.append(f"color={normalize_list_color(a.color)}")
@@ -6029,7 +6128,7 @@ def cmd_list_create(a):
         if a.json:
             print(json.dumps({"status": "created", "name": a.name}))
         else:
-            print(f"Created list: {a.name}")
+            print(f"Created list: {safe_display(a.name)}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to create list '{a.name}'" + (f": {message}" if message else ""), file=sys.stderr)
@@ -6057,14 +6156,17 @@ def cmd_list_edit(a):
             "private": result,
         }))
     else:
-        print(f"Updated list: {output_name}")
+        print(f"Updated list: {safe_display(output_name)}")
 
 
 def _cmd_list_pin_state(a, pinned):
-    require_private_metadata(a)
     if getattr(a, "list_id", None) is not None and getattr(a, "smart_list_id", None) is not None:
         print("Error: pass either --list-id or --smart-list-id, not both.", file=sys.stderr)
         sys.exit(1)
+    if not (getattr(a, "name", None) or getattr(a, "list_id", None) is not None or getattr(a, "smart_list_id", None) is not None):
+        print("Error: pass a list/smart-list name, --list-id, or --smart-list-id.", file=sys.stderr)
+        sys.exit(1)
+    require_private_metadata(a)
     db = open_db()
     smart_list_id = getattr(a, "smart_list_id", None)
     name = getattr(a, "name", None)
@@ -6118,7 +6220,7 @@ def _cmd_list_pin_state(a, pinned):
         }, ensure_ascii=False))
     else:
         label = "smart list" if target_kind == "smart-list" else "list"
-        print(f"{status.capitalize()} {label}: {target_ref['title']}")
+        print(f"{status.capitalize()} {label}: {safe_display(target_ref['title'])}")
 
 
 def cmd_list_pin(a):
@@ -6153,7 +6255,7 @@ def cmd_list_rename(a):
         if a.json:
             print(json.dumps({"status": "renamed", "id": list_ref["id"], "old_name": target_name, "new_name": new_name}))
         else:
-            print(f"Renamed: {target_name} -> {new_name}")
+            print(f"Renamed: {safe_display(target_name)} -> {safe_display(new_name)}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to rename list '{target_name}'" + (f": {message}" if message else ""), file=sys.stderr)
@@ -6171,7 +6273,7 @@ def cmd_list_delete(a):
         sys.exit(1)
     target_name = list_ref["title"]
     if not a.force:
-        ans = input(f"Delete list '{target_name}'? This cannot be undone. [y/N] ")
+        ans = input(f"Delete list '{safe_display(target_name)}'? This cannot be undone. [y/N] ")
         if not ans.lower().startswith("y"):
             print("Cancelled.")
             return
@@ -6183,7 +6285,7 @@ def cmd_list_delete(a):
         if a.json:
             print(json.dumps({"status": "deleted", "id": list_ref["id"], "name": target_name}))
         else:
-            print(f"Deleted list: {target_name}")
+            print(f"Deleted list: {safe_display(target_name)}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to delete list '{target_name}'" + (f": {message}" if message else ""), file=sys.stderr)
@@ -6897,6 +6999,9 @@ def current_python_path():
 
 
 def current_bridge_path():
+    override = os.environ.get("REMCTL_BRIDGE_PATH")
+    if override:
+        return Path(override).expanduser()
     if BRIDGE_PATH.exists():
         return BRIDGE_PATH.resolve()
     discovered = shutil.which("remctl-bridge")
@@ -6906,6 +7011,9 @@ def current_bridge_path():
 
 
 def current_private_path():
+    override = os.environ.get("REMCTL_PRIVATE_PATH")
+    if override:
+        return Path(override).expanduser()
     if PRIVATE_PATH.exists():
         return PRIVATE_PATH.resolve()
     discovered = shutil.which("remctl-private")
@@ -6915,6 +7023,9 @@ def current_private_path():
 
 
 def current_permissions_path():
+    override = os.environ.get("REMCTL_PERMISSIONS_PATH")
+    if override:
+        return Path(override).expanduser()
     if PERMISSIONS_PATH.exists():
         return PERMISSIONS_PATH.resolve()
     discovered = shutil.which("remctl-permissions")
@@ -6970,7 +7081,7 @@ def _print_show_payload(list_name, items, args):
         print(fmt_table(reminders_to_table_data(items)))
         return
     if not items:
-        print(f"No {'active ' if not args.completed else ''}reminders in '{list_name}'")
+        print(f"No {'active ' if not args.completed else ''}reminders in '{safe_display(list_name)}'")
         return
     print(f"{C.bold(color_list_name(list_name))}:")
     section_names = [item["section"] for item in items if item.get("section")]
@@ -6989,7 +7100,7 @@ def _print_show_payload(list_name, items, args):
             if section not in seen:
                 seen.append(section)
         for section in seen:
-            print(f"\n  {C.bold(f'[{section}]')}")
+            print(f"\n  {C.bold(f'[{safe_display(section)}]')}")
             for item in sec_items[section]:
                 print(fmt(item, verbose=args.verbose, indent="  "))
     else:
@@ -7006,9 +7117,9 @@ def _print_search_payload(query, items, args):
         print(fmt_table(reminders_to_table_data(items)))
         return
     if not items:
-        print(f"No reminders matching '{query}'")
+        print(f"No reminders matching '{safe_display(query)}'")
         return
-    print(f"Search: {C.bold(query)}")
+    print(f"Search: {C.bold(safe_display(query))}")
     for item in items:
         print(fmt(item, verbose=args.verbose))
     print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
@@ -7086,7 +7197,7 @@ def _print_tags_payload(rows, json_mode=False):
         return
     print(C.bold("Tags:"))
     for row in rows:
-        print(f"  {C.magenta('#' + row['name'])}")
+        print(f"  {C.magenta('#' + safe_display(row['name']))}")
     print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
 
 
@@ -7102,7 +7213,7 @@ def _print_sections_payload(grouped, json_mode=False):
         print(f"{C.bold(color_list_name(list_name))}:")
         for name in names:
             count += 1
-            print(f"  - {name}")
+            print(f"  - {safe_display(name)}")
         print()
     print(f"{count} section{'s' if count != 1 else ''}")
 
@@ -7127,10 +7238,10 @@ def _print_info_payload(item, args):
         print(json.dumps(item, indent=2))
         return
     print(f"{C.bold('Reminder')} {reminder_id_text(item['id'], item.get('list'))}")
-    print(f"  Title:     {item.get('title') or '(untitled)'}")
+    print(f"  Title:     {safe_display(item.get('title') or '(untitled)')}")
     print(f"  List:      {color_list_name(item.get('list'))}")
     if item.get("section"):
-        print(f"  Section:   {C.bold(item['section'])}")
+        print(f"  Section:   {C.bold(safe_display(item['section']))}")
     status_str = C.green("Completed") if item.get("completed") else C.yellow("Active")
     print(f"  Status:    {status_str}")
     pri_display = item.get("priority", "none")
@@ -7155,13 +7266,13 @@ def _print_info_payload(item, args):
     if item.get("completionDate"):
         print(f"  Completed: {datetime.fromisoformat(item['completionDate']).strftime('%b %d, %Y at %I:%M %p')}")
     if item.get("notes"):
-        print(f"  Notes:     {item['notes']}")
+        print(f"  Notes:     {safe_display(item['notes'])}")
     if item.get("url"):
-        print(f"  URL:       {item['url']}")
+        print(f"  URL:       {safe_display(item['url'])}")
     if item.get("tags"):
-        print(f"  Tags:      {', '.join(C.magenta('#' + tag) for tag in item['tags'])}")
+        print(f"  Tags:      {', '.join(C.magenta('#' + safe_display(tag)) for tag in item['tags'])}")
     if item.get("parentTitle"):
-        print(f"  Parent:    #{item['parentID']} ({item['parentTitle']})")
+        print(f"  Parent:    #{item['parentID']} ({safe_display(item['parentTitle'])})")
     elif item.get("parentID"):
         print(f"  Parent:    #{item['parentID']}")
     if item.get("subtasks"):
@@ -7172,8 +7283,8 @@ def _print_info_payload(item, args):
         print(f"  Attachments ({len(item['attachments'])}):")
         for attachment in item["attachments"]:
             print(
-                f"    - {attachment.get('filename') or 'untitled'} "
-                f"({attachment.get('type') or '?'})"
+                f"    - {safe_display(attachment.get('filename') or 'untitled')} "
+                f"({safe_display(attachment.get('type') or '?')})"
             )
     if item.get("deepLink"):
         print(f"  Deep link: {C.dim(item['deepLink'])}")

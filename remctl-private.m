@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
 
 @interface REMObjectID : NSObject
 + (id)objectIDWithURL:(NSURL *)url;
@@ -352,13 +355,85 @@ static NSURL *templateURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDTemplate/%@", ckIdentifier]];
 }
 
+static BOOL ipv4AddressIsPrivateOrLocal(uint32_t address) {
+    uint32_t ip = ntohl(address);
+    return
+        ((ip & 0xff000000) == 0x00000000) ||      // 0.0.0.0/8
+        ((ip & 0xff000000) == 0x0a000000) ||      // 10.0.0.0/8
+        ((ip & 0xff000000) == 0x7f000000) ||      // 127.0.0.0/8
+        ((ip & 0xffc00000) == 0x64400000) ||      // 100.64.0.0/10
+        ((ip & 0xfff00000) == 0xac100000) ||      // 172.16.0.0/12
+        ((ip & 0xffff0000) == 0xa9fe0000) ||      // 169.254.0.0/16
+        ((ip & 0xffff0000) == 0xc0a80000) ||      // 192.168.0.0/16
+        ((ip & 0xffffff00) == 0xc0000000) ||      // 192.0.0.0/24
+        ((ip & 0xffffff00) == 0xc0000200) ||      // 192.0.2.0/24
+        ((ip & 0xffffff00) == 0xc6336400) ||      // 198.51.100.0/24
+        ((ip & 0xffffff00) == 0xcb007100) ||      // 203.0.113.0/24
+        ((ip & 0xf0000000) == 0xe0000000);        // multicast/reserved
+}
+
+static BOOL sockaddrIsPrivateOrLocal(const struct sockaddr *addr) {
+    if (!addr) return YES;
+    if (addr->sa_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)addr;
+        return ipv4AddressIsPrivateOrLocal(ipv4->sin_addr.s_addr);
+    }
+    if (addr->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)addr;
+        const struct in6_addr *address = &ipv6->sin6_addr;
+        return IN6_IS_ADDR_UNSPECIFIED(address) ||
+            IN6_IS_ADDR_LOOPBACK(address) ||
+            IN6_IS_ADDR_LINKLOCAL(address) ||
+            IN6_IS_ADDR_SITELOCAL(address) ||
+            IN6_IS_ADDR_MULTICAST(address) ||
+            address->s6_addr[0] == 0xfc ||
+            address->s6_addr[0] == 0xfd;
+    }
+    return YES;
+}
+
+static BOOL hostResolvesOnlyToPublicAddresses(NSString *host) {
+    if (![host isKindOfClass:[NSString class]] || host.length == 0) {
+        return NO;
+    }
+    NSString *lower = [host lowercaseString];
+    if ([lower isEqualToString:@"localhost"] || [lower hasSuffix:@".local"]) {
+        return NO;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    struct addrinfo *results = NULL;
+    int status = getaddrinfo([host UTF8String], NULL, &hints, &results);
+    if (status != 0 || !results) {
+        if (results) freeaddrinfo(results);
+        return NO;
+    }
+
+    BOOL safe = YES;
+    for (struct addrinfo *cursor = results; cursor != NULL; cursor = cursor->ai_next) {
+        if (sockaddrIsPrivateOrLocal(cursor->ai_addr)) {
+            safe = NO;
+            break;
+        }
+    }
+    freeaddrinfo(results);
+    return safe;
+}
+
 static BOOL looksLikeWebURL(NSString *value) {
     NSURL *url = [NSURL URLWithString:value];
     if (!url || url.host.length == 0) {
         return NO;
     }
     NSString *scheme = [url.scheme lowercaseString];
-    return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
+        return NO;
+    }
+    return hostResolvesOnlyToPublicAddresses(url.host);
 }
 
 static NSData *decodedBase64Data(NSString *value, NSString *field) {

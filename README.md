@@ -102,6 +102,8 @@ The full command guide is in [docs/commands.md](docs/commands.md). For smart lis
 
 Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
 
+Recurrence, normal alarm, and priority inputs are also validated before writes. Supported recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; `upcoming DAYS` requires a positive range from 1 to 3650 days.
+
 ## Groceries Lists
 
 Reminders stores Groceries lists as normal lists with private grocery metadata. RemCTL reads those fields directly: `lists --json` reports `listType`, `isGroceries`, and the grocery locale flags, while human `lists` and `show` output mark detected Groceries lists with `🥕`. When `show` prints Groceries sections, known Reminders grocery categories get matching leading emoji such as `🥛 Dairy, Eggs & Cheese`, `🥬 Produce`, and `🧻 Household Items`; `show --json` includes `sectionEmoji` for the same categories.
@@ -200,6 +202,7 @@ A few rules keep this safe and predictable:
 
 - `edit -l/--list` and `edit --list-id` are normal EventKit moves; they do not require `--private`.
 - Location alarms still require the `--private` guardrail, but RemCTL saves them through `remctl-bridge` because EventKit structured-location alarms persist correctly on current macOS.
+- `--private --url` and rich subtask URLs must be public `http` or `https` hosts. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
 - Rich-link and image edit operations are additive. RemCTL can add them, but it does not remove or replace existing rich links/images.
 - `--early-reminder` accepts values such as `15m`, `1h`, `2d`, `1w`, `1mo`, or `clear`. Non-clear values require a due date.
 - `list-create --color` uses public EventKit for normal color names. Add `--private` for exact colors, official symbols, or emoji badges.
@@ -236,6 +239,7 @@ RemCTL output is designed for both humans and agents:
 - recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`
 - Groceries lists show `🥕` in list headings and list summaries
 - table output keeps a dedicated `Repeat` column when any row is recurring
+- human output strips terminal control characters from Reminders text before printing
 - every read command supports JSON output
 
 ```bash
@@ -281,6 +285,8 @@ remctl doctor --for-agent --json
 `search` matches reminder titles and notes. By default it searches active reminders; pass `--completed` to include completed reminders too.
 
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `info` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so agents should not need raw SQLite checks for ordinary reminder metadata verification.
+
+Use JSON for automation when exact raw text matters. Human output is terminal-safe and strips control characters; JSON preserves the underlying Reminders values.
 
 For smart-list automation, use `smart-list-create`, `smart-list-edit`, and `smart-list-delete` with `--private`, prefer `--smart-list-id` when editing or deleting an existing custom smart list, and verify with `remctl smart-lists --json`. `smart-lists --json` also reports smart-list pin state; on macOS 26, smart-list pinning is verified from `pinnedDate` because the regular-list boolean can stay empty. Reminders.app currently materializes only one included-list filter at a time; RemCTL rejects repeated included lists and list exclusions before writing. The smart-list command surface and examples are documented in [docs/commands.md#smart-lists](docs/commands.md#smart-lists); the private ReminderKit behavior and filter storage details are in [docs/private-metadata.md#smart-list-examples](docs/private-metadata.md#smart-list-examples).
 

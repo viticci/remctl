@@ -49,7 +49,7 @@ RemCTL opens the database read-only. It never writes to SQLite.
 
 Writes go through Apple-supported APIs:
 
-1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, moving reminders between lists, complete, delete, recurrence, alarms, URLs appended to notes, and list management.
+1. `remctl-bridge` writes via EventKit. This is the normal path for create, edit, moving reminders between lists, complete, delete, recurrence, alarms, URLs appended to notes, and list management. The Python CLI validates user input first, and the bridge also rejects malformed due dates, recurrence rules, alarms, priorities, and location payloads if called directly.
 2. AppleScript is a fallback for operations that still need Reminders.app automation behavior.
 
 There is also an explicitly unsupported opt-in helper:
@@ -62,6 +62,8 @@ The bridge is detected next to the installed CLI. Override it with:
 REMCTL_BRIDGE_PATH=/path/to/remctl-bridge remctl add "Test"
 ```
 
+`doctor` and `permissions` report the same helper path that the write path will use. Environment overrides are authoritative, even when the target is missing, so an agent can diagnose the exact failing helper path instead of silently falling back to another binary.
+
 Override the private helper path with:
 
 ```bash
@@ -69,6 +71,12 @@ REMCTL_PRIVATE_PATH=/path/to/remctl-private remctl edit 123 --private --url http
 ```
 
 See [private-metadata.md](private-metadata.md) for supported private fields, known limits, and verification rules.
+
+## Output Safety
+
+Human output neutralizes terminal control characters from Reminders-controlled text such as titles, notes, URLs, list names, section names, and tags. JSON output preserves the raw stored values for automation.
+
+Private rich URL attachments validate the target before writing. RemCTL accepts only public `http` and `https` hosts and rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts. Non-private `--url` remains a notes fallback and does not create a rich attachment.
 
 ## List Appearance
 

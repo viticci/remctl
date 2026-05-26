@@ -95,6 +95,8 @@ RemCTL uses nouns for read-only inspectors (`lists`, `smart-lists`, `templates`,
 
 Use `--json` on subcommands when scripting. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command, so both `remctl --format table show Work` and `remctl show Work --format table` are valid. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
+`upcoming DAYS` accepts 1 through 3650 days. Zero and negative ranges fail before RemCTL opens the Reminders database.
+
 List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
 
 List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that ignores decorative punctuation and emoji. If more than one list matches, RemCTL fails before writing and prints the candidate IDs; pass `--list-id` to target one explicitly.
@@ -104,6 +106,8 @@ List names are resolved conservatively: exact match first, then case-insensitive
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
 `--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+
+Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts before creating or editing a reminder; rich subtask URLs follow the same rule. Non-private `--url` remains a notes fallback.
 
 `edit` covers these existing-reminder surfaces:
 
@@ -131,7 +135,7 @@ remctl add "Pay rent" --recurrence monthly
 remctl add "Annual review" --recurrence yearly
 ```
 
-Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
+Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; invalid recurrence, alarm, and priority values fail before writing. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
 
 Early Reminders:
 

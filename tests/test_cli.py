@@ -60,6 +60,15 @@ class CliTests(unittest.TestCase):
     def test_parse_due_rejects_invalid_clock_time(self):
         self.assertIsNone(self.remctl.parse_due("today at 25:00"))
 
+    def test_parse_recurrence_rejects_invalid_specs(self):
+        self.assertEqual(
+            self.remctl.parse_recurrence("weekly mon,wed"),
+            {"frequency": "weekly", "interval": 1, "daysOfWeek": [2, 4]},
+        )
+        self.assertIsNone(self.remctl.parse_recurrence("fortnightly"))
+        self.assertIsNone(self.remctl.parse_recurrence("weekly funday"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly 0,32"))
+
     def test_private_call_returns_structured_error_payload(self):
         with mock.patch.object(
             self.remctl,
@@ -167,6 +176,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(bridge_call.call_args.args[0]["locationTitle"], "Apple Park")
         private_call.assert_not_called()
         self.assertEqual(result["source"], "eventkit_bridge")
+
+    def test_current_helper_paths_honor_environment_overrides(self):
+        with mock.patch.dict(
+            self.remctl.os.environ,
+            {
+                "REMCTL_BRIDGE_PATH": "/tmp/custom-bridge",
+                "REMCTL_PRIVATE_PATH": "/tmp/custom-private",
+                "REMCTL_PERMISSIONS_PATH": "/tmp/custom-permissions",
+            },
+            clear=False,
+        ):
+            self.assertEqual(self.remctl.current_bridge_path(), Path("/tmp/custom-bridge"))
+            self.assertEqual(self.remctl.current_private_path(), Path("/tmp/custom-private"))
+            self.assertEqual(self.remctl.current_permissions_path(), Path("/tmp/custom-permissions"))
 
     def _list_db(self, names, grocery_locales=None):
         grocery_locales = grocery_locales or {}
@@ -1968,6 +1991,46 @@ class CliTests(unittest.TestCase):
         self.assertIn("No reminder was created", stderr.getvalue())
         self.assertIn("today at 3pm", stderr.getvalue())
 
+    def test_cmd_add_rejects_invalid_recurrence_priority_and_alarm_before_writing(self):
+        base = dict(
+            title="Should not be created",
+            list="Projects",
+            list_id=None,
+            notes=None,
+            due=None,
+            flag=False,
+            tags=None,
+            url=None,
+            private=False,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            urgent=None,
+            early_reminder=None,
+            json=True,
+        )
+        cases = [
+            ({"priority": "urgent", "recurrence": None, "alarm": None}, "priority"),
+            ({"priority": None, "recurrence": "fortnightly", "alarm": None}, "recurrence"),
+            ({"priority": None, "recurrence": None, "alarm": "eventually"}, "alarm"),
+        ]
+        for extra, needle in cases:
+            args = SimpleNamespace(**base, **extra)
+            with (
+                mock.patch.object(self.remctl, "bridge_available") as bridge_available,
+                mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_add(args)
+            bridge_available.assert_not_called()
+            bridge_call.assert_not_called()
+            self.assertIn(needle, stderr.getvalue())
+
     def test_cmd_add_json_reports_structured_unparseable_due_error(self):
         args = SimpleNamespace(
             title="Should not be created",
@@ -2480,6 +2543,43 @@ class CliTests(unittest.TestCase):
         bridge_call.assert_not_called()
         self.assertIn("http or https", stderr.getvalue())
 
+    def test_cmd_add_private_rejects_local_rich_url_before_creation(self):
+        args = SimpleNamespace(
+            title="Research",
+            list="Projects",
+            list_id=None,
+            notes=None,
+            due="today",
+            priority=None,
+            flag=False,
+            tags=None,
+            url="http://127.0.0.1:631/",
+            recurrence=None,
+            alarm=None,
+            private=True,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            urgent=None,
+            early_reminder=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(args)
+        bridge_call.assert_not_called()
+        self.assertIn("public http or https", stderr.getvalue())
+
     def test_resolve_setup_shell_auto_skips_unsupported_shells(self):
         with mock.patch.dict("os.environ", {"SHELL": "/bin/tcsh"}, clear=False):
             self.assertEqual(self.remctl.resolve_setup_shell("auto"), "skip")
@@ -2502,6 +2602,18 @@ class CliTests(unittest.TestCase):
         self.assertIn("RemCTL setup", output)
         self.assertIn("Shell completion: skipped", output)
         self.assertIn("remctl onboard", output)
+
+    def test_cmd_upcoming_rejects_non_positive_days_before_database_read(self):
+        for days in (0, -1):
+            args = SimpleNamespace(days=days, json=True, verbose=False, format="json")
+            with (
+                mock.patch.object(self.remctl, "open_db") as open_db,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_upcoming(args)
+            open_db.assert_not_called()
+            self.assertIn("between 1 and 3650", stderr.getvalue())
 
     def test_bridge_access_check_for_onboarding_reports_authorized_bridge(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3469,6 +3581,30 @@ class CliTests(unittest.TestCase):
         self.assertIn("Test reminder", formatted)
         self.assertEqual(self.remctl._strip_ansi(table[0]["id"]), "#42")
         self.assertEqual(table[0]["title"], "Test reminder")
+
+    def test_human_reminder_output_sanitizes_terminal_controls(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT 42 AS Z_PK, ? AS ZTITLE, 0 AS ZCOMPLETED, "
+            "0 AS ZFLAGGED, 0 AS ZPRIORITY, NULL AS ZDUEDATE, "
+            "? AS list_name, ? AS ZNOTES, ? AS ZICSURL",
+            (
+                "\033]52;c;cHduZWQ=\aClipboard",
+                "Work\033[31m",
+                "line one\nline two\033]8;;https://evil.example\a",
+                "https://example.com/\033]52;c;cHduZWQ=\a",
+            ),
+        ).fetchone()
+        formatted = self.remctl.fmt(row, db=None, verbose=True)
+        table = self.remctl.reminders_to_table_data([row], db=None)
+        conn.close()
+
+        self.assertNotIn("\033]52", formatted)
+        self.assertNotIn("\033]8", formatted)
+        self.assertNotIn("\a", formatted)
+        self.assertNotIn("\033]52", table[0]["title"])
+        self.assertIn("Clipboard", formatted)
 
     def test_flagged_and_urgent_reminders_show_distinct_symbols_and_serialize(self):
         conn = sqlite3.connect(":memory:")

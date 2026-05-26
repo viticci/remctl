@@ -16,7 +16,7 @@ The helper is still experimental. It links a private framework, so Apple can ren
 
 Verified on macOS/iCloud sync:
 
-- web rich URL attachments: `--private --url https://example.com`
+- web rich URL attachments to public HTTP(S) hosts: `--private --url https://example.com`
 - synced tags: `--private -t remctl,work`
 - section assignment: `--private --section "Research"`
 - section assignment by stable ID: `--private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8`
@@ -61,7 +61,7 @@ remctl add "Flagged private task" -l Work --private -f
 remctl add "Leave early" -l Work -d "today 14:00" --private --early-reminder 15m
 ```
 
-With `--private`, `--url` creates a web rich link attachment and `-t/--tags` creates real synced Reminders tags. Without `--private`, `--url` is appended to notes and `-t/--tags` appends inline hashtags to the title.
+With `--private`, `--url` creates a web rich link attachment and `-t/--tags` creates real synced Reminders tags. Private rich URLs must resolve to public `http` or `https` hosts; loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts fail before writing. Without `--private`, `--url` is appended to notes and `-t/--tags` appends inline hashtags to the title.
 
 ## Edit Examples
 
@@ -81,9 +81,9 @@ remctl edit 23880 --private --no-flagged --no-urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200 --proximity arriving
 ```
 
-`--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`). `address` is not supported for location alarms. Public fields such as notes, due dates, and location alarms are applied through `remctl-bridge`; private fields such as rich links, tags, and Early Reminders are applied through `remctl-private`.
+`--subtask` remains backwards compatible with a plain title string. To set metadata on the child reminder itself, pass a JSON object. Supported subtask fields are `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields (`locationTitle`, `latitude`, `longitude`, `radius`, `proximity`). Rich subtask URLs follow the same public-host rule as parent private URLs. `address` is not supported for location alarms. Public fields such as notes, due dates, and location alarms are applied through `remctl-bridge`; private fields such as rich links, tags, and Early Reminders are applied through `remctl-private`.
 
-Subtask due dates use the same parser as parent reminders. Invalid parent or subtask due dates fail before RemCTL creates or edits anything, so private metadata is not silently dropped onto a partially-created reminder.
+Subtask due dates, priority, recurrence, and alarms use the same validators as parent reminders. Invalid parent or subtask values fail before RemCTL creates or edits anything, so private metadata is not silently dropped onto a partially-created reminder.
 
 Early Reminders are stored by Reminders as private `REMDueDateDeltaAlert` metadata and mirrored in `ZDUEDATEDELTAALERTSDATA`. RemCTL writes them with `REMReminderChangeItem.dueDateDeltaAlertContext`, removes existing due-date delta identifiers before replacing the value, and verifies readback through `remctl info ID --json`. Non-clear values require a due date because Reminders anchors the delta to the reminder's due date. The unit mapping is `0 = minutes`, `1 = hours`, `2 = days`, `3 = weeks`, `4 = months`; RemCTL accepts friendly forms such as `15m`, `1h`, `2d`, `1w`, and `1mo`.
 
@@ -207,7 +207,7 @@ These fail because they would otherwise look successful while silently dropping 
 
 Moving a reminder to another list is not private metadata: use `remctl edit ID -l LIST` or `remctl edit ID --list-id ID` through the normal EventKit bridge. If a move is combined with `--private --section` or `--private --grocery`, RemCTL validates the private metadata against the destination list.
 
-`--private --url` and subtask `url`/`urls` accept `http` and `https` URLs. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving, then write through the EventKit bridge as structured-location alarms. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
+`--private --url` and subtask `url`/`urls` accept only public `http` and `https` hosts. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving, then write through the EventKit bridge as structured-location alarms. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
 
 ## Installation and Doctor
 

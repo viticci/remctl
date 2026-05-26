@@ -143,3 +143,10 @@ def is_safe_remote_url(url: str) -> bool:
         ):
             return False
     return True
+
+
+def is_safe_terminal_text(text: str) -> bool:
+    return not any(
+        ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F
+        for char in str(text)
+    )
