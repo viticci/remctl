@@ -4,9 +4,11 @@ import contextlib
 import base64
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -3960,6 +3962,116 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["earlyReminder"]["unitCode"], 0)
         self.assertEqual(payload["earlyReminder"]["count"], -15)
         self.assertEqual(payload["earlyReminders"][0]["identifier"], "DELTA-1")
+
+    def _due_window_db(self):
+        """Minimal reminders schema for due-window query tests."""
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute(
+            "CREATE TABLE ZREMCDREMINDER ("
+            "Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZNOTES TEXT, ZCOMPLETED INTEGER, "
+            "ZFLAGGED INTEGER, ZPRIORITY INTEGER, ZISURGENTSTATEENABLEDFORCURRENTUSER INTEGER, "
+            "ZDUEDATEDELTAALERTSDATA TEXT, ZDUEDATE REAL, ZDISPLAYDATEDATE REAL, ZALLDAY INTEGER, "
+            "ZCOMPLETIONDATE REAL, ZCREATIONDATE REAL, ZPARENTREMINDER INTEGER, ZLIST INTEGER, "
+            "ZICSURL TEXT, ZCKIDENTIFIER TEXT, ZACCOUNT INTEGER, ZMARKEDFORDELETION INTEGER)"
+        )
+        db.execute("CREATE TABLE ZREMCDBASELIST (Z_PK INTEGER PRIMARY KEY, ZNAME TEXT)")
+        # Referenced by the recurrence subqueries in rem_cols(); empty is fine.
+        db.execute(
+            "CREATE TABLE ZREMCDOBJECT ("
+            "Z_PK INTEGER, Z_ENT INTEGER, ZREMINDER4 INTEGER, ZMARKEDFORDELETION INTEGER, "
+            "ZFREQUENCY INTEGER, ZINTERVAL INTEGER, ZOCCURRENCECOUNT INTEGER, ZENDDATE REAL, "
+            "ZDAYSOFTHEWEEK BLOB, ZDAYSOFTHEMONTH BLOB, ZMONTHSOFTHEYEAR BLOB, "
+            "ZDAYSOFTHEYEAR BLOB, ZWEEKSOFTHEYEAR BLOB, ZSETPOSITIONS BLOB)"
+        )
+        db.execute("INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME) VALUES (1, 'Inbox')")
+        return db
+
+    def _insert_due_reminder(self, db, pk, title, *, due_ts, display_ts, all_day):
+        db.execute(
+            "INSERT INTO ZREMCDREMINDER "
+            "(Z_PK, ZTITLE, ZCOMPLETED, ZFLAGGED, ZPRIORITY, ZDUEDATE, ZDISPLAYDATEDATE, "
+            "ZALLDAY, ZLIST, ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+            "VALUES (?, ?, 0, 0, 0, ?, ?, ?, 1, ?, 1, 0)",
+            (pk, title, due_ts, display_ts, 1 if all_day else 0, f"CK-{pk}"),
+        )
+
+    def test_all_day_reminders_bucket_by_display_date_west_of_utc(self):
+        from datetime import datetime, timedelta, timezone
+
+        # All-day reminders store ZDUEDATE at midnight UTC, which lands on the
+        # previous local day west of UTC. Pin a fixed western zone so the bug
+        # is reproducible regardless of where the suite runs.
+        prev_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        self.remctl._REMINDER_COLUMN_CACHE.clear()
+        db = self._due_window_db()
+        try:
+            apple_epoch = self.remctl.APPLE_EPOCH
+
+            def utc_midnight_ts(d):
+                dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+                return dt.timestamp() - apple_epoch
+
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            tomorrow = today + timedelta(days=1)
+
+            # All-day due today: display anchored to local midnight today,
+            # raw due at midnight UTC today (lands "yesterday evening" locally).
+            self._insert_due_reminder(
+                db, 1, "AllDay Today",
+                due_ts=utc_midnight_ts(today),
+                display_ts=self.remctl.to_ts(today),
+                all_day=True,
+            )
+            # All-day due tomorrow: the reported bug. Raw due lands today locally.
+            self._insert_due_reminder(
+                db, 2, "AllDay Tomorrow",
+                due_ts=utc_midnight_ts(tomorrow),
+                display_ts=self.remctl.to_ts(tomorrow),
+                all_day=True,
+            )
+            # Timed reminder due today at 9am: due == display, must be unaffected.
+            timed_due = self.remctl.to_ts(today.replace(hour=9))
+            self._insert_due_reminder(
+                db, 3, "Timed Today",
+                due_ts=timed_due, display_ts=timed_due, all_day=False,
+            )
+
+            # Sanity: the all-day-tomorrow raw due really does fall on today
+            # locally, so this exercises the timezone shift (not a no-op).
+            raw_tomorrow_due = db.execute(
+                "SELECT ZDUEDATE FROM ZREMCDREMINDER WHERE Z_PK = 2"
+            ).fetchone()["ZDUEDATE"]
+            self.assertEqual(self.remctl.ts(raw_tomorrow_due).date(), today.date())
+
+            due_today = self.remctl.q_due_today(db, include_overdue=True)
+            titles = {row["ZTITLE"] for row in due_today}
+            self.assertEqual(titles, {"AllDay Today", "Timed Today"})
+
+            # Nothing is overdue: the all-day-today item must not be misfiled.
+            self.assertEqual(self.remctl.q_overdue(db), [])
+
+            # Upcoming groups the all-day-tomorrow item under tomorrow, not today.
+            upcoming = {row["ZTITLE"]: row for row in self.remctl.q_upcoming(db, days=7)}
+            self.assertIn("AllDay Tomorrow", upcoming)
+            effective = self.remctl.row_effective_due(upcoming["AllDay Tomorrow"])
+            self.assertEqual(self.remctl.ts(effective).date(), tomorrow.date())
+
+            # The human label must match the bucket: "(tomorrow)", with no
+            # spurious all-day time leaking through from the UTC-midnight due.
+            rendered = self.remctl._strip_ansi(self.remctl.fmt(upcoming["AllDay Tomorrow"]))
+            self.assertIn("(tomorrow)", rendered)
+            self.assertNotIn("20:00", rendered)
+        finally:
+            db.close()
+            self.remctl._REMINDER_COLUMN_CACHE.clear()
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            time.tzset()
 
 
 if __name__ == "__main__":

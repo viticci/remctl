@@ -1257,6 +1257,23 @@ def display_due_expr(db, table_alias="r"):
 def due_expr(table_alias="r"):
     return f"{table_alias}.ZDUEDATE"
 
+def due_filter_expr(db, table_alias="r"):
+    """Date used for due-window bucketing (today/upcoming/overdue).
+
+    All-day reminders store ZDUEDATE at midnight UTC, so for any timezone west
+    of UTC the raw value lands on the previous local day (and east of UTC, the
+    next day). The Reminders app buckets all-day items by their local-anchored
+    display date instead, so we match that: prefer ZDISPLAYDATEDATE for all-day
+    reminders, and keep the exact due time for timed reminders.
+    """
+    due = f"{table_alias}.ZDUEDATE"
+    if reminder_has_column(db, "ZALLDAY") and reminder_has_column(db, "ZDISPLAYDATEDATE"):
+        return (
+            f"(CASE WHEN {table_alias}.ZALLDAY = 1 "
+            f"THEN COALESCE({table_alias}.ZDISPLAYDATEDATE, {due}) ELSE {due} END)"
+        )
+    return due
+
 def rem_cols(db):
     return f"""r.Z_PK, r.ZTITLE, r.ZNOTES, r.ZCOMPLETED, r.ZFLAGGED, r.ZPRIORITY,
     {urgent_column_expr(db)} AS ZISURGENTSTATEENABLEDFORCURRENTUSER,
@@ -1589,7 +1606,7 @@ def q_search(db, query, completed=False):
 
 def q_due_today(db, include_overdue=True):
     sod, eod = due_today_window()
-    due_column = due_expr()
+    due_column = due_filter_expr(db)
     if include_overdue:
         w = f"{due_column} < {to_ts(eod)} AND {due_column} IS NOT NULL"
     else:
@@ -1619,7 +1636,7 @@ def q_urgent(db):
 def q_upcoming(db, days=7):
     """Reminders due within the next N days (not overdue)."""
     sod, future = upcoming_window(days)
-    due_column = due_expr()
+    due_column = due_filter_expr(db)
     return db.execute(
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
@@ -1631,7 +1648,7 @@ def q_upcoming(db, days=7):
 def q_overdue(db):
     """All overdue incomplete reminders."""
     sod = start_of_day()
-    due_column = due_expr()
+    due_column = due_filter_expr(db)
     return db.execute(
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
         f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
@@ -1641,7 +1658,7 @@ def q_overdue(db):
 
 # ── Format ───────────────────────────────────────────────────────────────────
 
-def fmt_due(v, colored=True):
+def fmt_due(v, colored=True, all_day=False):
     if not v: return ""
     if isinstance(v, datetime):
         dt = v
@@ -1657,7 +1674,7 @@ def fmt_due(v, colored=True):
     now = datetime.now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if dt.date() == today.date():
-        label = f" (today {dt.strftime('%H:%M')})" if dt.hour or dt.minute else " (today)"
+        label = f" (today {dt.strftime('%H:%M')})" if not all_day and (dt.hour or dt.minute) else " (today)"
         return label
     if dt.date() == (today + timedelta(days=1)).date():
         return " (tomorrow)"
@@ -1697,6 +1714,21 @@ def _item_get(item, key, default=None):
     if _item_has(item, key):
         return item[key]
     return default
+
+
+def row_effective_due(item):
+    """Raw due timestamp used for day bucketing, honoring all-day display dates.
+
+    Mirrors due_filter_expr() for in-Python partitioning/grouping: all-day
+    reminders store ZDUEDATE at midnight UTC, so bucket them by their
+    local-anchored ZDISPLAYDATEDATE when present.
+    """
+    due = _item_get(item, "ZDUEDATE")
+    if _item_get(item, "ZALLDAY"):
+        display = _item_get(item, "ZDISPLAYDATEDATE")
+        if display is not None:
+            return display
+    return due
 
 
 def _priority_value_from_item(item):
@@ -1833,7 +1865,14 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
     pri_str = f" {_color_priority(pri_val)}" if PRI.get(pri_val, "") else ""
     id_str = reminder_id_from_item(r, db)
     title = safe_display((r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)")
-    due_str = fmt_due(r["ZDUEDATE"] if _item_has(r, "ZDUEDATE") else _item_get(r, "dueDate"))
+    if _item_has(r, "ZDUEDATE"):
+        all_day = bool(_item_get(r, "ZALLDAY"))
+        due_val = row_effective_due(r)
+    else:
+        all_day = bool(_item_get(r, "allDay"))
+        display = _item_get(r, "displayDate")
+        due_val = display if (all_day and display is not None) else _item_get(r, "dueDate")
+    due_str = fmt_due(due_val, all_day=all_day)
     repeat_badge = recurrence_badge(r)
     recur_str = f" {repeat_badge}" if repeat_badge else ""
     if completed:
@@ -5673,7 +5712,7 @@ def cmd_today(a):
         print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
         return
     sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    overdue = [i for i in items if ts(i["ZDUEDATE"]) < sod]
+    overdue = [i for i in items if ts(row_effective_due(i)) < sod]
     overdue_pks = {i["Z_PK"] for i in overdue}
     due = [i for i in items if i["Z_PK"] not in overdue_pks]
     if overdue:
@@ -6048,7 +6087,7 @@ def cmd_upcoming(a):
     # Group by day
     groups = {}
     for i in items:
-        dt = ts(i["ZDUEDATE"])
+        dt = ts(row_effective_due(i))
         day_key = dt.strftime("%Y-%m-%d")
         day_label = dt.strftime("%A, %b %d")
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
