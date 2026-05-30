@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.0.3
+"""remctl — Power-user Reminders CLI v1.0.4
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -44,7 +44,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
