@@ -10,6 +10,8 @@ struct Command: Decodable {
     let title: String?
     let newTitle: String?
     let list: String?
+    let calendarIdentifier: String?  // stable EKCalendar.calendarIdentifier; preferred over list name
+    let account: String?              // EKSource.title hint for disambiguating same-name lists
     let due: String?
     let priority: Int?
     let notes: String?
@@ -199,18 +201,44 @@ func findReminder(_ store: EKEventStore, id: String) -> EKReminder {
     return item
 }
 
-func findList(_ store: EKEventStore, name: String) -> EKCalendar {
-    guard let cal = store.calendars(for: .reminder).first(where: { $0.title == name }) else {
-        fail("List not found: \(name)")
+func sourceTypeName(_ type: EKSourceType?) -> String? {
+    guard let type = type else { return nil }
+    switch type {
+    case .local:       return "Local"
+    case .exchange:    return "Exchange"
+    case .calDAV:      return "CalDAV"
+    case .mobileMe:    return "MobileMe"
+    case .subscribed:  return "Subscribed"
+    case .birthdays:   return "Birthdays"
+    default:           return nil
     }
-    return cal
+}
+
+func findList(_ store: EKEventStore, calendarIdentifier: String? = nil, name: String? = nil, account: String? = nil) -> EKCalendar {
+    // Prefer stable calendarIdentifier
+    if let cid = calendarIdentifier, let cal = store.calendar(withIdentifier: cid) {
+        return cal
+    }
+    guard let name = name else { fail("findList: must provide calendarIdentifier or name") }
+    let candidates = store.calendars(for: .reminder).filter { $0.title == name }
+    if candidates.isEmpty { fail("List not found: \(name)") }
+    // If account hint given, prefer matching source
+    if let account = account {
+        let accountMatch = candidates.filter { $0.source?.title == account }
+        if accountMatch.count == 1 { return accountMatch[0] }
+        if accountMatch.count > 1 { fail("Ambiguous list '\(name)' in account '\(account)': \(accountMatch.count) matches") }
+        // account hint didn't match any source; fall through to single-candidate check
+    }
+    if candidates.count == 1 { return candidates[0] }
+    let sourceNames = candidates.compactMap { $0.source?.title }.joined(separator: ", ")
+    fail("Ambiguous list '\(name)': exists in multiple accounts (\(sourceNames)). Pass calendarIdentifier or account.")
 }
 
 func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
     if let t = cmd.title { reminder.title = t }
 
-    if let list = cmd.list {
-        reminder.calendar = findList(store, name: list)
+    if cmd.calendarIdentifier != nil || cmd.list != nil {
+        reminder.calendar = findList(store, calendarIdentifier: cmd.calendarIdentifier, name: cmd.list, account: cmd.account)
     }
 
     // due: present string → set date, JSON null → clear.
@@ -365,8 +393,8 @@ case "create":
     guard let title = cmd.title, !title.isEmpty else { fail("title is required for create") }
     let reminder = EKReminder(eventStore: store)
     reminder.title = title
-    if let list = cmd.list {
-        reminder.calendar = findList(store, name: list)
+    if cmd.calendarIdentifier != nil || cmd.list != nil {
+        reminder.calendar = findList(store, calendarIdentifier: cmd.calendarIdentifier, name: cmd.list, account: cmd.account)
     } else {
         reminder.calendar = store.defaultCalendarForNewReminders()
     }
@@ -448,16 +476,63 @@ case "unflag":
         fail("Unflag failed: \(error.localizedDescription)")
     }
 
+case "find_reminder":
+    // Find a reminder by title within a specific calendar and return its calendarItemIdentifier.
+    // Used to obtain a stable EventKit identifier for reminders (e.g. Exchange) that have no
+    // ZCKIDENTIFIER in the CoreData store.
+    guard let calId = cmd.calendarIdentifier else { fail("find_reminder: calendarIdentifier required") }
+    guard let searchTitle = cmd.title else { fail("find_reminder: title required") }
+    guard let cal = store.calendar(withIdentifier: calId) else { fail("Calendar not found: \(calId)") }
+    let predicate = store.predicateForReminders(in: [cal])
+    let sem = DispatchSemaphore(value: 0)
+    var found: EKReminder? = nil
+    store.fetchReminders(matching: predicate) { items in
+        found = items?.first(where: { $0.title == searchTitle && !$0.isCompleted })
+               ?? items?.first(where: { $0.title == searchTitle })
+        sem.signal()
+    }
+    sem.wait()
+    guard let reminder = found else { fail("Reminder not found: \(searchTitle)") }
+    let result: [String: Any] = ["calendarItemIdentifier": reminder.calendarItemIdentifier]
+    if let data = try? JSONSerialization.data(withJSONObject: result),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+    exit(0)
+
+case "list_calendars":
+    let cals = store.calendars(for: .reminder).map { cal -> [String: Any] in
+        var entry: [String: Any] = [
+            "title":              cal.title,
+            "calendarIdentifier": cal.calendarIdentifier,
+        ]
+        if let sourceTitle = cal.source?.title { entry["sourceTitle"] = sourceTitle }
+        if let typeName = sourceTypeName(cal.source?.sourceType) { entry["sourceType"] = typeName }
+        return entry
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: cals),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+    exit(0)
+
 case "create_list":
     guard let title = cmd.title, !title.isEmpty else { fail("title is required for create_list") }
     let cal = EKCalendar(for: .reminder, eventStore: store)
     cal.title = title
-    // Use the local/iCloud source for reminders
-    guard let source = store.sources.first(where: { $0.sourceType == .calDAV })
-            ?? store.sources.first(where: { $0.sourceType == .local }) else {
-        fail("No suitable calendar source found")
+    if let account = cmd.account {
+        guard let source = store.sources.first(where: { $0.title == account }) else {
+            fail("Account not found: \(account)")
+        }
+        cal.source = source
+    } else {
+        // Fallback: prefer calDAV (iCloud), then local
+        guard let source = store.sources.first(where: { $0.sourceType == .calDAV })
+                ?? store.sources.first(where: { $0.sourceType == .local }) else {
+            fail("No suitable calendar source found")
+        }
+        cal.source = source
     }
-    cal.source = source
     if let colorName = cmd.color, let cg = colorForName(colorName) {
         cal.cgColor = cg
     }
@@ -471,7 +546,7 @@ case "create_list":
 case "rename_list":
     guard let title = cmd.title else { fail("title is required for rename_list") }
     guard let newTitle = cmd.newTitle else { fail("newTitle is required for rename_list") }
-    let cal = findList(store, name: title)
+    let cal = findList(store, calendarIdentifier: cmd.calendarIdentifier, name: title, account: cmd.account)
     cal.title = newTitle
     do {
         try store.saveCalendar(cal, commit: true)
@@ -482,7 +557,7 @@ case "rename_list":
 
 case "delete_list":
     guard let title = cmd.title else { fail("title is required for delete_list") }
-    let cal = findList(store, name: title)
+    let cal = findList(store, calendarIdentifier: cmd.calendarIdentifier, name: title, account: cmd.account)
     do {
         try store.removeCalendar(cal, commit: true)
         output(["status": "deleted", "title": title])

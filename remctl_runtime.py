@@ -30,6 +30,11 @@ def resolve_store_dir() -> Path:
     return Path.home() / DEFAULT_STORE_SUBPATH
 
 
+def resolve_db_override() -> "Path | None":
+    override = os.environ.get("REMCTL_DB")
+    return Path(override).expanduser() if override else None
+
+
 def resolve_config_dir(app_name: str = "remctl") -> Path:
     override = os.environ.get("REMCTL_CONFIG_DIR")
     if override:

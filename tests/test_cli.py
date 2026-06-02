@@ -23,6 +23,40 @@ class CliTests(unittest.TestCase):
     def setUpClass(cls):
         cls.remctl = load_module("remctl_cli_test", "remctl")
 
+    def setUp(self):
+        """Isolate every test from the developer's real config file, the
+        REMCTL_ACCOUNT_SCOPE environment variable, and module-level caches so
+        account-scope behavior is deterministic regardless of local state."""
+        # Save module globals that scope/config logic mutates.
+        self._saved_store_dir = self.remctl.STORE_DIR
+        self._saved_db_override = self.remctl.DB_OVERRIDE
+        self._saved_config_file = self.remctl.CONFIG_FILE
+        self._saved_account_scope_env = os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+        self._saved_db_env = os.environ.pop("REMCTL_DB", None)
+        self._saved_store_env = os.environ.pop("REMCTL_STORE_DIR", None)
+        # Point config at a path that does not exist so load_config() returns {}.
+        self.remctl.CONFIG_FILE = Path("/nonexistent/remctl-test-config.json")
+        self.remctl._ACCOUNT_CACHE = None
+        try:
+            self.remctl._REMINDER_COLUMN_CACHE.clear()
+        except Exception:
+            pass
+
+    def tearDown(self):
+        self.remctl.STORE_DIR = self._saved_store_dir
+        self.remctl.DB_OVERRIDE = self._saved_db_override
+        self.remctl.CONFIG_FILE = self._saved_config_file
+        self.remctl._ACCOUNT_CACHE = None
+        for var, val in (
+            ("REMCTL_ACCOUNT_SCOPE", self._saved_account_scope_env),
+            ("REMCTL_DB", self._saved_db_env),
+            ("REMCTL_STORE_DIR", self._saved_store_env),
+        ):
+            if val is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = val
+
     def test_parse_alarm_normalizes_relative_and_absolute_values(self):
         self.assertEqual(self.remctl.parse_alarm("15m"), "-15m")
         self.assertEqual(self.remctl.parse_alarm("2h"), "-2h")
@@ -385,6 +419,7 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_lists(SimpleNamespace(json=True))
@@ -408,6 +443,7 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_lists(SimpleNamespace(json=False, format=None))
@@ -715,7 +751,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("unknown command: 'symbols'", output)
         self.assertIn("Did you mean: remctl list-symbols", output)
         self.assertIn("Available commands:", output)
-        self.assertIn("  add,", output)
+        self.assertIn("add,", output)
         self.assertNotIn("choose from", output)
 
     def test_read_command_accepts_format_after_subcommand(self):
@@ -4291,6 +4327,2747 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["earlyReminder"]["unitCode"], 0)
         self.assertEqual(payload["earlyReminder"]["count"], -15)
         self.assertEqual(payload["earlyReminders"][0]["identifier"], "DELTA-1")
+
+    # ── Multi-Account Tests ──────────────────────────────────────────────────
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _make_account_db(self, name, account_type, lists, reminders=None):
+        """Build a minimal in-memory SQLite db representing one Reminders account store."""
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+
+        # ZREMCDBASELIST
+        db.execute(
+            "CREATE TABLE ZREMCDBASELIST ("
+            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, "
+            "ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER, "
+            "ZBADGEEMBLEM TEXT, ZCOLOR BLOB, "
+            "ZISPINNEDBYCURRENTUSER INTEGER, ZPINNEDDATE REAL, "
+            "ZSHOULDCATEGORIZEGROCERYITEMS INTEGER, ZSHOULDAUTOCATEGORIZEITEMS INTEGER, "
+            "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST INTEGER, ZGROCERYLOCALEID TEXT, "
+            "ZAUTOCATEGORIZATIONLOCALCORRECTIONSASDATA_LENGTH INTEGER)"
+        )
+        for pk, lname, ckid in lists:
+            db.execute(
+                "INSERT INTO ZREMCDBASELIST "
+                "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, "
+                "ZBADGEEMBLEM, ZCOLOR, ZISPINNEDBYCURRENTUSER, ZPINNEDDATE, "
+                "ZSHOULDCATEGORIZEGROCERYITEMS, ZSHOULDAUTOCATEGORIZEITEMS, "
+                "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST, ZGROCERYLOCALEID) "
+                "VALUES (?, ?, ?, 0, 3, NULL, NULL, 0, NULL, 0, 0, 0, NULL)",
+                (pk, lname, ckid),
+            )
+
+        # ZREMCDBASESECTION
+        db.execute(
+            "CREATE TABLE ZREMCDBASESECTION ("
+            "Z_PK INTEGER PRIMARY KEY, ZDISPLAYNAME TEXT, ZLIST INTEGER, "
+            "ZTEMPLATE INTEGER, "
+            "ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER)"
+        )
+
+        # ZREMCDTEMPLATE / ZREMCDSAVEDREMINDER — empty, so template lookups
+        # resolve to "not found" rather than raising on a missing table.
+        db.execute(
+            "CREATE TABLE ZREMCDTEMPLATE ("
+            "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, "
+            "ZCREATIONDATE REAL, ZLASTMODIFIEDDATE REAL, "
+            "ZPUBLICLINKCREATIONDATE REAL, ZPUBLICLINKEXPIRATIONDATE REAL, "
+            "ZPUBLICLINKLASTMODIFIEDDATE REAL, ZMARKEDFORDELETION INTEGER)"
+        )
+        db.execute(
+            "CREATE TABLE ZREMCDSAVEDREMINDER ("
+            "Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZTEMPLATE INTEGER, "
+            "ZMARKEDFORDELETION INTEGER)"
+        )
+
+        # ZREMCDREMINDER
+        db.execute(
+            "CREATE TABLE ZREMCDREMINDER ("
+            "Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZNOTES TEXT, ZCOMPLETED INTEGER, "
+            "ZFLAGGED INTEGER, ZPRIORITY INTEGER, ZISURGENTSTATEENABLEDFORCURRENTUSER INTEGER, "
+            "ZDUEDATEDELTAALERTSDATA TEXT, ZDUEDATE REAL, ZDISPLAYDATEDATE REAL, ZALLDAY INTEGER, "
+            "ZCOMPLETIONDATE REAL, ZCREATIONDATE REAL, ZPARENTREMINDER INTEGER, ZLIST INTEGER, "
+            "ZICSURL TEXT, ZCKIDENTIFIER TEXT, ZACCOUNT INTEGER, ZMARKEDFORDELETION INTEGER)"
+        )
+
+        # ZREMCDOBJECT — used for account entity row, recurrence objects, hashtag joins,
+        # rich link lookups, alarm lookups, attachment lookups, assignment lookups
+        db.execute(
+            "CREATE TABLE ZREMCDOBJECT ("
+            "Z_PK INTEGER, Z_ENT INTEGER, ZNAME TEXT, "
+            "ZREMINDER INTEGER, ZREMINDER1 INTEGER, ZREMINDER2 INTEGER, "
+            "ZREMINDER3 INTEGER, ZREMINDER4 INTEGER, "
+            "ZHASHTAGLABEL INTEGER, ZURL TEXT, ZFILENAME TEXT, "
+            "ZTRIGGER INTEGER, ZTIMEINTERVAL REAL, ZDATECOMPONENTSDATA BLOB, "
+            "ZTITLE TEXT, ZLATITUDE REAL, ZLONGITUDE REAL, ZRADIUS REAL, "
+            "ZADDRESS TEXT, ZPROXIMITY INTEGER, "
+            "ZCKIDENTIFIER TEXT, ZDISPLAYNAME TEXT, ZFIRSTNAME TEXT, ZLASTNAME TEXT, "
+            "ZADDRESS1 TEXT, ZASSIGNEDDATE REAL, ZLIST INTEGER, "
+            "ZCKASSIGNEEIDENTIFIER TEXT, ZCKORIGINATORIDENTIFIER TEXT, "
+            "ZASSIGNEE INTEGER, ZORIGINATOR INTEGER, ZSTATUS INTEGER, ZACCESSLEVEL INTEGER, "
+            "ZMARKEDFORDELETION INTEGER, ZFREQUENCY INTEGER, ZINTERVAL INTEGER, "
+            "ZOCCURRENCECOUNT INTEGER, ZENDDATE REAL, ZDAYSOFTHEWEEK BLOB, "
+            "ZDAYSOFTHEMONTH BLOB, ZMONTHSOFTHEYEAR BLOB, ZDAYSOFTHEYEAR BLOB, "
+            "ZWEEKSOFTHEYEAR BLOB, ZSETPOSITIONS BLOB)"
+        )
+
+        # Z_PRIMARYKEY — needed for _store_account_info
+        db.execute(
+            "CREATE TABLE Z_PRIMARYKEY (Z_NAME TEXT, Z_ENT INTEGER, Z_MAX INTEGER)"
+        )
+        db.execute(
+            "INSERT INTO Z_PRIMARYKEY (Z_NAME, Z_ENT, Z_MAX) VALUES ('REMCDAccount', 14, 1)"
+        )
+
+        # Insert account object row
+        db.execute(
+            "INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZNAME, ZMARKEDFORDELETION) VALUES (1, 14, ?, 0)",
+            (name,),
+        )
+
+        # ZREMCDREPLICAMANAGER — determines account type
+        db.execute(
+            "CREATE TABLE ZREMCDREPLICAMANAGER (Z_PK INTEGER, Z_ENT INTEGER, ZIDENTIFIER TEXT)"
+        )
+        if account_type == "Exchange":
+            identifier = "exchange-uuid/com.apple.exchangesync.exchangesyncd"
+        else:
+            identifier = "icloud-uuid/com.apple.reminders"
+        db.execute(
+            "INSERT INTO ZREMCDREPLICAMANAGER (Z_PK, Z_ENT, ZIDENTIFIER) VALUES (1, 15, ?)",
+            (identifier,),
+        )
+
+        # ZREMCDHASHTAGLABEL — needed by q_hashtags
+        db.execute(
+            "CREATE TABLE ZREMCDHASHTAGLABEL (Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZREMINDER3 INTEGER)"
+        )
+
+        # Insert reminders if provided
+        if reminders:
+            for rem in reminders:
+                db.execute(
+                    "INSERT INTO ZREMCDREMINDER "
+                    "(Z_PK, ZTITLE, ZNOTES, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                    "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATEDELTAALERTSDATA, "
+                    "ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, ZCKIDENTIFIER, "
+                    "ZACCOUNT, ZMARKEDFORDELETION) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, 0)",
+                    (
+                        rem["Z_PK"],
+                        rem["ZTITLE"],
+                        rem.get("ZCOMPLETED", 0),
+                        rem.get("ZFLAGGED", 0),
+                        rem.get("ZPRIORITY", 0),
+                        rem.get("ZISURGENTSTATEENABLEDFORCURRENTUSER", 0),
+                        rem.get("ZDUEDATE"),
+                        rem.get("ZDUEDATE"),
+                        rem["ZLIST"],
+                        rem.get("ZCKIDENTIFIER", f"CK-{rem['Z_PK']}"),
+                        rem.get("ZACCOUNT", 1),
+                    ),
+                )
+
+        return db
+
+    @contextlib.contextmanager
+    def _multi_account_patch(self, accounts):
+        """Context manager patching discover_accounts and iter_account_dbs.
+
+        accounts: list of (Account_namedtuple, sqlite3.Connection) pairs.
+        """
+        account_list = [acct for acct, _db in accounts]
+        first_db = accounts[0][1] if accounts else None
+
+        @contextlib.contextmanager
+        def _fake_iter_account_dbs(scope):
+            scope_names = {a.name.lower() for a in scope}
+            yield [(acct, db) for acct, db in accounts if acct.name.lower() in scope_names]
+
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=account_list),
+            mock.patch.object(self.remctl, "iter_account_dbs", side_effect=_fake_iter_account_dbs),
+            mock.patch.object(self.remctl, "open_db", return_value=first_db),
+        ):
+            yield
+
+    # ── Group 1: discover_accounts / _store_account_info ─────────────────────
+
+    def test_discover_accounts_excludes_hidden_and_empty_stores(self):
+        """discover_accounts filters out LocalInternal and empty stores."""
+        import pathlib
+
+        fake_paths = [
+            pathlib.Path(f"/tmp/fake-Data-{i}.sqlite") for i in range(3)
+        ]
+
+        info_map = {
+            fake_paths[0]: ("iCloud", "iCloud"),
+            fake_paths[1]: ("Work Exchange", "Exchange"),
+            fake_paths[2]: ("LocalInternal", "Local"),
+        }
+
+        def fake_store_account_info(path):
+            return info_map.get(path)
+
+        def fake_reminder_count(path):
+            return 5  # all non-empty
+
+        # Build a fake STORE_DIR object that returns our paths from glob()
+        class FakeStoreDir:
+            def glob(self, pattern):
+                return list(fake_paths)
+
+        with (
+            mock.patch.object(
+                self.remctl, "reminders_store_access_error", return_value=None
+            ),
+            mock.patch.object(self.remctl, "DB_OVERRIDE", None),
+            mock.patch.object(self.remctl, "STORE_DIR", FakeStoreDir()),
+            mock.patch.object(
+                self.remctl, "_store_account_info", side_effect=fake_store_account_info
+            ),
+            mock.patch.object(
+                self.remctl, "_store_reminder_count", side_effect=fake_reminder_count
+            ),
+            mock.patch.object(
+                self.remctl, "_store_file_group_mtime", return_value=0.0
+            ),
+        ):
+            self.remctl._ACCOUNT_CACHE = None
+            accounts = self.remctl.discover_accounts(force_refresh=True)
+
+        names = [a.name for a in accounts]
+        self.assertIn("iCloud", names)
+        self.assertIn("Work Exchange", names)
+        self.assertNotIn("LocalInternal", names)
+        self.assertEqual(len(accounts), 2)
+
+    def test_store_account_info_reads_name_and_type_from_db(self):
+        """_store_account_info correctly extracts name and type for iCloud and Exchange.
+
+        _store_account_info opens with immutable=1, so the db file must have no
+        WAL/journal.  We create each db directly on disk (not via backup from
+        :memory:) and use PRAGMA journal_mode=DELETE to ensure no WAL exists.
+        """
+        import tempfile, os
+
+        def _make_disk_account_db(path, name, account_type):
+            """Write a minimal account db directly to *path* on disk."""
+            conn = sqlite3.connect(path)
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute(
+                "CREATE TABLE Z_PRIMARYKEY (Z_NAME TEXT, Z_ENT INTEGER, Z_MAX INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO Z_PRIMARYKEY (Z_NAME, Z_ENT, Z_MAX) VALUES ('REMCDAccount', 14, 1)"
+            )
+            conn.execute(
+                "CREATE TABLE ZREMCDOBJECT (Z_PK INTEGER, Z_ENT INTEGER, "
+                "ZNAME TEXT, ZMARKEDFORDELETION INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZNAME, ZMARKEDFORDELETION) "
+                "VALUES (1, 14, ?, 0)",
+                (name,),
+            )
+            conn.execute(
+                "CREATE TABLE ZREMCDREPLICAMANAGER "
+                "(Z_PK INTEGER, Z_ENT INTEGER, ZIDENTIFIER TEXT)"
+            )
+            if account_type == "Exchange":
+                ident = "exchange-uuid/com.apple.exchangesync.exchangesyncd"
+            else:
+                ident = "icloud-uuid/com.apple.reminders"
+            conn.execute(
+                "INSERT INTO ZREMCDREPLICAMANAGER (Z_PK, Z_ENT, ZIDENTIFIER) VALUES (1, 15, ?)",
+                (ident,),
+            )
+            conn.commit()
+            conn.close()
+
+        # iCloud variant
+        fd, icloud_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        _make_disk_account_db(icloud_path, "iCloud", "iCloud")
+        try:
+            result = self.remctl._store_account_info(icloud_path)
+            self.assertIsNotNone(result)
+            self.assertEqual(result[0], "iCloud")
+            self.assertEqual(result[1], "iCloud")
+        finally:
+            os.unlink(icloud_path)
+
+        # Exchange variant
+        fd, exchange_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        _make_disk_account_db(exchange_path, "Work Exchange", "Exchange")
+        try:
+            result_ex = self.remctl._store_account_info(exchange_path)
+            self.assertIsNotNone(result_ex)
+            self.assertEqual(result_ex[0], "Work Exchange")
+            self.assertEqual(result_ex[1], "Exchange")
+        finally:
+            os.unlink(exchange_path)
+
+    # ── Group 2: resolve_account_scope ───────────────────────────────────────
+
+    def test_resolve_account_scope_default_returns_first_account(self):
+        """Default scope (no flags, no env) returns only the first account."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        self.remctl._ACCOUNT_CACHE = None
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl.resolve_account_scope(
+                SimpleNamespace(account=None, all_accounts=False)
+            )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, "iCloud")
+
+    def test_resolve_account_scope_all_accounts_flag(self):
+        """--all-accounts returns all discovered accounts."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl.resolve_account_scope(
+                SimpleNamespace(account=None, all_accounts=True)
+            )
+        self.assertEqual(len(result), 2)
+        self.assertEqual({a.name for a in result}, {"iCloud", "Exchange"})
+
+    def test_resolve_account_scope_named_account(self):
+        """--account Exchange returns only the Exchange account."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl.resolve_account_scope(
+                SimpleNamespace(account="Exchange", all_accounts=False)
+            )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, "Exchange")
+
+    def test_resolve_account_scope_unknown_account_exits(self):
+        """Unknown --account name triggers sys.exit."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud]),
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            with self.assertRaises(SystemExit):
+                self.remctl.resolve_account_scope(
+                    SimpleNamespace(account="NoSuchAccount", all_accounts=False)
+                )
+
+    def test_resolve_account_scope_env_override(self):
+        """REMCTL_ACCOUNT_SCOPE=all env var returns all accounts."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+            mock.patch.dict(os.environ, {"REMCTL_ACCOUNT_SCOPE": "all"}),
+        ):
+            result = self.remctl.resolve_account_scope(
+                SimpleNamespace(account=None, all_accounts=False)
+            )
+        self.assertEqual(len(result), 2)
+
+    def test_resolve_account_scope_config_override(self):
+        """config.json accountScope=all returns all accounts."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(self.remctl, "load_config", return_value={"accountScope": "all"}),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl.resolve_account_scope(
+                SimpleNamespace(account=None, all_accounts=False)
+            )
+        self.assertEqual(len(result), 2)
+
+    # ── Group 3: READ commands — single-account back-compat ──────────────────
+
+    def test_cmd_lists_single_account_no_account_field_in_json(self):
+        """Single-account cmd_lists JSON output has no 'account' key on any item."""
+        db = self._list_db(["Inbox", "Work"])
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(SimpleNamespace(json=True))
+        finally:
+            db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertGreater(len(payload), 0)
+        for item in payload:
+            self.assertNotIn("account", item)
+
+    def _extend_due_window_db_for_serialization(self, db):
+        """Add columns needed by to_dict/serialize_reminder to a _due_window_db instance."""
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS ZREMCDHASHTAGLABEL "
+            "(Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZREMINDER3 INTEGER)"
+        )
+        for col in ("ZREMINDER", "ZREMINDER2", "ZREMINDER3", "ZHASHTAGLABEL",
+                    "ZURL", "ZFILENAME", "ZTRIGGER", "ZTIMEINTERVAL",
+                    "ZDATECOMPONENTSDATA", "ZTITLE", "ZLATITUDE", "ZLONGITUDE",
+                    "ZRADIUS", "ZADDRESS", "ZPROXIMITY",
+                    "ZASSIGNEE", "ZORIGINATOR", "ZSTATUS", "ZACCESSLEVEL"):
+            try:
+                db.execute(f"ALTER TABLE ZREMCDOBJECT ADD COLUMN {col}")
+            except Exception:
+                pass  # column may already exist
+
+    def test_cmd_today_single_account_output_unchanged(self):
+        """Single-account cmd_today JSON output has no 'account' key."""
+        from datetime import datetime
+
+        db = self._due_window_db()
+        self._extend_due_window_db_for_serialization(db)
+        now = datetime.now()
+        due_ts = self.remctl.to_ts(now)
+        self._insert_due_reminder(db, 1, "Today Task", due_ts=due_ts, display_ts=due_ts, all_day=False)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(SimpleNamespace(json=True, no_overdue=False))
+        finally:
+            db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertGreater(len(payload), 0)
+        for item in payload:
+            self.assertNotIn("account", item)
+
+    def test_cmd_search_single_account_output_unchanged(self):
+        """Single-account cmd_search JSON output has no 'account' key."""
+        db = self._due_window_db()
+        self._extend_due_window_db_for_serialization(db)
+        self._insert_due_reminder(db, 1, "Find me", due_ts=None, display_ts=None, all_day=False)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_search(
+                    SimpleNamespace(json=True, query="Find me", completed=False,
+                                    verbose=False, format=None)
+                )
+        finally:
+            db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertGreater(len(payload), 0)
+        for item in payload:
+            self.assertNotIn("account", item)
+
+    def test_cmd_flagged_single_account_output_unchanged(self):
+        """Single-account cmd_flagged JSON output has no 'account' key."""
+        db = self._due_window_db()
+        self._extend_due_window_db_for_serialization(db)
+        db.execute(
+            "INSERT INTO ZREMCDREMINDER "
+            "(Z_PK, ZTITLE, ZNOTES, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+            "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATEDELTAALERTSDATA, "
+            "ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, ZCKIDENTIFIER, "
+            "ZACCOUNT, ZMARKEDFORDELETION) "
+            "VALUES (1, 'Flagged Task', NULL, 0, 1, 0, 0, NULL, NULL, NULL, 0, 1, 'CK-1', 1, 0)"
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "load_config", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_flagged(
+                    SimpleNamespace(json=True, verbose=False, format=None)
+                )
+        finally:
+            db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertGreater(len(payload), 0)
+        for item in payload:
+            self.assertNotIn("account", item)
+
+    # ── Group 4: READ commands — multi-account (--all-accounts) ──────────────
+
+    def test_cmd_lists_all_accounts_json_includes_account_field(self):
+        """Multi-account cmd_lists JSON includes 'account' and 'accountType' on each item."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Inbox", "CK-1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Tasks", "CK-2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(
+                    SimpleNamespace(json=True, all_accounts=True, account=None, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        titles = [item["title"] for item in payload]
+        self.assertIn("Inbox", titles)
+        self.assertIn("Tasks", titles)
+        for item in payload:
+            self.assertIn("account", item)
+            self.assertIn("accountType", item)
+
+    def test_cmd_lists_all_accounts_human_shows_account_headers(self):
+        """Multi-account cmd_lists human output shows [iCloud] and [Exchange] headers."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Inbox", "CK-1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Tasks", "CK-2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(
+                    SimpleNamespace(json=False, all_accounts=True, account=None, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        output = stdout.getvalue()
+        self.assertIn("iCloud", output)
+        self.assertIn("Exchange", output)
+
+    def test_cmd_today_all_accounts_json_includes_account_field(self):
+        """Multi-account cmd_today JSON includes 'account' on each item."""
+        from datetime import datetime
+
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+
+        now = datetime.now()
+        due_ts = self.remctl.to_ts(now)
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud Task", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Exchange Task", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(
+                    SimpleNamespace(json=True, all_accounts=True, account=None,
+                                    no_overdue=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertGreater(len(payload), 0)
+        for item in payload:
+            self.assertIn("account", item)
+        names = {item["account"] for item in payload}
+        self.assertIn("iCloud", names)
+        self.assertIn("Exchange", names)
+
+    def test_cmd_today_all_accounts_human_output_has_full_formatting(self):
+        """Multi-account cmd_today human output contains '[ ]' checkbox format (regression guard for closed-db bug)."""
+        from datetime import datetime
+
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+
+        now = datetime.now()
+        due_ts = self.remctl.to_ts(now)
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "Task Alpha", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Task Beta", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(
+                    SimpleNamespace(json=False, all_accounts=True, account=None,
+                                    no_overdue=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        output = self.remctl._strip_ansi(stdout.getvalue())
+        # The checkbox format from fmt() must be present — this is the regression guard
+        self.assertIn("[ ]", output)
+        self.assertIn("Task Alpha", output)
+        self.assertIn("Task Beta", output)
+
+    def test_cmd_search_all_accounts_merges_results(self):
+        """Multi-account cmd_search returns results from both accounts with account labels."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "Meeting notes iCloud", "ZLIST": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Meeting notes Exchange", "ZLIST": 1}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_search(
+                    SimpleNamespace(json=True, query="Meeting notes", all_accounts=True,
+                                    account=None, completed=False, verbose=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        for item in payload:
+            self.assertIn("account", item)
+
+    def test_cmd_flagged_all_accounts_merges_results(self):
+        """Multi-account cmd_flagged returns flagged reminders from both accounts."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud Flagged", "ZLIST": 1, "ZFLAGGED": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Exchange Flagged", "ZLIST": 1, "ZFLAGGED": 1}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_flagged(
+                    SimpleNamespace(json=True, all_accounts=True, account=None,
+                                    verbose=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        for item in payload:
+            self.assertIn("account", item)
+        titles = {item["title"] for item in payload}
+        self.assertIn("iCloud Flagged", titles)
+        self.assertIn("Exchange Flagged", titles)
+
+    def test_cmd_urgent_all_accounts_merges_results(self):
+        """Multi-account cmd_urgent returns urgent reminders from both accounts."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud Urgent",
+                        "ZLIST": 1, "ZISURGENTSTATEENABLEDFORCURRENTUSER": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Exchange Urgent",
+                        "ZLIST": 1, "ZISURGENTSTATEENABLEDFORCURRENTUSER": 1}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_urgent(
+                    SimpleNamespace(json=True, all_accounts=True, account=None,
+                                    verbose=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        for item in payload:
+            self.assertIn("account", item)
+
+    def test_cmd_overdue_all_accounts_merges_results(self):
+        """Multi-account cmd_overdue returns overdue reminders from both accounts."""
+        from datetime import datetime, timedelta
+
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+
+        yesterday = datetime.now() - timedelta(days=2)
+        past_ts = self.remctl.to_ts(yesterday)
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud Overdue", "ZLIST": 1, "ZDUEDATE": past_ts}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Exchange Overdue", "ZLIST": 1, "ZDUEDATE": past_ts}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_overdue(
+                    SimpleNamespace(json=True, all_accounts=True, account=None,
+                                    verbose=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        for item in payload:
+            self.assertIn("account", item)
+
+    # ── Group 5: READ commands — --account filter ─────────────────────────────
+
+    def test_cmd_lists_account_filter_returns_only_that_account(self):
+        """--account iCloud returns only iCloud lists, not Exchange."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Inbox", "CK-1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Tasks", "CK-2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(
+                    SimpleNamespace(json=True, all_accounts=False,
+                                    account="iCloud", format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        titles = [item["title"] for item in payload]
+        self.assertIn("Inbox", titles)
+        self.assertNotIn("Tasks", titles)
+
+    def test_cmd_show_account_flag_queries_correct_store(self):
+        """--account Exchange for show uses Exchange's list, not iCloud's."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        # Both accounts have list Z_PK=1 but different names
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "iCloud-List", "CK-icloud-1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud reminder", "ZLIST": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Exchange-List", "CK-exch-1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "Exchange reminder", "ZLIST": 1}],
+        )
+        connected_paths = []
+
+        # Wrap sqlite3.connect in the remctl module so exception types remain intact
+        original_sqlite3_connect = self.remctl.sqlite3.connect
+
+        def fake_connect(path, **kwargs):
+            connected_paths.append(str(path))
+            # Strip the URI parameters and return the correct in-memory db
+            if "fake-exchange" in str(path):
+                exchange_db.row_factory = sqlite3.Row
+                return exchange_db
+            return original_sqlite3_connect(path, **kwargs)
+
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                mock.patch.object(self.remctl.sqlite3, "connect", side_effect=fake_connect),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_show(
+                    SimpleNamespace(
+                        json=True, account="Exchange",
+                        list="Exchange-List", list_id=None,
+                        completed=False, verbose=False, format=None,
+                    )
+                )
+        finally:
+            icloud_db.close()
+            # exchange_db is returned directly; don't double-close via fake_connect
+        output = stdout.getvalue()
+        payload = json.loads(output)
+        titles = [item["title"] for item in payload]
+        self.assertIn("Exchange reminder", titles)
+        self.assertTrue(
+            any("fake-exchange" in p for p in connected_paths),
+            f"Expected Exchange store path in connect calls; got: {connected_paths}",
+        )
+
+    def test_cmd_today_account_filter(self):
+        """--account iCloud for today returns only iCloud's due reminders."""
+        from datetime import datetime
+
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+
+        now = datetime.now()
+        due_ts = self.remctl.to_ts(now)
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud Today", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 2, "ZTITLE": "Exchange Today", "ZLIST": 1, "ZDUEDATE": due_ts}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(
+                    SimpleNamespace(json=True, all_accounts=False, account="iCloud",
+                                    no_overdue=False, format=None)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        titles = [item["title"] for item in payload]
+        self.assertIn("iCloud Today", titles)
+        self.assertNotIn("Exchange Today", titles)
+
+    # ── Group 6: Ambiguity / error cases ─────────────────────────────────────
+
+    def test_resolve_list_ref_across_ambiguous_same_name(self):
+        """Same list name in two accounts returns error='ambiguous' with candidates."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Work", "CK-i1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Work", "CK-e1")])
+        try:
+            result = self.remctl.resolve_list_ref_across(
+                [(icloud_acct, icloud_db), (exchange_acct, exchange_db)],
+                name="Work",
+                account_name=None,
+            )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("error"), "ambiguous")
+        candidates = result.get("candidates", [])
+        self.assertEqual(len(candidates), 2)
+        candidate_accounts = {c.get("account") for c in candidates}
+        self.assertIn("iCloud", candidate_accounts)
+        self.assertIn("Exchange", candidate_accounts)
+
+    def test_resolve_list_ref_across_resolved_by_account_name(self):
+        """account_name disambiguates a list that exists in both accounts."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Work", "CK-i1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Work", "CK-e2")])
+        try:
+            result = self.remctl.resolve_list_ref_across(
+                [(icloud_acct, icloud_db), (exchange_acct, exchange_db)],
+                name="Work",
+                account_name="iCloud",
+            )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result.get("error"), "ambiguous")
+        self.assertEqual(result.get("account"), "iCloud")
+        self.assertEqual(result.get("title"), "Work")
+
+    def test_resolve_reminder_across_ambiguous_same_pk(self):
+        """Same Z_PK in two accounts without account_name causes sys.exit."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud rem", "ZLIST": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "Exchange rem", "ZLIST": 1}],
+        )
+        try:
+            with self.assertRaises(SystemExit):
+                self.remctl.resolve_reminder_across(
+                    [(icloud_acct, icloud_db), (exchange_acct, exchange_db)],
+                    1,
+                    account_name=None,
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+
+    def test_resolve_reminder_across_resolved_by_account(self):
+        """account_name disambiguates when same Z_PK exists in two accounts."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud rem", "ZLIST": 1}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "Exchange rem", "ZLIST": 1}],
+        )
+        try:
+            result = self.remctl.resolve_reminder_across(
+                [(icloud_acct, icloud_db), (exchange_acct, exchange_db)],
+                1,
+                account_name="Exchange",
+            )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        self.assertIsNotNone(result)
+        acct, db, row = result
+        self.assertEqual(acct.name, "Exchange")
+        self.assertEqual(row["ZTITLE"], "Exchange rem")
+
+    # ── Group 6b: sharees / template-info / link cross-account scanning ──────
+
+    def test_cmd_sharees_single_account_json_omits_internal_fields(self):
+        """`sharees --account NAME` (single scope) must not leak _store_path/
+        account/accountType into the JSON 'list' payload — byte-compat with the
+        original single-account output."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(2, "Reminders", "CK-r2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_sharees(
+                    SimpleNamespace(list="Reminders", list_id=None,
+                                    json=True, account="iCloud", all_accounts=False)
+                )
+        finally:
+            icloud_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["list"]["title"], "Reminders")
+        # internal/multi-only keys must be absent for single-account scope
+        self.assertNotIn("_store_path", payload["list"])
+        self.assertNotIn("account", payload["list"])
+        self.assertNotIn("accountType", payload["list"])
+        self.assertEqual(payload["sharees"], [])
+
+    def test_cmd_sharees_all_accounts_ambiguous_lists_account_qualified(self):
+        """`sharees NAME --all-accounts` on a name present in two accounts errors
+        with account-qualified candidates (cross-account scan)."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Work", "CK-i1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Work", "CK-e1")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_sharees(
+                    SimpleNamespace(list="Work", list_id=None,
+                                    json=False, account=None, all_accounts=True)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        msg = stderr.getvalue()
+        self.assertIn("iCloud", msg)
+        self.assertIn("Exchange", msg)
+        self.assertIn("--account", msg)
+
+    def test_cmd_sharees_account_filter_resolves_in_target_store(self):
+        """`sharees NAME --account X` resolves the list in the named account even
+        when the same name exists elsewhere (no ambiguity error)."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Work", "CK-i1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Work", "CK-e1")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_sharees(
+                    SimpleNamespace(list="Work", list_id=None,
+                                    json=True, account="Exchange", all_accounts=False)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["list"]["title"], "Work")
+        # single-account scope: no leaked label fields
+        self.assertNotIn("_store_path", payload["list"])
+        self.assertNotIn("account", payload["list"])
+
+    def test_cmd_link_all_accounts_scans_for_reminder_id(self):
+        """`link <id> --all-accounts` finds the reminder in whichever store holds
+        it and emits its deep link."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-L1")],
+            reminders=[{"Z_PK": 1, "ZTITLE": "iCloud rem", "ZLIST": 1, "ZCKIDENTIFIER": "ICK-1"}],
+        )
+        exchange_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L2")],
+            reminders=[{"Z_PK": 9, "ZTITLE": "Exchange rem", "ZLIST": 1, "ZCKIDENTIFIER": "ECK-9"}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_link(
+                    SimpleNamespace(ids=[9], list=None, list_id=None,
+                                    completed=False, json=True,
+                                    account=None, all_accounts=True)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["id"], 9)
+        self.assertEqual(payload[0]["title"], "Exchange rem")
+        self.assertIn("ECK-9", payload[0]["link"])
+        # output is the original 3-field shape — no internal keys
+        self.assertEqual(set(payload[0].keys()), {"id", "title", "link"})
+
+    def test_cmd_template_info_all_accounts_not_found(self):
+        """`template-info NAME --all-accounts` reports not-found cleanly when no
+        store has the template."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Inbox", "CK-L1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-L2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_template_info(
+                    SimpleNamespace(name="Nonexistent", template_id=None,
+                                    json=False, account=None, all_accounts=True)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        self.assertIn("not found", stderr.getvalue())
+
+    def test_cmd_export_refuses_multi_account_scope(self):
+        """export must refuse an 'all-accounts' scope (rc=2) rather than silently
+        exporting only the default account — guards against partial backups."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange_acct = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        icloud_db = self._make_account_db("iCloud", "iCloud", [(1, "Inbox", "CK-1")])
+        exchange_db = self._make_account_db("Exchange", "Exchange", [(2, "Tasks", "CK-2")])
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db), (exchange_acct, exchange_db)]),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as cm,
+            ):
+                self.remctl.cmd_export(
+                    SimpleNamespace(account=None, all_accounts=True,
+                                    list=None, list_id=None, export_format="json", json=False)
+                )
+        finally:
+            icloud_db.close()
+            exchange_db.close()
+        self.assertEqual(cm.exception.code, 2)
+        msg = stderr.getvalue()
+        self.assertIn("single account", msg)
+        self.assertIn("--account", msg)
+
+    def test_cmd_export_single_account_scope_proceeds(self):
+        """export with a single-account scope opens that account and dumps it
+        (no multi-scope error)."""
+        icloud_acct = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        icloud_db = self._make_account_db(
+            "iCloud", "iCloud", [(1, "Inbox", "CK-1")],
+            reminders=[{"Z_PK": 5, "ZTITLE": "Solo", "ZLIST": 1, "ZCKIDENTIFIER": "CK-5"}],
+        )
+        try:
+            with (
+                self._multi_account_patch([(icloud_acct, icloud_db)]),
+                mock.patch.object(self.remctl, "_open_db_for_account", return_value=icloud_db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_export(
+                    SimpleNamespace(account=None, all_accounts=False,
+                                    list=None, list_id=None, export_format="json", json=False)
+                )
+        finally:
+            icloud_db.close()
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(any(r.get("title") == "Solo" for r in payload))
+
+    # ── Group 7: WRITE commands — _resolve_reminder_for_write ────────────────
+
+    def test_resolve_reminder_for_write_default_uses_open_db(self):
+        """Without --account, _resolve_reminder_for_write calls open_db()."""
+        fake_row = {"ZTITLE": "My Task", "ZCKIDENTIFIER": "ABC", "ZLIST": 1}
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=fake_db) as open_db_mock,
+            mock.patch.object(self.remctl, "q_reminder", return_value=fake_row),
+        ):
+            db, row = self.remctl._resolve_reminder_for_write(SimpleNamespace(id=1, account=None))
+        open_db_mock.assert_called_once()
+        self.assertIs(db, fake_db)
+        self.assertEqual(row["ZTITLE"], "My Task")
+
+    def test_resolve_reminder_for_write_account_flag_opens_correct_store(self):
+        """--account Exchange opens Exchange's store_path via sqlite3.connect."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        fake_row = {"ZTITLE": "Exchange Task", "ZCKIDENTIFIER": "XYZ", "ZLIST": 1}
+        fake_db = mock.Mock()
+        fake_db.row_factory = None
+        connected_paths = []
+
+        def fake_connect(path, **kwargs):
+            connected_paths.append(path)
+            return fake_db
+
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=fake_connect),
+            mock.patch.object(self.remctl, "q_reminder", return_value=fake_row),
+        ):
+            db, row = self.remctl._resolve_reminder_for_write(
+                SimpleNamespace(id=1, account="Exchange")
+            )
+        # The connect path should contain the Exchange store path
+        self.assertTrue(
+            any("fake-exchange.sqlite" in str(p) for p in connected_paths),
+            f"Expected Exchange store path in connect calls; got: {connected_paths}",
+        )
+        self.assertEqual(row["ZTITLE"], "Exchange Task")
+
+    def test_resolve_reminder_for_write_not_found_exits(self):
+        """Reminder not found triggers sys.exit."""
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=fake_db),
+            mock.patch.object(self.remctl, "q_reminder", return_value=None),
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl._resolve_reminder_for_write(SimpleNamespace(id=99, account=None))
+
+    def test_resolve_reminder_for_write_unknown_account_exits(self):
+        """Unknown --account name triggers sys.exit with useful message."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud]),
+        ):
+            with self.assertRaises(SystemExit):
+                self.remctl._resolve_reminder_for_write(
+                    SimpleNamespace(id=1, account="NoSuchAccount")
+                )
+
+    # ── Group 8: WRITE commands — done/undone/delete/flag/unflag with --account ──
+
+    def _make_write_reminder(self, title="Task", ckid="CK-WRITE-001"):
+        return {
+            "ZCKIDENTIFIER": ckid,
+            "ZTITLE": title,
+            "list_name": "Inbox",
+            "ZLIST": 1,
+            "ZDUEDATE": None,
+        }
+
+    def test_cmd_done_with_account_flag_looks_up_correct_store(self):
+        """cmd_done with --account Exchange calls bridge_call with reminder's ZCKIDENTIFIER."""
+        fake_row = self._make_write_reminder("Exchange Done Task", "EXCH-DONE-001")
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(
+                self.remctl, "_resolve_reminder_for_write", return_value=(fake_db, fake_row)
+            ),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "completed", "id": fake_row["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_done(SimpleNamespace(id=1, json=True, account="Exchange"))
+        bridge_call.assert_called_once()
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["id"], "EXCH-DONE-001")
+        self.assertEqual(payload["action"], "complete")
+
+    def test_cmd_undone_with_account_flag(self):
+        """cmd_undone with --account Exchange calls bridge_call with the correct identifier."""
+        fake_row = self._make_write_reminder("Exchange Undone Task", "EXCH-UNDONE-001")
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(
+                self.remctl, "_resolve_reminder_for_write", return_value=(fake_db, fake_row)
+            ),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "uncompleted", "id": fake_row["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_undone(SimpleNamespace(id=1, json=True, account="Exchange"))
+        bridge_call.assert_called_once()
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["id"], "EXCH-UNDONE-001")
+        self.assertEqual(payload["action"], "uncomplete")
+
+    def test_cmd_delete_with_account_flag(self):
+        """cmd_delete with --account Exchange and force=True calls bridge_call delete."""
+        fake_row = self._make_write_reminder("Exchange Delete Task", "EXCH-DEL-001")
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(
+                self.remctl, "_resolve_reminder_for_write", return_value=(fake_db, fake_row)
+            ),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "deleted", "id": fake_row["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_delete(
+                SimpleNamespace(id=1, json=True, account="Exchange", force=True)
+            )
+        bridge_call.assert_called_once()
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["id"], "EXCH-DEL-001")
+        self.assertEqual(payload["action"], "delete")
+
+    def test_cmd_flag_with_account_flag(self):
+        """cmd_flag with --account Exchange uses AppleScript (flagged-first path)."""
+        fake_row = self._make_write_reminder("Exchange Flag Task", "EXCH-FLAG-001")
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(
+                self.remctl, "_resolve_reminder_for_write", return_value=(fake_db, fake_row)
+            ),
+            mock.patch.object(
+                self.remctl, "osa_by_id_try", return_value=True
+            ) as osa_mock,
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_flag(SimpleNamespace(id=1, json=True, account="Exchange"))
+        osa_mock.assert_called_once()
+        script = osa_mock.call_args.args[2]
+        self.assertIn("set flagged of r to true", script)
+
+    def test_cmd_unflag_with_account_flag(self):
+        """cmd_unflag with --account Exchange uses AppleScript (unflag-first path)."""
+        fake_row = self._make_write_reminder("Exchange Unflag Task", "EXCH-UNFLAG-001")
+        fake_db = mock.Mock()
+        with (
+            mock.patch.object(
+                self.remctl, "_resolve_reminder_for_write", return_value=(fake_db, fake_row)
+            ),
+            mock.patch.object(
+                self.remctl, "osa_by_id_try", return_value=True
+            ) as osa_mock,
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_unflag(SimpleNamespace(id=1, json=True, account="Exchange"))
+        osa_mock.assert_called_once()
+        script = osa_mock.call_args.args[2]
+        self.assertIn("set flagged of r to false", script)
+
+    # ── Group 9: WRITE — cmd_add with --account ───────────────────────────────
+
+    def test_cmd_add_with_account_opens_correct_store_for_list_lookup(self):
+        """cmd_add with account=["Exchange"] connects to Exchange's store_path for list lookup."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        connected_paths = []
+
+        def fake_connect(path, **kwargs):
+            connected_paths.append(str(path))
+            fake_db = mock.Mock()
+            fake_db.row_factory = None
+            return fake_db
+
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=fake_connect),
+            mock.patch.object(
+                self.remctl, "resolve_list_or_die",
+                return_value={"id": 1, "title": "Tasks", "requested": "Tasks", "method": "exact"},
+            ),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "created", "id": "NEW-001"},
+            ),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_add(
+                SimpleNamespace(
+                    title="New Task",
+                    list="Tasks",
+                    list_id=None,
+                    notes=None,
+                    due=None,
+                    priority=None,
+                    flag=False,
+                    tags=None,
+                    url=None,
+                    recurrence=None,
+                    alarm=None,
+                    private=False,
+                    private_metadata=False,
+                    section=None,
+                    new_section=None,
+                    subtask=None,
+                    image=None,
+                    json=True,
+                    account=["Exchange"],
+                )
+            )
+        self.assertTrue(
+            any("fake-exchange.sqlite" in p for p in connected_paths),
+            f"Expected Exchange store path in connect calls; got: {connected_paths}",
+        )
+
+    def test_cmd_add_without_account_uses_open_db(self):
+        """cmd_add without --account calls open_db() for list lookup."""
+        fake_db = mock.Mock()
+        fake_db.row_factory = None
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=fake_db) as open_db_mock,
+            mock.patch.object(
+                self.remctl, "resolve_list_or_die",
+                return_value={"id": 1, "title": "Inbox", "requested": "Inbox", "method": "exact"},
+            ),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "created", "id": "NEW-002"},
+            ),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_add(
+                SimpleNamespace(
+                    title="No Account Task",
+                    list="Inbox",
+                    list_id=None,
+                    notes=None,
+                    due=None,
+                    priority=None,
+                    flag=False,
+                    tags=None,
+                    url=None,
+                    recurrence=None,
+                    alarm=None,
+                    private=False,
+                    private_metadata=False,
+                    section=None,
+                    new_section=None,
+                    subtask=None,
+                    image=None,
+                    json=True,
+                    account=None,
+                )
+            )
+        open_db_mock.assert_called()
+
+    # ── Group 10: config / accounts command ──────────────────────────────────
+
+    def test_cmd_accounts_json_lists_all_discovered_accounts(self):
+        """cmd_accounts --json lists all discovered accounts with name, type, storePath."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(
+                self.remctl, "discover_accounts", return_value=[icloud, exchange]
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_accounts(SimpleNamespace(json=True))
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        names = {item["name"] for item in payload}
+        self.assertIn("iCloud", names)
+        self.assertIn("Exchange", names)
+        for item in payload:
+            self.assertIn("name", item)
+            self.assertIn("type", item)
+            self.assertIn("storePath", item)
+
+    def test_cmd_accounts_human_shows_default_label(self):
+        """cmd_accounts human output marks the first account as (default)."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        with (
+            mock.patch.object(
+                self.remctl, "discover_accounts", return_value=[icloud, exchange]
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_accounts(SimpleNamespace(json=False))
+        output = self.remctl._strip_ansi(stdout.getvalue())
+        self.assertIn("(default)", output)
+        # The first account (iCloud) should be the default
+        lines = output.splitlines()
+        default_line = next((l for l in lines if "(default)" in l), "")
+        self.assertIn("iCloud", default_line)
+
+    def test_cmd_config_set_and_get(self):
+        """cmd_config set accountScope all; then get returns 'all'."""
+        config_store = {}
+
+        def fake_load_config():
+            return dict(config_store)
+
+        def fake_save_config(data):
+            config_store.clear()
+            config_store.update(data)
+
+        with (
+            mock.patch.object(self.remctl, "load_config", side_effect=fake_load_config),
+            mock.patch.object(self.remctl, "save_config", side_effect=fake_save_config),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_config(
+                SimpleNamespace(key="accountScope", value="all", json=False)
+            )
+
+        self.assertEqual(config_store.get("accountScope"), "all")
+
+        with (
+            mock.patch.object(self.remctl, "load_config", side_effect=fake_load_config),
+            mock.patch.object(self.remctl, "save_config", side_effect=fake_save_config),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_config(
+                SimpleNamespace(key="accountScope", value=None, json=False)
+            )
+        self.assertIn("all", stdout.getvalue())
+
+    def test_is_multi_account_mode_false_by_default(self):
+        """Default args with no flags, no env, no config returns False."""
+        with (
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl._is_multi_account_mode(
+                SimpleNamespace(all_accounts=False, account=None)
+            )
+        self.assertFalse(result)
+
+    def test_is_multi_account_mode_true_with_all_accounts_flag(self):
+        """all_accounts=True returns True from _is_multi_account_mode."""
+        with mock.patch.object(self.remctl, "load_config", return_value={}):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl._is_multi_account_mode(
+                SimpleNamespace(all_accounts=True, account=None)
+            )
+        self.assertTrue(result)
+
+    def test_is_multi_account_mode_true_with_account_flag(self):
+        """account='iCloud' returns True from _is_multi_account_mode."""
+        with mock.patch.object(self.remctl, "load_config", return_value={}):
+            os.environ.pop("REMCTL_ACCOUNT_SCOPE", None)
+            result = self.remctl._is_multi_account_mode(
+                SimpleNamespace(all_accounts=False, account="iCloud")
+            )
+        self.assertTrue(result)
+
+    def test_is_multi_account_mode_true_with_env(self):
+        """REMCTL_ACCOUNT_SCOPE=all env var returns True from _is_multi_account_mode."""
+        with (
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+            mock.patch.dict(os.environ, {"REMCTL_ACCOUNT_SCOPE": "all"}),
+        ):
+            result = self.remctl._is_multi_account_mode(
+                SimpleNamespace(all_accounts=False, account=None)
+            )
+        self.assertTrue(result)
+
+    def test_is_multi_account_mode_true_with_config_scope(self):
+        """accountScope in config makes _is_multi_account_mode True."""
+        with mock.patch.object(self.remctl, "load_config", return_value={"accountScope": "all"}):
+            result = self.remctl._is_multi_account_mode(
+                SimpleNamespace(all_accounts=False, account=None)
+            )
+        self.assertTrue(result)
+
+    # ── Group 11: _open_db_for_account ───────────────────────────────────────
+
+    def test_open_db_for_account_none_uses_open_db(self):
+        """_open_db_for_account(None) falls back to open_db()."""
+        sentinel = mock.Mock()
+        with mock.patch.object(self.remctl, "open_db", return_value=sentinel) as open_db_mock:
+            result = self.remctl._open_db_for_account(None)
+        open_db_mock.assert_called_once()
+        self.assertIs(result, sentinel)
+
+    def test_open_db_for_account_named_opens_correct_store(self):
+        """_open_db_for_account('Exchange') connects to Exchange's store_path."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        connected = []
+
+        def fake_connect(conn_str, *args, **kwargs):
+            connected.append(str(conn_str))
+            return mock.Mock()
+
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=fake_connect),
+        ):
+            self.remctl._open_db_for_account("Exchange")
+        self.assertTrue(any("fake-exchange.sqlite" in p for p in connected),
+                        f"got: {connected}")
+
+    def test_open_db_for_account_case_insensitive(self):
+        """Account name matching is case-insensitive."""
+        exchange = self.remctl.Account("/tmp/fake-exchange.sqlite", "Exchange", "Exchange")
+        connected = []
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=lambda conn_str, *a, **k: connected.append(str(conn_str)) or mock.Mock()),
+        ):
+            self.remctl._open_db_for_account("EXCHANGE")
+        self.assertTrue(any("fake-exchange.sqlite" in p for p in connected))
+
+    def test_open_db_for_account_unknown_exits(self):
+        """Unknown account name exits with an error."""
+        icloud = self.remctl.Account("/tmp/fake-icloud.sqlite", "iCloud", "iCloud")
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud]),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl._open_db_for_account("NoSuchAccount")
+        self.assertIn("NoSuchAccount", stderr.getvalue())
+
+    # ── Group 12: _ek_identifier (Exchange identifier resolution) ────────────
+
+    def test_ek_identifier_returns_ckidentifier_for_icloud(self):
+        """When ZCKIDENTIFIER is present it is returned directly, no bridge call."""
+        r = {"ZCKIDENTIFIER": "CK-ABC", "list_name": "Reminders", "ZTITLE": "Task"}
+        with mock.patch.object(self.remctl, "bridge_call") as bridge_call:
+            result = self.remctl._ek_identifier(r)
+        self.assertEqual(result, "CK-ABC")
+        bridge_call.assert_not_called()
+
+    def test_ek_identifier_falls_back_to_find_reminder_for_exchange(self):
+        """Exchange reminder (no ZCKIDENTIFIER) resolves via list_calendars + find_reminder."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "Exch Task"}
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-EX",
+                         "sourceTitle": "Exchange", "sourceType": "Exchange"}]
+            if data["action"] == "find_reminder":
+                self.assertEqual(data["calendarIdentifier"], "CAL-EX")
+                self.assertEqual(data["title"], "Exch Task")
+                return {"calendarItemIdentifier": "EK-ITEM-99"}
+            return None
+
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+        ):
+            result = self.remctl._ek_identifier(r, account_name="Exchange")
+        self.assertEqual(result, "EK-ITEM-99")
+
+    def test_ek_identifier_narrows_by_account_when_list_name_collides(self):
+        """When the same list name exists in two accounts, the account hint selects the right calendar."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "T"}
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [
+                    {"title": "Tasks", "calendarIdentifier": "CAL-A", "sourceTitle": "AcctA"},
+                    {"title": "Tasks", "calendarIdentifier": "CAL-B", "sourceTitle": "AcctB"},
+                ]
+            if data["action"] == "find_reminder":
+                self.assertEqual(data["calendarIdentifier"], "CAL-B")
+                return {"calendarItemIdentifier": "EK-B"}
+            return None
+
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+        ):
+            result = self.remctl._ek_identifier(r, account_name="AcctB")
+        self.assertEqual(result, "EK-B")
+
+    def test_ek_identifier_none_when_bridge_unavailable(self):
+        """No ZCKIDENTIFIER and no bridge → None."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "T"}
+        with mock.patch.object(self.remctl, "bridge_available", return_value=False):
+            self.assertIsNone(self.remctl._ek_identifier(r))
+
+    def test_ek_identifier_none_when_no_list_or_title(self):
+        """No ZCKIDENTIFIER and missing list_name/title → None."""
+        r = {"ZCKIDENTIFIER": None, "list_name": None, "ZTITLE": None}
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+        ):
+            self.assertIsNone(self.remctl._ek_identifier(r))
+        bridge_call.assert_not_called()
+
+    # ── Group 13: _resolve_reminder_for_write cross-account scan ─────────────
+
+    def _connect_by_path(self, mapping):
+        """Return a sqlite3.connect replacement mapping store paths to in-memory dbs."""
+        def fake_connect(conn_str, *args, **kwargs):
+            for path, db in mapping.items():
+                if path in str(conn_str):
+                    return db
+            raise sqlite3.OperationalError(f"unmapped uri: {conn_str}")
+        return fake_connect
+
+    def test_resolve_reminder_for_write_multi_scope_unique_match(self):
+        """Multi-account scope: a unique id match resolves and stamps a.account."""
+        icloud = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 50, "ZTITLE": "iC", "ZLIST": 1}])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")],
+                                      reminders=[{"Z_PK": 99, "ZTITLE": "ExOnly", "ZLIST": 1}])
+        a = SimpleNamespace(id=99, account=None)
+        try:
+            with (
+                mock.patch.object(self.remctl, "_is_multi_account_mode", return_value=True),
+                mock.patch.object(self.remctl, "resolve_account_scope", return_value=[icloud, exchange]),
+                mock.patch.object(sqlite3, "connect",
+                                  side_effect=self._connect_by_path({"/tmp/ic.sqlite": ic_db,
+                                                                     "/tmp/ex.sqlite": ex_db})),
+            ):
+                db, row = self.remctl._resolve_reminder_for_write(a)
+            self.assertEqual(row["ZTITLE"], "ExOnly")
+            self.assertEqual(a.account, "Exchange")  # stamped for downstream write path
+        finally:
+            ic_db.close()
+            ex_db.close()
+
+    def test_resolve_reminder_for_write_multi_scope_ambiguous_exits(self):
+        """Same id in two active accounts raises an ambiguity error."""
+        a1 = self.remctl.Account("/tmp/a1.sqlite", "AcctA", "Exchange")
+        a2 = self.remctl.Account("/tmp/a2.sqlite", "AcctB", "Exchange")
+        db1 = self._make_account_db("AcctA", "Exchange", [(1, "Tasks", "CK-1")],
+                                    reminders=[{"Z_PK": 5, "ZTITLE": "A5", "ZLIST": 1}])
+        db2 = self._make_account_db("AcctB", "Exchange", [(1, "Tasks", "CK-2")],
+                                    reminders=[{"Z_PK": 5, "ZTITLE": "B5", "ZLIST": 1}])
+        try:
+            with (
+                mock.patch.object(self.remctl, "_is_multi_account_mode", return_value=True),
+                mock.patch.object(self.remctl, "resolve_account_scope", return_value=[a1, a2]),
+                mock.patch.object(sqlite3, "connect",
+                                  side_effect=self._connect_by_path({"/tmp/a1.sqlite": db1,
+                                                                     "/tmp/a2.sqlite": db2})),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl._resolve_reminder_for_write(SimpleNamespace(id=5, account=None))
+            err = stderr.getvalue()
+            self.assertIn("multiple accounts", err)
+            self.assertIn("AcctA", err)
+            self.assertIn("AcctB", err)
+        finally:
+            db1.close()
+            db2.close()
+
+    def test_resolve_reminder_for_write_multi_scope_not_found_exits(self):
+        """An id absent from every active account exits cleanly."""
+        a1 = self.remctl.Account("/tmp/a1.sqlite", "AcctA", "Exchange")
+        db1 = self._make_account_db("AcctA", "Exchange", [(1, "Tasks", "CK-1")],
+                                    reminders=[{"Z_PK": 1, "ZTITLE": "A1", "ZLIST": 1}])
+        try:
+            with (
+                mock.patch.object(self.remctl, "_is_multi_account_mode", return_value=True),
+                mock.patch.object(self.remctl, "resolve_account_scope", return_value=[a1]),
+                mock.patch.object(sqlite3, "connect",
+                                  side_effect=self._connect_by_path({"/tmp/a1.sqlite": db1})),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl._resolve_reminder_for_write(SimpleNamespace(id=777, account=None))
+        finally:
+            db1.close()
+
+    # ── Group 14: _gather_stats / cmd_stats (incl. overdue-definition fix) ───
+
+    def _stats_db(self):
+        """A single-account db with a controlled mix for stats assertions."""
+        from datetime import timedelta
+        db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-L1")])
+        sod = self.remctl.start_of_day()
+        yesterday = self.remctl.to_ts(sod - timedelta(days=1))
+        today_midnight = self.remctl.to_ts(sod)
+        tomorrow = self.remctl.to_ts(sod + timedelta(days=1))
+        # overdue: due yesterday, timed
+        db.execute("INSERT INTO ZREMCDREMINDER (Z_PK, ZTITLE, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                   "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, "
+                   "ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+                   "VALUES (1,'Overdue',0,0,0,0,?,?,0,1,'CK-1',1,0)", (yesterday, yesterday))
+        # all-day due today → NOT overdue (display date == start of day)
+        db.execute("INSERT INTO ZREMCDREMINDER (Z_PK, ZTITLE, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                   "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, "
+                   "ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+                   "VALUES (2,'AllDayToday',0,0,0,0,?,?,1,1,'CK-2',1,0)", (today_midnight, today_midnight))
+        # flagged + future
+        db.execute("INSERT INTO ZREMCDREMINDER (Z_PK, ZTITLE, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                   "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, "
+                   "ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+                   "VALUES (3,'Flagged',0,1,0,0,?,?,0,1,'CK-3',1,0)", (tomorrow, tomorrow))
+        # completed
+        db.execute("INSERT INTO ZREMCDREMINDER (Z_PK, ZTITLE, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                   "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZLIST, "
+                   "ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+                   "VALUES (4,'Done',1,0,0,0,NULL,NULL,0,1,'CK-4',1,0)")
+        return db
+
+    def test_gather_stats_counts(self):
+        """_gather_stats returns correct totals/active/completed/flagged."""
+        db = self._stats_db()
+        try:
+            with mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}):
+                s = self.remctl._gather_stats(db)
+        finally:
+            db.close()
+        self.assertEqual(s["total"], 4)
+        self.assertEqual(s["active"], 3)
+        self.assertEqual(s["completed"], 1)
+        self.assertEqual(s["flagged"], 1)
+
+    def test_gather_stats_overdue_matches_q_overdue(self):
+        """stats overdue count equals what q_overdue lists (canonical definition)."""
+        db = self._stats_db()
+        try:
+            with mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}):
+                s = self.remctl._gather_stats(db)
+                overdue_rows = self.remctl.q_overdue(db)
+        finally:
+            db.close()
+        # Only the due-yesterday reminder is overdue; all-day-today is NOT.
+        self.assertEqual(s["overdue"], 1)
+        self.assertEqual(s["overdue"], len(overdue_rows))
+
+    def test_gather_stats_all_day_today_not_overdue(self):
+        """An all-day reminder due today must not be counted overdue."""
+        db = self._stats_db()
+        try:
+            with mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}):
+                overdue_rows = self.remctl.q_overdue(db)
+        finally:
+            db.close()
+        titles = {r["ZTITLE"] for r in overdue_rows}
+        self.assertNotIn("AllDayToday", titles)
+        self.assertIn("Overdue", titles)
+
+    def test_cmd_stats_multi_account_totals(self):
+        """cmd_stats --all-accounts JSON has per-account stats and a summed total."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "A", "ZLIST": 1}])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "B", "ZLIST": 1},
+                                                 {"Z_PK": 2, "ZTITLE": "C", "ZLIST": 1}])
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_stats(SimpleNamespace(json=True, all_accounts=True, account=None))
+            payload = json.loads(stdout.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+        self.assertEqual(payload["total"]["total"], 3)
+        self.assertIn("iCloud", payload["accounts"])
+        self.assertIn("Exchange", payload["accounts"])
+        self.assertEqual(payload["accounts"]["Exchange"]["total"], 2)
+
+    # ── Group 15: multi-account tags (merge + dedup) ─────────────────────────
+
+    def test_cmd_tags_all_accounts_merges_and_dedups(self):
+        """Tags from all accounts are merged, deduplicated, and sorted."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "R", "CK-1")])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "T", "CK-2")])
+        ic_db.execute("INSERT INTO ZREMCDHASHTAGLABEL (Z_PK, ZNAME) VALUES (1,'work'),(2,'home')")
+        ex_db.execute("INSERT INTO ZREMCDHASHTAGLABEL (Z_PK, ZNAME) VALUES (1,'work'),(2,'urgent')")
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_tags(SimpleNamespace(json=True, all_accounts=True, account=None))
+            payload = json.loads(stdout.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+        names = [t["name"] for t in payload]
+        self.assertEqual(names, ["home", "urgent", "work"])  # deduped + sorted
+
+    # ── Group 16: multi-account sections (label consistency) ─────────────────
+
+    def _sections_account_db(self, account_name, account_type, list_name, sections):
+        db = self._make_account_db(account_name, account_type, [(1, list_name, "CK-L1")])
+        for i, sec in enumerate(sections, start=1):
+            db.execute("INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+                       "VALUES (?,?,1,?,0)", (i, sec, f"SEC-{i}"))
+        return db
+
+    def test_cmd_sections_single_account_no_label(self):
+        """sections --account X shows no redundant account label (single scope)."""
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ex_db = self._sections_account_db("Exchange", "Exchange", "Tasks", ["Phase 1"])
+        try:
+            with (
+                self._multi_account_patch([(ex, ex_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_sections(SimpleNamespace(json=False, all_accounts=False, account="Exchange"))
+            out = self.remctl._strip_ansi(stdout.getvalue())
+        finally:
+            ex_db.close()
+        self.assertIn("Tasks:", out)
+        self.assertNotIn("(Exchange)", out)
+
+    def test_cmd_sections_multi_account_shows_label(self):
+        """sections --all-accounts labels each list with its account."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._sections_account_db("iCloud", "iCloud", "Groceries", ["Produce"])
+        ex_db = self._sections_account_db("Exchange", "Exchange", "Tasks", ["Phase 1"])
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_sections(SimpleNamespace(json=False, all_accounts=True, account=None))
+            out = self.remctl._strip_ansi(stdout.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+        self.assertIn("(iCloud)", out)
+        self.assertIn("(Exchange)", out)
+
+    # ── Group 17: config storeDir / dbPath + _apply_config_path_overrides ────
+
+    def test_cmd_config_set_and_clear_store_dir(self):
+        store = {}
+        with (
+            mock.patch.object(self.remctl, "load_config", side_effect=lambda: dict(store)),
+            mock.patch.object(self.remctl, "save_config", side_effect=lambda d: (store.clear(), store.update(d))),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_config(SimpleNamespace(key="storeDir", value="/tmp/x", json=False))
+            self.assertEqual(store.get("storeDir"), "/tmp/x")
+            # clearing with empty string removes the key
+            self.remctl.cmd_config(SimpleNamespace(key="storeDir", value="", json=False))
+            self.assertNotIn("storeDir", store)
+
+    def test_cmd_config_unknown_key_warns(self):
+        store = {}
+        with (
+            mock.patch.object(self.remctl, "load_config", side_effect=lambda: dict(store)),
+            mock.patch.object(self.remctl, "save_config", side_effect=lambda d: (store.clear(), store.update(d))),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.remctl.cmd_config(SimpleNamespace(key="bogusKey", value="x", json=False))
+        self.assertIn("not a recognised config key", stderr.getvalue())
+
+    def test_cmd_config_empty_lists_supported_keys(self):
+        with (
+            mock.patch.object(self.remctl, "load_config", return_value={}),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_config(SimpleNamespace(key=None, value=None, json=False))
+        out = stdout.getvalue()
+        self.assertIn("accountScope", out)
+        self.assertIn("storeDir", out)
+        self.assertIn("dbPath", out)
+
+    def test_apply_config_path_overrides_sets_store_dir(self):
+        """storeDir from config sets STORE_DIR when REMCTL_STORE_DIR is unset."""
+        import tempfile, json as _json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"storeDir": "/tmp/custom-stores"}, f)
+            cfg_path = f.name
+        try:
+            self.remctl.CONFIG_FILE = Path(cfg_path)
+            self.remctl._apply_config_path_overrides()
+            self.assertEqual(str(self.remctl.STORE_DIR), "/tmp/custom-stores")
+        finally:
+            os.unlink(cfg_path)
+
+    def test_apply_config_path_overrides_sets_db_path(self):
+        import tempfile, json as _json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"dbPath": "/tmp/pinned.sqlite"}, f)
+            cfg_path = f.name
+        try:
+            self.remctl.CONFIG_FILE = Path(cfg_path)
+            self.remctl._apply_config_path_overrides()
+            self.assertEqual(str(self.remctl.DB_OVERRIDE), "/tmp/pinned.sqlite")
+        finally:
+            os.unlink(cfg_path)
+
+    def test_apply_config_path_overrides_env_wins_over_config(self):
+        """REMCTL_STORE_DIR env var takes precedence over config storeDir."""
+        import tempfile, json as _json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"storeDir": "/tmp/from-config"}, f)
+            cfg_path = f.name
+        try:
+            self.remctl.CONFIG_FILE = Path(cfg_path)
+            with mock.patch.dict(os.environ, {"REMCTL_STORE_DIR": "/tmp/from-env"}):
+                self.remctl.STORE_DIR = Path("/tmp/from-env")  # as resolve_store_dir would have set
+                self.remctl._apply_config_path_overrides()
+                # config must not override the env-derived value
+                self.assertEqual(str(self.remctl.STORE_DIR), "/tmp/from-env")
+        finally:
+            os.unlink(cfg_path)
+
+    # ── Group 18: first_command_token (global flag positioning) ──────────────
+
+    def test_first_command_token_account_before_command(self):
+        """--account NAME before the subcommand: NAME is not mistaken for the command."""
+        self.assertEqual(
+            self.remctl.first_command_token(["--account", "Work Exchange", "lists"]),
+            "lists",
+        )
+
+    def test_first_command_token_account_equals_form(self):
+        self.assertEqual(
+            self.remctl.first_command_token(["--account=Exchange", "today"]),
+            "today",
+        )
+
+    def test_first_command_token_all_accounts_before_command(self):
+        self.assertEqual(
+            self.remctl.first_command_token(["--all-accounts", "stats"]),
+            "stats",
+        )
+
+    def test_first_command_token_format_value_still_skipped(self):
+        """Regression: --format value is not mistaken for the command."""
+        self.assertEqual(
+            self.remctl.first_command_token(["--format", "table", "lists"]),
+            "lists",
+        )
+
+    def test_first_command_token_combined_global_flags(self):
+        self.assertEqual(
+            self.remctl.first_command_token(["--no-color", "--account", "iCloud", "show", "Work"]),
+            "show",
+        )
+
+    # ── Group 19: bridge_call returns a list (list_calendars) ────────────────
+
+    def test_bridge_call_returns_list_payload(self):
+        """bridge_call returns list payloads (e.g. list_calendars), not just dicts."""
+        fake_result = {"returncode": 0, "stdout": "[]", "stderr": "",
+                       "payload": [{"title": "Tasks", "calendarIdentifier": "CAL-1"}]}
+        with mock.patch.object(self.remctl, "bridge_call_result", return_value=fake_result):
+            result = self.remctl.bridge_call({"action": "list_calendars"})
+        self.assertIsInstance(result, list)
+        self.assertEqual(result[0]["calendarIdentifier"], "CAL-1")
+
+    def test_bridge_call_returns_dict_payload(self):
+        """bridge_call still returns dict payloads for normal actions."""
+        fake_result = {"returncode": 0, "stdout": "{}", "stderr": "",
+                       "payload": {"status": "created", "id": "X"}}
+        with mock.patch.object(self.remctl, "bridge_call_result", return_value=fake_result):
+            result = self.remctl.bridge_call({"action": "create"})
+        self.assertEqual(result["status"], "created")
+
+    # ── Group 20: serialization account fields & table column ────────────────
+
+    def test_list_to_dict_account_kwarg(self):
+        row = {"Z_PK": 1, "ZNAME": "Work", "ZCKIDENTIFIER": "CK-1"}
+        acct = self.remctl.Account("/tmp/x", "Exchange", "Exchange")
+        with_acct = self.remctl.list_to_dict(row, account=acct)
+        without = self.remctl.list_to_dict(row)
+        self.assertEqual(with_acct["account"], "Exchange")
+        self.assertEqual(with_acct["accountType"], "Exchange")
+        self.assertNotIn("account", without)
+
+    def test_list_ref_payload_account_kwarg(self):
+        row = {"Z_PK": 2, "ZNAME": "Tasks", "ZCKIDENTIFIER": "CK-2"}
+        acct = self.remctl.Account("/tmp/x", "iCloud", "iCloud")
+        with_acct = self.remctl.list_ref_payload(row, account=acct)
+        without = self.remctl.list_ref_payload(row)
+        self.assertEqual(with_acct["account"], "iCloud")
+        self.assertNotIn("account", without)
+
+    def test_fmt_table_account_column_present_when_tagged(self):
+        rows = [{"id": 1, "title": "A", "list": "", "due": "", "pri": "", "account": "iCloud"}]
+        out = self.remctl.fmt_table(rows)
+        self.assertIn("Account", out)
+        self.assertIn("iCloud", out)
+
+    def test_fmt_table_account_column_absent_when_untagged(self):
+        rows = [{"id": 1, "title": "A", "list": "", "due": "", "pri": ""}]
+        out = self.remctl.fmt_table(rows)
+        self.assertNotIn("Account", out)
+
+    def test_tag_account_helper(self):
+        acct = self.remctl.Account("/tmp/x", "Exchange", "Exchange")
+        multi = self.remctl._tag_account({"id": 1}, acct, True)
+        single = self.remctl._tag_account({"id": 2}, acct, False)
+        self.assertEqual(multi["account"], "Exchange")
+        self.assertEqual(multi["accountType"], "Exchange")
+        self.assertNotIn("account", single)
+
+    # ── Group 21: discovery edge cases ───────────────────────────────────────
+
+    def test_store_account_info_fallback_name_for_unsynced_account(self):
+        """A store whose account row has no ZNAME yet derives a fallback name."""
+        import tempfile
+        path = Path(tempfile.mkdtemp()) / "Data-ABCD1234-5678.sqlite"
+        db = sqlite3.connect(str(path))
+        db.execute("CREATE TABLE Z_PRIMARYKEY (Z_NAME TEXT, Z_ENT INTEGER, Z_MAX INTEGER)")
+        db.execute("INSERT INTO Z_PRIMARYKEY VALUES ('REMCDAccount', 14, 1)")
+        db.execute("CREATE TABLE ZREMCDOBJECT (Z_PK INTEGER, Z_ENT INTEGER, ZNAME TEXT)")
+        db.execute("INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZNAME) VALUES (1, 14, NULL)")
+        db.execute("CREATE TABLE ZREMCDREPLICAMANAGER (Z_PK INTEGER, Z_ENT INTEGER, ZIDENTIFIER TEXT)")
+        db.execute("INSERT INTO ZREMCDREPLICAMANAGER VALUES (1, 15, 'EE402AA3-1111/com.apple.exchangesync.exchangesyncd')")
+        db.commit()
+        db.close()
+        try:
+            info = self.remctl._store_account_info(path)
+        finally:
+            os.unlink(path)
+            os.rmdir(path.parent)
+        self.assertIsNotNone(info)
+        name, acct_type = info
+        self.assertEqual(acct_type, "Exchange")
+        self.assertTrue(name)  # a non-empty fallback name was derived
+
+    def test_discover_accounts_includes_empty_store(self):
+        """A real account with zero reminders is still discovered (not filtered out)."""
+        import tempfile
+        store_dir = Path(tempfile.mkdtemp())
+        # one store with a valid account name but no reminders
+        path = store_dir / "Data-EMPTY1234-0000.sqlite"
+        db = sqlite3.connect(str(path))
+        db.execute("CREATE TABLE Z_PRIMARYKEY (Z_NAME TEXT, Z_ENT INTEGER, Z_MAX INTEGER)")
+        db.execute("INSERT INTO Z_PRIMARYKEY VALUES ('REMCDAccount', 14, 1)")
+        db.execute("CREATE TABLE ZREMCDOBJECT (Z_PK INTEGER, Z_ENT INTEGER, ZNAME TEXT)")
+        db.execute("INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZNAME) VALUES (1, 14, 'NewAccount')")
+        db.execute("CREATE TABLE ZREMCDREPLICAMANAGER (Z_PK INTEGER, Z_ENT INTEGER, ZIDENTIFIER TEXT)")
+        db.execute("INSERT INTO ZREMCDREPLICAMANAGER VALUES (1, 15, 'uuid/com.apple.exchangesync.exchangesyncd')")
+        db.commit()
+        db.close()
+        try:
+            self.remctl._ACCOUNT_CACHE = None
+            with (
+                mock.patch.object(self.remctl, "STORE_DIR", store_dir),
+                mock.patch.object(self.remctl, "DB_OVERRIDE", None),
+                mock.patch.object(self.remctl, "reminders_store_access_error", return_value=None),
+            ):
+                accounts = self.remctl.discover_accounts(force_refresh=True)
+        finally:
+            os.unlink(path)
+            os.rmdir(store_dir)
+            self.remctl._ACCOUNT_CACHE = None
+        names = [a.name for a in accounts]
+        self.assertIn("NewAccount", names)
+
+    # ── Group 22: cmd_show / cmd_info cross-account via config ───────────────
+
+    def test_cmd_show_ambiguous_list_via_config_all(self):
+        """With config=all, show <name> present in two accounts reports ambiguity."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Tasks", "CK-1")])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")])
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                mock.patch.object(self.remctl, "load_config", return_value={"accountScope": "all"}),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_show(SimpleNamespace(list="Tasks", list_id=None, account=None,
+                                                     completed=False, json=False, format=None,
+                                                     verbose=False))
+            self.assertIn("multiple lists match", stderr.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+
+    def test_cmd_info_with_account_routes_through_resolver(self):
+        """info --account Exchange resolves via the --account-aware resolver."""
+        fake_db = mock.Mock()
+        fake_row = {"Z_PK": 7, "ZTITLE": "ExInfo", "ZLIST": None,
+                    "ZCKIDENTIFIER": "X", "list_name": "Tasks"}
+        captured = {}
+
+        def fake_resolve(a):
+            captured["account"] = getattr(a, "account", None)
+            return fake_db, fake_row
+
+        with (
+            mock.patch.object(self.remctl, "_resolve_reminder_for_write", side_effect=fake_resolve),
+            mock.patch.object(self.remctl, "q_reminders", return_value=[]),
+            mock.patch.object(self.remctl, "q_attachments", return_value=[]),
+            mock.patch.object(self.remctl, "q_alarms", return_value=[]),
+            mock.patch.object(self.remctl, "q_hashtags", return_value=[]),
+            mock.patch.object(self.remctl, "q_rich_link", return_value=None),
+            mock.patch.object(self.remctl, "to_dict", return_value={"id": 7, "title": "ExInfo"}),
+            mock.patch.object(self.remctl, "hydrate_reminder_detail", side_effect=lambda db, d, i: d),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_info(SimpleNamespace(id=7, account="Exchange", json=True))
+        self.assertEqual(captured["account"], "Exchange")
+        self.assertEqual(json.loads(stdout.getvalue())["title"], "ExInfo")
+
+    # ── Group 23: cmd_add account-aware write targeting ──────────────────────
+
+    def _add_args(self, **overrides):
+        base = dict(
+            title="X", list=None, list_id=None, notes=None, due=None, priority=None,
+            flag=False, tags=None, url=None, recurrence=None, alarm=None,
+            private=False, private_metadata=False, section=None, new_section=None,
+            subtask=None, image=None, grocery=False, json=False, account=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_cmd_add_account_with_list_passes_calendar_identifier(self):
+        """add -l Tasks --account Exchange resolves a stable calendarIdentifier for create."""
+        icloud = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        exchange = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        create_payloads = []
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-EX", "sourceTitle": "Exchange"},
+                        {"title": "Tasks", "calendarIdentifier": "CAL-IC", "sourceTitle": "iCloud"}]
+            if data["action"] == "create":
+                create_payloads.append(data)
+                return {"status": "created", "id": "NEW-1"}
+            return None
+
+        fake_db = mock.Mock()
+        fake_db.row_factory = None
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[icloud, exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: fake_db),
+            mock.patch.object(self.remctl, "resolve_list_or_die",
+                              return_value={"id": 1, "title": "Tasks", "requested": "Tasks", "method": "exact"}),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_add(self._add_args(title="T", list="Tasks", account="Exchange"))
+        self.assertEqual(len(create_payloads), 1)
+        self.assertEqual(create_payloads[0].get("calendarIdentifier"), "CAL-EX")
+        self.assertEqual(create_payloads[0].get("account"), "Exchange")
+        self.assertNotIn("list", create_payloads[0])  # calendarIdentifier supersedes title
+
+    def test_cmd_add_account_no_list_picks_first_calendar_in_account(self):
+        """add --account Exchange with no list targets the first calendar in that account."""
+        exchange = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        create_payloads = []
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Other", "calendarIdentifier": "CAL-IC", "sourceTitle": "iCloud"},
+                        {"title": "Tasks", "calendarIdentifier": "CAL-EX", "sourceTitle": "Exchange"}]
+            if data["action"] == "create":
+                create_payloads.append(data)
+                return {"status": "created", "id": "NEW-2"}
+            return None
+
+        with (
+            mock.patch.object(self.remctl, "discover_accounts", return_value=[exchange]),
+            mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: mock.Mock()),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+            mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_add(self._add_args(title="T", account="Exchange"))
+        self.assertEqual(len(create_payloads), 1)
+        self.assertEqual(create_payloads[0].get("calendarIdentifier"), "CAL-EX")
+
+    def test_cmd_add_ambiguous_list_without_account_exits(self):
+        """add -l Tasks with no --account when Tasks exists in two accounts errors."""
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-A", "sourceTitle": "AcctA"},
+                        {"title": "Tasks", "calendarIdentifier": "CAL-B", "sourceTitle": "AcctB"}]
+            return {"status": "created", "id": "X"}
+
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=mock.Mock()),
+            mock.patch.object(self.remctl, "resolve_list_or_die",
+                              return_value={"id": 1, "title": "Tasks", "requested": "Tasks", "method": "exact"}),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+            mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(self._add_args(title="T", list="Tasks", account=None))
+        self.assertIn("multiple accounts", stderr.getvalue())
+
+    def test_cmd_add_exchange_id_fallback_by_title(self):
+        """For Exchange (no ZCKIDENTIFIER), the numeric id is recovered by title after create."""
+        exchange = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ex_db = self._make_account_db(
+            "Exchange", "Exchange", [(1, "Tasks", "CK-L1")],
+            reminders=[{"Z_PK": 42, "ZTITLE": "NewTask", "ZLIST": 1, "ZCKIDENTIFIER": None}],
+        )
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-EX", "sourceTitle": "Exchange"}]
+            if data["action"] == "create":
+                return {"status": "created", "id": "EK-NEW"}
+            return None
+
+        try:
+            with (
+                mock.patch.object(self.remctl, "discover_accounts", return_value=[exchange]),
+                mock.patch.object(sqlite3, "connect",
+                                  side_effect=self._connect_by_path({"/tmp/ex.sqlite": ex_db})),
+                mock.patch.object(self.remctl, "resolve_list_or_die",
+                                  return_value={"id": 1, "title": "Tasks", "requested": "Tasks", "method": "exact"}),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+                mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
+                mock.patch.object(self.remctl, "private_metadata_enabled", return_value=False),
+                mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_add(self._add_args(title="NewTask", list="Tasks", account="Exchange", json=True))
+            payload = json.loads(stdout.getvalue())
+        finally:
+            ex_db.close()
+        self.assertEqual(payload.get("numericId"), 42)
+
+    # ── Group 24: multi-account human output shows account group headers ─────
+
+    def test_cmd_today_all_accounts_shows_account_group_headers(self):
+        """today --all-accounts human output groups items under bold account headers."""
+        from datetime import datetime
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        due_ts = self.remctl.to_ts(datetime.now())
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "iThing", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "xThing", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(SimpleNamespace(json=False, all_accounts=True, account=None,
+                                                      no_overdue=False, format=None))
+            out = self.remctl._strip_ansi(stdout.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+        # Both account headers and both items (same Z_PK=1 in each, no collision corruption)
+        self.assertIn("iCloud", out)
+        self.assertIn("Exchange", out)
+        self.assertIn("iThing", out)
+        self.assertIn("xThing", out)
+
+    # ── Group 25: priority bucketing (Exchange/CalDAV full 1-9 range) ────────
+
+    def test_priority_bucket_ranges(self):
+        """priority_bucket maps the full iCalendar 1-9 range to canonical buckets."""
+        b = self.remctl.priority_bucket
+        self.assertEqual(b(0), "none")
+        self.assertEqual(b(None), "none")
+        for v in (1, 2, 3, 4):
+            self.assertEqual(b(v), "high", f"priority {v} should be high")
+        self.assertEqual(b(5), "medium")
+        for v in (6, 7, 8, 9):
+            self.assertEqual(b(v), "low", f"priority {v} should be low")
+
+    def test_pri_marker_apple_native_values_unchanged(self):
+        """Apple's native 1/5/9 still map to !!!/!!/! (backward compatible)."""
+        self.assertEqual(self.remctl.PRI[0], "")
+        self.assertEqual(self.remctl.PRI[1], "!!!")
+        self.assertEqual(self.remctl.PRI[5], "!!")
+        self.assertEqual(self.remctl.PRI[9], "!")
+
+    def test_pri_marker_exchange_intermediate_values(self):
+        """Exchange/CalDAV intermediate values resolve via range buckets."""
+        # high range 1-4
+        for v in (2, 3, 4):
+            self.assertEqual(self.remctl.PRI[v], "!!!", f"priority {v}")
+        # low range 6-8
+        for v in (6, 7, 8):
+            self.assertEqual(self.remctl.PRI[v], "!", f"priority {v}")
+
+    def test_pri_name_map_ranges(self):
+        """PRI_NAME buckets values for the JSON 'priority' field."""
+        self.assertEqual(self.remctl.PRI_NAME[3], "high")
+        self.assertEqual(self.remctl.PRI_NAME[5], "medium")
+        self.assertEqual(self.remctl.PRI_NAME[7], "low")
+        self.assertEqual(self.remctl.PRI_NAME[0], "none")
+
+    def test_pri_get_with_default_buckets(self):
+        """.get() (used by serialize_reminder) buckets too, honoring its default for none."""
+        self.assertEqual(self.remctl.PRI_NAME.get(3, "none"), "high")
+        self.assertEqual(self.remctl.PRI.get(3, ""), "!!!")
+        self.assertEqual(self.remctl.PRI_NAME.get(0, "none"), "none")
+
+    def test_color_priority_marks_exchange_high(self):
+        """_color_priority returns a non-empty marker for an Exchange high value (3)."""
+        prev = self.remctl.C.enabled
+        self.remctl.C.enabled = False  # no ANSI, so we compare plain text
+        try:
+            self.assertEqual(self.remctl._color_priority(3), "!!!")
+            self.assertEqual(self.remctl._color_priority(5), "!!")
+            self.assertEqual(self.remctl._color_priority(7), "!")
+            self.assertEqual(self.remctl._color_priority(0), "")
+        finally:
+            self.remctl.C.enabled = prev
+
+    def test_serialize_reminder_exchange_priority_is_high(self):
+        """A reminder stored with priority 3 (Exchange/To Do starred) serializes as 'high'."""
+        row = {
+            "Z_PK": 7, "ZTITLE": "Starred Task", "ZNOTES": None, "ZCOMPLETED": 0,
+            "ZFLAGGED": 0, "ZPRIORITY": 3, "ZISURGENTSTATEENABLEDFORCURRENTUSER": 0,
+            "ZDUEDATEDELTAALERTSDATA": None, "ZDUEDATE": None, "ZDISPLAYDATEDATE": None,
+            "ZALLDAY": 0, "ZCOMPLETIONDATE": None, "ZCREATIONDATE": None,
+            "ZPARENTREMINDER": None, "ZLIST": 1, "ZICSURL": None, "ZCKIDENTIFIER": None,
+            "list_name": "Tasks",
+            "recurrence_frequency": None, "recurrence_interval": None,
+            "recurrence_count": None, "recurrence_end_date": None,
+            "recurrence_days_of_week": None, "recurrence_days_of_month": None,
+            "recurrence_months_of_year": None, "recurrence_days_of_year": None,
+            "recurrence_weeks_of_year": None, "recurrence_set_positions": None,
+        }
+        payload = self.remctl.to_dict(row, db=None)
+        self.assertEqual(payload["priority"], "high")
+        # And not flagged — confirms starred maps to priority, not the flag
+        self.assertFalse(payload["flagged"])
+
+    def test_fmt_shows_exchange_high_priority_marker(self):
+        """fmt() renders the !!! marker for an Exchange high-priority reminder."""
+        row = {
+            "Z_PK": 7, "ZTITLE": "Starred", "ZNOTES": None, "ZCOMPLETED": 0,
+            "ZFLAGGED": 0, "ZPRIORITY": 3, "ZISURGENTSTATEENABLEDFORCURRENTUSER": 0,
+            "ZDUEDATEDELTAALERTSDATA": None, "ZDUEDATE": None, "ZDISPLAYDATEDATE": None,
+            "ZALLDAY": 0, "ZCOMPLETIONDATE": None, "ZCREATIONDATE": None,
+            "ZPARENTREMINDER": None, "ZLIST": 1, "ZICSURL": None, "ZCKIDENTIFIER": None,
+            "list_name": "Tasks",
+        }
+        prev = self.remctl.C.enabled
+        self.remctl.C.enabled = False
+        try:
+            line = self.remctl.fmt(row, db=None)
+        finally:
+            self.remctl.C.enabled = prev
+        self.assertIn("!!!", line)
+
+    # ── Group 26: flag/unflag on non-iCloud accounts + _ek_identifier case ───
+
+    def test_cmd_flag_exchange_reminder_refuses_with_honest_error(self):
+        """flag on a reminder with no ZCKIDENTIFIER (Exchange) errors honestly, no fake success."""
+        fake_db = mock.Mock()
+        fake_row = {"ZCKIDENTIFIER": None, "ZTITLE": "Test_CAT1",
+                    "list_name": "Tasks", "ZLIST": 1, "ZDUEDATE": None}
+        with (
+            mock.patch.object(self.remctl, "_resolve_reminder_for_write",
+                              return_value=(fake_db, fake_row)),
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_mock,
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_flag(SimpleNamespace(id=2, json=False, account="Work Exchange"))
+        err = stderr.getvalue()
+        self.assertIn("no flag attribute", err)
+        self.assertIn("priority", err)
+        # Must NOT have attempted AppleScript or the misleading bridge proxy
+        osa_mock.assert_not_called()
+        bridge_call.assert_not_called()
+
+    def test_cmd_unflag_exchange_reminder_refuses_with_honest_error(self):
+        """unflag on a no-ZCKIDENTIFIER reminder errors honestly."""
+        fake_db = mock.Mock()
+        fake_row = {"ZCKIDENTIFIER": None, "ZTITLE": "Test_CAT1",
+                    "list_name": "Tasks", "ZLIST": 1, "ZDUEDATE": None}
+        with (
+            mock.patch.object(self.remctl, "_resolve_reminder_for_write",
+                              return_value=(fake_db, fake_row)),
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_mock,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_unflag(SimpleNamespace(id=2, json=False, account="Exchange"))
+        self.assertIn("no flag attribute", stderr.getvalue())
+        osa_mock.assert_not_called()
+
+    def test_cmd_flag_icloud_reminder_uses_applescript(self):
+        """flag on an iCloud reminder (ZCKIDENTIFIER present) sets the real flag via AppleScript."""
+        fake_db = mock.Mock()
+        fake_row = {"ZCKIDENTIFIER": "CK-IC-1", "ZTITLE": "iThing",
+                    "list_name": "Reminders", "ZLIST": 1, "ZDUEDATE": None}
+        with (
+            mock.patch.object(self.remctl, "_resolve_reminder_for_write",
+                              return_value=(fake_db, fake_row)),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_mock,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_flag(SimpleNamespace(id=1, json=False, account=None))
+        osa_mock.assert_called_once()
+        self.assertIn("set flagged of r to true", osa_mock.call_args.args[2])
+        self.assertIn("Flagged", stdout.getvalue())
+
+    def test_ek_identifier_account_match_is_case_insensitive(self):
+        """_ek_identifier matches the account hint case-insensitively."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "T"}
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-X",
+                         "sourceTitle": "Work Exchange"}]
+            if data["action"] == "find_reminder":
+                self.assertEqual(data["calendarIdentifier"], "CAL-X")
+                return {"calendarItemIdentifier": "EK-1"}
+            return None
+
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+        ):
+            # lowercase account hint must still match the canonical-cased sourceTitle
+            result = self.remctl._ek_identifier(r, account_name="work exchange")
+        self.assertEqual(result, "EK-1")
+
+    def test_ek_identifier_refuses_wrong_account_when_name_collides(self):
+        """When the account hint matches no calendar of that name, return None (no wrong-account guess)."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "T"}
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-A", "sourceTitle": "AcctA"},
+                        {"title": "Tasks", "calendarIdentifier": "CAL-B", "sourceTitle": "AcctB"}]
+            # find_reminder must never be called with a wrong calendar
+            raise AssertionError("find_reminder should not be called when account does not match")
+
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+        ):
+            result = self.remctl._ek_identifier(r, account_name="AcctC")  # not present
+        self.assertIsNone(result)
+
+    def test_ek_identifier_ambiguous_without_account_returns_none(self):
+        """Same list name in two accounts and no account hint → None (don't guess)."""
+        r = {"ZCKIDENTIFIER": None, "list_name": "Tasks", "ZTITLE": "T"}
+
+        def fake_bridge_call(data):
+            if data["action"] == "list_calendars":
+                return [{"title": "Tasks", "calendarIdentifier": "CAL-A", "sourceTitle": "AcctA"},
+                        {"title": "Tasks", "calendarIdentifier": "CAL-B", "sourceTitle": "AcctB"}]
+            raise AssertionError("find_reminder should not be called when ambiguous")
+
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call", side_effect=fake_bridge_call),
+        ):
+            result = self.remctl._ek_identifier(r, account_name=None)
+        self.assertIsNone(result)
+
+    # ── Group 27: multi-account --format table preserves rich rows ───────────
+
+    def test_gather_table_rows_multi_has_rich_fields_and_account(self):
+        """Multi-account table rows keep id/due/repeat formatting AND add an account column."""
+        from datetime import datetime
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        due_ts = self.remctl.to_ts(datetime.now())
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 5, "ZTITLE": "iTask", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")],
+                                      reminders=[{"Z_PK": 9, "ZTITLE": "xTask", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        try:
+            with self._multi_account_patch([(ic, ic_db), (ex, ex_db)]):
+                rows = self.remctl.gather_table_rows(
+                    [ic, ex], lambda db: self.remctl.q_due_today(db, include_overdue=True)
+                )
+        finally:
+            ic_db.close()
+            ex_db.close()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            # rich table shape: id carries the '#', due is populated, account present
+            self.assertIn("#", self.remctl._strip_ansi(str(row["id"])))
+            self.assertIn("due", row)
+            self.assertIn(row["account"], {"iCloud", "Exchange"})
+
+    def test_gather_table_rows_single_account_has_no_account_key(self):
+        """Single-account table rows must not carry an account key (byte-compat)."""
+        from datetime import datetime
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        due_ts = self.remctl.to_ts(datetime.now())
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 5, "ZTITLE": "iTask", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        try:
+            with self._multi_account_patch([(ic, ic_db)]):
+                rows = self.remctl.gather_table_rows(
+                    [ic], lambda db: self.remctl.q_due_today(db, include_overdue=True)
+                )
+        finally:
+            ic_db.close()
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("account", rows[0])
+
+    def test_cmd_today_all_accounts_table_populates_due_column(self):
+        """Regression: today --all-accounts --format table must populate Due (not blank)."""
+        from datetime import datetime
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        due_ts = self.remctl.to_ts(datetime.now())
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 5, "ZTITLE": "iTask", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        ex_db = self._make_account_db("Exchange", "Exchange", [(1, "Tasks", "CK-2")],
+                                      reminders=[{"Z_PK": 9, "ZTITLE": "xTask", "ZLIST": 1, "ZDUEDATE": due_ts}])
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(SimpleNamespace(json=False, all_accounts=True, account=None,
+                                                      no_overdue=False, format="table"))
+            out = self.remctl._strip_ansi(stdout.getvalue())
+        finally:
+            ic_db.close()
+            ex_db.close()
+        self.assertIn("Today", out)       # Due column populated, not blank
+        self.assertIn("Account", out)     # account column present
+        self.assertIn("#5", out)          # id keeps the # prefix
+        self.assertIn("#9", out)
+
+    # ── Group 28: single-account scope (--account) must not add labels ───────
+
+    def test_cmd_lists_single_account_scope_no_labels(self):
+        """lists --account X (one account in scope) emits no account field/column — byte-compat."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")])
+        try:
+            # JSON: no account field
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  contextlib.redirect_stdout(io.StringIO()) as out):
+                self.remctl.cmd_lists(SimpleNamespace(json=True, all_accounts=False, account="iCloud"))
+            payload = json.loads(out.getvalue())
+            self.assertTrue(payload)
+            for item in payload:
+                self.assertNotIn("account", item)
+            # table: no Account column
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  contextlib.redirect_stdout(io.StringIO()) as out2):
+                self.remctl.cmd_lists(SimpleNamespace(json=False, all_accounts=False,
+                                                      account="iCloud", format="table"))
+            self.assertNotIn("Account", out2.getvalue())
+        finally:
+            ic_db.close()
+
+    def test_cmd_stats_single_account_scope_flat_json_and_heading(self):
+        """stats --account X (one account) uses the flat JSON + 'Reminders Stats' heading (byte-compat)."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "x", "ZLIST": 1}])
+        try:
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}),
+                  contextlib.redirect_stdout(io.StringIO()) as out):
+                self.remctl.cmd_stats(SimpleNamespace(json=True, all_accounts=False, account="iCloud"))
+            payload = json.loads(out.getvalue())
+            # flat structure (original), NOT nested {"total": {...}, "accounts": {...}}
+            self.assertIsInstance(payload["total"], int)
+            self.assertNotIn("accounts", payload)
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  mock.patch.object(self.remctl, "_REMINDER_COLUMN_CACHE", {}),
+                  contextlib.redirect_stdout(io.StringIO()) as out2):
+                self.remctl.cmd_stats(SimpleNamespace(json=False, all_accounts=False, account="iCloud"))
+            self.assertIn("Reminders Stats", out2.getvalue())
+            self.assertNotIn("Stats: iCloud", out2.getvalue())
+        finally:
+            ic_db.close()
+
+    def test_cmd_search_single_account_scope_no_indent(self):
+        """search --account X (one account) does not indent results — matches original flat format."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ic_db = self._make_account_db("iCloud", "iCloud", [(1, "Reminders", "CK-1")],
+                                      reminders=[{"Z_PK": 1, "ZTITLE": "findme", "ZLIST": 1}])
+        try:
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  contextlib.redirect_stdout(io.StringIO()) as out):
+                self.remctl.cmd_search(SimpleNamespace(json=False, all_accounts=False, account="iCloud",
+                                                       query="findme", completed=False, verbose=False,
+                                                       format=None))
+            lines = [l for l in self.remctl._strip_ansi(out.getvalue()).splitlines()
+                     if "findme" in l]
+            self.assertTrue(lines)
+            for l in lines:
+                self.assertFalse(l.startswith("  "), f"single-account search must not indent: {l!r}")
+        finally:
+            ic_db.close()
+
+
+    # ── Group 29: global account-flag strictness for non-account commands ────
+
+    def test_global_account_flag_rejected_for_non_account_command(self):
+        """--account before a non-account command (doctor) errors strictly (rc 2)."""
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "--account", "iCloud", "doctor"]),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("does not support", stderr.getvalue())
+
+    def test_global_all_accounts_flag_rejected_for_non_account_command(self):
+        """--all-accounts before a non-account command (accounts) errors strictly."""
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "--all-accounts", "accounts"]),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("does not support", stderr.getvalue())
+
+    def test_all_accounts_rejected_for_single_account_command(self):
+        """A command that supports --account but does not aggregate (export) rejects
+        --all-accounts rather than silently ignoring it (per-flag strictness)."""
+        with (
+            mock.patch.object(sys, "argv", ["remctl", "--all-accounts", "export"]),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self.remctl.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("does not support --all-accounts", stderr.getvalue())
+
+    # ── Group 30: smart-lists / templates multi-account aggregation ──────────
+
+    def test_cmd_smart_lists_single_account_no_account_field(self):
+        """smart-lists --account X (single) emits no account field — byte-compat with original."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ic_db = self._make_account_db("iCloud", "iCloud", [])
+        try:
+            with (self._multi_account_patch([(ic, ic_db)]),
+                  contextlib.redirect_stdout(io.StringIO()) as out):
+                self.remctl.cmd_smart_lists(SimpleNamespace(json=True, all_accounts=False, account="iCloud"))
+            payload = json.loads(out.getvalue())
+            for item in payload:
+                self.assertNotIn("account", item)
+        finally:
+            ic_db.close()
+
+    def test_cmd_smart_lists_all_accounts_runs_and_tags_when_multi(self):
+        """smart-lists --all-accounts aggregates across accounts (valid JSON, account-tagged)."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [])
+        ex_db = self._make_account_db("Exchange", "Exchange", [])
+        try:
+            with (self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                  contextlib.redirect_stdout(io.StringIO()) as out):
+                self.remctl.cmd_smart_lists(SimpleNamespace(json=True, all_accounts=True, account=None))
+            payload = json.loads(out.getvalue())  # must be valid JSON (list), no crash
+            self.assertIsInstance(payload, list)
+        finally:
+            ic_db.close()
+            ex_db.close()
+
+    def test_cmd_templates_all_accounts_aggregates_and_tags(self):
+        """templates --all-accounts aggregates per account and tags each with its account."""
+        ic = self.remctl.Account("/tmp/ic.sqlite", "iCloud", "iCloud")
+        ex = self.remctl.Account("/tmp/ex.sqlite", "Exchange", "Exchange")
+        ic_db = self._make_account_db("iCloud", "iCloud", [])
+        ex_db = self._make_account_db("Exchange", "Exchange", [])
+        # q_templates is unchanged code needing extra schema; mock it to focus on
+        # cmd_templates' multi-account aggregation wiring. Return one row for iCloud.
+        def fake_q_templates(db):
+            return [{"_ck": "T1"}] if db is ic_db else []
+        try:
+            with (
+                self._multi_account_patch([(ic, ic_db), (ex, ex_db)]),
+                mock.patch.object(self.remctl, "q_templates", side_effect=fake_q_templates),
+                mock.patch.object(self.remctl, "template_to_dict",
+                                  side_effect=lambda row: {"id": 1, "name": "Tmpl", "itemCount": 0}),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                self.remctl.cmd_templates(SimpleNamespace(json=True, all_accounts=True, account=None))
+            payload = json.loads(out.getvalue())
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["account"], "iCloud")  # tagged with its account
+        finally:
+            ic_db.close()
+            ex_db.close()
 
 
 if __name__ == "__main__":

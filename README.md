@@ -60,6 +60,7 @@ Full setup details live in [docs/installation.md](docs/installation.md).
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag` |
 | Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
+| Work across accounts | `accounts`, `config`, `--all-accounts` and `--account NAME` on read and write commands |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
 Common examples:
@@ -98,7 +99,12 @@ remctl list-edit Projects --private --color orange --symbol education3
 remctl list-pin "Project X" --private
 remctl list-rename --list-id 123 --new-name "Project X Archive"
 remctl info 23880 --json
+remctl accounts
+remctl today --all-accounts
+remctl add "Send invoice" -l Tasks --account Exchange
 ```
+
+RemCTL works across every Reminders account on the Mac — iCloud, Exchange, and on-device local. By default it operates on your primary account; add `--all-accounts` to any read command to see everything at once (grouped by account), or `--account NAME` to target a specific account for reads and writes. Run `remctl accounts` to list them, and set a personal default with `remctl config accountScope all`. See [Multi-Account in the command guide](docs/commands.md#multi-account).
 
 The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes. Template commands are covered in [docs/commands.md#templates](docs/commands.md#templates) and [docs/private-metadata.md#template-examples](docs/private-metadata.md#template-examples).
 

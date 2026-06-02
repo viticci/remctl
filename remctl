@@ -6,7 +6,8 @@ attachments, completion status, list colors). Writes via remctl-bridge (EventKit
 with AppleScript fallback. Zero Python dependencies with small shared helpers.
 """
 
-import argparse, base64, csv, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+import argparse, base64, contextlib, csv, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from remctl_runtime import (
     is_safe_remote_url,
     resolve_binary_path,
     resolve_config_dir,
+    resolve_db_override,
     resolve_store_dir,
     start_of_day,
     upcoming_window,
@@ -48,12 +50,45 @@ VERSION = "1.0.5"
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
+DB_OVERRIDE = resolve_db_override()
 BRIDGE_PATH = resolve_binary_path(__file__, "remctl-bridge", "REMCTL_BRIDGE_PATH")
 PRIVATE_PATH = resolve_binary_path(__file__, "remctl-private", "REMCTL_PRIVATE_PATH")
 PERMISSIONS_PATH = resolve_binary_path(__file__, "remctl-permissions", "REMCTL_PERMISSIONS_PATH")
 CONFIG_DIR = resolve_config_dir("remctl")
 ONBOARD_STATE_FILE = CONFIG_DIR / "onboard-state.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 AUTO_ONBOARD_SKIP_ENV = "REMCTL_SKIP_ONBOARD"
+ACCOUNT_SCOPE_ENV = "REMCTL_ACCOUNT_SCOPE"
+
+def _apply_config_path_overrides():
+    """Apply storeDir / dbPath from config.json when env vars are not set.
+
+    Env vars always win; config is a fallback for users who prefer not to
+    set shell variables permanently.
+    """
+    global STORE_DIR, DB_OVERRIDE
+    try:
+        if not CONFIG_FILE.exists():
+            return
+        import json as _json
+        cfg = _json.loads(CONFIG_FILE.read_text())
+        if not isinstance(cfg, dict):
+            return
+        if not os.environ.get("REMCTL_STORE_DIR"):
+            store_dir_val = cfg.get("storeDir", "")
+            if store_dir_val:
+                STORE_DIR = Path(store_dir_val).expanduser()
+        if not os.environ.get("REMCTL_DB"):
+            db_path_val = cfg.get("dbPath", "")
+            if db_path_val:
+                DB_OVERRIDE = Path(db_path_val).expanduser()
+    except Exception:
+        pass
+
+_apply_config_path_overrides()
+HIDDEN_ACCOUNT_NAMES = {"LocalInternal"}
+
+Account = namedtuple("Account", ["store_path", "name", "type"])
 AUTO_ONBOARD_SKIP_COMMANDS = {"completion", "doctor", "onboard", "permissions", "setup"}
 FULL_DISK_ACCESS_SETTINGS_URLS = [
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles",
@@ -188,11 +223,143 @@ def find_main_db():
     return db_path
 
 
+def _store_file_group_mtime(path):
+    mtimes = [path.stat().st_mtime]
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            mtimes.append(sidecar.stat().st_mtime)
+    return max(mtimes)
+
+
+def _store_reminder_count(path):
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM ZREMCDOBJECT").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+
 def find_main_db_path():
     if reminders_store_access_error():
         return None
-    candidates = sorted(STORE_DIR.glob("Data-*.sqlite"), key=lambda p: p.stat().st_size, reverse=True)
-    return candidates[0] if candidates else None
+    if DB_OVERRIDE:
+        return DB_OVERRIDE if DB_OVERRIDE.exists() else None
+    candidates = list(STORE_DIR.glob("Data-*.sqlite"))
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return max(candidates, key=lambda p: (_store_reminder_count(p), _store_file_group_mtime(p)))
+
+def _store_account_info(path):
+    """Return (name, type) for the account in *path*, or None if unreadable."""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            # Derive the account entity number dynamically — do not hardcode Z_ENT=14
+            ent_row = conn.execute(
+                "SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME='REMCDAccount'"
+            ).fetchone()
+            if ent_row is None:
+                return None
+            ent = ent_row[0]
+            name_row = conn.execute(
+                "SELECT ZNAME FROM ZREMCDOBJECT WHERE Z_ENT=? AND ZNAME IS NOT NULL LIMIT 1",
+                (ent,),
+            ).fetchone()
+            # name may be absent on a freshly-added account that hasn't synced yet
+            name = name_row[0] if name_row else None
+
+            # Derive account type from replica manager identifiers
+            acct_type = "Local"
+            try:
+                rows = conn.execute(
+                    "SELECT ZIDENTIFIER FROM ZREMCDREPLICAMANAGER WHERE ZIDENTIFIER IS NOT NULL"
+                ).fetchall()
+                identifiers = [r[0] for r in rows]
+            except Exception:
+                identifiers = []
+            for ident in identifiers:
+                if "exchangesync" in ident:
+                    acct_type = "Exchange"
+                    break
+            else:
+                if any("com.apple.reminders" in i for i in identifiers):
+                    if any("sharingextension" in i for i in identifiers):
+                        acct_type = "iCloud"
+                    elif identifiers:
+                        acct_type = "iCloud"
+
+            # Fall back to a name derived from the replica UUID or the store filename
+            if not name:
+                if identifiers:
+                    # e.g. "338B0300-8139-4FBC-99F1-F90AF04ECEA3/com.apple.exchangesync.exchangesyncd"
+                    # → use the UUID prefix as a temporary identifier
+                    uuid_part = identifiers[0].split("/")[0]
+                    name = f"{acct_type} ({uuid_part[:8]})"
+                else:
+                    name = f"{acct_type} ({path.stem[-8:]})"
+
+            return (name, acct_type)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+_ACCOUNT_CACHE = None
+
+
+def discover_accounts(*, force_refresh=False):
+    """Return all real (non-hidden, non-empty) Reminders accounts, most-reminders first.
+
+    Each element is an Account(store_path, name, type) namedtuple. The first
+    element is always the same store that find_main_db_path() would return,
+    preserving backward-compat for the default single-account path.
+
+    Results are process-memoized; pass force_refresh=True to re-scan.
+    """
+    global _ACCOUNT_CACHE
+    if _ACCOUNT_CACHE is not None and not force_refresh:
+        return _ACCOUNT_CACHE
+
+    if reminders_store_access_error():
+        _ACCOUNT_CACHE = []
+        return _ACCOUNT_CACHE
+
+    # Honor single-file override
+    if DB_OVERRIDE:
+        if not DB_OVERRIDE.exists():
+            _ACCOUNT_CACHE = []
+            return _ACCOUNT_CACHE
+        info = _store_account_info(DB_OVERRIDE)
+        name = info[0] if info else DB_OVERRIDE.stem
+        acct_type = info[1] if info else "Local"
+        _ACCOUNT_CACHE = [Account(DB_OVERRIDE, name, acct_type)]
+        return _ACCOUNT_CACHE
+
+    candidates = list(STORE_DIR.glob("Data-*.sqlite"))
+    accounts = []
+    for path in candidates:
+        info = _store_account_info(path)
+        if info is None:
+            continue  # unreadable or missing CoreData schema
+        name, acct_type = info
+        if name in HIDDEN_ACCOUNT_NAMES:
+            continue
+        count = _store_reminder_count(path)
+        mtime = _store_file_group_mtime(path)
+        accounts.append((count, mtime, Account(path, name, acct_type)))
+
+    # Sort: most reminders first, then newest mtime (same sort key as find_main_db_path)
+    accounts.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _ACCOUNT_CACHE = [a for _, _, a in accounts]
+    return _ACCOUNT_CACHE
+
 
 def open_db():
     conn = sqlite3.connect(f"file:{find_main_db()}?mode=ro", uri=True)
@@ -206,8 +373,46 @@ def ts(v):
 def to_ts(dt):
     return dt.timestamp() - APPLE_EPOCH
 
-PRI = {0: "", 1: "!!!", 5: "!!", 9: "!"}
-PRI_NAME = {0: "none", 1: "high", 5: "medium", 9: "low"}
+def priority_bucket(value):
+    """Map a stored priority value to a canonical bucket.
+
+    Apple iCloud reminders only use 1/5/9, but Exchange and other CalDAV
+    accounts store the full iCalendar (RFC 5545) priority range, where
+    1-4 = high, 5 = medium, and 6-9 = low. 0 (or NULL) means no priority.
+    Reminders.app interprets these ranges; RemCTL matches that behavior so a
+    Microsoft To Do "starred" (High importance) task — which can sync as any
+    value in 1-4 — is shown as high rather than dropped.
+    """
+    v = value or 0
+    if v <= 0:
+        return "none"
+    if v <= 4:
+        return "high"
+    if v == 5:
+        return "medium"
+    return "low"  # 6-9 (and any value > 9, defensively)
+
+
+class _PriorityMap(dict):
+    """Range-aware priority lookup keyed by stored value (0-9).
+
+    Behaves like the old exact-value dict for Apple's native 1/5/9, but buckets
+    the full iCalendar range so Exchange/CalDAV values (e.g. 3) resolve too.
+    """
+    def __init__(self, by_bucket):
+        super().__init__({0: by_bucket["none"], 1: by_bucket["high"],
+                          5: by_bucket["medium"], 9: by_bucket["low"]})
+        self._by_bucket = by_bucket
+
+    def get(self, key, default=None):
+        return self._by_bucket.get(priority_bucket(key), default if default is not None else self._by_bucket["none"])
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+
+PRI = _PriorityMap({"none": "", "high": "!!!", "medium": "!!", "low": "!"})
+PRI_NAME = _PriorityMap({"none": "none", "high": "high", "medium": "medium", "low": "low"})
 
 # ── List Color Parsing ───────────────────────────────────────────────────────
 
@@ -404,14 +609,14 @@ def load_list_colors(db):
         pass
     return colors
 
-# Global list color cache — populated on demand
-_list_colors = None
+# Per-connection list color cache keyed by connection id()
+_list_colors_cache = {}
 
 def get_list_colors(db):
-    global _list_colors
-    if _list_colors is None:
-        _list_colors = load_list_colors(db)
-    return _list_colors
+    key = id(db)
+    if key not in _list_colors_cache:
+        _list_colors_cache[key] = load_list_colors(db)
+    return _list_colors_cache[key]
 
 def color_list_name(name, db=None):
     """Return the list name colored by its Reminders color."""
@@ -736,7 +941,7 @@ def grocery_list_payload(row):
     return payload
 
 
-def list_to_dict(row):
+def list_to_dict(row, *, account=None):
     is_groceries = is_grocery_list_row(row)
     item = {
         "id": _row_value(row, "Z_PK"),
@@ -744,6 +949,9 @@ def list_to_dict(row):
         "listType": "groceries" if is_groceries else "standard",
         "isGroceries": is_groceries,
     }
+    if account is not None:
+        item["account"] = account.name
+        item["accountType"] = account.type
     object_uuid = _row_value(row, "ZCKIDENTIFIER")
     if object_uuid:
         item["objectUUID"] = object_uuid
@@ -786,7 +994,7 @@ def normalize_list_lookup_name(name):
                     last_space = True
     return "".join(parts).strip()
 
-def list_ref_payload(row, *, requested=None, method="exact"):
+def list_ref_payload(row, *, requested=None, method="exact", account=None):
     payload = {
         "id": _row_value(row, "Z_PK"),
         "title": _row_value(row, "ZNAME"),
@@ -794,6 +1002,9 @@ def list_ref_payload(row, *, requested=None, method="exact"):
         "requested": requested,
         "method": method,
     }
+    if account is not None:
+        payload["account"] = account.name
+        payload["accountType"] = account.type
     payload["isGroceries"] = is_grocery_list_row(row)
     grocery = grocery_list_payload(row)
     if grocery and (payload["isGroceries"] or any(grocery.values())):
@@ -996,16 +1207,106 @@ def resolve_list_ref(db, name=None, list_id=None):
 
 def _print_list_resolution_error(requested, result=None):
     if result and result.get("error") == "ambiguous":
+        candidates = result.get("candidates", [])
         options = ", ".join(
-            f"{candidate['id']} ({candidate['title']})"
-            for candidate in result.get("candidates", [])
+            (f"{c.get('account', '')}/{c['id']} ({c['title']})"
+             if c.get("account") else f"{c['id']} ({c['title']})")
+            for c in candidates
         )
+        hint = " Use --account to specify the account." if any(c.get("account") for c in candidates) else ""
         print(
-            f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}",
+            f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}{hint}",
             file=sys.stderr,
         )
     else:
         print(f"Error: list not found: {requested}", file=sys.stderr)
+
+
+def resolve_list_ref_across(account_dbs, *, name=None, list_id=None, account_name=None):
+    """Resolve a list reference across multiple account connections.
+
+    When *account_name* is given, resolution is limited to that one account
+    (exactly as today's single-account resolve_list_ref, plus stamping account).
+    When *account_dbs* has only one entry, behaviour is identical to the
+    single-account path (back-compat).
+
+    Returns a list_ref_payload dict on success (with an 'account' field when
+    multi-account), an ambiguity dict when the reference matches in multiple
+    accounts, or None when not found.
+    """
+    multi = len(account_dbs) > 1
+
+    # Filter to a specific account if requested
+    if account_name:
+        lower = account_name.lower()
+        target = [(acct, db) for acct, db in account_dbs if acct.name.lower() == lower]
+        if not target:
+            print(f"Error: account {account_name!r} not found or not active.", file=sys.stderr)
+            sys.exit(1)
+        acct, db = target[0]
+        result = resolve_list_ref(db, name=name, list_id=list_id)
+        if result and not result.get("error"):
+            result["account"] = acct.name
+            result["accountType"] = acct.type
+            result["_store_path"] = str(acct.store_path)
+        return result
+
+    # Scan all active accounts
+    hits = []
+    for acct, db in account_dbs:
+        result = resolve_list_ref(db, name=name, list_id=list_id)
+        if result and not result.get("error"):
+            result["_store_path"] = str(acct.store_path)
+            if multi:
+                result["account"] = acct.name
+                result["accountType"] = acct.type
+            hits.append(result)
+
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    # Multiple accounts matched — return ambiguity payload
+    return {"error": "ambiguous", "requested": name or str(list_id), "candidates": hits}
+
+
+def resolve_reminder_across(account_dbs, pk, *, account_name=None):
+    """Resolve a reminder by integer Z_PK across multiple account connections.
+
+    Returns (Account, sqlite3.Connection, row) on success, None if not found.
+    Calls sys.exit on ambiguity (same Z_PK found in multiple active accounts).
+
+    For UUID-based lookups use q_reminder_by_identifier directly — UUIDs are
+    globally unique and need no cross-account disambiguation.
+    """
+    if account_name:
+        lower = account_name.lower()
+        target = [(acct, db) for acct, db in account_dbs if acct.name.lower() == lower]
+        if not target:
+            print(f"Error: account {account_name!r} not found or not active.", file=sys.stderr)
+            sys.exit(1)
+        acct, db = target[0]
+        row = q_reminder(db, pk)
+        return (acct, db, row) if row else None
+
+    hits = []
+    for acct, db in account_dbs:
+        row = q_reminder(db, pk)
+        if row:
+            hits.append((acct, db, row))
+
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    # Ambiguous — same Z_PK in multiple accounts
+    accounts_str = ", ".join(h[0].name for h in hits)
+    print(
+        f"Error: reminder id {pk} exists in multiple accounts ({accounts_str}). "
+        "Use --account to specify which one.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 def resolve_list_or_die(db, name=None, list_id=None):
     result = resolve_list_ref(db, name=name, list_id=list_id)
@@ -1257,6 +1558,43 @@ def resolve_required_template_target_or_die(db, *, name=None, template_id=None):
     requested = f"id {template_id}" if template_id is not None else name
     _print_template_resolution_error(requested, result)
     sys.exit(1)
+
+
+def resolve_template_ref_across(account_dbs, *, name=None, template_id=None, account_name=None):
+    """Resolve a template reference across multiple account connections.
+
+    Mirrors resolve_list_ref_across: stamps '_store_path' (and account/accountType
+    when multi-account), returns an ambiguity dict when matched in multiple
+    accounts, or None when not found.
+    """
+    multi = len(account_dbs) > 1
+    if account_name:
+        lower = account_name.lower()
+        target = [(acct, db) for acct, db in account_dbs if acct.name.lower() == lower]
+        if not target:
+            print(f"Error: account {account_name!r} not found or not active.", file=sys.stderr)
+            sys.exit(1)
+        acct, db = target[0]
+        result = resolve_template_ref(db, name=name, template_id=template_id)
+        if result and not result.get("error"):
+            result["account"] = acct.name
+            result["accountType"] = acct.type
+            result["_store_path"] = str(acct.store_path)
+        return result
+    hits = []
+    for acct, db in account_dbs:
+        result = resolve_template_ref(db, name=name, template_id=template_id)
+        if result and not result.get("error"):
+            result["_store_path"] = str(acct.store_path)
+            if multi:
+                result["account"] = acct.name
+                result["accountType"] = acct.type
+            hits.append(result)
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    return {"error": "ambiguous", "requested": name or str(template_id), "candidates": hits}
 
 
 def _template_time(row, key):
@@ -1887,12 +2225,13 @@ def preload_extras(db, pks):
     return shared_preload_extras(db, pks)
 
 def _color_priority(pri_val):
-    """Color a priority marker based on level."""
+    """Color a priority marker based on level (range-aware for Exchange/CalDAV)."""
     p = PRI.get(pri_val or 0, "")
     if not p: return ""
-    if pri_val == 1: return C.red(p)
-    if pri_val == 5: return C.yellow(p)
-    if pri_val == 9: return C.green(p)
+    bucket = priority_bucket(pri_val)
+    if bucket == "high": return C.red(p)
+    if bucket == "medium": return C.yellow(p)
+    if bucket == "low": return C.green(p)
     return p
 
 
@@ -2155,6 +2494,63 @@ def reminders_to_dicts(items, db=None, memberships=None):
                     payload["assignment"] = assignment
     return payloads
 
+def _tag_account(payload, account, multi):
+    """Stamp account metadata onto *payload* when in multi-account mode."""
+    if multi:
+        payload["account"] = account.name
+        payload["accountType"] = account.type
+    return payload
+
+
+def gather_reminder_dicts(scope, query_fn, *,
+                          memberships_fn=None, section=None):
+    """Execute *query_fn(db)* against each account in *scope*, serialize
+    per-connection (preserving Z_PK-scoped joins), and return a merged list
+    of dicts, each tagged with 'account'/'accountType' when multi-account.
+
+    *query_fn* must be a callable that takes a single sqlite3.Connection and
+    returns a list of reminder rows from that store.
+
+    *memberships_fn(db, list_pk)* is optional — used by show/section commands.
+    """
+    multi = len(scope) > 1
+    results = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            rows = query_fn(db)
+            if not rows:
+                continue
+            pks = [r["Z_PK"] for r in rows]
+            sc, ht = preload_extras(db, pks)
+            memberships = memberships_fn(db) if memberships_fn else None
+            for r in rows:
+                s = section
+                if memberships is not None:
+                    s = memberships.get(r["Z_PK"])
+                payload = to_dict(r, db=db, section=s, _sc=sc, _ht=ht)
+                _tag_account(payload, acct, multi)
+                results.append(payload)
+    return results
+
+
+def gather_table_rows(scope, query_fn):
+    """Like gather_reminder_dicts but produces fmt_table-shaped rows, preserving
+    the rich id/title/due/repeat/pri formatting that reminders_to_table_data
+    builds. An 'account' column is added only when more than one account is
+    active, so single-account table output is byte-identical to the original.
+    """
+    multi = len(scope) > 1
+    rows = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = query_fn(db)
+            for row in reminders_to_table_data(items, db):
+                if multi:
+                    row["account"] = acct.name
+                rows.append(row)
+    return rows
+
+
 # ── Table Format ─────────────────────────────────────────────────────────────
 
 def _strip_ansi(s):
@@ -2184,6 +2580,8 @@ def fmt_table(rows_data, max_width=None):
             max_width = 80
 
     columns = [("id", "ID"), ("title", "Title"), ("list", "List"), ("due", "Due")]
+    if any(row.get("account") for row in rows_data):
+        columns.append(("account", "Account"))
     if any(row.get("repeat") for row in rows_data):
         columns.append(("repeat", "Repeat"))
     columns.append(("pri", "Pri"))
@@ -2312,9 +2710,9 @@ def bridge_call_result(data, timeout=30):
     }
 
 def bridge_call(data):
-    """Call remctl-bridge with JSON data. Returns parsed JSON response."""
+    """Call remctl-bridge with JSON data. Returns parsed JSON response (dict or list)."""
     result = bridge_call_result(data)
-    if result and result["returncode"] == 0 and isinstance(result["payload"], dict):
+    if result and result["returncode"] == 0 and result["payload"] is not None:
         return result["payload"]
     return None
 
@@ -3820,6 +4218,116 @@ def write_onboard_state(result, *, auto=False):
     }, indent=2) + "\n")
 
 
+def load_config():
+    """Return the user's remctl config dict, or {} on missing/invalid."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(data):
+    """Persist *data* to the remctl config file."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def resolve_account_scope(a):
+    """Return the list of Account objects to use for the current command.
+
+    Precedence (highest first):
+      1. --account NAME (repeatable flag; case-insensitive)
+      2. --all-accounts flag
+      3. REMCTL_ACCOUNT_SCOPE env var ("all" or an account name)
+      4. config.json accountScope key ("all" or an account name)
+      5. default: [discover_accounts()[0]]  (single-account, back-compat)
+    """
+    all_accounts = discover_accounts()
+    if not all_accounts:
+        return []
+
+    def _filter_by_name(names):
+        lower = [n.lower() for n in names]
+        matched = [a for a in all_accounts if a.name.lower() in lower]
+        missing = [n for n in names if not any(a.name.lower() == n.lower() for a in all_accounts)]
+        if missing:
+            print(f"Error: Unknown account(s): {', '.join(missing)}. "
+                  f"Available: {', '.join(a.name for a in all_accounts)}", file=sys.stderr)
+            sys.exit(1)
+        return matched
+
+    # 1. --account flag (string from acct(c) or list from account_scope(c))
+    account_flags = getattr(a, "account", None)
+    if account_flags:
+        if isinstance(account_flags, str):
+            account_flags = [account_flags]
+        return _filter_by_name(account_flags)
+
+    # 2. --all-accounts flag
+    if getattr(a, "all_accounts", False):
+        return all_accounts
+
+    # 3. Env override
+    env_scope = os.environ.get(ACCOUNT_SCOPE_ENV, "").strip()
+    if env_scope:
+        if env_scope.lower() == "all":
+            return all_accounts
+        return _filter_by_name([env_scope])
+
+    # 4. Config file
+    cfg_scope = load_config().get("accountScope", "")
+    if cfg_scope:
+        if cfg_scope.lower() == "all":
+            return all_accounts
+        return _filter_by_name([cfg_scope])
+
+    # 5. Default: single-account (back-compat)
+    return [all_accounts[0]]
+
+
+def _is_multi_account_mode(a):
+    """Return True when the caller explicitly requested multi-account output.
+
+    Single-account mode (the default) falls through to the existing open_db()
+    path so that mocking remains simple in tests.
+    """
+    if getattr(a, "all_accounts", False):
+        return True
+    if getattr(a, "account", None):
+        return True
+    if os.environ.get(ACCOUNT_SCOPE_ENV, "").strip():
+        return True
+    if load_config().get("accountScope", ""):
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def iter_account_dbs(scope):
+    """Context manager yielding (Account, sqlite3.Connection) for each active account.
+
+    Connections are read-only (mode=ro) and closed on exit, even if an
+    exception occurs.  When scope has one entry the single connection is
+    yielded exactly like open_db() does today.
+    """
+    conns = []
+    try:
+        for acct in scope:
+            conn = sqlite3.connect(f"file:{acct.store_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conns.append((acct, conn))
+        yield conns
+    finally:
+        for _, conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def open_reminders_app_for_onboarding():
     try:
         proc = subprocess.run(
@@ -4510,60 +5018,155 @@ def smart_list_to_dict(row):
         payload["filterError"] = decoded["error"]
     return payload
 
+def _render_smart_list_item(item):
+    kind = item["kind"]
+    smart_type = item["smartListType"] or "(none)"
+    length = item["filterLength"]
+    summary = item.get("filter", {})
+    desc = safe_display(summary.get("description") or "No filter data")
+    if summary and not summary.get("supported", True):
+        desc = f"{desc}: {safe_display(', '.join(summary.get('keys', [])) or 'unknown keys')}"
+    id_details = C.dim(f"(id: {item['id']}, {kind})")
+    pin_info = C.dim(" [pinned]") if item.get("pinned") else ""
+    print(f"  {safe_display(item['name'])} {id_details}{pin_info}")
+    print(f"    {smart_type} · filter bytes: {length} · {desc}")
+
+
 def cmd_smart_lists(a):
-    db = open_db()
-    rows = q_smart_lists(db)
-    payload = [smart_list_to_dict(row) for row in rows]
-    if a.json:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        payload = [smart_list_to_dict(row) for row in q_smart_lists(db)]
+        if a.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+        if not payload:
+            print("No smart lists")
+            return
+        print(C.bold("Smart Lists:"))
+        for item in payload:
+            _render_smart_list_item(item)
+        print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
         return
-    if not payload:
-        print("No smart lists")
-        return
-    print(C.bold("Smart Lists:"))
-    for item in payload:
-        kind = item["kind"]
-        smart_type = item["smartListType"] or "(none)"
-        length = item["filterLength"]
-        summary = item.get("filter", {})
-        desc = safe_display(summary.get("description") or "No filter data")
-        if summary and not summary.get("supported", True):
-            desc = f"{desc}: {safe_display(', '.join(summary.get('keys', [])) or 'unknown keys')}"
-        id_details = C.dim(f"(id: {item['id']}, {kind})")
-        pin_info = C.dim(" [pinned]") if item.get("pinned") else ""
-        print(f"  {safe_display(item['name'])} {id_details}{pin_info}")
-        print(f"    {smart_type} · filter bytes: {length} · {desc}")
-    print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
+
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
+    with iter_account_dbs(scope) as account_dbs:
+        if a.json:
+            out = []
+            for acct, db in account_dbs:
+                for row in q_smart_lists(db):
+                    d = smart_list_to_dict(row)
+                    if multi:
+                        d["account"] = acct.name
+                        d["accountType"] = acct.type
+                    out.append(d)
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return
+        total = 0
+        first = True
+        for acct, db in account_dbs:
+            payload = [smart_list_to_dict(row) for row in q_smart_lists(db)]
+            if not payload:
+                continue
+            if multi:
+                if not first:
+                    print()
+                print(C.bold(f"  {acct.name}"))
+            elif first:
+                print(C.bold("Smart Lists:"))
+            first = False
+            for item in payload:
+                _render_smart_list_item(item)
+            total += len(payload)
+        if total == 0:
+            print("No smart lists")
+            return
+        print(f"\n{total} smart list{'s' if total != 1 else ''}")
+
+
+def _render_template_item(item):
+    bits = [f"id: {item['id']}", f"{item['itemCount']} item{'s' if item['itemCount'] != 1 else ''}"]
+    if item.get("sectionCount"):
+        bits.append(f"{item['sectionCount']} section{'s' if item['sectionCount'] != 1 else ''}")
+    if item.get("publicLink"):
+        bits.append("shared")
+    print(f"  {safe_display(item['name'])} {C.dim('(' + ', '.join(bits) + ')')}")
 
 
 def cmd_templates(a):
-    db = open_db()
-    rows = q_templates(db)
-    payload = [template_to_dict(row) for row in rows]
-    if a.json:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        payload = [template_to_dict(row) for row in q_templates(db)]
+        if a.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+        if not payload:
+            print("No templates")
+            return
+        print(C.bold("Templates:"))
+        for item in payload:
+            _render_template_item(item)
+        print(f"\n{len(payload)} template{'s' if len(payload) != 1 else ''}")
         return
-    if not payload:
-        print("No templates")
-        return
-    print(C.bold("Templates:"))
-    for item in payload:
-        bits = [f"id: {item['id']}", f"{item['itemCount']} item{'s' if item['itemCount'] != 1 else ''}"]
-        if item.get("sectionCount"):
-            bits.append(f"{item['sectionCount']} section{'s' if item['sectionCount'] != 1 else ''}")
-        if item.get("publicLink"):
-            bits.append("shared")
-        print(f"  {safe_display(item['name'])} {C.dim('(' + ', '.join(bits) + ')')}")
-    print(f"\n{len(payload)} template{'s' if len(payload) != 1 else ''}")
+
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
+    with iter_account_dbs(scope) as account_dbs:
+        if a.json:
+            out = []
+            for acct, db in account_dbs:
+                for row in q_templates(db):
+                    d = template_to_dict(row)
+                    if multi:
+                        d["account"] = acct.name
+                        d["accountType"] = acct.type
+                    out.append(d)
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return
+        total = 0
+        first = True
+        for acct, db in account_dbs:
+            payload = [template_to_dict(row) for row in q_templates(db)]
+            if not payload:
+                continue
+            if multi:
+                if not first:
+                    print()
+                print(C.bold(f"  {acct.name}"))
+            elif first:
+                print(C.bold("Templates:"))
+            first = False
+            for item in payload:
+                _render_template_item(item)
+            total += len(payload)
+        if total == 0:
+            print("No templates")
+            return
+        print(f"\n{total} template{'s' if total != 1 else ''}")
 
 
 def cmd_template_info(a):
-    db = open_db()
-    ref = resolve_required_template_target_or_die(
-        db,
-        name=getattr(a, "name", None),
-        template_id=getattr(a, "template_id", None),
-    )
+    name = getattr(a, "name", None)
+    tid = getattr(a, "template_id", None)
+    account_name = getattr(a, "account", None)
+    if _is_multi_account_mode(a):
+        if name and tid is not None:
+            print("Error: pass either a template name or --template-id, not both.", file=sys.stderr)
+            sys.exit(1)
+        if not name and tid is None:
+            print("Error: pass a template name or --template-id.", file=sys.stderr)
+            sys.exit(1)
+        scope = resolve_account_scope(a)
+        with iter_account_dbs(scope) as account_dbs:
+            ref = resolve_template_ref_across(account_dbs, name=name, template_id=tid, account_name=account_name)
+        if not ref or ref.get("error") == "ambiguous":
+            _print_template_resolution_error(name if name else f"id {tid}", ref)
+            sys.exit(1)
+        db = sqlite3.connect(f"file:{Path(ref['_store_path'])}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+    else:
+        db = open_db()
+        ref = resolve_required_template_target_or_die(db, name=name, template_id=tid)
     row = q_template_matches(db, template_id=ref["id"])[0]
     payload = template_to_dict(row, db, include_items=True)
     if a.json:
@@ -5041,25 +5644,74 @@ def cmd_smart_list_delete(a):
         print(f"Deleted smart list: {safe_display(name)}")
 
 def cmd_lists(a):
-    db = open_db()
-    rows = q_lists(db)
-    if a.json:
-        print(json.dumps([list_to_dict(r) for r in rows], indent=2, ensure_ascii=False))
+    if not _is_multi_account_mode(a):
+        # Single-account fast path — back-compat with existing open_db() mocks
+        db = open_db()
+        rows = q_lists(db)
+        if a.json:
+            print(json.dumps([list_to_dict(r) for r in rows], indent=2, ensure_ascii=False))
+            return
+        if getattr(a, 'format', None) == 'table':
+            data = [{"id": r["Z_PK"], "title": format_list_title(r, color=False),
+                     "list": "", "due": "", "pri": ""} for r in rows]
+            print(fmt_table(data))
+            return
+        print(C.bold("Reminder Lists:"))
+        for r in rows:
+            secs = q_sections(db, r["Z_PK"])
+            list_name = format_list_title(r, db)
+            sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
+            pin_info = C.dim(" [pinned]") if _row_has_key(r, "ZISPINNEDBYCURRENTUSER") and r["ZISPINNEDBYCURRENTUSER"] else ""
+            id_dim = C.dim(f"(id: {r['Z_PK']})")
+            print(f"  {list_name} {id_dim}{sec_info}{pin_info}")
+        print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
         return
-    if getattr(a, 'format', None) == 'table':
-        data = [{"id": r["Z_PK"], "title": format_list_title(r, color=False),
-                 "list": "", "due": "", "pri": ""} for r in rows]
-        print(fmt_table(data))
-        return
-    print(C.bold("Reminder Lists:"))
-    for r in rows:
-        secs = q_sections(db, r["Z_PK"])
-        list_name = format_list_title(r, db)
-        sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
-        pin_info = C.dim(" [pinned]") if _row_has_key(r, "ZISPINNEDBYCURRENTUSER") and r["ZISPINNEDBYCURRENTUSER"] else ""
-        id_dim = C.dim(f"(id: {r['Z_PK']})")
-        print(f"  {list_name} {id_dim}{sec_info}{pin_info}")
-    print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
+
+    # Multi-account path
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
+    with iter_account_dbs(scope) as account_dbs:
+        if a.json:
+            all_dicts = []
+            for acct, db in account_dbs:
+                acct_arg = acct if multi else None
+                all_dicts.extend(list_to_dict(r, account=acct_arg) for r in q_lists(db))
+            print(json.dumps(all_dicts, indent=2, ensure_ascii=False))
+            return
+        if getattr(a, 'format', None) == 'table':
+            table_rows = []
+            for acct, db in account_dbs:
+                for r in q_lists(db):
+                    row = {"id": r["Z_PK"], "title": format_list_title(r, color=False),
+                           "list": "", "due": "", "pri": ""}
+                    if multi:
+                        row["account"] = acct.name
+                    table_rows.append(row)
+            print(fmt_table(table_rows))
+            return
+        total = 0
+        first = True
+        for acct, db in account_dbs:
+            rows = q_lists(db)
+            if not rows:
+                continue
+            if multi:
+                if not first:
+                    print()
+                print(C.bold(f"  {acct.name}"))
+                first = False
+            elif first:
+                print(C.bold("Reminder Lists:"))
+                first = False
+            for r in rows:
+                secs = q_sections(db, r["Z_PK"])
+                list_name = format_list_title(r, db)
+                sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
+                pin_info = C.dim(" [pinned]") if _row_has_key(r, "ZISPINNEDBYCURRENTUSER") and r["ZISPINNEDBYCURRENTUSER"] else ""
+                id_dim = C.dim(f"(id: {r['Z_PK']})")
+                print(f"  {list_name} {id_dim}{sec_info}{pin_info}")
+            total += len(rows)
+        print(f"\n{total} list{'s' if total != 1 else ''}")
 
 REMINDERS_UI_CORE_BUNDLE = Path("/System/Library/PrivateFrameworks/RemindersUICore.framework")
 
@@ -5401,12 +6053,31 @@ def cmd_list_symbols(a):
         print(f"  {row['preview']:<2}  {row['name']:<{width}}  {C.dim(row['asset'])}")
 
 def cmd_show(a):
-    db = open_db()
-    list_ref = resolve_required_list_target_or_die(
-        db,
-        name=getattr(a, "list", None),
-        list_id=getattr(a, "list_id", None),
-    )
+    account_name = getattr(a, "account", None)
+    if _is_multi_account_mode(a):
+        scope = resolve_account_scope(a)
+        with iter_account_dbs(scope) as account_dbs:
+            result = resolve_list_ref_across(
+                account_dbs,
+                name=getattr(a, "list", None),
+                list_id=getattr(a, "list_id", None),
+                account_name=account_name,
+            )
+        if not result or result.get("error") == "ambiguous":
+            _print_list_resolution_error(getattr(a, "list", None) or str(getattr(a, "list_id", "")), result)
+            sys.exit(1)
+        # Re-open only the target account's connection for the actual query
+        store_path = Path(result["_store_path"])
+        db = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        list_ref = result
+    else:
+        db = open_db()
+        list_ref = resolve_required_list_target_or_die(
+            db,
+            name=getattr(a, "list", None),
+            list_id=getattr(a, "list_id", None),
+        )
     pk = list_ref["id"]
     list_name = list_ref["title"]
     items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
@@ -5498,9 +6169,22 @@ def cmd_add(a):
     target_list_name = getattr(a, "list", None)
     list_resolution = None
     list_id = getattr(a, "list_id", None)
+    add_account_name = getattr(a, "account", None)
+    if isinstance(add_account_name, list):
+        add_account_name = add_account_name[0] if add_account_name else None
     if target_list_name or list_id is not None:
         try:
-            db = open_db()
+            if add_account_name:
+                matched = [ac for ac in discover_accounts()
+                           if ac.name.lower() == add_account_name.lower()]
+                if not matched:
+                    print(f"Error: account {add_account_name!r} not found. "
+                          f"Run 'remctl accounts' to see available accounts.", file=sys.stderr)
+                    sys.exit(1)
+                db = sqlite3.connect(f"file:{matched[0].store_path}?mode=ro", uri=True)
+                db.row_factory = sqlite3.Row
+            else:
+                db = open_db()
             list_resolution = resolve_list_or_die(db, name=target_list_name, list_id=list_id)
             target_list_pk = list_resolution["id"]
             target_list_name = list_resolution["title"]
@@ -5514,6 +6198,50 @@ def cmd_add(a):
             sys.exit(1)
         require_grocery_list_target(db, target_list_pk)
 
+    # Resolve calendarIdentifier for accurate multi-account write targeting.
+    # list_calendars returns [{title, calendarIdentifier, sourceTitle, sourceType}].
+    target_calendar_id = None
+    target_account = getattr(a, "account", None)
+    if isinstance(target_account, list):
+        target_account = target_account[0] if target_account else None
+    if (target_list_name or list_id is not None or target_account) and bridge_available():
+        try:
+            cals_result = bridge_call({"action": "list_calendars"})
+            cals = cals_result if isinstance(cals_result, list) else []
+            if target_list_name:
+                # Match by list name, optionally narrowed by account
+                matches = [c for c in cals if c.get("title") == target_list_name]
+                if target_account:
+                    acct_matches = [c for c in matches
+                                    if (c.get("sourceTitle") or "").lower() == target_account.lower()]
+                    if acct_matches:
+                        matches = acct_matches
+                if len(matches) == 1:
+                    target_calendar_id = matches[0].get("calendarIdentifier")
+                elif len(matches) > 1 and not target_account:
+                    sources = ", ".join(c.get("sourceTitle", "?") for c in matches)
+                    print(
+                        f"Error: List {target_list_name!r} exists in multiple accounts ({sources}). "
+                        "Use --account to specify which one.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                elif len(matches) > 1:
+                    target_calendar_id = matches[0].get("calendarIdentifier")
+            elif target_account:
+                # No list specified — pick the first calendar in the named account
+                acct_cals = [c for c in cals if (c.get("sourceTitle") or "").lower() == target_account.lower()]
+                if not acct_cals:
+                    print(
+                        f"Error: No lists found in account {target_account!r}. "
+                        "Run 'remctl accounts' to see available accounts.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                target_calendar_id = acct_cals[0].get("calendarIdentifier")
+        except Exception:
+            pass  # bridge list_calendars failed; fall back to title-only
+
     if a.tags and not wants_private:
         for t in a.tags.split(","):
             t = t.strip()
@@ -5523,7 +6251,12 @@ def cmd_add(a):
     # Try bridge first
     if bridge_available():
         data = {"action": "create", "title": title}
-        if target_list_name: data["list"] = target_list_name
+        if target_calendar_id:
+            data["calendarIdentifier"] = target_calendar_id
+        elif target_list_name:
+            data["list"] = target_list_name
+        if target_account:
+            data["account"] = target_account
         if a.notes: data["notes"] = a.notes
         if dt:
             data["due"] = dt.isoformat()
@@ -5552,8 +6285,29 @@ def cmd_add(a):
                 )
             try:
                 if db is None:
-                    db = open_db()
+                    if add_account_name:
+                        matched = [ac for ac in discover_accounts()
+                                   if ac.name.lower() == add_account_name.lower()]
+                        if matched:
+                            db = sqlite3.connect(f"file:{matched[0].store_path}?mode=ro", uri=True)
+                            db.row_factory = sqlite3.Row
+                        else:
+                            db = open_db()
+                    else:
+                        db = open_db()
                 created_row = q_reminder_by_identifier(db, result.get("id", ""))
+                # Exchange reminders have no ZCKIDENTIFIER — fall back to most-recent by title
+                if not created_row and title:
+                    try:
+                        created_row = db.execute(
+                            f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r "
+                            f"LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+                            f"WHERE r.ZTITLE = ? AND r.ZMARKEDFORDELETION = 0 AND r.ZACCOUNT IS NOT NULL "
+                            f"ORDER BY r.Z_PK DESC LIMIT 1",
+                            (title,)
+                        ).fetchone()
+                    except Exception:
+                        pass
             except RemindersDBUnavailable:
                 created_row = None
             if a.json:
@@ -5566,7 +6320,10 @@ def cmd_add(a):
                         "method": list_resolution["method"],
                     }
                 if created_row:
-                    payload["numericId"] = created_row["Z_PK"]
+                    try:
+                        payload["numericId"] = created_row["Z_PK"]
+                    except (TypeError, KeyError, IndexError):
+                        pass
                 if private_results:
                     payload["private"] = private_results
                 print(json.dumps(payload))
@@ -5575,7 +6332,10 @@ def cmd_add(a):
                 if list_resolution and list_resolution.get("method") != "exact":
                     print(f"List: {safe_display(list_resolution['title'])} (resolved from {safe_display(list_resolution['requested'])})")
                 if created_row:
-                    print(f"ID: #{created_row['Z_PK']}")
+                    try:
+                        print(f"ID: #{created_row['Z_PK']}")
+                    except (TypeError, KeyError, IndexError):
+                        pass
                 if private_results:
                     print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
             return
@@ -5646,17 +6406,141 @@ def _refuse_unsafe_title_fallback(reminder, operation, reason):
     )
     sys.exit(1)
 
-def cmd_done(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
+def _ek_identifier(r, account_name=None):
+    """Return the EventKit calendarItemIdentifier for a reminder row.
+
+    For iCloud reminders this is r["ZCKIDENTIFIER"].  For Exchange and other
+    non-CloudKit accounts that don't populate ZCKIDENTIFIER, the bridge is
+    queried via find_reminder using the list name and reminder title.
+    Returns None when no stable identifier can be resolved.
+    """
+    ck_id = r["ZCKIDENTIFIER"] if _item_has(r, "ZCKIDENTIFIER") else None
+    if ck_id:
+        return ck_id
+    if not bridge_available():
+        return None
+    list_name = r["list_name"] if _item_has(r, "list_name") else None
+    title = r["ZTITLE"] if _item_has(r, "ZTITLE") else None
+    if not list_name or not title:
+        return None
+    try:
+        cals = bridge_call({"action": "list_calendars"})
+        if not isinstance(cals, list):
+            return None
+        matches = [c for c in cals if c.get("title") == list_name]
+        if account_name:
+            acct_matches = [c for c in matches
+                            if (c.get("sourceTitle") or "").lower() == account_name.lower()]
+            if not acct_matches:
+                # An account was specified but no calendar of this name lives in it —
+                # refuse rather than target a same-named list in a different account.
+                return None
+            matches = acct_matches
+        if len(matches) != 1:
+            # Ambiguous (same list name in multiple accounts, no account hint) —
+            # do not guess which calendar to target.
+            return None
+        cal_id = matches[0].get("calendarIdentifier")
+        result = bridge_call({"action": "find_reminder", "calendarIdentifier": cal_id, "title": title})
+        if isinstance(result, dict):
+            return result.get("calendarItemIdentifier")
+    except Exception:
+        pass
+    return None
+
+
+def _open_db_for_account(account_name):
+    """Return an open read-only connection to the named account's store.
+
+    Falls back to open_db() when account_name is None or empty.
+    Exits with an error if the named account is not found.
+    """
+    if not account_name:
+        return open_db()
+    matched = [ac for ac in discover_accounts()
+               if ac.name.lower() == account_name.lower()]
+    if not matched:
+        print(f"Error: account {account_name!r} not found. "
+              f"Run 'remctl accounts' to see available accounts.", file=sys.stderr)
         sys.exit(1)
+    conn = sqlite3.connect(f"file:{matched[0].store_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _resolve_reminder_for_write(a):
+    """Open the right account's store and look up the reminder for a write command.
+
+    Resolution order:
+      1. --account NAME given → look only in that account.
+      2. Single-account default scope → open_db() (back-compat).
+      3. Multi-account scope (config/env 'all' or a named scope) → scan every
+         active account; a unique match wins, multiple matches raise an
+         ambiguity error asking for --account. The resolved account name is
+         stamped onto `a.account` so the downstream write path targets it.
+
+    Returns (db, row). Exits with an error if the reminder is not found.
+    The caller is responsible for closing db when done.
+    """
+    account_name = getattr(a, "account", None)
+    if account_name:
+        db = _open_db_for_account(account_name)
+        r = q_reminder(db, a.id)
+        if not r:
+            print(f"Error: #{a.id} not found in account {account_name!r}", file=sys.stderr)
+            sys.exit(1)
+        return db, r
+
+    # Pure default scope: preserve exact single-account behavior (open_db()).
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        r = q_reminder(db, a.id)
+        if not r:
+            print(f"Error: #{a.id} not found", file=sys.stderr)
+            sys.exit(1)
+        return db, r
+
+    # Multi-account scope: scan all active accounts for the id.
+    scope = resolve_account_scope(a)
+    hits = []  # (Account, conn, row)
+    conns = []
+    for acct in scope:
+        conn = sqlite3.connect(f"file:{acct.store_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conns.append(conn)
+        row = q_reminder(conn, a.id)
+        if row:
+            hits.append((acct, conn, row))
+    if not hits:
+        for c in conns:
+            c.close()
+        print(f"Error: #{a.id} not found in any active account", file=sys.stderr)
+        sys.exit(1)
+    if len(hits) > 1:
+        names = ", ".join(h[0].name for h in hits)
+        for c in conns:
+            c.close()
+        print(f"Error: reminder id {a.id} exists in multiple accounts ({names}). "
+              "Use --account to specify which one.", file=sys.stderr)
+        sys.exit(1)
+    acct, db, row = hits[0]
+    # Close the non-winning connections; keep the winner open for the caller.
+    for c in conns:
+        if c is not db:
+            c.close()
+    # Record the resolved account so the write path (bridge/_ek_identifier) targets it.
+    a.account = acct.name
+    return db, row
+
+
+def cmd_done(a):
+    db, r = _resolve_reminder_for_write(a)
+    ek_id = _ek_identifier(r, getattr(a, "account", None))
 
     # Bridge-first for speed (post-2026-04-17 bridge fix: dueDateComponents
     # now reach CloudKit correctly). AppleScript stays as a fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
+    if bridge_available() and ek_id:
+        data = {"action": "complete", "id": ek_id}
         result = bridge_call(data)
         if result and result.get("status") == "completed":
             if a.json:
@@ -5682,15 +6566,12 @@ def cmd_done(a):
     )
 
 def cmd_undone(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, r = _resolve_reminder_for_write(a)
+    ek_id = _ek_identifier(r, getattr(a, "account", None))
 
     # Bridge-first for speed; AppleScript fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "uncomplete", "id": r["ZCKIDENTIFIER"]}
+    if bridge_available() and ek_id:
+        data = {"action": "uncomplete", "id": ek_id}
         result = bridge_call(data)
         if result and result.get("status") == "uncompleted":
             if a.json:
@@ -5715,11 +6596,8 @@ def cmd_undone(a):
     )
 
 def cmd_delete(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, r = _resolve_reminder_for_write(a)
+    ek_id = _ek_identifier(r, getattr(a, "account", None))
     if not a.force:
         ans = input(f"Delete '{safe_display(r['ZTITLE'])}' from {safe_display(r['list_name'])}? [y/N] ")
         if not ans.lower().startswith("y"):
@@ -5727,8 +6605,8 @@ def cmd_delete(a):
             return
 
     # Bridge-first for speed; AppleScript fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "delete", "id": r["ZCKIDENTIFIER"]}
+    if bridge_available() and ek_id:
+        data = {"action": "delete", "id": ek_id}
         result = bridge_call(data)
         if result and result.get("status") == "deleted":
             if a.json:
@@ -5757,11 +6635,8 @@ def cmd_edit(a):
     if getattr(a, "tags", None) and not private_metadata_enabled(a):
         print("Error: editing synced tags requires --private.", file=sys.stderr)
         sys.exit(1)
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, r = _resolve_reminder_for_write(a)
+    ek_id = _ek_identifier(r, getattr(a, "account", None))
     target_list_ref = None
     target_list_name = getattr(a, "list", None)
     target_list_id = getattr(a, "list_id", None)
@@ -5846,14 +6721,14 @@ def cmd_edit(a):
     # Double-tap defense: if the displayed date already equals the new target,
     # fire an intermediate update first so the CKRecord is forced to carry a
     # real dueDateComponents change.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
+    if bridge_available() and ek_id:
         if dt_nudge is not None:
             bridge_call({
                 "action": "update",
-                "id": r["ZCKIDENTIFIER"],
+                "id": ek_id,
                 "due": dt_nudge.isoformat(),
             })
-        data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
+        data = {"action": "update", "id": ek_id}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
         if target_list_ref:
@@ -5887,7 +6762,7 @@ def cmd_edit(a):
             result = bridge_call(data)
             if result and result.get("status") == "updated":
                 private_results = apply_private_changes(
-                    r["ZCKIDENTIFIER"],
+                    ek_id,
                     a,
                     db=db,
                     list_pk=target_list_pk,
@@ -5915,7 +6790,7 @@ def cmd_edit(a):
                 return
         elif wants_private:
             private_results = apply_private_changes(
-                r["ZCKIDENTIFIER"],
+                ek_id,
                 a,
                 db=db,
                 list_pk=target_list_pk,
@@ -5942,7 +6817,7 @@ def cmd_edit(a):
         or (hasattr(a, 'url') and a.url and not wants_private)
     )
 
-    if r["ZCKIDENTIFIER"] and has_applescript_fields and not has_bridge_only:
+    if ek_id and has_applescript_fields and not has_bridge_only:
         parts = []
         if a.title:
             parts.append(f'set name of r to "{esc(a.title)}"')
@@ -5970,7 +6845,7 @@ def cmd_edit(a):
     if not has_applescript_fields and not has_bridge_only:
         print("Nothing to update.")
         return
-    if not r["ZCKIDENTIFIER"]:
+    if not ek_id:
         _refuse_unsafe_title_fallback(r, "edit it", "The reminder has no stable identifier")
     _refuse_unsafe_title_fallback(
         r,
@@ -5980,93 +6855,265 @@ def cmd_edit(a):
 
 
 def cmd_search(a):
-    db = open_db()
-    items = q_search(db, a.query, completed=a.completed)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_search(db, a.query, completed=a.completed)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print(f"No reminders matching '{safe_display(a.query)}'")
+            return
+        print(f"Search: {C.bold(safe_display(a.query))}")
+        for i in items:
+            print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht))
+        print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, lambda db: q_search(db, a.query, completed=a.completed))
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print(fmt_table(gather_table_rows(scope, lambda db: q_search(db, a.query, completed=a.completed))))
         return
-    if not items:
+    # Single-account search has no indent (matches original); only indent under
+    # account group headers when actually showing more than one account.
+    item_indent = "  " if multi else ""
+    groups = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_search(db, a.query, completed=a.completed)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            lines = [fmt(i, db, verbose=a.verbose, indent=item_indent, _sc=sc, _ht=ht) for i in items]
+            if lines:
+                groups.append((acct.name if multi else None, lines))
+    total = sum(len(g[1]) for g in groups)
+    if not total:
         print(f"No reminders matching '{safe_display(a.query)}'")
         return
     print(f"Search: {C.bold(safe_display(a.query))}")
-    for i in items:
-        print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht))
-    print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
+    for acct_name, lines in groups:
+        if acct_name:
+            print(f"\n  {C.bold(acct_name)}")
+        for line in lines:
+            print(line)
+    print(f"\n{total} result{'s' if total != 1 else ''}")
 
 def cmd_today(a):
-    db = open_db()
-    items = q_due_today(db, include_overdue=not a.no_overdue)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_due_today(db, include_overdue=not a.no_overdue)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
+            return
+        sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        overdue = [i for i in items if ts(row_effective_due(i)) < sod]
+        overdue_pks = {i["Z_PK"] for i in overdue}
+        due = [i for i in items if i["Z_PK"] not in overdue_pks]
+        if overdue:
+            print(C.red(f"Overdue ({len(overdue)}):"))
+            for i in overdue:
+                print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
+            print()
+        if due:
+            print(C.bold(f"Due Today ({len(due)}):"))
+            for i in due:
+                print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
+        print(f"\n{len(items)} total")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, lambda db: q_due_today(db, include_overdue=not a.no_overdue))
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
-        return
-    if not items:
-        print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
+        print(fmt_table(gather_table_rows(scope, lambda db: q_due_today(db, include_overdue=not a.no_overdue))))
         return
     sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    overdue = [i for i in items if ts(row_effective_due(i)) < sod]
-    overdue_pks = {i["Z_PK"] for i in overdue}
-    due = [i for i in items if i["Z_PK"] not in overdue_pks]
-    if overdue:
-        print(C.red(f"Overdue ({len(overdue)}):"))
-        for i in overdue:
-            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
+    # Each entry: (acct_name_or_None, overdue_lines, due_lines)
+    groups = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_due_today(db, include_overdue=not a.no_overdue)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            ov, due = [], []
+            for i in items:
+                line = fmt(i, db, indent="  ", _sc=sc, _ht=ht)
+                (ov if ts(row_effective_due(i)) < sod else due).append(line)
+            if ov or due:
+                groups.append((acct.name if multi else None, ov, due))
+    total = sum(len(g[1]) + len(g[2]) for g in groups)
+    if not total:
+        print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
+        return
+    total_overdue = sum(len(g[1]) for g in groups)
+    total_due = sum(len(g[2]) for g in groups)
+    if total_overdue:
+        print(C.red(f"Overdue ({total_overdue}):"))
+        for acct_name, ov, _ in groups:
+            if acct_name and ov:
+                print(f"\n  {C.bold(acct_name)}")
+            for line in ov:
+                print(line)
         print()
-    if due:
-        print(C.bold(f"Due Today ({len(due)}):"))
-        for i in due:
-            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
-    print(f"\n{len(items)} total")
+    if total_due:
+        print(C.bold(f"Due Today ({total_due}):"))
+        for acct_name, _, due in groups:
+            if acct_name and due:
+                print(f"\n  {C.bold(acct_name)}")
+            for line in due:
+                print(line)
+    print(f"\n{total} total")
 
 def cmd_flagged(a):
-    db = open_db()
-    items = q_flagged(db)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_flagged(db)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print("No flagged reminders")
+            return
+        print(C.bold("Flagged:"))
+        for i in items:
+            print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+        print(f"\n{len(items)} flagged")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, q_flagged)
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print(fmt_table(gather_table_rows(scope, q_flagged)))
         return
-    if not items:
+    groups = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_flagged(db)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            lines = [fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht) for i in items]
+            if lines:
+                groups.append((acct.name if multi else None, lines))
+    total = sum(len(g[1]) for g in groups)
+    if not total:
         print("No flagged reminders")
         return
     print(C.bold("Flagged:"))
-    for i in items:
-        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
-    print(f"\n{len(items)} flagged")
+    for acct_name, lines in groups:
+        if acct_name:
+            print(f"\n  {C.bold(acct_name)}")
+        for line in lines:
+            print(line)
+    print(f"\n{total} flagged")
 
 def cmd_urgent(a):
-    db = open_db()
-    items = q_urgent(db)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_urgent(db)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print("No urgent reminders")
+            return
+        print(C.bold("Urgent:"))
+        for i in items:
+            print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+        print(f"\n{len(items)} urgent")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, q_urgent)
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print(fmt_table(gather_table_rows(scope, q_urgent)))
         return
-    if not items:
+    groups = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_urgent(db)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            lines = [fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht) for i in items]
+            if lines:
+                groups.append((acct.name if multi else None, lines))
+    total = sum(len(g[1]) for g in groups)
+    if not total:
         print("No urgent reminders")
         return
     print(C.bold("Urgent:"))
-    for i in items:
-        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
-    print(f"\n{len(items)} urgent")
+    for acct_name, lines in groups:
+        if acct_name:
+            print(f"\n  {C.bold(acct_name)}")
+        for line in lines:
+            print(line)
+    print(f"\n{total} urgent")
 
 def cmd_tags(a):
-    db = open_db()
+    if _is_multi_account_mode(a):
+        scope = resolve_account_scope(a)
+        seen = set()
+        all_tags = []
+        with iter_account_dbs(scope) as account_dbs:
+            for acct, db in account_dbs:
+                try:
+                    rows = db.execute(
+                        "SELECT ZNAME FROM ZREMCDHASHTAGLABEL WHERE ZNAME IS NOT NULL ORDER BY ZNAME"
+                    ).fetchall()
+                    for r in rows:
+                        name = r["ZNAME"]
+                        if name not in seen:
+                            seen.add(name)
+                            all_tags.append(name)
+                except Exception:
+                    pass
+        all_tags.sort()
+        if a.json:
+            print(json.dumps([{"name": t} for t in all_tags], indent=2))
+            return
+        if not all_tags:
+            print("No tags found")
+            return
+        print(C.bold("Tags:"))
+        for t in all_tags:
+            print(f"  {C.magenta('#' + safe_display(t))}")
+        print(f"\n{len(all_tags)} tag{'s' if len(all_tags) != 1 else ''}")
+        return
+    db = _open_db_for_account(getattr(a, "account", None))
     rows = db.execute(
         "SELECT ZNAME FROM ZREMCDHASHTAGLABEL WHERE ZNAME IS NOT NULL ORDER BY ZNAME"
     ).fetchall()
@@ -6082,11 +7129,7 @@ def cmd_tags(a):
     print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
 
 def cmd_subtasks(a):
-    db = open_db()
-    parent = q_reminder(db, a.id)
-    if not parent:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, parent = _resolve_reminder_for_write(a)
     subs = q_reminders(db, parent_pk=a.id, completed=True)
     sub_pks = [s["Z_PK"] for s in subs]
     sc, ht = preload_extras(db, sub_pks)
@@ -6104,11 +7147,7 @@ def cmd_subtasks(a):
         print(f"\n{len(subs)} subtask{'s' if len(subs) != 1 else ''}")
 
 def cmd_info(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, r = _resolve_reminder_for_write(a)
     subs = q_reminders(db, parent_pk=a.id, completed=True)
     atts = q_attachments(db, a.id)
     alarms = q_alarms(db, a.id)
@@ -6135,9 +7174,10 @@ def cmd_info(a):
     print(f"  Status:    {status_str}")
     pri_val = r["ZPRIORITY"] or 0
     pri_display = PRI_NAME.get(pri_val, "none")
-    if pri_val == 1: pri_display = C.red(pri_display)
-    elif pri_val == 5: pri_display = C.yellow(pri_display)
-    elif pri_val == 9: pri_display = C.green(pri_display)
+    pri_bucket = priority_bucket(pri_val)
+    if pri_bucket == "high": pri_display = C.red(pri_display)
+    elif pri_bucket == "medium": pri_display = C.yellow(pri_display)
+    elif pri_bucket == "low": pri_display = C.green(pri_display)
     print(f"  Priority:  {pri_display}")
     flagged_str = C.yellow("Yes") if r["ZFLAGGED"] else "No"
     print(f"  Flagged:   {flagged_str}")
@@ -6199,7 +7239,38 @@ def cmd_info(a):
         print(f"  Deep link: {C.dim(link)}")
 
 def cmd_sections(a):
-    db = open_db()
+    scope = resolve_account_scope(a) if _is_multi_account_mode(a) else None
+    if scope:
+        multi = len(scope) > 1
+        all_rows = []
+        with iter_account_dbs(scope) as account_dbs:
+            for acct, db in account_dbs:
+                rows = q_sections(db)
+                for r in rows:
+                    all_rows.append((acct.name, r, db))
+        if a.json:
+            out = {}
+            for acct_name, r, _ in all_rows:
+                key = f"{acct_name}/{r['list_name'] or '?'}" if multi else (r["list_name"] or "?")
+                out.setdefault(key, []).append(r["ZDISPLAYNAME"])
+            print(json.dumps(out, indent=2))
+            return
+        if not all_rows:
+            print("No sections found")
+            return
+        cur = None
+        for acct_name, r, db in all_rows:
+            ln = r["list_name"] or "?"
+            label = f"{acct_name}/{ln}" if multi else ln
+            if label != cur:
+                if cur: print()
+                acct_suffix = f" {C.dim(f'({acct_name})')}" if multi else ""
+                print(f"{C.bold(color_list_name(ln, db))}{acct_suffix}:")
+                cur = label
+            print(f"  - {safe_display(r['ZDISPLAYNAME'])}")
+        print(f"\n{len(all_rows)} section{'s' if len(all_rows) != 1 else ''}")
+        return
+    db = _open_db_for_account(getattr(a, "account", None))
     rows = q_sections(db)
     if a.json:
         out = {}
@@ -6222,14 +7293,43 @@ def cmd_sections(a):
 
 
 def cmd_sharees(a):
-    db = open_db()
-    list_ref = resolve_required_list_target_or_die(
-        db,
-        name=getattr(a, "list", None),
-        list_id=getattr(a, "list_id", None),
-    )
-    current_user_ckid = q_list_shared_owner_ckid(db, list_ref["id"])
-    rows = q_sharees(db, list_ref["id"])
+    account_name = getattr(a, "account", None)
+    if _is_multi_account_mode(a):
+        scope = resolve_account_scope(a)
+        with iter_account_dbs(scope) as account_dbs:
+            list_ref = resolve_list_ref_across(
+                account_dbs,
+                name=getattr(a, "list", None),
+                list_id=getattr(a, "list_id", None),
+                account_name=account_name,
+            )
+            if not list_ref or list_ref.get("error") == "ambiguous":
+                _print_list_resolution_error(getattr(a, "list", None) or str(getattr(a, "list_id", "")), list_ref)
+                sys.exit(1)
+            # Read sharees using the connection already open for the matching
+            # store, so we never reconnect after iter_account_dbs() closes them.
+            db = next(
+                (d for acct, d in account_dbs if str(acct.store_path) == list_ref["_store_path"]),
+                None,
+            )
+            current_user_ckid = q_list_shared_owner_ckid(db, list_ref["id"])
+            rows = q_sharees(db, list_ref["id"])
+        # Strip internal/multi-only fields so single-account output stays
+        # byte-identical to the original; keep account labels only when the
+        # active scope actually spans more than one account.
+        list_ref.pop("_store_path", None)
+        if len(scope) <= 1:
+            list_ref.pop("account", None)
+            list_ref.pop("accountType", None)
+    else:
+        db = open_db()
+        list_ref = resolve_required_list_target_or_die(
+            db,
+            name=getattr(a, "list", None),
+            list_id=getattr(a, "list_id", None),
+        )
+        current_user_ckid = q_list_shared_owner_ckid(db, list_ref["id"])
+        rows = q_sharees(db, list_ref["id"])
     payload = {
         "list": list_ref,
         "currentUserSharee": current_user_ckid,
@@ -6249,9 +7349,8 @@ def cmd_sharees(a):
     print(f"\n{len(rows)} sharee{'s' if len(rows) != 1 else ''}")
 
 
-def cmd_stats(a):
-    db = open_db()
-    due_column = due_expr()
+def _gather_stats(db):
+    """Return a stats dict for a single database connection."""
     total = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZACCOUNT IS NOT NULL").fetchone()[0]
     active = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZACCOUNT IS NOT NULL").fetchone()[0]
     flagged = db.execute("SELECT COUNT(*) FROM ZREMCDREMINDER WHERE ZMARKEDFORDELETION = 0 AND ZCOMPLETED = 0 AND ZFLAGGED = 1 AND ZACCOUNT IS NOT NULL").fetchone()[0]
@@ -6259,68 +7358,145 @@ def cmd_stats(a):
         f"SELECT COUNT(*) FROM ZREMCDREMINDER r WHERE r.ZMARKEDFORDELETION = 0 "
         f"AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL AND {urgent_where_clause(db)}"
     ).fetchone()[0]
+    # Overdue uses the same canonical definition as q_overdue() and the `today`
+    # view: all-day-aware due date earlier than the start of today. This keeps
+    # the "Overdue" count identical to what `remctl overdue` actually lists.
+    due_column = due_filter_expr(db)
+    sod_ts = to_ts(start_of_day())
     overdue = db.execute(
-        f"SELECT COUNT(*) FROM ZREMCDREMINDER r WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
-        f"AND {due_column} IS NOT NULL AND {due_column} < {to_ts(datetime.now())}"
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE r.ZMARKEDFORDELETION = 0 AND r.ZCOMPLETED = 0 AND r.ZACCOUNT IS NOT NULL "
+        f"AND l.Z_PK IS NOT NULL AND {due_column} IS NOT NULL AND {due_column} < {sod_ts}"
     ).fetchone()[0]
-    lists_count = len(q_lists(db))
-    sections_count = len(q_sections(db))
-    if a.json:
-        print(json.dumps({
-            "total": total, "active": active, "completed": total - active,
-            "overdue": overdue, "flagged": flagged, "urgent": urgent,
-            "lists": lists_count, "sections": sections_count
-        }, indent=2))
+    return {
+        "total": total, "active": active, "completed": total - active,
+        "overdue": overdue, "flagged": flagged, "urgent": urgent,
+        "lists": len(q_lists(db)), "sections": len(q_sections(db)),
+    }
+
+
+def _print_stats(stats, heading="Reminders Stats"):
+    print(C.bold(heading))
+    print(f"  Total:      {stats['total']}")
+    print(f"  Active:     {C.green(str(stats['active']))}")
+    print(f"  Completed:  {C.dim(str(stats['completed']))}")
+    print(f"  Overdue:    {C.red(str(stats['overdue'])) if stats['overdue'] else '0'}")
+    print(f"  Flagged:    {C.yellow(str(stats['flagged'])) if stats['flagged'] else '0'}")
+    print(f"  Urgent:     {C.red(str(stats['urgent'])) if stats['urgent'] else '0'}")
+    print(f"  Lists:      {stats['lists']}")
+    print(f"  Sections:   {stats['sections']}")
+
+
+def cmd_stats(a):
+    scope = resolve_account_scope(a) if _is_multi_account_mode(a) else None
+    if scope and len(scope) > 1:
+        # Multi-account: per-account breakdown + combined total
+        per_account = {}
+        totals = {"total": 0, "active": 0, "completed": 0, "overdue": 0,
+                  "flagged": 0, "urgent": 0, "lists": 0, "sections": 0}
+        with iter_account_dbs(scope) as account_dbs:
+            for acct, db in account_dbs:
+                s = _gather_stats(db)
+                per_account[acct.name] = s
+                for k in totals:
+                    totals[k] += s[k]
+        if a.json:
+            print(json.dumps({"total": totals, "accounts": per_account}, indent=2))
+            return
+        for acct_name, s in per_account.items():
+            _print_stats(s, heading=f"Stats: {acct_name}")
+            print()
+        _print_stats(totals, heading="Stats: All Accounts")
         return
-    print(C.bold("Reminders Stats"))
-    print(f"  Total:      {total}")
-    print(f"  Active:     {C.green(str(active))}")
-    print(f"  Completed:  {C.dim(str(total - active))}")
-    print(f"  Overdue:    {C.red(str(overdue)) if overdue else '0'}")
-    print(f"  Flagged:    {C.yellow(str(flagged)) if flagged else '0'}")
-    print(f"  Urgent:     {C.red(str(urgent)) if urgent else '0'}")
-    print(f"  Lists:      {lists_count}")
-    print(f"  Sections:   {sections_count}")
+    # Single account (default, or a single named/scoped account): original flat format
+    if scope:
+        with iter_account_dbs(scope) as account_dbs:
+            stats = _gather_stats(account_dbs[0][1])
+    else:
+        stats = _gather_stats(open_db())
+    if a.json:
+        print(json.dumps(stats, indent=2))
+        return
+    _print_stats(stats)
+
+def _emit_links(results, a):
+    """Render link results. Each result carries a pre-rendered 'id_text' so the
+    source db connection can be closed before printing (needed for multi-account)."""
+    if a.json:
+        print(json.dumps([{"id": r["id"], "title": r["title"], "link": r["link"]} for r in results], indent=2))
+    else:
+        for r in results:
+            print(f"{r['id_text']} {safe_display(r['title'])}")
+            print(f"  {C.dim(r['link'])}")
+
 
 def cmd_link(a):
-    db = open_db()
+    account_name = getattr(a, "account", None)
     ids = a.ids
     list_name = getattr(a, "list", None)
     list_id = getattr(a, "list_id", None)
     if ids and (list_name or list_id is not None):
         print("Error: pass reminder IDs or a list target, not both.", file=sys.stderr)
         sys.exit(1)
+
+    results = []
+    def add_result(rid, r, db):
+        if r["ZCKIDENTIFIER"]:
+            results.append({
+                "id": rid, "title": r["ZTITLE"],
+                "link": f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}",
+                "id_text": reminder_id_text(rid, r["list_name"], db),
+            })
+
+    if _is_multi_account_mode(a):
+        scope = resolve_account_scope(a)
+        with iter_account_dbs(scope) as account_dbs:
+            if list_name or list_id is not None:
+                ref = resolve_list_ref_across(account_dbs, name=list_name, list_id=list_id, account_name=account_name)
+                if not ref or ref.get("error") == "ambiguous":
+                    _print_list_resolution_error(list_name or str(list_id), ref)
+                    sys.exit(1)
+                tdb = next((db for acct, db in account_dbs if str(acct.store_path) == ref["_store_path"]), None)
+                for i in q_reminders(tdb, list_pk=ref["id"], completed=a.completed, top_level=True):
+                    add_result(i["Z_PK"], i, tdb)
+            else:
+                if not ids:
+                    print("No reminders specified.", file=sys.stderr)
+                    sys.exit(1)
+                for rid in ids:
+                    hit = None
+                    for acct, db in account_dbs:
+                        r = q_reminder(db, rid)
+                        if r:
+                            hit = (db, r)
+                            break
+                    if hit is None:
+                        print(f"Warning: #{rid} not found", file=sys.stderr)
+                        continue
+                    add_result(rid, hit[1], hit[0])
+            _emit_links(results, a)
+        return
+
+    # Default single-account
+    db = open_db()
     if list_name or list_id is not None:
         list_ref = resolve_required_list_target_or_die(db, name=list_name, list_id=list_id)
-        pk = list_ref["id"]
-        items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
+        items = q_reminders(db, list_pk=list_ref["id"], completed=a.completed, top_level=True)
         ids = [i["Z_PK"] for i in items]
     if not ids:
         print("No reminders specified.", file=sys.stderr)
         sys.exit(1)
-    results = []
     for rid in ids:
         r = q_reminder(db, rid)
         if not r:
             print(f"Warning: #{rid} not found", file=sys.stderr)
             continue
-        if r["ZCKIDENTIFIER"]:
-            link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
-            results.append({"id": rid, "title": r["ZTITLE"], "link": link, "_list_name": r["list_name"]})
-    if a.json:
-        print(json.dumps([{k: v for k, v in item.items() if not k.startswith("_")} for item in results], indent=2))
-    else:
-        for item in results:
-            print(f"{reminder_id_text(item['id'], item.get('_list_name'), db)} {safe_display(item['title'])}")
-            print(f"  {C.dim(item['link'])}")
+        add_result(rid, r, db)
+    _emit_links(results, a)
 
 def cmd_open(a):
     if hasattr(a, 'id') and a.id:
-        db = open_db()
-        r = q_reminder(db, a.id)
-        if not r:
-            print(f"Error: #{a.id} not found", file=sys.stderr)
-            sys.exit(1)
+        db, r = _resolve_reminder_for_write(a)
         if r["ZCKIDENTIFIER"]:
             link = f"x-apple-reminderkit://REMCDReminder/{r['ZCKIDENTIFIER']}"
             subprocess.run(["open", link])
@@ -6334,75 +7510,60 @@ def cmd_open(a):
 
 # ── New Commands ─────────────────────────────────────────────────────────────
 
-def cmd_flag(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+def _refuse_flag_unsupported(a, r, verb):
+    """Exit with an honest error when flag state can't be set for this account.
 
-    # AppleScript-first for flag/unflag: EventKit has no public "flagged"
-    # property, so the bridge approximates it with priority=1, which loses
-    # the real priority value. AppleScript `set flagged of r` touches the
-    # actual ZFLAGGED column — the only correct path.
+    The real flag lives in ZFLAGGED, which only AppleScript can write — and that
+    requires the iCloud x-apple-reminder:// identifier. Exchange and other CalDAV
+    accounts have no such identifier and no flag attribute, so flagging is not
+    supported there; the EventKit priority proxy would be misleading.
+    """
+    account_name = getattr(a, "account", None)
+    acct = f" in account {account_name!r}" if account_name else ""
+    title = r["ZTITLE"] if _item_has(r, "ZTITLE") else "?"
+    hint_account = f" --account {account_name}" if account_name else ""
+    print(
+        f"Error: cannot {verb} #{a.id} ({safe_display(title)}){acct}. "
+        "Reminder flags are stored only for iCloud and on-device lists; "
+        "Exchange/CalDAV accounts have no flag attribute. "
+        f"Use priority instead, e.g. `remctl edit {a.id}{hint_account} -p high`.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def cmd_flag(a):
+    db, r = _resolve_reminder_for_write(a)
+
+    # Only AppleScript can set the real ZFLAGGED flag, and it needs the iCloud
+    # x-apple-reminder:// id. Reminders with no such id (Exchange/CalDAV) cannot
+    # be flagged — the EventKit "priority=1" proxy is not a real flag, so we
+    # refuse honestly rather than report a misleading success.
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to true"):
+    if not rid:
+        _refuse_flag_unsupported(a, r, "flag")
+    if osa_by_id_try(r["list_name"], rid, "set flagged of r to true"):
         if a.json:
             print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
             print(f"Flagged: {safe_display(r['ZTITLE'])}")
         return
+    _refuse_unsafe_title_fallback(r, "flag it", "Identifier-based writes failed")
 
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "flag", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "flagged":
-            if a.json:
-                print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Flagged: {safe_display(r['ZTITLE'])}")
-            return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "flag it",
-        "Identifier-based writes failed",
-    )
 
 def cmd_unflag(a):
-    db = open_db()
-    r = q_reminder(db, a.id)
-    if not r:
-        print(f"Error: #{a.id} not found", file=sys.stderr)
-        sys.exit(1)
+    db, r = _resolve_reminder_for_write(a)
 
-    # AppleScript-first (see cmd_flag): only AppleScript can touch the real
-    # flagged column; bridge only toggles priority as a lossy proxy.
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set flagged of r to false"):
+    if not rid:
+        _refuse_flag_unsupported(a, r, "unflag")
+    if osa_by_id_try(r["list_name"], rid, "set flagged of r to false"):
         if a.json:
             print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
         else:
             print(f"Unflagged: {safe_display(r['ZTITLE'])}")
         return
-
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "unflag", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "unflagged":
-            if a.json:
-                print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Unflagged: {safe_display(r['ZTITLE'])}")
-            return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "unflag it",
-        "Identifier-based writes failed",
-    )
+    _refuse_unsafe_title_fallback(r, "unflag it", "Identifier-based writes failed")
 
 def cmd_upcoming(a):
     days = getattr(a, "days", None)
@@ -6411,56 +7572,133 @@ def cmd_upcoming(a):
     if days < 1 or days > 3650:
         print("Error: upcoming days must be between 1 and 3650.", file=sys.stderr)
         sys.exit(1)
-    db = open_db()
-    items = q_upcoming(db, days=days)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_upcoming(db, days=days)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print(f"Nothing due in the next {days} days")
+            return
+        print(C.bold(f"Upcoming ({days} days):"))
+        groups = {}
+        for i in items:
+            dt = ts(row_effective_due(i))
+            day_key = dt.strftime("%Y-%m-%d")
+            day_label = dt.strftime("%A, %b %d")
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            if dt.date() == today.date():
+                day_label = "Today"
+            elif dt.date() == (today + timedelta(days=1)).date():
+                day_label = "Tomorrow"
+            groups.setdefault((day_key, day_label), []).append(i)
+        for (day_key, day_label), day_items in sorted(groups.items()):
+            print(f"\n  {C.bold(day_label)}:")
+            for i in day_items:
+                print(fmt(i, db, indent="    ", _sc=sc, _ht=ht))
+        print(f"\n{len(items)} upcoming")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, lambda db: q_upcoming(db, days=days))
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print(fmt_table(gather_table_rows(scope, lambda db: q_upcoming(db, days=days))))
         return
-    if not items:
+    # groups: {(day_key, day_label): [(acct_name_or_None, rendered_line)]}
+    groups = {}
+    total = 0
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_upcoming(db, days=days)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            for i in items:
+                dt = ts(row_effective_due(i))
+                day_key = dt.strftime("%Y-%m-%d")
+                day_label = dt.strftime("%A, %b %d")
+                today_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                if dt.date() == today_dt.date():
+                    day_label = "Today"
+                elif dt.date() == (today_dt + timedelta(days=1)).date():
+                    day_label = "Tomorrow"
+                line = fmt(i, db, indent="    ", _sc=sc, _ht=ht)
+                groups.setdefault((day_key, day_label), []).append(
+                    (acct.name if multi else None, line)
+                )
+                total += 1
+    if not total:
         print(f"Nothing due in the next {days} days")
         return
     print(C.bold(f"Upcoming ({days} days):"))
-    # Group by day
-    groups = {}
-    for i in items:
-        dt = ts(row_effective_due(i))
-        day_key = dt.strftime("%Y-%m-%d")
-        day_label = dt.strftime("%A, %b %d")
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        if dt.date() == today.date():
-            day_label = "Today"
-        elif dt.date() == (today + timedelta(days=1)).date():
-            day_label = "Tomorrow"
-        groups.setdefault((day_key, day_label), []).append(i)
-    for (day_key, day_label), day_items in sorted(groups.items()):
+    for (day_key, day_label), entries in sorted(groups.items()):
         print(f"\n  {C.bold(day_label)}:")
-        for i in day_items:
-            print(fmt(i, db, indent="    ", _sc=sc, _ht=ht))
-    print(f"\n{len(items)} upcoming")
+        last_acct = None
+        for acct_name, line in entries:
+            if acct_name and acct_name != last_acct:
+                print(f"\n    {C.bold(acct_name)}")
+                last_acct = acct_name
+            print(line)
+    print(f"\n{total} upcoming")
+
 
 def cmd_overdue(a):
-    db = open_db()
-    items = q_overdue(db)
-    pks = [i["Z_PK"] for i in items]
-    sc, ht = preload_extras(db, pks)
+    if not _is_multi_account_mode(a):
+        db = open_db()
+        items = q_overdue(db)
+        pks = [i["Z_PK"] for i in items]
+        sc, ht = preload_extras(db, pks)
+        if a.json:
+            print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+            return
+        if getattr(a, 'format', None) == 'table':
+            print(fmt_table(reminders_to_table_data(items, db)))
+            return
+        if not items:
+            print("No overdue reminders")
+            return
+        print(C.red(C.bold(f"Overdue ({len(items)}):")))
+        for i in items:
+            print(fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  ", _sc=sc, _ht=ht))
+        print(f"\n{len(items)} overdue")
+        return
+    scope = resolve_account_scope(a)
+    multi = len(scope) > 1
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
+        dicts = gather_reminder_dicts(scope, q_overdue)
+        print(json.dumps(dicts, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print(fmt_table(gather_table_rows(scope, q_overdue)))
         return
-    if not items:
+    groups = []
+    with iter_account_dbs(scope) as account_dbs:
+        for acct, db in account_dbs:
+            items = q_overdue(db)
+            pks = [i["Z_PK"] for i in items]
+            sc, ht = preload_extras(db, pks)
+            lines = [fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  ", _sc=sc, _ht=ht) for i in items]
+            if lines:
+                groups.append((acct.name if multi else None, lines))
+    total = sum(len(g[1]) for g in groups)
+    if not total:
         print("No overdue reminders")
         return
-    print(C.red(C.bold(f"Overdue ({len(items)}):")))
-    for i in items:
-        print(fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  ", _sc=sc, _ht=ht))
-    print(f"\n{len(items)} overdue")
+    print(C.red(C.bold(f"Overdue ({total}):")))
+    for acct_name, lines in groups:
+        if acct_name:
+            print(f"\n  {C.bold(acct_name)}")
+        for line in lines:
+            print(line)
+    print(f"\n{total} overdue")
 
 def cmd_list_create(a):
     validate_list_appearance_args(a)
@@ -6520,7 +7758,7 @@ def cmd_list_edit(a):
         print("Error: pass at least one of --new-name, --color, --symbol, --emoji, --groceries, --standard, or --grocery-locale.", file=sys.stderr)
         sys.exit(1)
     require_private_metadata(a)
-    db = open_db()
+    db = _open_db_for_account(getattr(a, "account", None))
     list_ref = resolve_required_list_target_or_die(
         db,
         name=getattr(a, "name", None),
@@ -6547,7 +7785,7 @@ def _cmd_list_pin_state(a, pinned):
         print("Error: pass a list/smart-list name, --list-id, or --smart-list-id.", file=sys.stderr)
         sys.exit(1)
     require_private_metadata(a)
-    db = open_db()
+    db = _open_db_for_account(getattr(a, "account", None))
     smart_list_id = getattr(a, "smart_list_id", None)
     name = getattr(a, "name", None)
     if smart_list_id is not None:
@@ -6619,7 +7857,7 @@ def cmd_list_rename(a):
     if not new_name:
         print("Error: pass a new list name.", file=sys.stderr)
         sys.exit(1)
-    db = open_db()
+    db = _open_db_for_account(getattr(a, "account", None))
     list_ref = resolve_required_list_target_or_die(
         db,
         name=getattr(a, "name", None),
@@ -6642,7 +7880,7 @@ def cmd_list_rename(a):
         sys.exit(1)
 
 def cmd_list_delete(a):
-    db = open_db()
+    db = _open_db_for_account(getattr(a, "account", None))
     list_ref = resolve_required_list_target_or_die(
         db,
         name=getattr(a, "name", None),
@@ -6672,7 +7910,20 @@ def cmd_list_delete(a):
         sys.exit(1)
 
 def cmd_export(a):
-    db = open_db()
+    # export targets a single account. If an "all-accounts" scope is active via
+    # REMCTL_ACCOUNT_SCOPE or config accountScope, refuse rather than silently
+    # exporting only the default account. (The --all-accounts flag is already
+    # rejected by argparse for this command.)
+    scope = resolve_account_scope(a)
+    if len(scope) > 1:
+        print(
+            "Error: export targets a single account, but the active scope spans "
+            f"{len(scope)} accounts ({', '.join(ac.name for ac in scope)}). "
+            f"Re-run with --account NAME, e.g. `remctl export --account {scope[0].name}`.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    db = _open_db_for_account(getattr(a, "account", None) or (scope[0].name if scope else None))
     list_name = getattr(a, "list", None)
     list_id = getattr(a, "list_id", None)
     if list_name or list_id is not None:
@@ -6742,6 +7993,7 @@ def cmd_import(a):
         aa.url = item.get("url")
         aa.recurrence = item.get("recurrence")
         aa.alarm = item.get("alarm")
+        aa.account = getattr(a, "account", None)
         aa.json = False
 
         try:
@@ -7762,7 +9014,7 @@ def gather_doctor_checks():
             "database",
             "ok" if db_path else "fail",
             str(db_path) if db_path else "No Reminders database found",
-            None if db_path else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard.",
+            None if db_path else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard. Set REMCTL_DB to pin a specific database file.",
         )
 
     cli_path = current_cli_path()
@@ -7825,6 +9077,79 @@ def gather_doctor_checks():
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
     return checks
+
+
+def cmd_accounts(a):
+    """List all discovered Reminders accounts."""
+    accounts = discover_accounts(force_refresh=True)
+    if getattr(a, "json", False):
+        print(json.dumps([
+            {"name": acct.name, "type": acct.type, "storePath": str(acct.store_path)}
+            for acct in accounts
+        ], indent=2))
+        return
+    if not accounts:
+        print("No Reminders accounts found.")
+        return
+    default_name = accounts[0].name if accounts else None
+    print(C.bold("Reminders Accounts:"))
+    for acct in accounts:
+        is_default = " (default)" if acct.name == default_name else ""
+        print(f"  {C.bold(acct.name)}{C.dim(is_default)}  {C.dim(acct.type)}")
+    print(f"\n{len(accounts)} account{'s' if len(accounts) != 1 else ''}")
+
+
+CONFIG_KEYS = {
+    "accountScope": "Default account scope: 'all', an account name, or '' for the auto-detected default",
+    "storeDir":     "Override the Reminders Stores directory (equivalent to REMCTL_STORE_DIR)",
+    "dbPath":       "Pin a specific Reminders database file — full path (equivalent to REMCTL_DB)",
+}
+
+
+def cmd_config(a):
+    """Get or set remctl configuration values."""
+    cfg = load_config()
+    if getattr(a, "key", None) is None:
+        # Show all config
+        if getattr(a, "json", False):
+            print(json.dumps(cfg, indent=2))
+            return
+        if not cfg or all(not v for v in cfg.values()):
+            print("No configuration set.")
+            print(f"Config file: {CONFIG_FILE}")
+            print(f"\nSupported keys:")
+            for k, desc in CONFIG_KEYS.items():
+                print(f"  {k}: {desc}")
+        else:
+            for k, v in cfg.items():
+                if v:
+                    print(f"  {k}: {v}")
+        return
+    key = a.key
+    if getattr(a, "value", None) is None:
+        # Get a single key
+        val = cfg.get(key)
+        if not val:
+            print("(not set)")
+        else:
+            print(val if not getattr(a, "json", False) else json.dumps({key: val}))
+        return
+    # Set a key — warn on unrecognised keys
+    if key not in CONFIG_KEYS:
+        known = ", ".join(CONFIG_KEYS)
+        print(f"Warning: '{key}' is not a recognised config key. Known keys: {known}", file=sys.stderr)
+    value = a.value
+    # Clear the key when value is empty string
+    if value == "":
+        cfg.pop(key, None)
+    else:
+        cfg[key] = value
+    save_config(cfg)
+    if not getattr(a, "json", False):
+        if value == "":
+            print(f"Cleared {key}")
+        else:
+            print(f"Set {key} = {value}")
 
 
 def cmd_doctor(a):
@@ -7979,7 +9304,10 @@ def format_command_columns(commands, width=88):
 
 
 def first_command_token(argv):
-    skip_value_for = {"--format"}
+    # Flags that consume the next token as their value
+    skip_value_for = {"--format", "--account"}
+    # Flags with inline values (--flag=value form)
+    skip_prefix_for = ("--format=", "--account=")
     iterator = iter(argv)
     for token in iterator:
         if token in {"-h", "--help", "--version"}:
@@ -7987,9 +9315,9 @@ def first_command_token(argv):
         if token in skip_value_for:
             next(iterator, None)
             continue
-        if token.startswith("--format="):
+        if any(token.startswith(p) for p in skip_prefix_for):
             continue
-        if token == "--no-color":
+        if token in {"--no-color", "--all-accounts"}:
             continue
         if token.startswith("-"):
             continue
@@ -8037,6 +9365,10 @@ def main():
     p.add_argument("--no-color", action="store_true", help="Disable color output")
     p.add_argument("--format", choices=["plain", "table", "json"], default="plain",
                    help="Output format")
+    p.add_argument("--account", dest="account", metavar="NAME",
+                   help="Target a specific Reminders account (can also be placed after the command)")
+    p.add_argument("--all-accounts", dest="all_accounts", action="store_true",
+                   help="Read from all connected Reminders accounts")
 
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
@@ -8050,13 +9382,72 @@ def main():
             help="Output format for this read command",
         )
     def vb(c): c.add_argument("-v", "--verbose", action="store_true")
+    def account_scope(c):
+        """Add --all-accounts and --account flags for multi-account list/search commands."""
+        c.add_argument("--all-accounts", dest="all_accounts", action="store_true",
+                       default=argparse.SUPPRESS,
+                       help="Read from all connected Reminders accounts")
+        c.add_argument("--account", dest="account", metavar="NAME",
+                       default=argparse.SUPPRESS,
+                       help="Filter to a specific account. "
+                            "Use 'remctl accounts' to see available accounts.")
+
+    def acct(c):
+        """Add only --account NAME, for single-target commands that operate on one
+        account at a time and do NOT aggregate or scan across accounts (export,
+        smart-lists, templates, sharees, link, list-*/smart-list-*/template-* writes).
+        --all-accounts is intentionally not offered here so it can't be silently ignored."""
+        c.add_argument("--account", dest="account", metavar="NAME",
+                       default=argparse.SUPPRESS,
+                       help="Account to look up in (required when the same list name or "
+                            "reminder ID exists in multiple active accounts)")
+
+    def acct_scan(c):
+        """Add --account NAME and --all-accounts, for single-item commands that
+        resolve their target by scanning the active account scope (done, undone,
+        edit, delete, flag, unflag, info, subtasks, show, open). --all-accounts
+        means "search every connected account to resolve the target", and is
+        honored via _resolve_reminder_for_write / resolve_list_ref_across."""
+        c.add_argument("--account", dest="account", metavar="NAME",
+                       default=argparse.SUPPRESS,
+                       help="Account to look up in (required when the same list name or "
+                            "reminder ID exists in multiple active accounts)")
+        c.add_argument("--all-accounts", dest="all_accounts", action="store_true",
+                       default=argparse.SUPPRESS,
+                       help="Search every connected account to resolve the target")
+
+    # --- Accounts / config ---
+    c = sub.add_parser("accounts", help="List connected Reminders accounts"); js(c)
+
+    c = sub.add_parser(
+        "config",
+        help="Get or set remctl configuration",
+        description="Get or set persistent remctl configuration values.",
+        epilog=(
+            "Supported keys:\n"
+            "  accountScope   Default account scope: 'all', an account name, or '' to reset\n"
+            "  storeDir       Override the Reminders Stores directory (like REMCTL_STORE_DIR)\n"
+            "  dbPath         Pin a specific database file — full path (like REMCTL_DB)\n"
+            "\n"
+            "Examples:\n"
+            "  remctl config                          # show current settings\n"
+            "  remctl config accountScope             # get one key\n"
+            "  remctl config accountScope all         # set a key\n"
+            "  remctl config accountScope \"\"          # clear a key\n"
+            "  remctl config dbPath /path/to/Data-XXXX.sqlite\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("key", nargs="?", help="Config key (accountScope, storeDir, dbPath)")
+    c.add_argument("value", nargs="?", help="Value to set; pass '' to clear")
+    js(c)
 
     # --- Existing commands ---
-    c = sub.add_parser("lists", help="List all iCloud reminder lists"); js(c); display_format(c)
+    c = sub.add_parser("lists", help="List all Reminders lists"); js(c); display_format(c); account_scope(c)
 
-    c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c)
+    c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c); account_scope(c)
 
-    c = sub.add_parser("templates", help="Inspect saved Reminders templates"); js(c)
+    c = sub.add_parser("templates", help="Inspect saved Reminders templates"); js(c); account_scope(c)
 
     c = sub.add_parser(
         "template-info",
@@ -8073,13 +9464,13 @@ def main():
     )
     c.add_argument("name", nargs="?", help="Template name")
     c.add_argument("--template-id", type=int, help="Read by numeric template ID from templates")
-    js(c)
+    js(c); acct_scan(c)
 
     c = sub.add_parser("show", help="Show reminders in a list (grouped by section)")
     c.add_argument("list", nargs="?", help="List name")
     c.add_argument("--list-id", type=int, help="Show a list by stable numeric ID")
     c.add_argument("--completed", action="store_true", help="Include completed")
-    vb(c); js(c); display_format(c)
+    vb(c); js(c); display_format(c); acct_scan(c)
 
     c = sub.add_parser(
         "add",
@@ -8116,6 +9507,9 @@ def main():
     )
     c.add_argument("title"); c.add_argument("-l", "--list")
     c.add_argument("--list-id", type=int, help="Create in a list by stable numeric ID")
+    c.add_argument("--account", dest="account", metavar="NAME",
+                   default=argparse.SUPPRESS,
+                   help="Target account for this reminder (required when list name is ambiguous across accounts)")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders")
     c.add_argument("-p", "--priority", help="high, medium, low")
     c.add_argument("-f", "--flag", action="store_true")
@@ -8137,8 +9531,8 @@ def main():
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
     js(c)
 
-    c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
-    c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c); acct_scan(c)
+    c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c); acct_scan(c)
 
     c = sub.add_parser(
         "edit",
@@ -8200,30 +9594,33 @@ def main():
     c.add_argument("--radius", type=float, default=100.0, help="Guarded metadata: location alarm radius in meters")
     c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
     c.add_argument("--address", help=argparse.SUPPRESS)
-    js(c)
+    js(c); acct_scan(c)
 
     c = sub.add_parser("delete", help="Delete a reminder")
-    c.add_argument("id", type=int); c.add_argument("--force", action="store_true"); js(c)
+    c.add_argument("id", type=int); c.add_argument("--force", action="store_true"); js(c); acct_scan(c)
 
     c = sub.add_parser("search", help="Search reminders")
     c.add_argument("query"); c.add_argument("--completed", action="store_true"); vb(c); js(c)
-    display_format(c)
+    display_format(c); account_scope(c)
 
     c = sub.add_parser("today", help="Due today + overdue")
     c.add_argument("--no-overdue", action="store_true"); vb(c); js(c); display_format(c)
+    account_scope(c)
 
     c = sub.add_parser("flagged", help="Flagged reminders"); vb(c); js(c); display_format(c)
+    account_scope(c)
 
     c = sub.add_parser("urgent", help="Urgent reminders"); vb(c); js(c); display_format(c)
+    account_scope(c)
 
-    c = sub.add_parser("tags", help="List all hashtag labels"); js(c)
+    c = sub.add_parser("tags", help="List all hashtag labels"); js(c); account_scope(c)
 
     c = sub.add_parser("subtasks", help="Show subtasks of a reminder")
-    c.add_argument("id", type=int); vb(c); js(c)
+    c.add_argument("id", type=int); vb(c); js(c); acct_scan(c)
 
-    c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c); acct_scan(c)
 
-    c = sub.add_parser("sections", help="Show sections across lists"); js(c)
+    c = sub.add_parser("sections", help="Show sections across lists"); js(c); account_scope(c)
 
     c = sub.add_parser(
         "sharees",
@@ -8242,28 +9639,30 @@ def main():
     )
     c.add_argument("list", nargs="?", help="Shared list name")
     c.add_argument("--list-id", type=int, help="Shared list numeric ID")
-    js(c)
+    js(c); acct_scan(c)
 
-    c = sub.add_parser("stats", help="Statistics"); js(c)
+    c = sub.add_parser("stats", help="Statistics"); js(c); account_scope(c)
 
     c = sub.add_parser("link", help="Get deep link(s) for reminders")
     c.add_argument("ids", type=int, nargs="*", help="Reminder IDs")
     c.add_argument("-l", "--list", help="Get links for all active reminders in a list")
     c.add_argument("--list-id", type=int, help="Get links for all active reminders in a list by stable numeric ID")
-    c.add_argument("--completed", action="store_true"); js(c)
+    c.add_argument("--completed", action="store_true"); js(c); acct_scan(c)
 
     c = sub.add_parser("open", help="Open reminder in Reminders.app (or just open the app)")
     c.add_argument("id", type=int, nargs="?", default=None, help="Reminder ID (opens specific reminder via deep link)")
+    acct_scan(c)
 
     # --- New commands ---
-    c = sub.add_parser("flag", help="Flag a reminder"); c.add_argument("id", type=int); js(c)
-    c = sub.add_parser("unflag", help="Unflag a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("flag", help="Flag a reminder"); c.add_argument("id", type=int); js(c); acct_scan(c)
+    c = sub.add_parser("unflag", help="Unflag a reminder"); c.add_argument("id", type=int); js(c); acct_scan(c)
 
     c = sub.add_parser("upcoming", help="Show reminders due in next N days (default 7)")
     c.add_argument("days", type=int, nargs="?", default=7, help="Number of days to look ahead")
-    vb(c); js(c); display_format(c)
+    vb(c); js(c); display_format(c); account_scope(c)
 
     c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c); display_format(c)
+    account_scope(c)
 
     c = sub.add_parser("list-symbols", help="List official Reminders list symbols")
     c.add_argument("--html", nargs="?", const="", metavar="PATH", help="Write a standalone HTML preview contact sheet")
@@ -8308,7 +9707,7 @@ def main():
     c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge")
     add_smart_list_filter_arguments(c)
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser(
         "smart-list-edit",
@@ -8333,7 +9732,7 @@ def main():
     c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge")
     add_smart_list_filter_arguments(c)
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser(
         "smart-list-delete",
@@ -8347,7 +9746,7 @@ def main():
     c.add_argument("--smart-list-id", type=int, help="Delete by numeric smart-list ID from smart-lists")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit smart-list deletion")
     c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser(
         "template-create",
@@ -8371,7 +9770,7 @@ def main():
     c.add_argument("--from-list-id", type=int, help="Source list numeric ID")
     c.add_argument("--include-completed", action="store_true", help="Include completed reminders in the saved template")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit template creation")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser(
         "template-apply",
@@ -8390,7 +9789,7 @@ def main():
     c.add_argument("name", nargs="?", help="Template name")
     c.add_argument("--template-id", type=int, help="Apply by numeric template ID from templates")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit template application")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser(
         "template-delete",
@@ -8407,7 +9806,7 @@ def main():
     c.add_argument("--template-id", type=int, help="Delete by numeric template ID from templates")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit template deletion")
     c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("list-edit", help="Edit private list appearance by name or ID")
     c.add_argument("name", nargs="?", help="List name to edit")
@@ -8420,42 +9819,42 @@ def main():
     c.add_argument("--standard", action="store_true", help="Convert a Groceries list back to a standard list")
     c.add_argument("--grocery-locale", help="Groceries locale identifier, e.g. en_US or it_IT")
     c.add_argument("--private", action="store_true", help="Required for list appearance and grocery metadata writes")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("list-pin", help="Pin a list or smart list in Reminders.app")
     c.add_argument("name", nargs="?", help="List or smart-list name to pin")
     c.add_argument("--list-id", type=int, help="Pin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Pin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("list-unpin", help="Unpin a list or smart list in Reminders.app")
     c.add_argument("name", nargs="?", help="List or smart-list name to unpin")
     c.add_argument("--list-id", type=int, help="Unpin a list by stable numeric ID")
     c.add_argument("--smart-list-id", type=int, help="Unpin a smart list by stable numeric ID")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit list pinning")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("list-rename", help="Rename a list (bridge only)")
     c.add_argument("name", nargs="?", help="List name to rename")
     c.add_argument("new_name", nargs="?", help="New list name")
     c.add_argument("--list-id", type=int, help="Rename a list by stable numeric ID")
     c.add_argument("--new-name", dest="new_name_option", help="New list name, useful with --list-id")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("list-delete", help="Delete a list (bridge only)")
     c.add_argument("name", nargs="?", help="List name to delete")
     c.add_argument("--list-id", type=int, help="Delete a list by stable numeric ID")
-    c.add_argument("--force", action="store_true"); js(c)
+    c.add_argument("--force", action="store_true"); js(c); acct(c)
 
     c = sub.add_parser("export", help="Export reminders")
     c.add_argument("-l", "--list", help="Export only this list")
     c.add_argument("--list-id", type=int, help="Export only this list by stable numeric ID")
     c.add_argument("--format", dest="export_format", choices=["json", "csv"], default="json", help="Export format")
-    js(c)
+    js(c); acct(c)
 
     c = sub.add_parser("import", help="Import reminders from JSON file")
-    c.add_argument("file", help="Path to JSON file"); js(c)
+    c.add_argument("file", help="Path to JSON file"); js(c); acct(c)
 
     c = sub.add_parser(
         "onboard",
@@ -8564,6 +9963,25 @@ def main():
         print("Run `remctl <command> --help` for command-specific options.", file=sys.stderr)
         sys.exit(2)
     a = p.parse_args()
+
+    # Strictness: the global --account/--all-accounts flags are accepted before
+    # any command so they work in either position. Reject each flag for commands
+    # whose subparser does not define it — matching the error those commands give
+    # when the flag is placed after the subcommand, and ensuring a flag is never
+    # silently ignored (e.g. --all-accounts on export, which targets one account).
+    subparser = sub.choices.get(getattr(a, "cmd", None))
+    sub_opts = set()
+    if subparser:
+        for act in subparser._actions:
+            sub_opts.update(act.option_strings)
+    cmd_label = getattr(a, "cmd", None) or "(none)"
+    if getattr(a, "account", None) and "--account" not in sub_opts:
+        print(f"remctl: error: command {cmd_label!r} does not support --account", file=sys.stderr)
+        sys.exit(2)
+    if getattr(a, "all_accounts", False) and "--all-accounts" not in sub_opts:
+        print(f"remctl: error: command {cmd_label!r} does not support --all-accounts", file=sys.stderr)
+        sys.exit(2)
+
     command_format = getattr(a, "command_format", None)
     if command_format:
         a.format = command_format
@@ -8599,6 +10017,8 @@ def main():
 
     # Route to command handler
     cmds = {
+        "accounts": cmd_accounts,
+        "config": cmd_config,
         "lists": cmd_lists,
         "smart-lists": cmd_smart_lists,
         "templates": cmd_templates,
