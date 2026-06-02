@@ -84,6 +84,18 @@ remctl list-delete --list-id 123 --force --json
 - Commands that target lists consistently support exact numeric targeting where the underlying write/read path is safe: `show --list-id`, `add --list-id`, `edit --list-id`, `link --list-id`, `export --list-id`, `list-edit --list-id`, `list-pin --list-id`, `list-unpin --list-id`, `list-rename --list-id --new-name`, `list-delete --list-id`, plus smart-list `--include-list-id`. `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`.
 - If a command accepts both a list name and `--list-id`, passing both is an error.
 
+## Multi-Account
+
+- The Mac may have several Reminders accounts (iCloud, Exchange, on-device local). By default every command operates on the primary account only; existing single-account behavior is unchanged.
+- `remctl accounts` lists connected accounts with their type. Run it first when the user mentions work/Exchange reminders or multiple accounts.
+- Read commands accept `--all-accounts` (every account, grouped/labeled) and `--account NAME` (one account). `--json` adds `account`/`accountType` fields; `--format table` adds an Account column.
+- Write commands (`add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`) accept `--account NAME`. Account flags may be placed before or after the command.
+- Reminder IDs (`Z_PK`) are unique only within an account. When the scope spans multiple accounts, a bare ID that exists in more than one account is rejected with a disambiguation error — pass `--account` to resolve it.
+- Prefer `--account NAME` over a bare ID when acting on a non-primary account, and use `remctl accounts` plus `show <list> --account NAME --json` to find the correct ID first.
+- A user can set a default scope with `remctl config accountScope all` (or an account name); `REMCTL_ACCOUNT_SCOPE` is the environment-variable equivalent.
+- Non-iCloud accounts (Exchange/CalDAV) support create/edit/complete/delete (changes sync to the server) but not `flag`/`unflag` (no flag attribute) or `link`/`open` deep links. Microsoft To Do "Important (starred)" tasks sync in as **priority**, not flags — surface them with priority, and use `edit <id> -p high` rather than `flag`.
+- Exchange/CalDAV sync is not instant (unlike iCloud). A write applies locally immediately but can take a minute or two to reach the server; don't re-issue the command if the server hasn't caught up yet. The local `ZEXTERNALIDENTIFIER` field is not a reliable "synced" indicator — it populates only on the return sync.
+
 ## Recurring Schedules
 
 Recurring schedules are normal EventKit writes and do not require `--private`.

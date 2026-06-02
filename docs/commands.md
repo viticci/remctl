@@ -2,6 +2,107 @@
 
 Run `remctl --help` for the full parser-generated reference and `remctl <command> --help` for command-specific options.
 
+## Multi-Account
+
+RemCTL supports multiple Reminders accounts — iCloud, Exchange, and on-device local — simultaneously. Each account is stored in a separate database file. By default, RemCTL reads from and writes to the account with the most reminders; all existing behavior is unchanged when only one account is active.
+
+### Discovering accounts
+
+```bash
+remctl accounts          # list all connected accounts with their type and default status
+remctl accounts --json   # machine-readable output
+```
+
+### Reading across accounts
+
+Pass `--all-accounts` to any read command to include all connected accounts (`export` and `import` are the exception — see below). Pass `--account NAME` to restrict the scope to a single named account.
+
+```bash
+remctl lists --all-accounts
+remctl today --all-accounts
+remctl flagged --all-accounts
+remctl search "meeting" --all-accounts
+remctl tags --all-accounts
+remctl sections --all-accounts
+remctl stats --all-accounts
+remctl show --list-id 1 --account Exchange
+remctl show Tasks --account Exchange
+```
+
+When multiple accounts are active, human output groups results under a bold account name header. JSON output includes `account` and `accountType` fields on each item. The table format adds an Account column. `tags` returns the deduplicated union across accounts; `stats --all-accounts` prints a per-account breakdown followed by a combined total.
+
+`export` and `import` are the exception: they operate on a single account. Both accept `--account NAME`, but not `--all-accounts`. Because reminder IDs are unique only within an account, an all-account dump would carry colliding IDs; to avoid a backup that silently spans accounts, `export` refuses any `all`-scope (whether from `accountScope` or the environment) and exits with an error directing you to pass `--account NAME`. Export each account separately to back up everything.
+
+### Writing to a specific account
+
+Pass `--account NAME` to any write command to target a reminder or list in a specific account.
+
+```bash
+remctl add "Send invoice" -l Work --account Exchange
+remctl done 23 --account Exchange
+remctl edit 23 --title "Updated title" --account Exchange
+remctl delete 23 --force --account Exchange
+remctl flag 23 --account iCloud
+```
+
+Reminder IDs (`Z_PK`) are unique only within a single account. When the active scope spans more than one account — because `--all-accounts` is in effect or `accountScope` is set to `all` — RemCTL resolves a bare `done 23` / `edit 23` / `info 23` by searching every active account: a unique match is acted on automatically, while an ID or list name present in multiple accounts produces a disambiguation error listing the candidates and requires `--account`. In the default single-account scope, IDs resolve against that account exactly as before.
+
+> **Note on non-iCloud accounts.** Exchange and other CalDAV accounts do not store the CloudKit identifier that iCloud reminders carry. RemCTL resolves a stable EventKit identifier for these reminders through the bridge so that create, edit, complete, and delete work normally and sync to the server. Two features are iCloud/on-device only and are unavailable for Exchange/CalDAV reminders: **flagging** (`flag`/`unflag` — those accounts have no flag attribute; use priority instead) and **deep links** (`link` reports no link, and `open` falls back to launching Reminders.app). To Do "Important (starred)" tasks come through as priority, not flags — see [Flags, Priorities, Urgent, and Recurrence](#flags-priorities-urgent-and-recurrence).
+>
+> **Exchange sync is not instant.** Unlike iCloud (which pushes through CloudKit immediately), Exchange/CalDAV changes are uploaded by macOS on a short sync cycle, so a `done`/`add`/`edit`/`delete` may take a minute or two to appear on the server. The change applies locally right away; if you check the server immediately and don't see it yet, give the sync cycle time rather than re-issuing the command.
+
+### Setting a default account scope
+
+The default scope (single account) can be overridden persistently via the config file or an environment variable:
+
+```bash
+remctl config accountScope all      # show all accounts by default for every command
+remctl config accountScope Exchange # restrict all commands to Exchange by default
+remctl config accountScope          # show the current setting
+```
+
+```bash
+REMCTL_ACCOUNT_SCOPE=all remctl today    # one-shot override via environment variable
+```
+
+### Configuration
+
+```bash
+remctl config                        # show all current settings
+remctl config --help                 # list every supported key and its meaning
+remctl config accountScope           # get a single setting
+remctl config accountScope all       # set a setting
+remctl config accountScope ""        # clear a setting (restore the default)
+```
+
+The configuration file is stored at `~/.config/remctl/config.json` and can be edited directly. Three keys are recognized:
+
+| Key | Purpose | Equivalent environment variable |
+|-----|---------|----------------------------------|
+| `accountScope` | Default account scope: `all`, an account name, or `""` for the auto-detected default | `REMCTL_ACCOUNT_SCOPE` |
+| `storeDir` | Override the Reminders Stores directory | `REMCTL_STORE_DIR` |
+| `dbPath` | Pin a specific database file (full path); bypasses auto-detection | `REMCTL_DB` |
+
+Setting a key to an empty string removes it. Environment variables always take precedence over the config file. `dbPath` pins one exact `.sqlite` file and overrides `storeDir`; use `storeDir` to point auto-detection at a non-standard Stores directory while still selecting among the accounts it contains.
+
+```bash
+remctl config storeDir "/Volumes/Backup/Reminders/Stores"   # non-standard location
+remctl config dbPath "/path/to/Data-XXXX.sqlite"            # pin one exact database
+```
+
+### Flag placement
+
+Account flags may be given either before or after the command, so both forms are equivalent:
+
+```bash
+remctl --account Exchange today
+remctl today --account Exchange
+remctl --all-accounts lists
+remctl lists --all-accounts
+```
+
+---
+
 ## Viewing
 
 ```bash
@@ -43,7 +144,8 @@ remctl edit 23880 --recurrence "weekly mon,wed"
 RemCTL keeps these states distinct:
 
 - priority is written with `-p high`, `-p medium`, or `-p low` and shown as `!!!`, `!!`, or `!`
-- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`
+- iCloud stores priority as 1 (high), 5 (medium), or 9 (low). Exchange and other CalDAV accounts use the full iCalendar range, where 1–4 is high, 5 is medium, and 6–9 is low; RemCTL buckets these the same way Reminders.app does. A Microsoft To Do task marked **Important (starred)** syncs through Exchange as high importance and appears in Reminders as a high priority (`!!!`), not as a flag
+- flagged reminders are shown with `⚑` and can be changed with `flag` / `unflag`. Flags exist only for iCloud and on-device reminders; Exchange/CalDAV accounts have no flag attribute, so `flag`/`unflag` are unavailable there and report a clear error suggesting priority instead
 - macOS 26 urgent reminders are shown with `⏰` and listed with `urgent`
 - urgent is stored in private ReminderKit metadata; power users can opt into unsupported writes with `add --private --urgent` or `edit --private --urgent`
 - recurring reminders are shown with a `↻` badge and, in table output, a `Repeat` column
@@ -169,6 +271,14 @@ remctl flag 23880
 remctl unflag 23880
 remctl delete 23880
 remctl delete 23880 --force
+```
+
+When the same reminder ID exists in more than one account, pass `--account NAME` to disambiguate:
+
+```bash
+remctl done 23 --account Exchange
+remctl edit 23 -d tomorrow --account iCloud
+remctl delete 23 --force --account Exchange
 ```
 
 ## Lists
