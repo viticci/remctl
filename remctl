@@ -197,6 +197,18 @@ def find_main_db_path():
 def open_db():
     conn = sqlite3.connect(f"file:{find_main_db()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # forward-compat fail-fast: if a macOS bump restructures the store, surface
+    # an actionable message instead of a cryptic OperationalError deep in a
+    # query. Cannot false-positive on a working store (the table is present).
+    have_core = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ZREMCDREMINDER' LIMIT 1"
+    ).fetchone()
+    if not have_core:
+        conn.close()
+        raise RemindersDBUnavailable(
+            "Reminders store is missing the expected 'ZREMCDREMINDER' table — the schema "
+            "may have changed in this macOS version; remctl likely needs an update."
+        )
     return conn
 
 def ts(v):
@@ -2333,15 +2345,65 @@ def private_available():
     return PRIVATE_PATH.exists() and PRIVATE_PATH.stat().st_mode & 0o111
 
 
+def remindd_running():
+    """True if the Reminders background daemon (remindd) is up.
+
+    Private ReminderKit writes coordinate with this daemon; if it is down,
+    the helper hangs or fails opaquely. Fails open (returns True) if the
+    check itself errors, so a flaky pgrep never blocks a legitimate write.
+    """
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-x", "remindd"], capture_output=True, text=True, timeout=5
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+
+def _private_error(status, message, stderr=""):
+    """Structured error result shaped like a normal private_call_result."""
+    return {
+        "returncode": -1,
+        "stdout": "",
+        "stderr": stderr,
+        "payload": {"status": status, "message": message},
+    }
+
+
 def private_call_result(data, timeout=30):
-    """Call remctl-private and return raw subprocess + parsed JSON details."""
+    """Call remctl-private and return raw subprocess + parsed JSON details.
+
+    Never returns None: every failure path comes back as a structured dict
+    with an error payload carrying an actionable `message`, so callers print
+    the real reason instead of a generic "private helper failed".
+    """
+    # the daemon must be up for private writes to land; checking here turns a
+    # 30s opaque timeout into an instant, fixable message.
+    if not remindd_running():
+        return _private_error(
+            "daemon_down",
+            "Reminders daemon (remindd) is not running — open Reminders.app, then retry.",
+        )
+
     try:
         proc = subprocess.run(
             [str(PRIVATE_PATH)], input=json.dumps(data),
             capture_output=True, text=True, timeout=timeout
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
+    except subprocess.TimeoutExpired:
+        return _private_error(
+            "timeout",
+            f"private helper did not respond within {timeout}s "
+            "(Reminders may be busy syncing — try again, or open Reminders.app).",
+        )
+    except FileNotFoundError:
+        return _private_error(
+            "missing_helper",
+            f"private helper not found at {PRIVATE_PATH} — reinstall remctl (./install.sh).",
+        )
+    except OSError as exc:
+        return _private_error("exec_error", f"could not run private helper: {exc}", str(exc))
 
     payload = None
     if proc.stdout:
@@ -2349,6 +2411,15 @@ def private_call_result(data, timeout=30):
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
             payload = None
+
+    # non-zero exit or unparseable output: synthesise an error payload from
+    # the helper's stderr so the caller surfaces something actionable.
+    if not isinstance(payload, dict):
+        detail = (proc.stderr or proc.stdout or "").strip()
+        payload = {
+            "status": "error",
+            "message": detail or f"private helper exited {proc.returncode} with no output.",
+        }
     return {
         "returncode": proc.returncode,
         "stdout": proc.stdout,
@@ -2358,11 +2429,17 @@ def private_call_result(data, timeout=30):
 
 
 def private_call(data):
-    """Call remctl-private with JSON data. Returns parsed JSON response."""
+    """Call remctl-private with JSON data. Returns the parsed JSON payload.
+
+    Never returns None — private_call_result always supplies a payload dict
+    (a structured error on failure), so every call site can read .get("status")
+    and .get("message") to report the real reason.
+    """
     result = private_call_result(data)
-    if result and isinstance(result["payload"], dict):
-        return result["payload"]
-    return None
+    payload = result.get("payload") if isinstance(result, dict) else None
+    if isinstance(payload, dict):
+        return payload
+    return {"status": "error", "message": "private helper failed (no response)."}
 
 
 def private_helper_error_is_transient(result):
