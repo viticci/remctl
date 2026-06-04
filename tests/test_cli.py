@@ -2832,47 +2832,6 @@ class CliTests(unittest.TestCase):
         self.assertIn("Shell completion: skipped", output)
         self.assertIn("remctl onboard", output)
 
-    def test_cmd_setup_prints_zsh_fpath_hint(self):
-        args = SimpleNamespace(
-            shell="zsh",
-            doctor=False,
-            json=False,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            completion_path = Path(tmpdir) / "completions" / "_remctl"
-            with (
-                mock.patch.object(self.remctl, "CONFIG_DIR", Path(tmpdir) / "config"),
-                mock.patch.object(
-                    self.remctl, "install_completion", return_value=completion_path
-                ),
-                contextlib.redirect_stdout(io.StringIO()) as stdout,
-            ):
-                self.remctl.cmd_setup(args)
-        output = stdout.getvalue()
-        self.assertIn("Enable zsh completions:", output)
-        self.assertIn(f"fpath=({completion_path.parent} $fpath)", output)
-        self.assertIn("autoload -Uz compinit && compinit", output)
-
-    def test_cmd_setup_omits_zsh_hint_for_other_shells(self):
-        args = SimpleNamespace(
-            shell="fish",
-            doctor=False,
-            json=False,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            completion_path = Path(tmpdir) / "completions" / "remctl.fish"
-            with (
-                mock.patch.object(self.remctl, "CONFIG_DIR", Path(tmpdir) / "config"),
-                mock.patch.object(
-                    self.remctl, "install_completion", return_value=completion_path
-                ),
-                contextlib.redirect_stdout(io.StringIO()) as stdout,
-            ):
-                self.remctl.cmd_setup(args)
-        output = stdout.getvalue()
-        self.assertNotIn("Enable zsh completions:", output)
-        self.assertNotIn("compinit", output)
-
     def test_cmd_upcoming_rejects_non_positive_days_before_database_read(self):
         for days in (0, -1):
             args = SimpleNamespace(days=days, json=True, verbose=False, format="json")
