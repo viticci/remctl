@@ -4161,7 +4161,7 @@ def invalid_due_date_payload(value, field="due"):
         "code": "invalid_due_date",
         "field": field,
         "input": value,
-        "message": "Could not parse due date. No reminder was created or changed.",
+        "message": "Could not parse date. No reminder was created or changed.",
         "examples": due_date_examples(),
     }
 
@@ -4170,7 +4170,7 @@ def fail_invalid_due_date(value, *, json_mode=False, field="due"):
     if json_mode:
         print(json.dumps(payload), file=sys.stderr)
     else:
-        print(f"Error: could not parse due date {value!r}.", file=sys.stderr)
+        print(f"Error: could not parse date {value!r}.", file=sys.stderr)
         print("No reminder was created or changed.", file=sys.stderr)
         print("", file=sys.stderr)
         print("Use exact forms like:", file=sys.stderr)
@@ -5646,6 +5646,33 @@ def _refuse_unsafe_title_fallback(reminder, operation, reason):
     )
     sys.exit(1)
 
+def osa_set_completion_date_script(dt):
+    """AppleScript statements (operating on `r`) that set its completion date to
+    dt. Built from components rather than a `date "..."` literal so it does not
+    depend on the system's locale date format."""
+    seconds_into_day = dt.hour * 3600 + dt.minute * 60 + dt.second
+    return (
+        "set d to current date\n"
+        "set day of d to 1\n"  # set day=1 first so changing month can't overflow
+        f"set year of d to {dt.year}\n"
+        f"set month of d to {dt.month}\n"
+        f"set day of d to {dt.day}\n"
+        f"set time of d to {seconds_into_day}\n"
+        "set completion date of r to d"
+    )
+
+def _bridge_completion_local_iso(iso_str):
+    """A bridge completion ISO ("…Z" UTC or with offset) as local-naive ISO,
+    matching how dueDate is serialized. None if absent; the raw string back if
+    it can't be parsed."""
+    if not iso_str:
+        return None
+    try:
+        local = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+        return local.replace(tzinfo=None).isoformat()
+    except ValueError:
+        return iso_str
+
 def cmd_done(a):
     db = open_db()
     r = q_reminder(db, a.id)
@@ -5653,25 +5680,85 @@ def cmd_done(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Look for dated completion parameter
+    want_date = getattr(a, "date", None)
+    done_iso = None
+    done_dt = None
+    if want_date:
+        done_dt = parse_due(want_date)
+        if not done_dt:
+            fail_invalid_due_date(want_date, json_mode=getattr(a, "json", False), field="date")
+        done_iso = done_dt.isoformat()
+
+    # Dating is refused for recurring reminders: otherwise completing one
+    # makes EventKit advance the series (rolling the due date forward from
+    # "now") and split off a completed occurrence, discarding any completionDate
+    # we set. Plain `done` (without --date) still advances the series correctly.
+    if done_iso and r["recurrence_frequency"] is not None:
+        message = (
+            "--date is not supported for recurring reminders. "
+            f"Use 'remctl done {a.id}' (without --date) to advance the series."
+        )
+        if getattr(a, "json", False):
+            print(json.dumps({
+                "status": "error", "code": "date_unsupported_for_recurring",
+                "message": message, "id": a.id,
+            }), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
     # Bridge-first for speed (post-2026-04-17 bridge fix: dueDateComponents
     # now reach CloudKit correctly). AppleScript stays as a fallback.
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
+        if done_iso:
+            data["completionDate"] = done_iso
         result = bridge_call(data)
         if result and result.get("status") == "completed":
             if a.json:
-                print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+                out = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
+                # Report completionDate as local-naive ISO like dueDate. For
+                # --date, echo what we sent (done_iso) so this matches the
+                # AppleScript path exactly; otherwise normalize the bridge's UTC
+                # stamp to local-naive.
+                cd_out = done_iso or _bridge_completion_local_iso(result.get("completionDate"))
+                if cd_out:
+                    out["completionDate"] = cd_out
+                print(json.dumps(out))
             else:
-                print(f"Completed: {safe_display(r['ZTITLE'])}")
+                when = ""
+                cd = result.get("completionDate")
+                if cd:
+                    # The bridge echoes the stored completion as UTC ISO; render
+                    # it in local time to match how `show` displays completions
+                    # (JSON reports the same instant as local-naive ISO).
+                    try:
+                        local = datetime.fromisoformat(cd.replace("Z", "+00:00")).astimezone()
+                        when = f" (completed {local.strftime('%b %d, %Y at %I:%M %p')})"
+                    except ValueError:
+                        when = f" (completed {cd})"
+                print(f"Completed: {safe_display(r['ZTITLE'])}{when}")
             return
 
-    # AppleScript fallback
+    # AppleScript fallback. The basic complete only marks the reminder done;
+    # when --date is given we additionally set its completion date (AppleScript
+    # can do this). The recurring guard above already excluded recurring
+    # reminders, so the target here is always non-recurring.
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set completed of r to true"):
+    action = "set completed of r to true"
+    if done_dt is not None:
+        action += "\n" + osa_set_completion_date_script(done_dt)
+    if rid and osa_by_id_try(r["list_name"], rid, action):
         if a.json:
-            print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+            out = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
+            if done_iso:
+                out["completionDate"] = done_iso
+            print(json.dumps(out))
         else:
-            print(f"Completed: {safe_display(r['ZTITLE'])}")
+            when = (f" (completed {done_dt.strftime('%b %d, %Y at %I:%M %p')})"
+                    if done_dt is not None else "")
+            print(f"Completed: {safe_display(r['ZTITLE'])}{when}")
         return
     if not rid:
         _refuse_unsafe_title_fallback(r, "complete it", "The reminder has no stable identifier")
@@ -8137,7 +8224,7 @@ def main():
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
     js(c)
 
-    c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("done", help="Complete a reminder (or amend its completion date)"); c.add_argument("id", type=int); c.add_argument("--date", dest="date", metavar="WHEN", help="Set completion date to WHEN, an absolute YYYY-MM-DD or 'YYYY-MM-DD HH:MM' (date alone = midnight; also amends an already-completed reminder)"); js(c)
     c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
 
     c = sub.add_parser(

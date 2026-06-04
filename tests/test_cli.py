@@ -3180,6 +3180,142 @@ class CliTests(unittest.TestCase):
     def test_cmd_done_is_bridge_first(self):
         self._assert_bridge_first("cmd_done", SimpleNamespace(id=1, json=True), "complete")
 
+    def _done_with_date(self, reminder, args, *, bridge_available=True, bridge_result=None):
+        """Run cmd_done capturing the bridge payload and stdout/stderr."""
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=bridge_available) as avail,
+            mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                self.remctl.cmd_done(args)
+                exit_code = None
+            except SystemExit as exc:
+                exit_code = exc.code
+        return SimpleNamespace(
+            avail=avail, bridge_call=bridge_call, osa_try=osa_try,
+            stdout=out.getvalue(), stderr=err.getvalue(), exit_code=exit_code,
+        )
+
+    def test_cmd_done_date_forwards_parsed_iso_to_bridge(self):
+        # --date is parsed CLI-side and reaches the bridge as a clean ISO string.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=True, date="2026-05-27"),
+            bridge_result={"status": "completed", "id": reminder["ZCKIDENTIFIER"],
+                           "completionDate": "2026-05-27T07:00:00Z"},
+        )
+        self.assertIsNone(res.exit_code)
+        payload = res.bridge_call.call_args.args[0]
+        self.assertEqual(payload["action"], "complete")
+        self.assertEqual(payload["completionDate"], "2026-05-27T00:00:00")
+        # JSON echoes local-naive ISO (like dueDate) — same value the AppleScript
+        # path emits, regardless of the bridge's UTC echo or the local timezone.
+        self.assertEqual(json.loads(res.stdout)["completionDate"], "2026-05-27T00:00:00")
+        res.osa_try.assert_not_called()
+
+    def test_cmd_done_date_accepts_due_style_shortcut(self):
+        # --date speaks the same vocabulary as --due, not just strict ISO.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=True, date="today"),
+            bridge_result={"status": "completed", "id": reminder["ZCKIDENTIFIER"]},
+        )
+        expected = self.remctl.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0).isoformat()
+        self.assertEqual(res.bridge_call.call_args.args[0]["completionDate"], expected)
+
+    def test_cmd_done_date_rejected_for_recurring_reminder(self):
+        # A supplied completion date is silently ignored for recurring reminders, so refuse it.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": "daily"}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=False, date="2026-05-27"))
+        self.assertEqual(res.exit_code, 1)
+        res.bridge_call.assert_not_called()
+        self.assertIn("recurring", res.stderr)
+
+    def test_cmd_done_date_rejected_for_recurring_reminder_json(self):
+        # --json mode emits a structured error, not bare text.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": "daily"}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=True, date="2026-05-27"))
+        self.assertEqual(res.exit_code, 1)
+        res.bridge_call.assert_not_called()
+        payload = json.loads(res.stderr)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["code"], "date_unsupported_for_recurring")
+
+    def test_cmd_done_recurring_without_date_still_completes(self):
+        # The guard must not block ordinary completion of a recurring reminder.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": "daily"}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=True),
+            bridge_result={"status": "completed", "id": reminder["ZCKIDENTIFIER"]},
+        )
+        self.assertIsNone(res.exit_code)
+        res.bridge_call.assert_called_once()
+        self.assertEqual(res.bridge_call.call_args.args[0]["action"], "complete")
+
+    def test_cmd_done_date_via_applescript_fallback(self):
+        # With the bridge unavailable, --date completes via AppleScript and sets
+        # the completion date in the same action (no bridge required).
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=False, date="2026-05-27"),
+            bridge_available=False)
+        self.assertIsNone(res.exit_code)
+        res.bridge_call.assert_not_called()
+        res.osa_try.assert_called_once()
+        action = res.osa_try.call_args.args[2]
+        self.assertIn("set completed of r to true", action)
+        self.assertIn("set completion date of r to d", action)
+        self.assertIn("set year of d to 2026", action)
+        self.assertIn("set month of d to 5", action)
+        self.assertIn("set day of d to 27", action)
+
+    def test_cmd_done_date_via_applescript_fallback_json(self):
+        # JSON output on the AppleScript path echoes the completion date.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=True, date="2026-05-27"),
+            bridge_available=False)
+        self.assertIsNone(res.exit_code)
+        res.osa_try.assert_called_once()
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["completionDate"], "2026-05-27T00:00:00")
+
+    def test_cmd_done_invalid_date_fails_fast(self):
+        # Unparseable --date fails before any bridge work.
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        res = self._done_with_date(
+            reminder, SimpleNamespace(id=1, json=False, date="zzznotadatezzz"))
+        self.assertEqual(res.exit_code, 2)
+        res.avail.assert_not_called()
+        res.bridge_call.assert_not_called()
+        self.assertIn("could not parse date", res.stderr)
+
+    def test_osa_set_completion_date_script(self):
+        # The AppleScript snippet builds the date from integer components
+        # (locale-independent) and guards against month-length overflow by
+        # setting day=1 before changing the month.
+        script = self.remctl.osa_set_completion_date_script(
+            self.remctl.datetime(2026, 5, 27, 9, 30, 15))
+        self.assertIn("set year of d to 2026", script)
+        self.assertIn("set month of d to 5", script)
+        self.assertIn("set day of d to 27", script)
+        self.assertIn("set completion date of r to d", script)
+        # 9*3600 + 30*60 + 15 = 34215 seconds into the day
+        self.assertIn("set time of d to 34215", script)
+        # day is reset to 1 before the month is set, to avoid overflow
+        self.assertLess(script.index("set day of d to 1\n"),
+                        script.index("set month of d to 5"))
+
     def test_cmd_undone_is_bridge_first(self):
         self._assert_bridge_first("cmd_undone", SimpleNamespace(id=1, json=True), "uncomplete")
 

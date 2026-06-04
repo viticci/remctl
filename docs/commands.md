@@ -158,6 +158,8 @@ Location alarms are normal reminder alarms saved through EventKit structured-loc
 
 ```bash
 remctl done 23880
+remctl done 23880 --date 2026-05-27
+remctl done 23880 --date "2026-05-27 09:30"
 remctl undone 23880
 remctl edit 23880 --title "New title"
 remctl edit 23880 -d "next friday" -p medium
@@ -170,6 +172,8 @@ remctl unflag 23880
 remctl delete 23880
 remctl delete 23880 --force
 ```
+
+`done --date WHEN` sets a completion date instead of stamping it with the current date & time, and also works on an already-completed reminder to correct its completion date. `WHEN` is an absolute date (`2026-05-27`) or datetime (`2026-05-27 09:30`); a bare date records midnight of that day. It is rejected for recurring reminders: use plain `done` (without `--date`) instead.
 
 ## Lists
 

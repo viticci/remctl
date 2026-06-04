@@ -25,6 +25,7 @@ struct Command: Decodable {
     let radius: Double?
     let proximity: String?
     let color: String?
+    let completionDate: String?
 }
 
 struct RecurrenceSpec: Decodable {
@@ -406,9 +407,19 @@ case "complete":
     guard let id = cmd.id else { fail("id is required for complete") }
     let reminder = findReminder(store, id: id)
     reminder.isCompleted = true
+    if let completionDate = cmd.completionDate {
+        // Setting isCompleted automatically sets completionDate to "now", so we
+        // override with our own completion date here.
+        guard let date = parseISO(completionDate) else { fail("Invalid completion date") }
+        reminder.completionDate = date
+    }
     do {
         try store.save(reminder, commit: true)
-        output(["status": "completed", "id": id])
+        var response: [String: Any] = ["status": "completed", "id": id]
+        if let completionDate = reminder.completionDate {
+            response["completionDate"] = isoFormatter.string(from: completionDate)
+        }
+        output(response)
     } catch {
         fail("Complete failed: \(error.localizedDescription)")
     }
