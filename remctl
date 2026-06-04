@@ -7381,6 +7381,31 @@ def install_completion(shell):
     return target
 
 
+def zsh_completion_loadable(completion_path):
+    target = completion_path.parent.resolve()
+    try:
+        result = subprocess.run(
+            ["zsh", "-i", "-c", "print -rl -- $fpath"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).resolve() == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def resolve_setup_shell(requested_shell):
     if requested_shell != "auto":
         return requested_shell
@@ -7815,12 +7840,24 @@ def gather_doctor_checks():
     shell = detect_shell_name()
     if shell in {"zsh", "bash", "fish"}:
         completion_path = completion_target_path(shell)
+        completion_exists = completion_path.exists()
         add(
             "completion",
-            "ok" if completion_path.exists() else "warn",
+            "ok" if completion_exists else "warn",
             f"{shell}: {completion_path}",
-            None if completion_path.exists() else f"Run remctl setup --shell {shell} to install completion.",
+            None if completion_exists else f"Run remctl setup --shell {shell} to install completion.",
         )
+        if shell == "zsh" and completion_exists:
+            loadable = zsh_completion_loadable(completion_path)
+            if loadable is True:
+                add("completion_fpath", "ok", f"{completion_path.parent} is on $fpath", None)
+            elif loadable is False:
+                add(
+                    "completion_fpath",
+                    "warn",
+                    f"{completion_path.parent} is not on $fpath",
+                    f"Add to ~/.zshrc:\n    fpath=({completion_path.parent} $fpath)\n    autoload -Uz compinit && compinit",
+                )
     else:
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
