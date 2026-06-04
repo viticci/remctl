@@ -7951,6 +7951,13 @@ def cmd_setup(a):
             print(f"Shell completion: {completion_path}")
         else:
             print("Shell completion: skipped")
+        if selected_shell == "zsh" and completion_path:
+            print()
+            print(C.bold("Enable zsh completions:"))
+            print("  Add these lines to ~/.zshrc, then open a new terminal:")
+            print(f"    fpath=({completion_path.parent} $fpath)")
+            print("    autoload -Uz compinit && compinit")
+            print(C.dim("  Skip if your config already adds ~/.zsh/completions to fpath."))
         print()
         print("Next:")
         print("  1. remctl onboard   # trigger macOS Reminders and Automation prompts")
