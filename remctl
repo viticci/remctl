@@ -801,6 +801,17 @@ def list_ref_payload(row, *, requested=None, method="exact"):
     return payload
 
 
+def _ckid_eq(a, b):
+    """Case-insensitive CloudKit identifier comparison.
+
+    uuid_from_blob() upper-cases UUIDs decoded from BLOB columns such as
+    ZSHAREDOWNERIDENTIFIER, but ZCKIDENTIFIER text columns are stored
+    lower-cased by the live Reminders store, so a direct == never matches
+    a current-user/owner sharee on device.
+    """
+    return bool(a) and bool(b) and str(a).upper() == str(b).upper()
+
+
 def sharee_to_dict(row, *, current_user_ckid=None):
     payload = {
         "id": _row_get(row, "Z_PK"),
@@ -820,7 +831,7 @@ def sharee_to_dict(row, *, current_user_ckid=None):
         payload["status"] = _row_get(row, "ZSTATUS")
     if _row_get(row, "ZACCESSLEVEL") is not None:
         payload["accessLevel"] = _row_get(row, "ZACCESSLEVEL")
-    if current_user_ckid and payload.get("objectUUID") == current_user_ckid:
+    if _ckid_eq(payload.get("objectUUID"), current_user_ckid):
         payload["currentUser"] = True
     return payload
 
@@ -855,7 +866,7 @@ def resolve_sharee_or_die(db, list_pk, value, *, allow_me=True):
             print("Error: could not identify the current-user sharee for this list.", file=sys.stderr)
             sys.exit(1)
         for sharee in sharees:
-            if _row_get(sharee, "ZCKIDENTIFIER") == current_user_ckid:
+            if _ckid_eq(_row_get(sharee, "ZCKIDENTIFIER"), current_user_ckid):
                 return sharee
         print("Error: current-user sharee is not present in this list.", file=sys.stderr)
         sys.exit(1)
@@ -903,7 +914,7 @@ def resolve_assignment_originator_or_die(db, list_pk):
         print("Error: could not identify the current-user sharee for assignment originator.", file=sys.stderr)
         sys.exit(1)
     for sharee in q_sharees(db, list_pk):
-        if _row_get(sharee, "ZCKIDENTIFIER") == owner_ckid:
+        if _ckid_eq(_row_get(sharee, "ZCKIDENTIFIER"), owner_ckid):
             return sharee
     print("Error: current-user sharee is not present in this list.", file=sys.stderr)
     sys.exit(1)

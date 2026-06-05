@@ -2635,6 +2635,43 @@ class CliTests(unittest.TestCase):
         self.assertIn("alex.second@example.com", stderr.getvalue())
         db.close()
 
+    def _sharee_db_lowercase(self):
+        # The live Reminders store records ZCKIDENTIFIER lower-cased, while the
+        # owner blob decodes upper-cased via uuid_from_blob(); mirror that.
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.executescript("""
+            CREATE TABLE ZREMCDBASELIST (
+                Z_PK INTEGER PRIMARY KEY, ZSHAREDOWNERIDENTIFIER BLOB,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0, Z_ENT INTEGER DEFAULT 3);
+            CREATE TABLE ZREMCDOBJECT (
+                Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0, ZLIST INTEGER, ZCKIDENTIFIER TEXT,
+                ZDISPLAYNAME TEXT, ZFIRSTNAME TEXT, ZLASTNAME TEXT, ZADDRESS1 TEXT,
+                ZSTATUS INTEGER, ZACCESSLEVEL INTEGER);
+        """)
+        owner = uuid.UUID("EBA4B6AE-6FA9-4361-BA3D-F548DE185CDA")
+        db.execute("INSERT INTO ZREMCDBASELIST (Z_PK, ZSHAREDOWNERIDENTIFIER) VALUES (?, ?)",
+                   (7, owner.bytes))
+        db.executemany(
+            "INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZLIST, ZCKIDENTIFIER, ZFIRSTNAME, ZLASTNAME, ZADDRESS1, ZSTATUS, ZACCESSLEVEL) "
+            "VALUES (?, 36, 7, ?, ?, ?, ?, 2, 2)",
+            [(10, "aaf651e6-f8d7-44fa-a71f-8ab3d69c5c5a", "Alex", "Example", "mailto:alex@example.com"),
+             (11, "eba4b6ae-6fa9-4361-ba3d-f548de185cda", "Current", "User", "mailto:current@example.com")])
+        return db
+
+    def test_resolve_me_matches_lowercased_current_user_ckid(self):
+        db = self._sharee_db_lowercase()
+        self.assertEqual(self.remctl.resolve_sharee_or_die(db, 7, "me")["ZCKIDENTIFIER"],
+                         "eba4b6ae-6fa9-4361-ba3d-f548de185cda")
+        db.close()
+
+    def test_resolve_assignment_originator_matches_lowercased_owner_ckid(self):
+        db = self._sharee_db_lowercase()
+        self.assertEqual(self.remctl.resolve_assignment_originator_or_die(db, 7)["ZCKIDENTIFIER"],
+                         "eba4b6ae-6fa9-4361-ba3d-f548de185cda")
+        db.close()
+
     def test_validate_private_args_rejects_assign_and_unassign_together(self):
         args = SimpleNamespace(
             assign="Alex",
