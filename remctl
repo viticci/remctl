@@ -6339,6 +6339,7 @@ def cmd_edit(a):
         dt = parse_due(a.due)
         if dt is None:
             fail_invalid_due_date(a.due, json_mode=getattr(a, "json", False))
+    due_all_day = bool(dt and due_spec_is_all_day(a.due))
     if early_reminder_requires_due_date(a) and a.due == "clear":
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
     if early_reminder_requires_due_date(a) and dt is None and not r["ZDUEDATE"]:
@@ -6361,7 +6362,7 @@ def cmd_edit(a):
     if dt is not None and r["ZDUEDATE"] is not None:
         current = ts(r["ZDUEDATE"])
         if current and int(current.timestamp()) == int(dt.timestamp()):
-            dt_nudge = dt + timedelta(hours=1)
+            dt_nudge = dt + (timedelta(days=1) if due_all_day else timedelta(hours=1))
     carry_absolute_alarm = should_carry_absolute_alarm_to_new_due(
         db,
         r,
@@ -6384,11 +6385,14 @@ def cmd_edit(a):
     # real dueDateComponents change.
     if bridge_available() and r["ZCKIDENTIFIER"]:
         if dt_nudge is not None:
-            bridge_call({
+            nudge_data = {
                 "action": "update",
                 "id": r["ZCKIDENTIFIER"],
                 "due": dt_nudge.isoformat(),
-            })
+            }
+            if due_all_day:
+                nudge_data["allDay"] = True
+            bridge_call(nudge_data)
         data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
@@ -6411,6 +6415,8 @@ def cmd_edit(a):
                 data["clearAlarms"] = True
         elif dt is not None:
             data["due"] = dt.isoformat(); has_changes = True
+            if due_all_day:
+                data["allDay"] = True
         if parsed_recurrence is not None:
             data["recurrence"] = parsed_recurrence; has_changes = True
         if clear_alarm:
@@ -6465,6 +6471,9 @@ def cmd_edit(a):
 
     if carry_absolute_alarm or clear_matching_absolute_alarm:
         print("Error: this edit requires remctl-bridge to keep due/display/alarm state aligned.", file=sys.stderr)
+        sys.exit(1)
+    if dt is not None and due_all_day:
+        print("Error: all-day due date edits require remctl-bridge so Reminders can store date-only components.", file=sys.stderr)
         sys.exit(1)
 
     # AppleScript fallback for when bridge isn't available.

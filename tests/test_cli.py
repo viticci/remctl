@@ -3702,6 +3702,55 @@ class CliTests(unittest.TestCase):
         payload = bridge_call.call_args.args[0]
         self.assertEqual(payload["action"], "update")
         self.assertEqual(payload["due"], "2026-04-20T09:00:00")
+        self.assertNotIn("allDay", payload)
+
+    def test_cmd_edit_date_only_due_is_all_day_bridge_update(self):
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-06-21", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+
+        bridge_call.assert_called_once()
+        osa_try.assert_not_called()
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["action"], "update")
+        self.assertEqual(payload["due"], "2026-06-21T00:00:00")
+        self.assertTrue(payload["allDay"])
+
+    def test_cmd_edit_date_only_due_requires_bridge(self):
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-06-21", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            with self.assertRaises(SystemExit):
+                self.remctl.cmd_edit(args)
+
+        bridge_call.assert_not_called()
+        osa_try.assert_not_called()
+        self.assertIn("all-day due date edits require remctl-bridge", stderr.getvalue())
 
     def test_cmd_edit_due_date_carries_matching_absolute_alarm(self):
         from datetime import datetime
@@ -4162,6 +4211,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(nudge_payload["due"], "2026-04-20T10:00:00")  # +1h
         self.assertEqual(real_payload["due"], "2026-04-20T09:00:00")
 
+    def test_cmd_edit_double_tap_keeps_date_only_due_all_day(self):
+        from datetime import datetime
+
+        target = datetime(2026, 6, 21, 0, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["ZDUEDATE"] = self.remctl.to_ts(target)
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(SimpleNamespace(
+                id=1, json=True, title=None, notes=None, priority=None,
+                due="2026-06-21", url=None, recurrence=None, alarm=None,
+            ))
+
+        self.assertEqual(bridge_call.call_count, 2)
+        nudge_payload, real_payload = (
+            bridge_call.call_args_list[0].args[0],
+            bridge_call.call_args_list[1].args[0],
+        )
+        self.assertEqual(nudge_payload["due"], "2026-06-22T00:00:00")
+        self.assertTrue(nudge_payload["allDay"])
+        self.assertEqual(real_payload["due"], "2026-06-21T00:00:00")
+        self.assertTrue(real_payload["allDay"])
+
     def test_cmd_edit_rejects_unparseable_due(self):
         """An unparseable due-date string must exit non-zero rather than
         silently dropping the field and letting the rest of the update proceed."""
@@ -4507,6 +4588,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["section"], "Playground")
 
     def test_info_json_keeps_due_date_separate_from_display_alarm_date(self):
+        from datetime import datetime
+
         row = {
             "Z_PK": 42,
             "ZTITLE": "Review",
@@ -4516,8 +4599,8 @@ class CliTests(unittest.TestCase):
             "ZPRIORITY": 0,
             "ZISURGENTSTATEENABLEDFORCURRENTUSER": 0,
             "ZDUEDATEDELTAALERTSDATA": None,
-            "ZDUEDATE": 801216000,
-            "ZDISPLAYDATEDATE": 801215100,
+            "ZDUEDATE": self.remctl.to_ts(datetime(2026, 5, 23, 10, 0, 0)),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(datetime(2026, 5, 23, 9, 45, 0)),
             "ZALLDAY": 0,
             "ZCOMPLETIONDATE": None,
             "ZCREATIONDATE": None,
