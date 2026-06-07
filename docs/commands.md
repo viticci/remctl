@@ -158,6 +158,8 @@ Location alarms are normal reminder alarms saved through EventKit structured-loc
 
 ```bash
 remctl done 23880
+remctl done 23880 --date 2026-05-27
+remctl done 23880 --date "2026-05-27 09:30"
 remctl undone 23880
 remctl edit 23880 --title "New title"
 remctl edit 23880 -d "next friday" -p medium
@@ -170,6 +172,8 @@ remctl unflag 23880
 remctl delete 23880
 remctl delete 23880 --force
 ```
+
+`done --date WHEN` records an explicit completion date instead of "now". It also works on an already-completed reminder to correct the stored completion date. `WHEN` must be an absolute `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; recurring reminders reject `--date` because plain completion advances the series and EventKit discards a manually supplied completion date.
 
 ## Lists
 
@@ -361,6 +365,8 @@ remctl completion zsh
 ```
 
 Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor --for-agent`, then adding the printed target in System Settings. Run `doctor` from the same terminal, app, or agent runner that will run the RemCTL write.
+
+`doctor` also checks whether an installed zsh completion file appears in exported `FPATH` or the usual zsh startup files. If it warns, add the printed `fpath=(... $fpath)` and `compinit` lines to `~/.zshrc`, then open a new terminal.
 
 ## Agent Fast Path
 

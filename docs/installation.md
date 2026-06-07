@@ -79,6 +79,8 @@ remctl doctor --for-agent --json
 
 Grant access to the target printed by that context, then relaunch the app or terminal that will run RemCTL.
 
+If your terminal embeds another terminal engine, trust the `host_app` and target path from `doctor --for-agent`; RemCTL prefers the real bundle path over inherited variables such as `TERM_PROGRAM=ghostty`.
+
 Default visual flow:
 
 ```bash
@@ -139,6 +141,15 @@ Recommended:
 ```bash
 remctl setup --shell auto
 ```
+
+For zsh, setup installs `_remctl` and prints the `fpath` lines that may need to be added to `~/.zshrc`:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+`remctl doctor` reports `completion_fpath` when the installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files.
 
 Manual:
 

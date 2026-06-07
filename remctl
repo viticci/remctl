@@ -191,12 +191,104 @@ def find_main_db():
 def find_main_db_path():
     if reminders_store_access_error():
         return None
-    candidates = sorted(STORE_DIR.glob("Data-*.sqlite"), key=lambda p: p.stat().st_size, reverse=True)
-    return candidates[0] if candidates else None
+    candidates = list(STORE_DIR.glob("Data-*.sqlite"))
+    if not candidates:
+        return None
+    scored = [(reminders_db_score(path), path) for path in candidates]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1] if scored else None
+
+
+def sqlite_sidecar_size(path):
+    total = 0
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            total += sidecar.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def table_exists(conn, name):
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (name,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def _db_scalar(conn, sql, default=0):
+    try:
+        row = conn.execute(sql).fetchone()
+    except sqlite3.Error:
+        return default
+    if not row:
+        return default
+    value = row[0]
+    return default if value is None else value
+
+
+def reminders_db_score(path):
+    """Score a candidate Reminders store using read-only content and sidecars."""
+    try:
+        db_size = path.stat().st_size
+    except OSError:
+        db_size = 0
+    sidecar_size = sqlite_sidecar_size(path)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return (0, 0, 0, 0, 0, sidecar_size, db_size)
+    try:
+        has_reminder_table = table_exists(conn, "ZREMCDREMINDER")
+        has_list_table = table_exists(conn, "ZREMCDBASELIST")
+        has_object_table = table_exists(conn, "ZREMCDOBJECT")
+        reminder_count = _db_scalar(
+            conn,
+            "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE COALESCE(ZMARKEDFORDELETION, 0) = 0",
+        ) if has_reminder_table else 0
+        active_count = _db_scalar(
+            conn,
+            "SELECT COUNT(*) FROM ZREMCDREMINDER WHERE COALESCE(ZMARKEDFORDELETION, 0) = 0 AND COALESCE(ZCOMPLETED, 0) = 0",
+        ) if has_reminder_table else 0
+        list_count = _db_scalar(
+            conn,
+            "SELECT COUNT(*) FROM ZREMCDBASELIST WHERE COALESCE(ZMARKEDFORDELETION, 0) = 0 AND ZNAME IS NOT NULL AND ZNAME != ''",
+        ) if has_list_table else 0
+        object_count = _db_scalar(
+            conn,
+            "SELECT COUNT(*) FROM ZREMCDOBJECT WHERE COALESCE(ZMARKEDFORDELETION, 0) = 0",
+        ) if has_object_table else 0
+        latest_modified = _db_scalar(
+            conn,
+            "SELECT MAX(COALESCE(ZMODIFIEDDATE, ZLASTMODIFIEDDATE, ZCREATIONDATE, 0)) FROM ZREMCDOBJECT",
+        ) if has_object_table else 0
+    finally:
+        conn.close()
+    return (
+        1 if has_reminder_table else 0,
+        int(reminder_count or 0),
+        int(active_count or 0),
+        int(list_count or 0),
+        int(object_count or 0),
+        float(latest_modified or 0),
+        sidecar_size,
+        db_size,
+    )
 
 def open_db():
     conn = sqlite3.connect(f"file:{find_main_db()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    if not table_exists(conn, "ZREMCDREMINDER"):
+        conn.close()
+        raise RemindersDBUnavailable(
+            "Reminders store is missing the expected ZREMCDREMINDER table; "
+            "this macOS Reminders schema may need a RemCTL update."
+        )
     return conn
 
 def ts(v):
@@ -801,6 +893,12 @@ def list_ref_payload(row, *, requested=None, method="exact"):
     return payload
 
 
+def ckid_eq(a, b):
+    if not a or not b:
+        return False
+    return str(a).casefold() == str(b).casefold()
+
+
 def sharee_to_dict(row, *, current_user_ckid=None):
     payload = {
         "id": _row_get(row, "Z_PK"),
@@ -820,7 +918,7 @@ def sharee_to_dict(row, *, current_user_ckid=None):
         payload["status"] = _row_get(row, "ZSTATUS")
     if _row_get(row, "ZACCESSLEVEL") is not None:
         payload["accessLevel"] = _row_get(row, "ZACCESSLEVEL")
-    if current_user_ckid and payload.get("objectUUID") == current_user_ckid:
+    if ckid_eq(payload.get("objectUUID"), current_user_ckid):
         payload["currentUser"] = True
     return payload
 
@@ -855,7 +953,7 @@ def resolve_sharee_or_die(db, list_pk, value, *, allow_me=True):
             print("Error: could not identify the current-user sharee for this list.", file=sys.stderr)
             sys.exit(1)
         for sharee in sharees:
-            if _row_get(sharee, "ZCKIDENTIFIER") == current_user_ckid:
+            if ckid_eq(_row_get(sharee, "ZCKIDENTIFIER"), current_user_ckid):
                 return sharee
         print("Error: current-user sharee is not present in this list.", file=sys.stderr)
         sys.exit(1)
@@ -903,7 +1001,7 @@ def resolve_assignment_originator_or_die(db, list_pk):
         print("Error: could not identify the current-user sharee for assignment originator.", file=sys.stderr)
         sys.exit(1)
     for sharee in q_sharees(db, list_pk):
-        if _row_get(sharee, "ZCKIDENTIFIER") == owner_ckid:
+        if ckid_eq(_row_get(sharee, "ZCKIDENTIFIER"), owner_ckid):
             return sharee
     print("Error: current-user sharee is not present in this list.", file=sys.stderr)
     sys.exit(1)
@@ -2333,6 +2431,28 @@ def private_available():
     return PRIVATE_PATH.exists() and PRIVATE_PATH.stat().st_mode & 0o111
 
 
+def remindd_running():
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-x", "remindd"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.returncode == 0
+
+
+def private_error_payload(status, message, stderr=""):
+    return {
+        "returncode": -1,
+        "stdout": "",
+        "stderr": stderr,
+        "payload": {"status": status, "message": message},
+    }
+
+
 def private_call_result(data, timeout=30):
     """Call remctl-private and return raw subprocess + parsed JSON details."""
     try:
@@ -2340,8 +2460,21 @@ def private_call_result(data, timeout=30):
             [str(PRIVATE_PATH)], input=json.dumps(data),
             capture_output=True, text=True, timeout=timeout
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
+    except subprocess.TimeoutExpired:
+        suffix = ""
+        if remindd_running() is False:
+            suffix = " Reminders daemon (remindd) is not running; open Reminders.app, then retry."
+        return private_error_payload(
+            "timeout",
+            f"private helper did not respond within {timeout}s.{suffix}",
+        )
+    except FileNotFoundError:
+        return private_error_payload(
+            "missing_helper",
+            f"private helper not found at {PRIVATE_PATH}. Reinstall remctl with ./install.sh.",
+        )
+    except OSError as exc:
+        return private_error_payload("exec_error", f"could not run private helper: {exc}", str(exc))
 
     payload = None
     if proc.stdout:
@@ -2349,6 +2482,12 @@ def private_call_result(data, timeout=30):
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
             payload = None
+    if not isinstance(payload, dict):
+        detail = (proc.stderr or proc.stdout or "").strip()
+        payload = {
+            "status": "error",
+            "message": detail or f"private helper exited {proc.returncode} with no JSON output.",
+        }
     return {
         "returncode": proc.returncode,
         "stdout": proc.stdout,
@@ -2360,9 +2499,9 @@ def private_call_result(data, timeout=30):
 def private_call(data):
     """Call remctl-private with JSON data. Returns parsed JSON response."""
     result = private_call_result(data)
-    if result and isinstance(result["payload"], dict):
+    if result and isinstance(result.get("payload"), dict):
         return result["payload"]
-    return None
+    return {"status": "error", "message": "private helper failed"}
 
 
 def private_helper_error_is_transient(result):
@@ -3475,6 +3614,61 @@ def _normalize_terminal_app_name(value):
     return KNOWN_TERMINAL_APPS.get(value.strip().lower())
 
 
+def app_bundle_from_path_hint(value):
+    if not value:
+        return None
+    match = re.search(r"(/.*?\.app)(?:/|\s|$)", str(value))
+    if not match:
+        return None
+    path = Path(match.group(1)).expanduser().resolve(strict=False)
+    return path if path.name.endswith(".app") and path.exists() else None
+
+
+def find_app_bundle_by_identifier(bundle_id):
+    if not bundle_id:
+        return None
+    if not re.match(r"^[A-Za-z0-9_.-]+$", str(bundle_id)):
+        return None
+    try:
+        proc = subprocess.run(
+            ["mdfind", f"kMDItemCFBundleIdentifier == '{bundle_id}'"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        path = Path(line.strip()).expanduser()
+        if path.name.endswith(".app") and path.exists():
+            return path.resolve()
+    return None
+
+
+def bundle_context_from_environment():
+    bundle_id = os.environ.get("__CFBundleIdentifier")
+    bundle_path = find_app_bundle_by_identifier(bundle_id) if bundle_id else None
+    if bundle_path:
+        return {
+            "app": bundle_path.name,
+            "path": str(bundle_path),
+            "bundle_id": bundle_id,
+            "source": "__CFBundleIdentifier",
+        }
+    for env_name in ("GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR"):
+        bundle_path = app_bundle_from_path_hint(os.environ.get(env_name))
+        if bundle_path:
+            return {
+                "app": bundle_path.name,
+                "path": str(bundle_path),
+                "bundle_id": bundle_id,
+                "source": env_name,
+            }
+    return None
+
+
 def detect_terminal_app_name():
     env_name = _normalize_terminal_app_name(os.environ.get("TERM_PROGRAM"))
     if env_name:
@@ -3566,18 +3760,36 @@ def doctor_execution_context():
     ancestry = process_ancestry()
     parent = ancestry[0] if ancestry else None
     terminal_app = detect_terminal_app_name()
-    host_app = terminal_app
+    bundle_context = bundle_context_from_environment()
+    host_app = bundle_context["app"] if bundle_context else terminal_app
+    host_app_path = bundle_context["path"] if bundle_context else None
+    host_bundle_id = bundle_context["bundle_id"] if bundle_context else None
+    host_app_source = bundle_context["source"] if bundle_context else ("terminal" if terminal_app else None)
     effective_context = "Terminal" if terminal_app else "unknown"
 
     for proc in ancestry:
         app_name = _app_name_from_process_name(proc.get("name"))
         if app_name:
+            if bundle_context and app_name == "Ghostty.app" and bundle_context["app"] != "Ghostty.app":
+                continue
             host_app = app_name
+            resolved = find_app_bundle(app_name) if app_name.endswith(".app") else None
+            host_app_path = str(resolved) if resolved else host_app_path
+            host_app_source = "process"
             if "codex" in app_name.lower():
                 effective_context = "Codex"
             elif app_name.endswith(".app"):
                 effective_context = app_name.removesuffix(".app")
             break
+        bundle_path = app_bundle_from_path_hint(proc.get("command"))
+        if bundle_path:
+            host_app = bundle_path.name
+            host_app_path = str(bundle_path)
+            host_app_source = "process_command"
+            effective_context = host_app.removesuffix(".app")
+            break
+    if bundle_context and host_app == bundle_context["app"]:
+        effective_context = host_app.removesuffix(".app")
 
     return {
         "python": sys.executable,
@@ -3585,6 +3797,9 @@ def doctor_execution_context():
         "parent_process": parent,
         "terminal_app": terminal_app,
         "host_app": host_app,
+        "host_app_path": host_app_path,
+        "host_bundle_id": host_bundle_id,
+        "host_app_source": host_app_source,
         "effective_context": effective_context,
     }
 
@@ -3643,7 +3858,10 @@ def full_disk_access_target_specs(*, include_cli=True):
             "Required when direct CLI reads cannot see the Reminders database.",
         )
         host_app = context.get("host_app")
-        host_path = find_app_bundle(host_app) if host_app and host_app.endswith(".app") else None
+        host_path_value = context.get("host_app_path")
+        host_path = Path(host_path_value) if host_path_value else (
+            find_app_bundle(host_app) if host_app and host_app.endswith(".app") else None
+        )
         if host_path:
             _add_permission_target(
                 targets,
@@ -3653,7 +3871,13 @@ def full_disk_access_target_specs(*, include_cli=True):
                 "Required when this host app launches remctl or an agent runner.",
             )
         terminal_name = detect_terminal_app_name()
-        terminal_path = find_app_bundle(terminal_name) if terminal_name else None
+        skip_terminal = (
+            terminal_name == "Ghostty.app"
+            and host_path is not None
+            and host_app
+            and host_app != terminal_name
+        )
+        terminal_path = None if skip_terminal else (find_app_bundle(terminal_name) if terminal_name else None)
         if terminal_path:
             _add_permission_target(
                 targets,
@@ -4177,6 +4401,46 @@ def fail_invalid_due_date(value, *, json_mode=False, field="due"):
         for example in payload["examples"]:
             print(f"  {example}", file=sys.stderr)
     sys.exit(2)
+
+
+COMPLETION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$")
+
+
+def parse_completion_date(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not COMPLETION_DATE_RE.match(text):
+        return None
+    normalized = text.replace("T", " ")
+    try:
+        if len(normalized) == 10:
+            return datetime.strptime(normalized, "%Y-%m-%d")
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def fail_invalid_completion_date(value, *, json_mode=False):
+    payload = {
+        "status": "error",
+        "code": "invalid_completion_date",
+        "field": "date",
+        "input": value,
+        "message": "Could not parse completion date. No reminder was changed.",
+        "examples": ["2026-05-27", "2026-05-27 09:30"],
+    }
+    if json_mode:
+        print(json.dumps(payload), file=sys.stderr)
+    else:
+        print(f"Error: could not parse completion date {value!r}.", file=sys.stderr)
+        print("No reminder was changed.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Use exact forms like:", file=sys.stderr)
+        for example in payload["examples"]:
+            print(f"  {example}", file=sys.stderr)
+    sys.exit(2)
+
 
 WEEKDAY_MAP = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -5653,25 +5917,62 @@ def cmd_done(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
+    completion_arg = getattr(a, "date", None)
+    completion_dt = None
+    completion_iso = None
+    if completion_arg:
+        completion_dt = parse_completion_date(completion_arg)
+        if not completion_dt:
+            fail_invalid_completion_date(completion_arg, json_mode=getattr(a, "json", False))
+        completion_iso = completion_dt.isoformat()
+    if completion_iso and _row_get(r, "recurrence_frequency") is not None:
+        message = (
+            "--date is not supported for recurring reminders. "
+            f"Use 'remctl done {a.id}' without --date to advance the series."
+        )
+        if getattr(a, "json", False):
+            print(json.dumps({
+                "status": "error",
+                "code": "completion_date_unsupported_for_recurring",
+                "message": message,
+                "id": a.id,
+            }), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
     # Bridge-first for speed (post-2026-04-17 bridge fix: dueDateComponents
     # now reach CloudKit correctly). AppleScript stays as a fallback.
     if bridge_available() and r["ZCKIDENTIFIER"]:
         data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
+        if completion_iso:
+            data["completionDate"] = completion_iso
         result = bridge_call(data)
         if result and result.get("status") == "completed":
             if a.json:
-                print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+                payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
+                if completion_iso:
+                    payload["completionDate"] = completion_iso
+                print(json.dumps(payload))
             else:
-                print(f"Completed: {safe_display(r['ZTITLE'])}")
+                suffix = f" ({completion_iso})" if completion_iso else ""
+                print(f"Completed: {safe_display(r['ZTITLE'])}{suffix}")
             return
 
     # AppleScript fallback
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set completed of r to true"):
+    action = "set completed of r to true"
+    if completion_dt:
+        action += "\n" + as_date_assign(completion_dt, "completion date of r")
+    if rid and osa_by_id_try(r["list_name"], rid, action):
         if a.json:
-            print(json.dumps({"status": "completed", "id": a.id, "title": r["ZTITLE"]}))
+            payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
+            if completion_iso:
+                payload["completionDate"] = completion_iso
+            print(json.dumps(payload))
         else:
-            print(f"Completed: {safe_display(r['ZTITLE'])}")
+            suffix = f" ({completion_iso})" if completion_iso else ""
+            print(f"Completed: {safe_display(r['ZTITLE'])}{suffix}")
         return
     if not rid:
         _refuse_unsafe_title_fallback(r, "complete it", "The reminder has no stable identifier")
@@ -6883,6 +7184,12 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        done)
+            _arguments \
+                '--date[Set completion date]:date:' \
+                '--json[JSON output]'
+            return
+            ;;
         edit)
             _arguments \
                 '--private[Use unsupported private ReminderKit metadata writes]' \
@@ -7108,6 +7415,9 @@ BASH_COMPLETION = '''_remctl() {
     if [ "$cmd" = "add" ]; then
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
+    elif [ "$cmd" = "done" ]; then
+        COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
+        return
     elif [ "$cmd" = "edit" ]; then
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
@@ -7226,6 +7536,8 @@ complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Prin
 complete -c remctl -n "__fish_seen_subcommand_from show" -l list-id -d "Show list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l completed -d "Include completed reminders"
 complete -c remctl -n "__fish_seen_subcommand_from show" -s v -l verbose -d "Verbose output"
+complete -c remctl -n "__fish_seen_subcommand_from done" -l date -d "Set completion date" -r
+complete -c remctl -n "__fish_seen_subcommand_from done" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from link" -s l -l list -d "Get links for active reminders in list" -r
 complete -c remctl -n "__fish_seen_subcommand_from link" -l list-id -d "Get links for active reminders in list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from link" -l completed -d "Include completed reminders"
@@ -7379,6 +7691,54 @@ def install_completion(shell):
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(get_completion_script(shell))
     return target
+
+
+def zsh_completion_hint(path):
+    directory = path.parent
+    return (
+        f"Add to ~/.zshrc:\n"
+        f"    fpath=({directory} $fpath)\n"
+        f"    autoload -Uz compinit && compinit"
+    )
+
+
+def zsh_completion_loadable(completion_path):
+    target = completion_path.parent.expanduser().resolve(strict=False)
+    exported_fpath = os.environ.get("FPATH")
+    if exported_fpath:
+        for entry in exported_fpath.split(os.pathsep):
+            if not entry:
+                continue
+            try:
+                if Path(entry).expanduser().resolve(strict=False) == target:
+                    return True
+            except OSError:
+                continue
+
+    home = Path.home()
+    zdotdir = Path(os.environ.get("ZDOTDIR", str(home))).expanduser()
+    config_files = [zdotdir / ".zshrc", zdotdir / ".zprofile", zdotdir / ".zshenv"]
+    needles = {
+        str(completion_path.parent),
+        str(completion_path.parent.expanduser()),
+        str(completion_path.parent.expanduser().resolve(strict=False)),
+    }
+    home_relative = None
+    try:
+        home_relative = completion_path.parent.expanduser().resolve(strict=False).relative_to(home)
+    except ValueError:
+        pass
+    if home_relative is not None:
+        rel = str(home_relative)
+        needles.update({f"~/{rel}", f"$HOME/{rel}"})
+    for config_file in config_files:
+        try:
+            text = config_file.read_text(errors="ignore")
+        except OSError:
+            continue
+        if any(needle and needle in text for needle in needles):
+            return True
+    return False
 
 
 def resolve_setup_shell(requested_shell):
@@ -7815,12 +8175,31 @@ def gather_doctor_checks():
     shell = detect_shell_name()
     if shell in {"zsh", "bash", "fish"}:
         completion_path = completion_target_path(shell)
+        completion_exists = completion_path.exists()
         add(
             "completion",
-            "ok" if completion_path.exists() else "warn",
+            "ok" if completion_exists else "warn",
             f"{shell}: {completion_path}",
-            None if completion_path.exists() else f"Run remctl setup --shell {shell} to install completion.",
+            None if completion_exists else f"Run remctl setup --shell {shell} to install completion.",
         )
+        if shell == "zsh" and completion_exists:
+            loadable = zsh_completion_loadable(completion_path)
+            if loadable is True:
+                add("completion_fpath", "ok", f"{completion_path.parent} is on zsh fpath", None)
+            elif loadable is False:
+                add(
+                    "completion_fpath",
+                    "warn",
+                    f"{completion_path.parent} is not on zsh fpath",
+                    zsh_completion_hint(completion_path),
+                )
+            else:
+                add(
+                    "completion_fpath",
+                    "warn",
+                    f"Could not verify zsh fpath for {completion_path.parent}",
+                    zsh_completion_hint(completion_path),
+                )
     else:
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
@@ -7951,6 +8330,12 @@ def cmd_setup(a):
             print(f"Shell completion: {completion_path}")
         else:
             print("Shell completion: skipped")
+        if selected_shell == "zsh" and completion_path:
+            print()
+            print(C.bold("Enable zsh completions:"))
+            print("  Add these lines to ~/.zshrc, then open a new terminal:")
+            print(f"    fpath=({completion_path.parent} $fpath)")
+            print("    autoload -Uz compinit && compinit")
         print()
         print("Next:")
         print("  1. remctl onboard   # trigger macOS Reminders and Automation prompts")
@@ -8137,7 +8522,25 @@ def main():
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
     js(c)
 
-    c = sub.add_parser("done", help="Complete a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser(
+        "done",
+        help="Complete a reminder",
+        description="Complete a reminder, optionally recording an explicit completion date.",
+        epilog=(
+            "Examples:\n"
+            "  remctl done 23880\n"
+            "  remctl done 23880 --date 2026-05-27\n"
+            "  remctl done 23880 --date \"2026-05-27 09:30\"\n"
+            "\n"
+            "--date accepts only absolute YYYY-MM-DD or YYYY-MM-DD HH:MM values. "
+            "It also updates an already-completed reminder's completion date. "
+            "Recurring reminders reject --date; use plain done to advance the series."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("id", type=int)
+    c.add_argument("--date", metavar="WHEN", help="Set completion date to YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
+    js(c)
     c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
 
     c = sub.add_parser(

@@ -62,6 +62,23 @@ class CliTests(unittest.TestCase):
     def test_parse_due_rejects_invalid_clock_time(self):
         self.assertIsNone(self.remctl.parse_due("today at 25:00"))
 
+    def test_parse_completion_date_accepts_only_absolute_values(self):
+        self.assertEqual(
+            self.remctl.parse_completion_date("2026-05-27"),
+            self.remctl.datetime(2026, 5, 27, 0, 0),
+        )
+        self.assertEqual(
+            self.remctl.parse_completion_date("2026-05-27 09:30"),
+            self.remctl.datetime(2026, 5, 27, 9, 30),
+        )
+        self.assertEqual(
+            self.remctl.parse_completion_date("2026-05-27T09:30:15"),
+            self.remctl.datetime(2026, 5, 27, 9, 30, 15),
+        )
+        self.assertIsNone(self.remctl.parse_completion_date("today"))
+        self.assertIsNone(self.remctl.parse_completion_date("+3d"))
+        self.assertIsNone(self.remctl.parse_completion_date("2026-02-31"))
+
     def test_due_spec_is_all_day_for_date_only_inputs(self):
         self.assertTrue(self.remctl.due_spec_is_all_day("today"))
         self.assertTrue(self.remctl.due_spec_is_all_day("tomorrow"))
@@ -148,6 +165,33 @@ class CliTests(unittest.TestCase):
                 self.remctl.private_call({"action": "create_list"}),
                 {"status": "error", "message": "ReminderKit unavailable"},
             )
+
+    def test_private_call_result_timeout_reports_structured_error(self):
+        with (
+            mock.patch.object(
+                self.remctl.subprocess,
+                "run",
+                side_effect=self.remctl.subprocess.TimeoutExpired(["remctl-private"], 30),
+            ),
+            mock.patch.object(self.remctl, "remindd_running", return_value=False),
+        ):
+            result = self.remctl.private_call_result({"action": "set_flagged"}, timeout=30)
+        self.assertEqual(result["payload"]["status"], "timeout")
+        self.assertIn("30s", result["payload"]["message"])
+        self.assertIn("remindd", result["payload"]["message"])
+
+    def test_private_call_result_missing_helper_reports_structured_error(self):
+        with mock.patch.object(self.remctl.subprocess, "run", side_effect=FileNotFoundError):
+            result = self.remctl.private_call_result({"action": "set_flagged"})
+        self.assertEqual(result["payload"]["status"], "missing_helper")
+        self.assertIn("Reinstall", result["payload"]["message"])
+
+    def test_private_call_result_non_json_output_reports_stderr(self):
+        proc = SimpleNamespace(returncode=2, stdout="", stderr="ReminderKit unavailable")
+        with mock.patch.object(self.remctl.subprocess, "run", return_value=proc):
+            result = self.remctl.private_call_result({"action": "set_flagged"})
+        self.assertEqual(result["payload"]["status"], "error")
+        self.assertEqual(result["payload"]["message"], "ReminderKit unavailable")
 
     def test_private_create_list_retries_transient_helper_error(self):
         transient = {
@@ -254,6 +298,76 @@ class CliTests(unittest.TestCase):
             self.assertEqual(self.remctl.current_bridge_path(), Path("/tmp/custom-bridge"))
             self.assertEqual(self.remctl.current_private_path(), Path("/tmp/custom-private"))
             self.assertEqual(self.remctl.current_permissions_path(), Path("/tmp/custom-permissions"))
+
+    def _store_db(self, path, *, reminders=0, active=0, objects=0, lists=1, filler=False):
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE ZREMCDREMINDER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0,
+                ZCOMPLETED INTEGER DEFAULT 0
+            );
+            CREATE TABLE ZREMCDBASELIST (
+                Z_PK INTEGER PRIMARY KEY,
+                ZNAME TEXT,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0
+            );
+            CREATE TABLE ZREMCDOBJECT (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMARKEDFORDELETION INTEGER DEFAULT 0,
+                ZMODIFIEDDATE REAL
+            );
+        """)
+        for i in range(lists):
+            db.execute("INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME) VALUES (?, ?)", (i + 1, f"List {i + 1}"))
+        for i in range(reminders):
+            completed = 0 if i < active else 1
+            db.execute("INSERT INTO ZREMCDREMINDER (Z_PK, ZCOMPLETED) VALUES (?, ?)", (i + 1, completed))
+        for i in range(objects):
+            db.execute("INSERT INTO ZREMCDOBJECT (Z_PK, ZMODIFIEDDATE) VALUES (?, ?)", (i + 1, 100 + i))
+        if filler:
+            db.execute("CREATE TABLE FILLER (body TEXT)")
+            db.execute("INSERT INTO FILLER VALUES (?)", ("x" * 20000,))
+        db.commit()
+        db.close()
+
+    def test_find_main_db_path_prefers_content_over_main_file_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Path(tmpdir)
+            inactive = store / "Data-inactive.sqlite"
+            active = store / "Data-active.sqlite"
+            self._store_db(inactive, reminders=0, objects=0, filler=True)
+            self._store_db(active, reminders=2, active=1, objects=2)
+            with (
+                mock.patch.object(self.remctl, "STORE_DIR", store),
+                mock.patch.object(self.remctl, "reminders_store_access_error", return_value=None),
+            ):
+                self.assertEqual(self.remctl.find_main_db_path(), active)
+
+    def test_find_main_db_path_uses_sidecar_size_as_tie_breaker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Path(tmpdir)
+            first = store / "Data-first.sqlite"
+            second = store / "Data-second.sqlite"
+            self._store_db(first, reminders=0, objects=0)
+            self._store_db(second, reminders=0, objects=0)
+            Path(f"{second}-wal").write_bytes(b"x" * 4096)
+            with (
+                mock.patch.object(self.remctl, "STORE_DIR", store),
+                mock.patch.object(self.remctl, "reminders_store_access_error", return_value=None),
+            ):
+                self.assertEqual(self.remctl.find_main_db_path(), second)
+
+    def test_open_db_rejects_unexpected_schema(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "Data-bad.sqlite"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE ZREMCDOBJECT (Z_PK INTEGER PRIMARY KEY)")
+            db.commit()
+            db.close()
+            with mock.patch.object(self.remctl, "find_main_db", return_value=path):
+                with self.assertRaises(self.remctl.RemindersDBUnavailable):
+                    self.remctl.open_db()
 
     def _list_db(self, names, grocery_locales=None):
         grocery_locales = grocery_locales or {}
@@ -741,6 +855,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.list, "Work")
         self.assertEqual(args.format, "table")
         self.assertFalse(args.json)
+
+    def test_done_command_accepts_date_after_id(self):
+        captured = {}
+
+        def capture(args, handler):
+            captured["args"] = args
+            captured["handler"] = handler
+
+        color_enabled = self.remctl.C.enabled
+        try:
+            with (
+                mock.patch.object(sys, "argv", ["remctl", "done", "23880", "--date", "2026-05-27", "--json"]),
+                mock.patch.object(self.remctl, "maybe_run_first_launch_onboarding"),
+                mock.patch.object(self.remctl, "run_handler_with_fallback", side_effect=capture),
+            ):
+                self.remctl.main()
+        finally:
+            self.remctl.C.enabled = color_enabled
+
+        args = captured["args"]
+        self.assertIs(captured["handler"], self.remctl.cmd_done)
+        self.assertEqual(args.id, 23880)
+        self.assertEqual(args.date, "2026-05-27")
+        self.assertTrue(args.json)
 
     def test_read_command_local_format_json_enables_json_output(self):
         captured = {}
@@ -2621,6 +2759,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.remctl.resolve_sharee_or_die(db, 7, "me")["ZCKIDENTIFIER"], "EBA4B6AE-6FA9-4361-BA3D-F548DE185CDA")
         db.close()
 
+    def test_resolve_sharee_me_matches_lowercase_current_user_ckid(self):
+        db = self._sharee_db()
+        db.execute("UPDATE ZREMCDOBJECT SET ZCKIDENTIFIER = lower(ZCKIDENTIFIER)")
+        self.assertEqual(
+            self.remctl.resolve_sharee_or_die(db, 7, "me")["ZCKIDENTIFIER"],
+            "eba4b6ae-6fa9-4361-ba3d-f548de185cda",
+        )
+        self.assertEqual(
+            self.remctl.resolve_assignment_originator_or_die(db, 7)["ZCKIDENTIFIER"],
+            "eba4b6ae-6fa9-4361-ba3d-f548de185cda",
+        )
+        db.close()
+
     def test_resolve_sharee_rejects_ambiguous_names(self):
         db = self._sharee_db()
         db.execute(
@@ -2697,6 +2848,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["list"]["title"], "Shopping")
         self.assertEqual(len(payload["sharees"]), 2)
         self.assertEqual(payload["sharees"][0]["address"], "mailto:alex@example.com")
+        self.assertTrue(payload["sharees"][1]["currentUser"])
+        db.close()
+
+    def test_cmd_sharees_json_reports_current_user_for_lowercase_ckid(self):
+        db = self._sharee_db()
+        db.execute("UPDATE ZREMCDOBJECT SET ZCKIDENTIFIER = lower(ZCKIDENTIFIER)")
+        list_ref = {
+            "id": 7,
+            "title": "Shopping",
+            "objectUUID": "LIST-UUID",
+            "requested": "Shopping",
+            "method": "exact",
+            "isGroceries": False,
+        }
+        args = SimpleNamespace(list="Shopping", list_id=None, json=True)
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=db),
+            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=list_ref),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_sharees(args)
+        payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["sharees"][1]["currentUser"])
         db.close()
 
@@ -2832,6 +3005,47 @@ class CliTests(unittest.TestCase):
         self.assertIn("Shell completion: skipped", output)
         self.assertIn("remctl onboard", output)
 
+    def test_cmd_setup_zsh_reports_fpath_snippet_without_changing_json(self):
+        args = SimpleNamespace(shell="zsh", doctor=False, json=False)
+        completion_path = Path("/tmp/remctl-zsh/completions/_remctl")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(self.remctl, "CONFIG_DIR", Path(tmpdir) / "config"),
+                mock.patch.object(self.remctl, "install_completion", return_value=completion_path),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_setup(args)
+        output = stdout.getvalue()
+        self.assertIn("Enable zsh completions", output)
+        self.assertIn(f"fpath=({completion_path.parent} $fpath)", output)
+
+        json_args = SimpleNamespace(shell="zsh", doctor=False, json=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(self.remctl, "CONFIG_DIR", Path(tmpdir) / "config"),
+                mock.patch.object(self.remctl, "install_completion", return_value=completion_path),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_setup(json_args)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["completion_shell"], "zsh")
+        self.assertEqual(payload["completion_path"], str(completion_path))
+
+    def test_gather_doctor_checks_warns_when_zsh_completion_is_not_on_fpath(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            completion_path = Path(tmpdir) / ".zsh" / "completions" / "_remctl"
+            completion_path.parent.mkdir(parents=True)
+            completion_path.write_text("#compdef remctl\n")
+            with (
+                mock.patch.object(self.remctl, "detect_shell_name", return_value="zsh"),
+                mock.patch.object(self.remctl, "completion_target_path", return_value=completion_path),
+                mock.patch.object(self.remctl, "zsh_completion_loadable", return_value=False),
+            ):
+                checks = self.remctl.gather_doctor_checks()
+        fpath_check = next(check for check in checks if check["name"] == "completion_fpath")
+        self.assertEqual(fpath_check["status"], "warn")
+        self.assertIn("fpath=", fpath_check["fix"])
+
     def test_cmd_upcoming_rejects_non_positive_days_before_database_read(self):
         for days in (0, -1):
             args = SimpleNamespace(days=days, json=True, verbose=False, format="json")
@@ -2887,6 +3101,64 @@ class CliTests(unittest.TestCase):
     def test_detect_terminal_app_name_prefers_term_program(self):
         with mock.patch.dict("os.environ", {"TERM_PROGRAM": "Apple_Terminal"}, clear=False):
             self.assertEqual(self.remctl.detect_terminal_app_name(), "Terminal.app")
+
+    def test_doctor_execution_context_prefers_ghostty_embedder_bundle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = Path(tmpdir) / "awesoMux.app"
+            resources = app / "Contents" / "Resources" / "ghostty"
+            resources.mkdir(parents=True)
+            with (
+                mock.patch.dict(
+                    self.remctl.os.environ,
+                    {
+                        "TERM_PROGRAM": "ghostty",
+                        "GHOSTTY_RESOURCES_DIR": str(resources),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(self.remctl, "process_ancestry", return_value=[]),
+                mock.patch.object(self.remctl, "find_app_bundle_by_identifier", return_value=None),
+            ):
+                context = self.remctl.doctor_execution_context()
+        self.assertEqual(context["terminal_app"], "Ghostty.app")
+        self.assertEqual(context["host_app"], "awesoMux.app")
+        self.assertEqual(context["effective_context"], "awesoMux")
+        self.assertEqual(context["host_app_source"], "GHOSTTY_RESOURCES_DIR")
+
+    def test_bundle_context_ignores_nonexistent_env_app_paths(self):
+        with (
+            mock.patch.dict(
+                self.remctl.os.environ,
+                {"GHOSTTY_RESOURCES_DIR": "/tmp/NotARealApp.app/Contents/Resources/ghostty"},
+                clear=False,
+            ),
+            mock.patch.object(self.remctl, "find_app_bundle_by_identifier", return_value=None),
+        ):
+            self.assertIsNone(self.remctl.bundle_context_from_environment())
+
+    def test_find_app_bundle_by_identifier_rejects_query_metacharacters(self):
+        with mock.patch.object(self.remctl.subprocess, "run") as run:
+            self.assertIsNone(self.remctl.find_app_bundle_by_identifier("com.example' || *"))
+        run.assert_not_called()
+
+    def test_full_disk_access_targets_skip_ghostty_when_embedder_is_known(self):
+        host_path = Path("/Users/test/Applications/awesoMux.app")
+        context = {
+            "host_app": "awesoMux.app",
+            "host_app_path": str(host_path),
+            "terminal_app": "Ghostty.app",
+            "effective_context": "awesoMux",
+        }
+        with (
+            mock.patch.object(self.remctl, "doctor_execution_context", return_value=context),
+            mock.patch.object(self.remctl, "detect_terminal_app_name", return_value="Ghostty.app"),
+            mock.patch.object(self.remctl, "find_app_bundle", return_value=Path("/Applications/Ghostty.app")),
+        ):
+            targets = self.remctl.full_disk_access_target_specs(include_cli=True)
+        titles = [target["title"] for target in targets]
+        self.assertIn("Current Python interpreter", titles)
+        self.assertIn("awesoMux.app", titles)
+        self.assertNotIn("Ghostty.app", titles)
 
     def test_full_disk_access_fix_text_mentions_targets_and_fallback(self):
         with mock.patch.object(
@@ -3179,6 +3451,81 @@ class CliTests(unittest.TestCase):
 
     def test_cmd_done_is_bridge_first(self):
         self._assert_bridge_first("cmd_done", SimpleNamespace(id=1, json=True), "complete")
+
+    def _done_with_date(self, reminder, args, *, bridge_available=True, bridge_result=None):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=bridge_available) as bridge_available_mock,
+            mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                self.remctl.cmd_done(args)
+                exit_code = None
+            except SystemExit as exc:
+                exit_code = exc.code
+        return SimpleNamespace(
+            stdout=out.getvalue(),
+            stderr=err.getvalue(),
+            exit_code=exit_code,
+            bridge_available=bridge_available_mock,
+            bridge_call=bridge_call,
+            osa_try=osa_try,
+        )
+
+    def test_cmd_done_date_forwards_completion_date_to_bridge(self):
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        result = self._done_with_date(
+            reminder,
+            SimpleNamespace(id=1, json=True, date="2026-05-27 09:30"),
+            bridge_result={"status": "completed", "id": reminder["ZCKIDENTIFIER"]},
+        )
+        self.assertIsNone(result.exit_code)
+        payload = result.bridge_call.call_args.args[0]
+        self.assertEqual(payload["action"], "complete")
+        self.assertEqual(payload["completionDate"], "2026-05-27T09:30:00")
+        self.assertEqual(json.loads(result.stdout)["completionDate"], "2026-05-27T09:30:00")
+        result.osa_try.assert_not_called()
+
+    def test_cmd_done_date_via_applescript_fallback(self):
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        result = self._done_with_date(
+            reminder,
+            SimpleNamespace(id=1, json=True, date="2026-05-27"),
+            bridge_available=False,
+        )
+        self.assertIsNone(result.exit_code)
+        result.bridge_call.assert_not_called()
+        script = result.osa_try.call_args.args[2]
+        self.assertIn("set completed of r to true", script)
+        self.assertIn("set completion date of r to _rdt", script)
+        self.assertEqual(json.loads(result.stdout)["completionDate"], "2026-05-27T00:00:00")
+
+    def test_cmd_done_date_rejects_recurring_reminder(self):
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": 2}
+        result = self._done_with_date(
+            reminder,
+            SimpleNamespace(id=1, json=True, date="2026-05-27"),
+        )
+        self.assertEqual(result.exit_code, 1)
+        result.bridge_call.assert_not_called()
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["code"], "completion_date_unsupported_for_recurring")
+
+    def test_cmd_done_date_rejects_non_absolute_date_before_writing(self):
+        reminder = {**self._FAKE_REMINDER, "recurrence_frequency": None}
+        result = self._done_with_date(
+            reminder,
+            SimpleNamespace(id=1, json=True, date="today"),
+        )
+        self.assertEqual(result.exit_code, 2)
+        result.bridge_available.assert_not_called()
+        result.bridge_call.assert_not_called()
+        self.assertEqual(json.loads(result.stderr)["code"], "invalid_completion_date")
 
     def test_cmd_undone_is_bridge_first(self):
         self._assert_bridge_first("cmd_undone", SimpleNamespace(id=1, json=True), "uncomplete")

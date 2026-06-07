@@ -66,6 +66,7 @@ remctl edit 23880 -l Work --json
 remctl edit 23880 --list-id 156 --json
 remctl edit 23880 --recurrence monthly --json
 remctl done 23880 --json
+remctl done 23880 --date 2026-05-27 --json
 remctl link --list-id 153 --json
 remctl export --list-id 153 --format json
 remctl list-symbols --preview
@@ -223,6 +224,7 @@ remctl template-delete "Packing Template" --private --force --json
 - Prefer deterministic due-date strings. If the user says "today at 3pm", either pass `today at 3pm` or normalize it to `YYYY-MM-DD HH:MM` in the user's timezone before calling `remctl`; do not invent broader natural-language phrases.
 - `add` and `edit` are atomic for due dates: if `-d/--due` is present and cannot be parsed, RemCTL exits before writing. With `--json`, parse failures are structured `invalid_due_date` errors on stderr with accepted examples. Retry with a corrected date instead of creating first and patching later.
 - Accepted dependency-free due-date forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
+- `remctl done ID --date WHEN --json` records an explicit completion date or corrects an already-completed reminder; `WHEN` must be absolute `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`. Recurring reminders reject `--date`; use plain `done` to advance the series.
 - `dueDate` in JSON is the actual Reminders due date from `ZDUEDATE`. If Reminders stores a separate UI/alert display date, including all-day display dates, RemCTL reports it separately as `displayDate`.
 - For ordinary rescheduling, use `remctl edit ID -d "YYYY-MM-DD HH:MM" --json` first. When a reminder has a single absolute alarm/display time equal to the old due time, RemCTL carries that alarm forward so Reminders.app does not keep showing the old time. `edit ID -d clear --json` also removes a single matching absolute alarm/display time so the item does not stay visible under the old time.
 - When debugging due-date or alarm mismatches, compare `dueDate`, `displayDate`, and `alarms` before assuming the CLI or UI is wrong.
@@ -249,3 +251,5 @@ remctl doctor
 RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript fallback operations, and Full Disk Access for direct database reads. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
 
 macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`, or for a one-off unblock run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
+
+`doctor` reports `completion_fpath` when an installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files. Full Disk Access targets come from the current process context; when terminal engines are embedded, trust `host_app` and `host_app_path` from `doctor --for-agent --json` over inherited `TERM_PROGRAM` labels.

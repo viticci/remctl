@@ -39,7 +39,7 @@ remctl doctor
 remctl today
 ```
 
-`--bootstrap` copies the CLI and helpers, compiles the Swift helpers when `swiftc` is available, creates RemCTL's config directory, and installs shell completion when supported.
+`--bootstrap` copies the CLI and helpers, compiles the Swift helpers when `swiftc` is available, creates RemCTL's config directory, and installs shell completion when supported. For zsh, `setup` prints the `fpath` lines to add to `~/.zshrc` when your config does not already load the completion directory.
 
 If the installer says `PATH action required`, add the printed PATH line and open a new Terminal window before typing `remctl`.
 
@@ -70,6 +70,7 @@ remctl show Work --format table
 remctl show --list-id 153 --json
 remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
 remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
+remctl done 23880 --date "2026-05-27 09:30"
 remctl edit 23880 -d clear
 remctl edit 23880 -l Work
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
@@ -289,7 +290,7 @@ remctl doctor
 
 The visual permission helper opens System Settings, copies the first target path, shows draggable targets for the current CLI process, and marks verified targets with a green check.
 
-Full Disk Access is scoped to the process context. A Terminal session can pass `remctl doctor` while Codex, another agent runner, or a different host app fails. Run `remctl doctor` from the same context that will run RemCTL commands; for agent setup, use `remctl doctor --for-agent`.
+Full Disk Access is scoped to the process context. A Terminal session can pass `remctl doctor` while Codex, another agent runner, or a different host app fails. Run `remctl doctor` from the same context that will run RemCTL commands; for agent setup, use `remctl doctor --for-agent`. When a terminal embeds another engine, RemCTL prefers the real host `.app` bundle over inherited terminal variables so the printed FDA target matches the app macOS will authorize.
 
 Manual fallback: run `remctl doctor --for-agent`, then add the printed target in System Settings > Privacy & Security > Full Disk Access. In the file picker, press `Command-Shift-G`, paste the path, press Return, then click Open.
 
