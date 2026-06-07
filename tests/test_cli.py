@@ -3570,6 +3570,73 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["action"], "update")
         self.assertEqual(payload["due"], "2026-04-20T09:00:00")
 
+    def test_cmd_edit_passes_all_day_to_bridge_for_date_only_due(self):
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-06-21", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["due"], "2026-06-21T00:00:00")
+        self.assertTrue(payload["allDay"])
+
+    def test_cmd_edit_does_not_pass_all_day_for_timed_due(self):
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-06-21 09:30", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call",
+                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+            ) as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        payload = bridge_call.call_args.args[0]
+        self.assertEqual(payload["due"], "2026-06-21T09:30:00")
+        self.assertNotIn("allDay", payload)
+
+    def test_cmd_edit_all_day_errors_when_bridge_unavailable(self):
+        # AppleScript can't write date-only dueDateComponents; error rather
+        # than silently demote to a midnight-timed reminder.
+        reminder = self._FAKE_REMINDER
+        args = SimpleNamespace(
+            id=1, json=False, title=None, notes=None, priority=None,
+            due="2026-06-21", url=None, recurrence=None, alarm=None,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.remctl.cmd_edit(args)
+        self.assertEqual(raised.exception.code, 1)
+        bridge_call.assert_not_called()
+        osa_try.assert_not_called()
+        self.assertIn("remctl-bridge", err.getvalue())
+
     def test_cmd_edit_due_date_carries_matching_absolute_alarm(self):
         from datetime import datetime
 

@@ -6100,10 +6100,12 @@ def cmd_edit(a):
     # string was given so the user doesn't silently get a no-op write that
     # falls through to the broken bridge path.
     dt = None
+    due_all_day = False
     if a.due and a.due != "clear":
         dt = parse_due(a.due)
         if dt is None:
             fail_invalid_due_date(a.due, json_mode=getattr(a, "json", False))
+        due_all_day = due_spec_is_all_day(a.due)
     if early_reminder_requires_due_date(a) and a.due == "clear":
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
     if early_reminder_requires_due_date(a) and dt is None and not r["ZDUEDATE"]:
@@ -6176,6 +6178,8 @@ def cmd_edit(a):
                 data["clearAlarms"] = True
         elif dt is not None:
             data["due"] = dt.isoformat(); has_changes = True
+            if due_all_day:
+                data["allDay"] = True
         if parsed_recurrence is not None:
             data["recurrence"] = parsed_recurrence; has_changes = True
         if clear_alarm:
@@ -6230,6 +6234,15 @@ def cmd_edit(a):
 
     if carry_absolute_alarm or clear_matching_absolute_alarm:
         print("Error: this edit requires remctl-bridge to keep due/display/alarm state aligned.", file=sys.stderr)
+        sys.exit(1)
+
+    # AppleScript cannot write date-only dueDateComponents, so all-day edits require the bridge.
+    if dt is not None and due_all_day:
+        message = "All-day due dates require remctl-bridge so Reminders can store date-only components."
+        if getattr(a, "json", False):
+            print(json.dumps({"status": "error", "code": "bridge_required_for_all_day", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
 
     # AppleScript fallback for when bridge isn't available.
