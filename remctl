@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.1.1
+"""remctl — Power-user Reminders CLI v1.2.0
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -44,7 +44,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
@@ -553,6 +553,12 @@ def list_select_columns(db):
     optional_columns = [
         "ZBADGEEMBLEM",
         "ZCOLOR",
+        "ZISGROUP",
+        "ZPARENTLIST",
+        "ZPARENTLIST1",
+        "Z_FOK_PARENTLIST",
+        "Z_FOK_PARENTLIST1",
+        "ZDADISPLAYORDER",
         "ZISPINNEDBYCURRENTUSER",
         "ZPINNEDDATE",
         "ZSHOULDCATEGORIZEGROCERYITEMS",
@@ -571,13 +577,63 @@ def list_select_columns(db):
     return columns
 
 
-def q_lists(db):
+def list_group_filter_sql(db, *, include_groups):
+    table_columns = table_column_names(db, "ZREMCDBASELIST")
+    if include_groups or "ZISGROUP" not in table_columns:
+        return ""
+    return "AND COALESCE(ZISGROUP, 0) = 0 "
+
+
+def q_base_lists(db, *, include_groups=False):
     columns = list_select_columns(db)
     return db.execute(
         f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL AND ZNAME != '' "
+        f"{list_group_filter_sql(db, include_groups=include_groups)}"
         "ORDER BY ZNAME"
     ).fetchall()
+
+
+def q_lists(db):
+    return q_base_lists(db, include_groups=False)
+
+
+def q_all_lists(db):
+    return q_base_lists(db, include_groups=True)
+
+
+def q_list_groups(db):
+    if "ZISGROUP" not in table_column_names(db, "ZREMCDBASELIST"):
+        return []
+    columns = list_select_columns(db)
+    return db.execute(
+        f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL AND ZNAME != '' "
+        "AND COALESCE(ZISGROUP, 0) = 1 ORDER BY ZNAME"
+    ).fetchall()
+
+
+def q_child_lists(db, group_pk):
+    table_columns = table_column_names(db, "ZREMCDBASELIST")
+    if "ZPARENTLIST" not in table_columns and "ZPARENTLIST1" not in table_columns:
+        return []
+    columns = list_select_columns(db)
+    parent_clauses = []
+    params = []
+    if "ZPARENTLIST" in table_columns:
+        parent_clauses.append("ZPARENTLIST = ?")
+        params.append(group_pk)
+    if "ZPARENTLIST1" in table_columns:
+        parent_clauses.append("ZPARENTLIST1 = ?")
+        params.append(group_pk)
+    rows = db.execute(
+        f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME IS NOT NULL AND ZNAME != '' "
+        f"{list_group_filter_sql(db, include_groups=False)}"
+        f"AND ({' OR '.join(parent_clauses)})",
+        params,
+    ).fetchall()
+    return sorted(rows, key=list_child_sort_key)
 
 def q_smart_lists(db):
     table_columns = table_column_names(db, "ZREMCDBASELIST")
@@ -844,24 +900,58 @@ def grocery_list_payload(row):
     return payload
 
 
+def is_group_list_row(row):
+    return bool(_row_get(row, "ZISGROUP", 0))
+
+
+def list_parent_pk(row):
+    for key in ("ZPARENTLIST", "ZPARENTLIST1"):
+        value = _row_get(row, key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def list_child_sort_value(row):
+    for key in ("Z_FOK_PARENTLIST", "Z_FOK_PARENTLIST1", "ZDADISPLAYORDER"):
+        value = _row_get(row, key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def list_child_sort_key(row):
+    order = list_child_sort_value(row)
+    # Reminders stores newer ordered child-list positions as larger sparse keys.
+    return (-order if order else 0, normalize_list_lookup_name(_row_get(row, "ZNAME")), _row_get(row, "Z_PK"))
+
+
 def list_to_dict(row):
+    is_group = is_group_list_row(row)
     is_groceries = is_grocery_list_row(row)
     item = {
         "id": _row_value(row, "Z_PK"),
         "title": _row_value(row, "ZNAME"),
-        "listType": "groceries" if is_groceries else "standard",
-        "isGroceries": is_groceries,
+        "listType": "group" if is_group else "groceries" if is_groceries else "standard",
+        "isGroup": is_group,
+        "isGroceries": False if is_group else is_groceries,
     }
     object_uuid = _row_value(row, "ZCKIDENTIFIER")
     if object_uuid:
         item["objectUUID"] = object_uuid
+    parent_id = list_parent_pk(row)
+    if parent_id:
+        item["parentListId"] = parent_id
     if _row_has_key(row, "ZCOLOR") and row["ZCOLOR"]:
         item["color"] = parse_list_color(row["ZCOLOR"])
     if _row_has_key(row, "ZBADGEEMBLEM") and row["ZBADGEEMBLEM"]:
         item["badge"] = parse_badge_emblem(row["ZBADGEEMBLEM"])
         item["badgeEmblem"] = row["ZBADGEEMBLEM"]
     grocery = grocery_list_payload(row)
-    if grocery and (is_groceries or any(grocery.values())):
+    if grocery and not is_group and (is_groceries or any(grocery.values())):
         item["grocery"] = grocery
     if _row_has_key(row, "ZISPINNEDBYCURRENTUSER"):
         item["pinned"] = bool(row["ZISPINNEDBYCURRENTUSER"])
@@ -870,9 +960,76 @@ def list_to_dict(row):
     return item
 
 
+def list_row_title_sort_key(row):
+    return (normalize_list_lookup_name(_row_get(row, "ZNAME")), _row_get(row, "Z_PK"))
+
+
+def list_group_stub(row):
+    payload = {
+        "id": _row_value(row, "Z_PK"),
+        "title": _row_value(row, "ZNAME"),
+    }
+    object_uuid = _row_value(row, "ZCKIDENTIFIER")
+    if object_uuid:
+        payload["objectUUID"] = object_uuid
+    return payload
+
+
+def split_list_group_rows(rows):
+    groups = sorted([row for row in rows if is_group_list_row(row)], key=list_row_title_sort_key)
+    group_ids = {_row_value(row, "Z_PK") for row in groups}
+    child_rows = {group_id: [] for group_id in group_ids}
+    ungrouped = []
+    for row in rows:
+        if is_group_list_row(row):
+            continue
+        parent_id = list_parent_pk(row)
+        if parent_id in group_ids:
+            child_rows[parent_id].append(row)
+        else:
+            ungrouped.append(row)
+    for group_id in child_rows:
+        child_rows[group_id] = sorted(child_rows[group_id], key=list_child_sort_key)
+    return groups, child_rows, sorted(ungrouped, key=list_row_title_sort_key)
+
+
+def list_hierarchy_payloads(rows, *, groups_only=False, include_child_duplicates=True, db=None):
+    groups, child_rows, ungrouped = split_list_group_rows(rows)
+    payloads = []
+    for group_row in groups:
+        group_payload = group_payload_from_rows(
+            db,
+            group_row,
+            child_rows.get(_row_value(group_row, "Z_PK"), []),
+        )
+        children = group_payload["children"]
+        payloads.append(group_payload)
+        if include_child_duplicates and not groups_only:
+            payloads.extend(children)
+    if not groups_only:
+        payloads.extend(list_to_dict(row) for row in ungrouped)
+    return payloads
+
+
+def group_payload_from_rows(db, group_row, children_rows):
+    group_payload = list_to_dict(group_row)
+    group_stub = list_group_stub(group_row)
+    children = []
+    for child_row in children_rows:
+        child_payload = list_to_dict(child_row)
+        child_payload["group"] = group_stub
+        children.append(child_payload)
+    if db is not None:
+        attach_group_counts(db, group_payload, children)
+    group_payload["children"] = children
+    return group_payload
+
+
 def format_list_title(row, db=None, *, color=True):
     title = _row_value(row, "ZNAME")
     rendered = color_list_name(title, db) if color else title
+    if is_group_list_row(row):
+        return rendered
     return f"{rendered} {GROCERY_LIST_MARKER}" if is_grocery_list_row(row) else rendered
 
 
@@ -895,18 +1052,122 @@ def normalize_list_lookup_name(name):
     return "".join(parts).strip()
 
 def list_ref_payload(row, *, requested=None, method="exact"):
+    is_group = is_group_list_row(row)
+    is_groceries = is_grocery_list_row(row)
     payload = {
         "id": _row_value(row, "Z_PK"),
         "title": _row_value(row, "ZNAME"),
         "objectUUID": _row_value(row, "ZCKIDENTIFIER"),
         "requested": requested,
         "method": method,
+        "listType": "group" if is_group else "groceries" if is_groceries else "standard",
+        "isGroup": is_group,
     }
-    payload["isGroceries"] = is_grocery_list_row(row)
+    payload["isGroceries"] = False if is_group else is_groceries
+    parent_id = list_parent_pk(row)
+    if parent_id:
+        payload["parentListId"] = parent_id
     grocery = grocery_list_payload(row)
-    if grocery and (payload["isGroceries"] or any(grocery.values())):
+    if grocery and not is_group and (payload["isGroceries"] or any(grocery.values())):
         payload["grocery"] = grocery
     return payload
+
+
+def list_group_ref_payload(db, row, *, requested=None, method="exact", include_children=True):
+    payload = list_ref_payload(row, requested=requested, method=method)
+    if include_children:
+        children = [list_ref_payload(child) for child in q_child_lists(db, payload["id"])]
+        attach_group_counts(db, payload, children)
+        payload["children"] = children
+    return payload
+
+
+def zero_reminder_counts():
+    return {"active": 0, "completed": 0, "total": 0}
+
+
+def q_list_reminder_counts(db, list_pks):
+    if not list_pks or not table_exists(db, "ZREMCDREMINDER"):
+        return {}
+    columns = table_column_names(db, "ZREMCDREMINDER")
+    if "ZLIST" not in columns:
+        return {}
+    placeholders = ", ".join("?" for _ in list_pks)
+    where = [f"ZLIST IN ({placeholders})"]
+    if "ZMARKEDFORDELETION" in columns:
+        where.append("ZMARKEDFORDELETION = 0")
+    if "ZACCOUNT" in columns:
+        where.append("ZACCOUNT IS NOT NULL")
+    if "ZPARENTREMINDER" in columns:
+        where.append("(ZPARENTREMINDER IS NULL OR ZPARENTREMINDER = 0)")
+    completed_expr = "ZCOMPLETED" if "ZCOMPLETED" in columns else "0"
+    rows = db.execute(
+        "SELECT ZLIST AS list_id, "
+        f"SUM(CASE WHEN {completed_expr} = 0 THEN 1 ELSE 0 END) AS active_count, "
+        f"SUM(CASE WHEN {completed_expr} = 1 THEN 1 ELSE 0 END) AS completed_count, "
+        "COUNT(*) AS total_count "
+        "FROM ZREMCDREMINDER "
+        f"WHERE {' AND '.join(where)} "
+        "GROUP BY ZLIST",
+        list(list_pks),
+    ).fetchall()
+    counts = {}
+    for row in rows:
+        active = int(_row_get(row, "active_count", 0) or 0)
+        completed = int(_row_get(row, "completed_count", 0) or 0)
+        total = int(_row_get(row, "total_count", active + completed) or 0)
+        counts[_row_get(row, "list_id")] = {
+            "active": active,
+            "completed": completed,
+            "total": total,
+        }
+    return counts
+
+
+def attach_group_counts(db, group_payload, child_payloads):
+    child_ids = [child["id"] for child in child_payloads]
+    counts_by_list = q_list_reminder_counts(db, child_ids)
+    totals = zero_reminder_counts()
+    for child in child_payloads:
+        counts = counts_by_list.get(child["id"], zero_reminder_counts())
+        child["counts"] = dict(counts)
+        totals["active"] += counts["active"]
+        totals["completed"] += counts["completed"]
+        totals["total"] += counts["total"]
+    group_payload["counts"] = totals
+    return group_payload
+
+
+def list_resolution_from_rows(rows, name, payload_factory):
+    exact = [row for row in rows if _row_value(row, "ZNAME") == name]
+    if len(exact) == 1:
+        return payload_factory(exact[0], requested=name, method="exact")
+    if len(exact) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [payload_factory(row) for row in exact]}
+
+    folded = str(name).casefold()
+    ci = [row for row in rows if str(_row_value(row, "ZNAME")).casefold() == folded]
+    if len(ci) == 1:
+        return payload_factory(ci[0], requested=name, method="case_insensitive")
+    if len(ci) > 1:
+        return {"error": "ambiguous", "requested": name, "candidates": [payload_factory(row) for row in ci]}
+
+    normalized = normalize_list_lookup_name(name)
+    if not normalized:
+        return None
+    normalized_matches = [
+        row for row in rows
+        if normalize_list_lookup_name(_row_value(row, "ZNAME")) == normalized
+    ]
+    if len(normalized_matches) == 1:
+        return payload_factory(normalized_matches[0], requested=name, method="normalized")
+    if len(normalized_matches) > 1:
+        return {
+            "error": "ambiguous",
+            "requested": name,
+            "candidates": [payload_factory(row) for row in normalized_matches],
+        }
+    return None
 
 
 def ckid_eq(a, b):
@@ -1063,7 +1324,7 @@ def assignment_to_dict(row):
     return payload
 
 
-def resolve_list_ref(db, name=None, list_id=None):
+def resolve_list_ref(db, name=None, list_id=None, *, allow_groups=False):
     if list_id is not None:
         columns = list_select_columns(db)
         row = db.execute(
@@ -1072,39 +1333,36 @@ def resolve_list_ref(db, name=None, list_id=None):
             "AND ZNAME IS NOT NULL AND ZNAME != ''",
             (list_id,),
         ).fetchone()
-        return list_ref_payload(row, requested=str(list_id), method="id") if row else None
+        if not row:
+            return None
+        if is_group_list_row(row):
+            if allow_groups:
+                return list_group_ref_payload(db, row, requested=str(list_id), method="id")
+            return {
+                "error": "group",
+                "requested": str(list_id),
+                "group": list_group_ref_payload(db, row, requested=str(list_id), method="id"),
+            }
+        return list_ref_payload(row, requested=str(list_id), method="id")
 
     if not name:
         return None
 
-    rows = q_lists(db)
-    exact = [row for row in rows if _row_value(row, "ZNAME") == name]
-    if len(exact) == 1:
-        return list_ref_payload(exact[0], requested=name, method="exact")
-    if len(exact) > 1:
-        return {"error": "ambiguous", "requested": name, "candidates": [list_ref_payload(row) for row in exact]}
-
-    folded = str(name).casefold()
-    ci = [row for row in rows if str(_row_value(row, "ZNAME")).casefold() == folded]
-    if len(ci) == 1:
-        return list_ref_payload(ci[0], requested=name, method="case_insensitive")
-    if len(ci) > 1:
-        return {"error": "ambiguous", "requested": name, "candidates": [list_ref_payload(row) for row in ci]}
-
-    normalized = normalize_list_lookup_name(name)
-    if not normalized:
-        return None
-    normalized_matches = [
-        row for row in rows
-        if normalize_list_lookup_name(_row_value(row, "ZNAME")) == normalized
-    ]
-    if len(normalized_matches) == 1:
-        return list_ref_payload(normalized_matches[0], requested=name, method="normalized")
-    if len(normalized_matches) > 1:
+    result = list_resolution_from_rows(q_lists(db), name, list_ref_payload)
+    if result:
+        return result
+    group_result = list_resolution_from_rows(
+        q_list_groups(db),
+        name,
+        lambda row, **kwargs: list_group_ref_payload(db, row, **kwargs),
+    )
+    if group_result:
+        if allow_groups or group_result.get("error"):
+            return group_result
         return {
-            "error": "ambiguous",
+            "error": "group",
             "requested": name,
-            "candidates": [list_ref_payload(row) for row in normalized_matches],
+            "group": group_result,
         }
     return None
 
@@ -1118,25 +1376,105 @@ def _print_list_resolution_error(requested, result=None):
             f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}",
             file=sys.stderr,
         )
+    elif result and result.get("error") == "group":
+        group = result.get("group", {})
+        title = group.get("title") or requested
+        children = group.get("children") or []
+        if children:
+            options = ", ".join(f"{child['title']} (id {child['id']})" for child in children)
+            print(
+                f"Error: {title!r} is a Reminders list group, not a writable list. Use one of its child lists: {options}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Error: {title!r} is a Reminders list group, not a writable list.",
+                file=sys.stderr,
+            )
     else:
         print(f"Error: list not found: {requested}", file=sys.stderr)
 
-def resolve_list_or_die(db, name=None, list_id=None):
-    result = resolve_list_ref(db, name=name, list_id=list_id)
+def resolve_list_or_die(db, name=None, list_id=None, *, allow_groups=False):
+    result = resolve_list_ref(db, name=name, list_id=list_id, allow_groups=allow_groups)
     if result and not result.get("error"):
         return result
     requested = f"id {list_id}" if list_id is not None else name
     _print_list_resolution_error(requested, result)
     sys.exit(1)
 
-def resolve_required_list_target_or_die(db, *, name=None, list_id=None):
+def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_groups=False):
     if name and list_id is not None:
         print("Error: pass either a list name or --list-id, not both.", file=sys.stderr)
         sys.exit(1)
     if not name and list_id is None:
         print("Error: pass a list name or --list-id.", file=sys.stderr)
         sys.exit(1)
-    return resolve_list_or_die(db, name=name, list_id=list_id)
+    return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups)
+
+
+def resolve_group_ref(db, name=None, group_id=None):
+    if group_id is not None:
+        columns = list_select_columns(db)
+        row = db.execute(
+            f"SELECT {', '.join(columns)} FROM ZREMCDBASELIST "
+            "WHERE Z_PK = ? AND ZMARKEDFORDELETION = 0 AND Z_ENT = 3 "
+            "AND ZNAME IS NOT NULL AND ZNAME != ''",
+            (group_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if not is_group_list_row(row):
+            return {
+                "error": "not_group",
+                "requested": str(group_id),
+                "list": list_ref_payload(row, requested=str(group_id), method="id"),
+            }
+        return list_group_ref_payload(db, row, requested=str(group_id), method="id")
+
+    if not name:
+        return None
+    return list_resolution_from_rows(
+        q_list_groups(db),
+        name,
+        lambda row, **kwargs: list_group_ref_payload(db, row, **kwargs),
+    )
+
+
+def _print_group_resolution_error(requested, result=None):
+    if result and result.get("error") == "ambiguous":
+        options = ", ".join(
+            f"{candidate['id']} ({candidate['title']})"
+            for candidate in result.get("candidates", [])
+        )
+        print(
+            f"Error: multiple groups match {requested!r}. Use --group-id with one of: {options}",
+            file=sys.stderr,
+        )
+    elif result and result.get("error") == "not_group":
+        item = result.get("list", {})
+        title = item.get("title") or requested
+        print(f"Error: {title!r} is a list, not a Reminders list group.", file=sys.stderr)
+    else:
+        print(f"Error: group not found: {requested}", file=sys.stderr)
+
+
+def resolve_group_or_die(db, name=None, group_id=None):
+    result = resolve_group_ref(db, name=name, group_id=group_id)
+    if result and not result.get("error"):
+        return result
+    requested = f"id {group_id}" if group_id is not None else name
+    _print_group_resolution_error(requested, result)
+    sys.exit(1)
+
+
+def resolve_required_group_target_or_die(db, *, name=None, group_id=None):
+    if name and group_id is not None:
+        print("Error: pass either a group name or --group-id, not both.", file=sys.stderr)
+        sys.exit(1)
+    if not name and group_id is None:
+        print("Error: pass a group name or --group-id.", file=sys.stderr)
+        sys.exit(1)
+    return resolve_group_or_die(db, name=name, group_id=group_id)
 
 
 def smart_list_ref_payload(row, *, requested=None, method="exact"):
@@ -1251,6 +1589,17 @@ def q_list_exact_name_count(db, name):
     row = db.execute(
         "SELECT COUNT(*) AS count FROM ZREMCDBASELIST "
         "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME = ?",
+        (name,),
+    ).fetchone()
+    return row["count"] if row else 0
+
+
+def q_group_exact_name_count(db, name):
+    if "ZISGROUP" not in table_column_names(db, "ZREMCDBASELIST"):
+        return 0
+    row = db.execute(
+        "SELECT COUNT(*) AS count FROM ZREMCDBASELIST "
+        "WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND COALESCE(ZISGROUP, 0) = 1 AND ZNAME = ?",
         (name,),
     ).fetchone()
     return row["count"] if row else 0
@@ -1575,6 +1924,25 @@ def q_reminders(db, list_pk=None, completed=False, parent_pk=None, top_level=Fal
         f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} ORDER BY r.Z_PK LIMIT ?",
         params + [limit]
     ).fetchall()
+
+
+def q_reminders_for_lists(db, list_pks, completed=False, top_level=False, limit=500):
+    if not list_pks:
+        return []
+    placeholders = ", ".join("?" for _ in list_pks)
+    order_cases = " ".join(f"WHEN {int(pk)} THEN {idx}" for idx, pk in enumerate(list_pks))
+    c = ["r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL", f"r.ZLIST IN ({placeholders})"]
+    if not completed:
+        c.append("r.ZCOMPLETED = 0")
+    if top_level:
+        c.append("(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)")
+    return db.execute(
+        f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} "
+        f"ORDER BY CASE r.ZLIST {order_cases} ELSE {len(list_pks)} END, r.Z_PK LIMIT ?",
+        list(list_pks) + [limit],
+    ).fetchall()
+
 
 def q_reminder(db, pk):
     return db.execute(
@@ -2361,16 +2729,46 @@ def _strip_ansi(s):
     """Remove ANSI escape codes for width calculation."""
     return re.sub(r'\033\[[0-9;]*m', '', s)
 
+def _cell_width_char(ch):
+    if not ch:
+        return 0
+    code = ord(ch)
+    if code == 0x200D or 0xFE00 <= code <= 0xFE0F:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    category = unicodedata.category(ch)
+    if category in {"Cc", "Cf"}:
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+
 def _visible_len(s):
-    """Length of string as displayed (without ANSI codes)."""
-    return len(_strip_ansi(s))
+    """Terminal cell width of string as displayed (without ANSI codes)."""
+    return sum(_cell_width_char(ch) for ch in _strip_ansi(str(s)))
 
 def _pad(s, width):
     """Pad string to width, accounting for ANSI codes."""
     visible = _visible_len(s)
     return s + " " * max(0, width - visible)
 
-def fmt_table(rows_data, max_width=None):
+def _truncate_visible(s, width):
+    plain = _strip_ansi(str(s))
+    if _visible_len(plain) <= width:
+        return str(s)
+    if width <= 1:
+        return "…"[:width]
+    target = width - 1
+    out = []
+    used = 0
+    for ch in plain:
+        ch_width = _cell_width_char(ch)
+        if used + ch_width > target:
+            break
+        out.append(ch)
+        used += ch_width
+    return "".join(out) + "…"
+
+def fmt_table(rows_data, max_width=None, *, date_mode="due", include_list=True, columns=None):
     """Format data as a Unicode box-drawing table.
 
     rows_data: list of dicts with keys: id, title, list, due, repeat, pri
@@ -2383,10 +2781,15 @@ def fmt_table(rows_data, max_width=None):
         except (ValueError, OSError):
             max_width = 80
 
-    columns = [("id", "ID"), ("title", "Title"), ("list", "List"), ("due", "Due")]
-    if any(row.get("repeat") for row in rows_data):
-        columns.append(("repeat", "Repeat"))
-    columns.append(("pri", "Pri"))
+    if columns is None:
+        date_key, date_label = ("completed", "Completed") if date_mode == "completed" else ("due", "Due")
+        columns = [("id", "ID"), ("title", "Title")]
+        if include_list:
+            columns.append(("list", "List"))
+        columns.append((date_key, date_label))
+        if any(row.get("repeat") for row in rows_data):
+            columns.append(("repeat", "Repeat"))
+        columns.append(("pri", "Pri"))
     headers = [label for _, label in columns]
     # Calculate column widths
     col_widths = [len(h) for h in headers]
@@ -2415,8 +2818,7 @@ def fmt_table(rows_data, max_width=None):
             s = str(v)
             # Truncate if needed (by visible length)
             if _visible_len(s) > col_widths[i]:
-                plain = _strip_ansi(s)
-                s = plain[:col_widths[i] - 1] + "…"
+                s = _truncate_visible(s, col_widths[i])
             cells.append(f" {_pad(s, col_widths[i])} ")
         return "│" + "│".join(cells) + "│"
 
@@ -2429,6 +2831,23 @@ def fmt_table(rows_data, max_width=None):
         lines.append(row_line(vals))
     lines.append(hline("└", "┴", "┘"))
     return "\n".join(lines)
+
+def _format_completed_for_table(r):
+    value = _item_get(r, "ZCOMPLETIONDATE")
+    if value is None:
+        value = _item_get(r, "completionDate")
+    if not value:
+        return ""
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return safe_display(value)
+    else:
+        dt = ts(value)
+    if not dt:
+        return ""
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 def reminders_to_table_data(items, db=None):
     """Convert reminder rows to table-friendly dicts."""
@@ -2477,10 +2896,60 @@ def reminders_to_table_data(items, db=None):
             "title": title,
             "list": list_name,
             "due": due_str,
+            "completed": _format_completed_for_table(r),
             "repeat": C.magenta(repeat) if repeat else "",
             "pri": pri_str,
         })
     return data
+
+def reminder_table_date_mode(args):
+    return "completed" if bool(getattr(args, "completed", False)) else "due"
+
+def print_reminder_table(items, db=None, *, args=None, include_list=True):
+    print(fmt_table(
+        reminders_to_table_data(items, db),
+        date_mode=reminder_table_date_mode(args) if args is not None else "due",
+        include_list=include_list,
+    ))
+
+def print_group_reminder_tables(group_ref, children, items, db, memberships_by_list, args):
+    if not items:
+        print(f"No {'active ' if not args.completed else ''}reminders in group '{safe_display(group_ref['title'])}'")
+        return
+    print(f"{C.bold(color_list_name(group_ref['title'], db))} {C.dim('(group)')}:")
+    for child in children:
+        child_items = [item for item in items if _row_get(item, "ZLIST") == child["Z_PK"]]
+        if not child_items:
+            continue
+        child_ref = list_ref_payload(child)
+        child_heading = color_list_name(child_ref["title"], db)
+        if child_ref.get("isGroceries"):
+            child_heading = f"{child_heading} {GROCERY_LIST_MARKER}"
+        print(f"\n  {C.bold(child_heading)}:")
+        secs = q_sections(db, child["Z_PK"])
+        memberships = memberships_by_list.get(child["Z_PK"], {})
+        if not secs:
+            print_reminder_table(child_items, db, args=args, include_list=False)
+            continue
+        sec_items, unsectioned = {}, []
+        for item in child_items:
+            section_name = memberships.get(item["ZCKIDENTIFIER"])
+            if section_name:
+                sec_items.setdefault(section_name, []).append(item)
+            else:
+                unsectioned.append(item)
+        if unsectioned:
+            print_reminder_table(unsectioned, db, args=args, include_list=False)
+        for section_name in [section["ZDISPLAYNAME"] for section in secs]:
+            if section_name not in sec_items:
+                continue
+            heading = safe_display(format_grocery_section_name(
+                section_name,
+                is_groceries=bool(child_ref.get("isGroceries")),
+            ))
+            print(f"\n    {C.bold(f'[{heading}]')}")
+            print_reminder_table(sec_items[section_name], db, args=args, include_list=False)
+    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
 
 # ── Bridge Integration ───────────────────────────────────────────────────────
 
@@ -2861,6 +3330,35 @@ def private_create_list_call(request, name, attempts=3):
             time.sleep(0.25)
             try:
                 if q_list_exact_name_count(open_db(), name):
+                    recovered = dict(result or {})
+                    recovered.update({
+                        "status": "created",
+                        "action": request.get("action"),
+                        "name": name,
+                        "verifiedAfterTransientError": True,
+                    })
+                    return recovered
+            except RemindersDBUnavailable:
+                break
+        if attempt < attempts - 1:
+            time.sleep(0.75 * (attempt + 1))
+    return last_result
+
+
+def private_create_group_call(request, name, attempts=3):
+    last_result = None
+    for attempt in range(attempts):
+        result = private_call(request)
+        last_result = result
+        if isinstance(result, dict) and result.get("status") == "created":
+            return result
+        if not private_helper_error_is_transient(result):
+            return result
+
+        for _ in range(4):
+            time.sleep(0.25)
+            try:
+                if q_group_exact_name_count(open_db(), name):
                     recovered = dict(result or {})
                     recovered.update({
                         "status": "created",
@@ -3626,6 +4124,62 @@ def apply_private_list_pinned(db, list_pk, a, pinned):
         sys.exit(1)
     result = private_call({"action": "set_list_pinned", "listId": ckid, "pinned": bool(pinned)})
     if result and result.get("status") == "updated":
+        return result
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def apply_private_list_parent_group(
+    db,
+    list_ref,
+    group_ref=None,
+    *,
+    require_current_group_id=None,
+    required_group_ref=None,
+    a=None,
+):
+    require_private_metadata(a)
+    list_ckid = list_ref.get("objectUUID") or q_list_ckid(db, list_ref["id"])
+    if not list_ckid:
+        print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    if list_ref.get("isGroup"):
+        print(f"Error: {list_ref['title']!r} is a group, not a regular list.", file=sys.stderr)
+        sys.exit(1)
+    if require_current_group_id is not None and list_ref.get("parentListId") != require_current_group_id:
+        expected_title = (required_group_ref or group_ref or {}).get("title") or f"id {require_current_group_id}"
+        print(
+            f"Error: list {list_ref['title']!r} is not currently in group {expected_title!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    payload = {
+        "action": "set_list_parent_group",
+        "listId": list_ckid,
+    }
+    if group_ref is not None:
+        group_ckid = group_ref.get("objectUUID") or q_list_ckid(db, group_ref["id"])
+        if not group_ckid:
+            print("Error: target group has no stable CloudKit identifier.", file=sys.stderr)
+            sys.exit(1)
+        payload["groupId"] = group_ckid
+    result = private_call(payload)
+    if result and result.get("status") == "updated":
+        return result
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def apply_private_group_delete(db, group_ref, a):
+    require_private_metadata(a)
+    group_ckid = group_ref.get("objectUUID") or q_list_ckid(db, group_ref["id"])
+    if not group_ckid:
+        print("Error: target group has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    result = private_call({"action": "delete_group", "groupId": group_ckid})
+    if result and result.get("status") == "deleted":
         return result
     message = result.get("message") if isinstance(result, dict) else "private helper failed"
     print(f"Error: {message}", file=sys.stderr)
@@ -5752,24 +6306,561 @@ def cmd_smart_list_delete(a):
 
 def cmd_lists(a):
     db = open_db()
-    rows = q_lists(db)
+    rows = q_all_lists(db)
+    groups, child_rows, ungrouped = split_list_group_rows(rows)
     if a.json:
-        print(json.dumps([list_to_dict(r) for r in rows], indent=2, ensure_ascii=False))
+        print(json.dumps(list_hierarchy_payloads(rows, db=db), indent=2, ensure_ascii=False))
         return
     if getattr(a, 'format', None) == 'table':
-        data = [{"id": r["Z_PK"], "title": format_list_title(r, color=False),
-                 "list": "", "due": "", "pri": ""} for r in rows]
+        data = []
+        for group in groups:
+            data.append({
+                "id": group["Z_PK"],
+                "title": format_list_title(group, color=False),
+                "list": "group",
+                "due": "",
+                "pri": f"{len(child_rows.get(group['Z_PK'], []))} lists",
+            })
+            for child in child_rows.get(group["Z_PK"], []):
+                data.append({
+                    "id": child["Z_PK"],
+                    "title": f"  {format_list_title(child, color=False)}",
+                    "list": group["ZNAME"],
+                    "due": "",
+                    "pri": "",
+                })
+        data.extend({"id": r["Z_PK"], "title": format_list_title(r, color=False),
+                     "list": "", "due": "", "pri": ""} for r in ungrouped)
         print(fmt_table(data))
         return
     print(C.bold("Reminder Lists:"))
-    for r in rows:
+    for group in groups:
+        children = child_rows.get(group["Z_PK"], [])
+        id_dim = C.dim(f"(id: {group['Z_PK']})")
+        child_info = C.dim(f" [{len(children)} list{'s' if len(children) != 1 else ''}]")
+        print(f"  {format_list_title(group, db)} {id_dim}{child_info}")
+        for child in children:
+            secs = q_sections(db, child["Z_PK"])
+            list_name = format_list_title(child, db)
+            sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
+            pin_info = C.dim(" [pinned]") if _row_has_key(child, "ZISPINNEDBYCURRENTUSER") and child["ZISPINNEDBYCURRENTUSER"] else ""
+            id_dim = C.dim(f"(id: {child['Z_PK']})")
+            print(f"    {list_name} {id_dim}{sec_info}{pin_info}")
+    for r in ungrouped:
         secs = q_sections(db, r["Z_PK"])
         list_name = format_list_title(r, db)
         sec_info = C.dim(f" [{len(secs)} sections]") if secs else ""
         pin_info = C.dim(" [pinned]") if _row_has_key(r, "ZISPINNEDBYCURRENTUSER") and r["ZISPINNEDBYCURRENTUSER"] else ""
         id_dim = C.dim(f"(id: {r['Z_PK']})")
         print(f"  {list_name} {id_dim}{sec_info}{pin_info}")
-    print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
+    list_count = sum(1 for row in rows if not is_group_list_row(row))
+    print(f"\n{list_count} list{'s' if list_count != 1 else ''}, {len(groups)} group{'s' if len(groups) != 1 else ''}")
+
+
+def cmd_groups(a):
+    db = open_db()
+    rows = q_all_lists(db)
+    groups, child_rows, _ungrouped = split_list_group_rows(rows)
+    if a.json:
+        print(json.dumps(
+            list_hierarchy_payloads(rows, groups_only=True, include_child_duplicates=False, db=db),
+            indent=2,
+            ensure_ascii=False,
+        ))
+        return
+    if getattr(a, 'format', None) == 'table':
+        data = []
+        for group in groups:
+            children = child_rows.get(group["Z_PK"], [])
+            payload = group_payload_from_rows(db, group, children)
+            counts = payload.get("counts", zero_reminder_counts())
+            data.append({
+                "id": group["Z_PK"],
+                "title": format_list_title(group, color=False),
+                "group": "",
+                "active": str(counts["active"]),
+                "completed": str(counts["completed"]),
+                "total": str(counts["total"]),
+            })
+            for child_payload in payload["children"]:
+                child_counts = child_payload.get("counts", zero_reminder_counts())
+                data.append({
+                    "id": child_payload["id"],
+                    "title": f"  {child_payload['title']}",
+                    "group": group["ZNAME"],
+                    "active": str(child_counts["active"]),
+                    "completed": str(child_counts["completed"]),
+                    "total": str(child_counts["total"]),
+                })
+        print(fmt_table(data, columns=[
+            ("id", "ID"),
+            ("title", "Title"),
+            ("group", "Group"),
+            ("active", "Active"),
+            ("completed", "Done"),
+            ("total", "Total"),
+        ]))
+        return
+    if not groups:
+        print("No Reminders list groups found.")
+        return
+    print(C.bold("Reminder List Groups:"))
+    for group in groups:
+        children = child_rows.get(group["Z_PK"], [])
+        payload = group_payload_from_rows(db, group, children)
+        counts = payload.get("counts", zero_reminder_counts())
+        id_dim = C.dim(f"(id: {group['Z_PK']})")
+        count_info = C.dim(f" [{counts['active']} active, {counts['completed']} completed, {len(children)} lists]")
+        print(f"  {format_list_title(group, db)} {id_dim}{count_info}")
+        for child, child_payload in zip(children, payload["children"]):
+            child_counts = child_payload.get("counts", zero_reminder_counts())
+            child_id = C.dim(f"(id: {child['Z_PK']})")
+            child_count_info = C.dim(f" [{child_counts['active']} active, {child_counts['completed']} completed]")
+            print(f"    {format_list_title(child, db)} {child_id}{child_count_info}")
+    print(f"\n{len(groups)} group{'s' if len(groups) != 1 else ''}")
+
+
+def group_suggested_commands(group_ref):
+    quoted_name = shlex.quote(group_ref["title"])
+    return {
+        "show": f"remctl show {quoted_name}",
+        "showTable": f"remctl show {quoted_name} --format table",
+        "addList": f"remctl group-edit {quoted_name} --private --add-list LIST",
+        "moveList": f"remctl group-edit {quoted_name} --private --move-list LIST --before-list SIBLING",
+        "createList": f"remctl list-create LIST --private --group {quoted_name}",
+        "delete": f"remctl group-delete {quoted_name} --private --force",
+    }
+
+
+def cmd_group_info(a):
+    db = open_db()
+    group_ref = resolve_required_group_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        group_id=getattr(a, "group_id", None),
+    )
+    group_ref["suggestedCommands"] = group_suggested_commands(group_ref)
+    if a.json:
+        print(json.dumps(group_ref, indent=2, ensure_ascii=False))
+        return
+    counts = group_ref.get("counts", zero_reminder_counts())
+    print(C.bold(f"Group: {safe_display(group_ref['title'])}"))
+    print(f"  ID: {group_ref['id']}")
+    if group_ref.get("objectUUID"):
+        print(f"  Object UUID: {group_ref['objectUUID']}")
+    print(f"  Counts: {counts['active']} active, {counts['completed']} completed, {counts['total']} total")
+    children = group_ref.get("children") or []
+    if children:
+        print("\nChild Lists:")
+        for child in children:
+            child_counts = child.get("counts", zero_reminder_counts())
+            print(
+                f"  {safe_display(child['title'])} (id: {child['id']}) "
+                f"- {child_counts['active']} active, {child_counts['completed']} completed, {child_counts['total']} total"
+            )
+    else:
+        print("\nNo child lists.")
+    print("\nSuggested Commands:")
+    for command in group_ref["suggestedCommands"].values():
+        print(f"  {command}")
+
+
+def resolve_group_member_list_refs(db, *, names=None, ids=None):
+    refs = []
+    seen = set()
+    for list_id in ids or []:
+        ref = resolve_list_or_die(db, list_id=list_id)
+        if ref["id"] not in seen:
+            refs.append(ref)
+            seen.add(ref["id"])
+    for name in names or []:
+        ref = resolve_list_or_die(db, name=name)
+        if ref["id"] not in seen:
+            refs.append(ref)
+            seen.add(ref["id"])
+    return refs
+
+
+def resolve_single_group_member_ref(db, *, name=None, list_id=None, option_name="--move-list"):
+    if name and list_id is not None:
+        print(f"Error: pass either {option_name} or {option_name}-id, not both.", file=sys.stderr)
+        sys.exit(1)
+    if not name and list_id is None:
+        return None
+    return resolve_list_or_die(db, name=name, list_id=list_id)
+
+
+def group_child_ref_by_position(group_ref, *, first=False, last=False, exclude_id=None):
+    children = [child for child in group_ref.get("children") or [] if child.get("id") != exclude_id]
+    if not children:
+        return None
+    return children[-1] if last else children[0]
+
+
+def resolve_group_ordering_request(db, group_ref, a):
+    move_ref = resolve_single_group_member_ref(
+        db,
+        name=getattr(a, "move_list", None),
+        list_id=getattr(a, "move_list_id", None),
+        option_name="--move-list",
+    )
+    before_ref = resolve_single_group_member_ref(
+        db,
+        name=getattr(a, "before_list", None),
+        list_id=getattr(a, "before_list_id", None),
+        option_name="--before-list",
+    )
+    after_ref = resolve_single_group_member_ref(
+        db,
+        name=getattr(a, "after_list", None),
+        list_id=getattr(a, "after_list_id", None),
+        option_name="--after-list",
+    )
+    first = bool(getattr(a, "first", False))
+    last = bool(getattr(a, "last", False))
+    position_count = sum(1 for item in (before_ref, after_ref) if item is not None) + int(first) + int(last)
+    if position_count and move_ref is None:
+        print("Error: --before-list/--after-list/--first/--last require --move-list or --move-list-id.", file=sys.stderr)
+        sys.exit(1)
+    if move_ref is None:
+        return None
+    if position_count != 1:
+        print("Error: pass exactly one of --before-list, --before-list-id, --after-list, --after-list-id, --first, or --last with --move-list.", file=sys.stderr)
+        sys.exit(1)
+    if before_ref is not None:
+        return {"list": move_ref, "sibling": before_ref, "placement": "before", "position": "before"}
+    if after_ref is not None:
+        return {"list": move_ref, "sibling": after_ref, "placement": "after", "position": "after"}
+    if first:
+        sibling = group_child_ref_by_position(group_ref, first=True, exclude_id=move_ref["id"])
+        return {"list": move_ref, "sibling": sibling, "placement": "before" if sibling else None, "position": "first"}
+    sibling = group_child_ref_by_position(group_ref, last=True, exclude_id=move_ref["id"])
+    return {"list": move_ref, "sibling": sibling, "placement": "after" if sibling else None, "position": "last"}
+
+
+def compute_group_child_order_after_move(group_ref, move_request):
+    children = list(group_ref.get("children") or [])
+    by_id = {child["id"]: child for child in children}
+    move_ref = by_id.get(move_request["list"]["id"], move_request["list"])
+    sibling = move_request.get("sibling")
+    if sibling and sibling["id"] == move_ref["id"]:
+        print("Error: cannot place a list relative to itself.", file=sys.stderr)
+        sys.exit(1)
+    remaining = [child for child in children if child["id"] != move_ref["id"]]
+    position = move_request["position"]
+    if position in {"before", "after"}:
+        if not sibling or sibling["id"] not in by_id:
+            sibling_title = (sibling or {}).get("title") or "target sibling"
+            print(
+                f"Error: sibling list {sibling_title!r} is not currently in group {group_ref['title']!r}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        insertion_index = next(idx for idx, child in enumerate(remaining) if child["id"] == sibling["id"])
+        if position == "after":
+            insertion_index += 1
+        return remaining[:insertion_index] + [move_ref] + remaining[insertion_index:]
+    if position == "first":
+        return [move_ref] + remaining
+    if position == "last":
+        return remaining + [move_ref]
+    print("Error: unsupported group list position.", file=sys.stderr)
+    sys.exit(1)
+
+
+def apply_private_group_child_order(db, group_ref, ordered_children, a):
+    current_children = list(group_ref.get("children") or [])
+    current_ids = [child["id"] for child in current_children]
+    ordered_ids = [child["id"] for child in ordered_children]
+    if current_ids == ordered_ids:
+        return {
+            "status": "updated",
+            "method": "unchanged",
+            "finalOrder": ordered_ids,
+        }
+    if not (group_ref.get("objectUUID") or q_list_ckid(db, group_ref["id"])):
+        print("Error: target group has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    refs_by_id = {child["id"]: child for child in current_children + ordered_children}
+    for child in refs_by_id.values():
+        if not (child.get("objectUUID") or q_list_ckid(db, child["id"])):
+            print(f"Error: list {child['title']!r} has no stable CloudKit identifier.", file=sys.stderr)
+            sys.exit(1)
+
+    detached = []
+    for child in current_children:
+        result = apply_private_list_parent_group(
+            db,
+            child,
+            None,
+            require_current_group_id=group_ref["id"],
+            required_group_ref=group_ref,
+            a=a,
+        )
+        detached.append(group_change_summary(child, result))
+
+    attached = []
+    # Reminders inserts a list at the top when it is assigned to a group.
+    # Reattaching in reverse desired order produces the requested visible order
+    # without raw SQLite writes or unsupported direct relationship mutation.
+    for child in reversed(ordered_children):
+        result = apply_private_list_parent_group(db, child, group_ref, a=a)
+        attached.append(group_change_summary(child, result))
+
+    return {
+        "status": "updated",
+        "method": "detach_reattach",
+        "detachedLists": detached,
+        "attachedLists": attached,
+        "finalOrder": ordered_ids,
+    }
+
+
+def group_change_summary(ref, result, *, skipped=False):
+    payload = {
+        "id": ref["id"],
+        "title": ref["title"],
+    }
+    if ref.get("objectUUID"):
+        payload["objectUUID"] = ref["objectUUID"]
+    if skipped:
+        payload["skipped"] = True
+    if result is not None:
+        payload["private"] = result
+    return payload
+
+
+def cmd_group_create(a):
+    require_private_metadata(a)
+    db = open_db()
+    if q_list_exact_name_count(db, a.name):
+        print(
+            f"Error: list or group already exists: {a.name}. Choose a unique group name.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    add_refs = resolve_group_member_list_refs(
+        db,
+        names=getattr(a, "add_list", None),
+        ids=getattr(a, "add_list_id", None),
+    )
+    result = private_create_group_call({"action": "create_group", "name": a.name}, a.name)
+    if not result or result.get("status") != "created":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: Failed to create group '{a.name}': {message}", file=sys.stderr)
+        sys.exit(1)
+    created_ref = None
+    for _ in range(8):
+        try:
+            refreshed = resolve_group_ref(open_db(), name=a.name)
+            if refreshed and not refreshed.get("error"):
+                created_ref = refreshed
+                break
+        except RemindersDBUnavailable:
+            pass
+        time.sleep(0.25)
+    group_ref = {
+        "id": created_ref.get("id") if created_ref else None,
+        "title": a.name,
+        "objectUUID": (created_ref.get("objectUUID") if created_ref else None) or result.get("id"),
+        "isGroup": True,
+    }
+    added = []
+    for ref in add_refs:
+        membership = apply_private_list_parent_group(db, ref, group_ref, a=a)
+        added.append(group_change_summary(ref, membership))
+    if a.json:
+        print(json.dumps({
+            "status": "created",
+            "id": group_ref.get("id"),
+            "name": a.name,
+            "objectUUID": group_ref.get("objectUUID"),
+            "private": result,
+            "addedLists": added,
+        }, ensure_ascii=False))
+    else:
+        print(f"Created group: {safe_display(a.name)}")
+        if added:
+            print("Added lists:")
+            for item in added:
+                print(f"  {safe_display(item['title'])} (id: {item['id']})")
+
+
+def cmd_group_edit(a):
+    require_private_metadata(a)
+    db = open_db()
+    group_ref = resolve_required_group_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        group_id=getattr(a, "group_id", None),
+    )
+    add_refs = resolve_group_member_list_refs(
+        db,
+        names=getattr(a, "add_list", None),
+        ids=getattr(a, "add_list_id", None),
+    )
+    remove_refs = resolve_group_member_list_refs(
+        db,
+        names=getattr(a, "remove_list", None),
+        ids=getattr(a, "remove_list_id", None),
+    )
+    move_request = resolve_group_ordering_request(db, group_ref, a)
+    new_name = getattr(a, "new_name", None)
+    if move_request:
+        move_id = move_request["list"]["id"]
+        if any(ref["id"] == move_id for ref in remove_refs):
+            print("Error: cannot move and remove the same list in one group edit.", file=sys.stderr)
+            sys.exit(1)
+        sibling = move_request.get("sibling")
+        if sibling and any(ref["id"] == sibling["id"] for ref in remove_refs):
+            print("Error: cannot place a list relative to a sibling that is being removed.", file=sys.stderr)
+            sys.exit(1)
+        add_refs = [ref for ref in add_refs if ref["id"] != move_id]
+        if add_refs or remove_refs:
+            print("Error: perform group ordering separately from other add/remove edits.", file=sys.stderr)
+            sys.exit(1)
+    if not new_name and not add_refs and not remove_refs and not move_request:
+        print("Error: pass --new-name, --add-list/--add-list-id, --remove-list/--remove-list-id, or --move-list with a position.", file=sys.stderr)
+        sys.exit(1)
+    renamed = None
+    if new_name:
+        if new_name != group_ref["title"] and q_list_exact_name_count(db, new_name):
+            print(
+                f"Error: list or group already exists: {new_name}. Choose a unique group name.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        group_ckid = group_ref.get("objectUUID") or q_list_ckid(db, group_ref["id"])
+        if not group_ckid:
+            print("Error: target group has no stable CloudKit identifier.", file=sys.stderr)
+            sys.exit(1)
+        result = private_call({
+            "action": "set_list_appearance",
+            "listId": group_ckid,
+            "name": new_name,
+        })
+        if not result or result.get("status") != "updated":
+            message = result.get("message") if isinstance(result, dict) else "private helper failed"
+            print(f"Error: Failed to rename group '{group_ref['title']}': {message}", file=sys.stderr)
+            sys.exit(1)
+        renamed = {
+            "oldName": group_ref["title"],
+            "newName": new_name,
+            "private": result,
+        }
+        group_ref = dict(group_ref)
+        group_ref["title"] = new_name
+    added = []
+    for ref in add_refs:
+        if ref.get("parentListId") == group_ref["id"]:
+            added.append(group_change_summary(ref, None, skipped=True))
+            continue
+        membership = apply_private_list_parent_group(db, ref, group_ref, a=a)
+        added.append(group_change_summary(ref, membership))
+    removed = []
+    for ref in remove_refs:
+        membership = apply_private_list_parent_group(
+            db,
+            ref,
+            None,
+            require_current_group_id=group_ref["id"],
+            required_group_ref=group_ref,
+            a=a,
+        )
+        removed.append(group_change_summary(ref, membership))
+    moved = None
+    if move_request:
+        ref = move_request["list"]
+        sibling = move_request.get("sibling")
+        ordered_children = compute_group_child_order_after_move(group_ref, move_request)
+        membership = apply_private_group_child_order(db, group_ref, ordered_children, a)
+        moved = group_change_summary(ref, membership)
+        moved["position"] = move_request["position"]
+        moved["finalOrder"] = [{"id": child["id"], "title": child["title"]} for child in ordered_children]
+        if sibling is not None:
+            moved["relativeTo"] = {
+                "id": sibling["id"],
+                "title": sibling["title"],
+                "placement": move_request.get("placement"),
+            }
+    if a.json:
+        print(json.dumps({
+            "status": "updated",
+            "id": group_ref["id"],
+            "name": group_ref["title"],
+            "objectUUID": group_ref.get("objectUUID"),
+            "renamed": renamed,
+            "addedLists": added,
+            "removedLists": removed,
+            "movedList": moved,
+        }, ensure_ascii=False))
+    else:
+        print(f"Updated group: {safe_display(group_ref['title'])}")
+        if renamed:
+            print(f"Renamed: {safe_display(renamed['oldName'])} -> {safe_display(renamed['newName'])}")
+        if added:
+            print("Added lists:")
+            for item in added:
+                suffix = " [already in group]" if item.get("skipped") else ""
+                print(f"  {safe_display(item['title'])} (id: {item['id']}){suffix}")
+        if removed:
+            print("Removed lists:")
+            for item in removed:
+                print(f"  {safe_display(item['title'])} (id: {item['id']})")
+        if moved:
+            relative = moved.get("relativeTo")
+            if relative:
+                print(
+                    f"Moved list: {safe_display(moved['title'])} {relative['placement']} "
+                    f"{safe_display(relative['title'])}"
+                )
+            else:
+                print(f"Moved list: {safe_display(moved['title'])} ({moved['position']})")
+
+
+def cmd_group_delete(a):
+    require_private_metadata(a)
+    db = open_db()
+    group_ref = resolve_required_group_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        group_id=getattr(a, "group_id", None),
+    )
+    children = group_ref.get("children") or [list_ref_payload(row) for row in q_child_lists(db, group_ref["id"])]
+    if not a.force:
+        ans = input(
+            f"Delete group '{safe_display(group_ref['title'])}'? Child lists and reminders will be kept at top level. [y/N] "
+        )
+        if ans.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return
+    detached = []
+    for child in children:
+        membership = apply_private_list_parent_group(
+            db,
+            child,
+            None,
+            require_current_group_id=group_ref["id"],
+            required_group_ref=group_ref,
+            a=a,
+        )
+        detached.append(group_change_summary(child, membership))
+    result = apply_private_group_delete(db, group_ref, a)
+    if a.json:
+        print(json.dumps({
+            "status": "deleted",
+            "id": group_ref["id"],
+            "name": group_ref["title"],
+            "objectUUID": group_ref.get("objectUUID"),
+            "detachedLists": detached,
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Deleted group: {safe_display(group_ref['title'])}")
+        if detached:
+            print("Kept child lists:")
+            for item in detached:
+                print(f"  {safe_display(item['title'])} (id: {item['id']})")
 
 REMINDERS_UI_CORE_BUNDLE = Path("/System/Library/PrivateFrameworks/RemindersUICore.framework")
 
@@ -6110,6 +7201,83 @@ def cmd_list_symbols(a):
     for row in rows:
         print(f"  {row['preview']:<2}  {row['name']:<{width}}  {C.dim(row['asset'])}")
 
+
+def cmd_show_group(a, db, group_ref):
+    children = q_child_lists(db, group_ref["id"])
+    if not children:
+        if a.json:
+            print(json.dumps([], indent=2, ensure_ascii=False))
+        else:
+            print(f"No child lists in group '{safe_display(group_ref['title'])}'")
+        return
+    child_ids = [child["Z_PK"] for child in children]
+    child_by_id = {child["Z_PK"]: child for child in children}
+    items = q_reminders_for_lists(db, child_ids, completed=a.completed, top_level=True)
+    pks = [item["Z_PK"] for item in items]
+    sc, ht = preload_extras(db, pks)
+    memberships_by_list = {}
+    for child in children:
+        sections = q_sections(db, child["Z_PK"])
+        memberships_by_list[child["Z_PK"]] = q_section_memberships(db, child["Z_PK"]) if sections else {}
+    if a.json:
+        payload = []
+        for item in items:
+            list_pk = _row_get(item, "ZLIST")
+            child = child_by_id.get(list_pk)
+            section = memberships_by_list.get(list_pk, {}).get(item["ZCKIDENTIFIER"])
+            item_payload = to_dict(item, db, section=section, _sc=sc, _ht=ht)
+            if child:
+                item_payload["list"] = list_group_stub(child)
+                group_payload = {
+                    "id": group_ref["id"],
+                    "title": group_ref["title"],
+                }
+                if group_ref.get("objectUUID"):
+                    group_payload["objectUUID"] = group_ref["objectUUID"]
+                item_payload["group"] = group_payload
+            payload.append(item_payload)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if getattr(a, 'format', None) == 'table':
+        print_group_reminder_tables(group_ref, children, items, db, memberships_by_list, a)
+        return
+    if not items:
+        print(f"No {'active ' if not a.completed else ''}reminders in group '{safe_display(group_ref['title'])}'")
+        return
+    print(f"{C.bold(color_list_name(group_ref['title'], db))} {C.dim('(group)')}:")
+    for child in children:
+        child_items = [item for item in items if _row_get(item, "ZLIST") == child["Z_PK"]]
+        if not child_items:
+            continue
+        child_ref = list_ref_payload(child)
+        child_heading = color_list_name(child_ref["title"], db)
+        if child_ref.get("isGroceries"):
+            child_heading = f"{child_heading} {GROCERY_LIST_MARKER}"
+        print(f"\n  {C.bold(child_heading)}:")
+        secs = q_sections(db, child["Z_PK"])
+        memberships = memberships_by_list.get(child["Z_PK"], {})
+        if secs:
+            sec_items, unsectioned = {}, []
+            for item in child_items:
+                section_name = memberships.get(item["ZCKIDENTIFIER"])
+                if section_name:
+                    sec_items.setdefault(section_name, []).append(item)
+                else:
+                    unsectioned.append(item)
+            for item in unsectioned:
+                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+            for section_name in [section["ZDISPLAYNAME"] for section in secs]:
+                if section_name in sec_items:
+                    heading = safe_display(format_grocery_section_name(section_name, is_groceries=bool(child_ref.get("isGroceries"))))
+                    print(f"\n    {C.bold(f'[{heading}]')}")
+                    for item in sec_items[section_name]:
+                        print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+        else:
+            for item in child_items:
+                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
+
+
 def cmd_show(a):
     if eventkit_read_requested(a):
         cmd_show_eventkit(a)
@@ -6119,7 +7287,11 @@ def cmd_show(a):
         db,
         name=getattr(a, "list", None),
         list_id=getattr(a, "list_id", None),
+        allow_groups=True,
     )
+    if list_ref.get("isGroup"):
+        cmd_show_group(a, db, list_ref)
+        return
     pk = list_ref["id"]
     list_name = list_ref["title"]
     items = q_reminders(db, list_pk=pk, completed=a.completed, top_level=True)
@@ -6140,11 +7312,11 @@ def cmd_show(a):
             ensure_ascii=False,
         ))
         return
-    if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
-        return
     if not items:
         print(f"No {'active ' if not a.completed else ''}reminders in '{safe_display(list_name)}'")
+        return
+    if getattr(a, 'format', None) == 'table':
+        print_reminder_table(items, db, args=a)
         return
     list_heading = color_list_name(list_name, db)
     if list_ref.get("isGroceries"):
@@ -6797,7 +7969,7 @@ def cmd_search(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print(f"No reminders matching '{safe_display(a.query)}'")
@@ -6819,7 +7991,7 @@ def cmd_today(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
@@ -6848,7 +8020,7 @@ def cmd_flagged(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print("No flagged reminders")
@@ -6867,7 +8039,7 @@ def cmd_urgent(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print("No urgent reminders")
@@ -7234,7 +8406,7 @@ def cmd_upcoming(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print(f"Nothing due in the next {days} days")
@@ -7267,7 +8439,7 @@ def cmd_overdue(a):
         print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht) for i in items], indent=2))
         return
     if getattr(a, 'format', None) == 'table':
-        print(fmt_table(reminders_to_table_data(items, db)))
+        print_reminder_table(items, db, args=a)
         return
     if not items:
         print("No overdue reminders")
@@ -7279,10 +8451,18 @@ def cmd_overdue(a):
 
 def cmd_list_create(a):
     validate_list_appearance_args(a)
-    private_payload_needed = bool(list_private_appearance_payload(a, include_public_color_names=False))
+    group_target_requested = bool(getattr(a, "group", None)) or getattr(a, "group_id", None) is not None
+    private_payload_needed = bool(list_private_appearance_payload(a, include_public_color_names=False)) or group_target_requested
     if private_payload_needed:
         require_private_metadata(a)
         preflight_db = open_db()
+        group_ref = None
+        if group_target_requested:
+            group_ref = resolve_required_group_target_or_die(
+                preflight_db,
+                name=getattr(a, "group", None),
+                group_id=getattr(a, "group_id", None),
+            )
         existing = q_list_exact_name_count(preflight_db, a.name)
         if existing:
             print(
@@ -7297,10 +8477,37 @@ def cmd_list_create(a):
             message = result.get("message") if isinstance(result, dict) else "private helper failed"
             print(f"Error: Failed to create list '{a.name}': {message}", file=sys.stderr)
             sys.exit(1)
+        created_ref = None
+        membership = None
+        if group_ref is not None:
+            for _ in range(8):
+                created_db = open_db()
+                resolved = resolve_list_ref(created_db, name=a.name)
+                if resolved and not resolved.get("error"):
+                    created_ref = resolved
+                    membership = apply_private_list_parent_group(created_db, created_ref, group_ref, a=a)
+                    break
+                time.sleep(0.25)
+            if created_ref is None:
+                print(f"Error: created list '{a.name}' was not visible for group assignment.", file=sys.stderr)
+                sys.exit(1)
         if a.json:
-            print(json.dumps({"status": "created", "name": a.name, "private": result}, ensure_ascii=False))
+            payload = {"status": "created", "name": a.name, "private": result}
+            if created_ref is not None:
+                payload["id"] = created_ref["id"]
+                payload["objectUUID"] = created_ref.get("objectUUID")
+            if group_ref is not None:
+                payload["group"] = {
+                    "id": group_ref["id"],
+                    "title": group_ref["title"],
+                    "objectUUID": group_ref.get("objectUUID"),
+                }
+                payload["membership"] = membership
+            print(json.dumps(payload, ensure_ascii=False))
         else:
             print(f"Created list: {safe_display(a.name)}")
+            if group_ref is not None:
+                print(f"Group: {safe_display(group_ref['title'])} (id: {group_ref['id']})")
             details = []
             if getattr(a, "color", None):
                 details.append(f"color={normalize_list_color(a.color)}")
@@ -7606,6 +8813,11 @@ ZSH_COMPLETION = '''#compdef remctl
 _remctl() {
     local -a commands=(
         'lists:List all iCloud reminder lists'
+        'groups:List Reminders list groups'
+        'group-info:Show details for a Reminders list group'
+        'group-create:Create a Reminders list group'
+        'group-edit:Rename a group or add/remove child lists'
+        'group-delete:Delete a Reminders list group'
         'smart-lists:Inspect Reminders smart lists'
         'templates:Inspect saved Reminders templates'
         'template-info:Show a saved Reminders template'
@@ -7693,6 +8905,48 @@ _remctl() {
         template-info)
             _arguments \
                 '--template-id[Read by numeric template ID]:id:' \
+                '--json[JSON output]'
+            return
+            ;;
+        group-create)
+            _arguments \
+                '--add-list[Move existing list into the new group]:list:' \
+                '--add-list-id[Move existing list by numeric ID into the new group]:id:' \
+                '--private[Use private ReminderKit group creation]' \
+                '--json[JSON output]'
+            return
+            ;;
+        group-info)
+            _arguments \
+                '--group-id[Read by numeric group ID]:id:' \
+                '--json[JSON output]'
+            return
+            ;;
+        group-edit)
+            _arguments \
+                '--group-id[Edit group by numeric ID]:id:' \
+                '--new-name[Rename the group]:name:' \
+                '--add-list[Move existing list into the group]:list:' \
+                '--add-list-id[Move existing list by numeric ID into the group]:id:' \
+                '--remove-list[Move child list out of the group]:list:' \
+                '--remove-list-id[Move child list by numeric ID out of the group]:id:' \
+                '--move-list[Move or reorder a list in this group]:list:' \
+                '--move-list-id[Move or reorder a list by numeric ID]:id:' \
+                '--before-list[Place moved list before this child list]:list:' \
+                '--before-list-id[Place moved list before this child list ID]:id:' \
+                '--after-list[Place moved list after this child list]:list:' \
+                '--after-list-id[Place moved list after this child list ID]:id:' \
+                '--first[Place moved list first in the group]' \
+                '--last[Place moved list last in the group]' \
+                '--private[Use private ReminderKit group editing]' \
+                '--json[JSON output]'
+            return
+            ;;
+        group-delete)
+            _arguments \
+                '--group-id[Delete group by numeric ID]:id:' \
+                '--private[Use private ReminderKit group deletion]' \
+                '--force[Skip confirmation prompt]' \
                 '--json[JSON output]'
             return
             ;;
@@ -7898,6 +9152,8 @@ _remctl() {
                 '--emoji[Private Reminders list emoji badge]:emoji:' \
                 '--groceries[Create as a Reminders Groceries list]' \
                 '--grocery-locale[Groceries locale identifier]:locale:' \
+                '--group[Private metadata: create this list inside a group]:group:' \
+                '--group-id[Private metadata: create this list inside a group ID]:id:' \
                 '--json[JSON output]'
             return
             ;;
@@ -7947,7 +9203,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -7983,8 +9239,20 @@ BASH_COMPLETION = '''_remctl() {
     elif [ "$cmd" = "list-symbols" ]; then
         COMPREPLY=( $(compgen -W "--html --preview --json" -- "$cur") )
         return
+    elif [ "$cmd" = "group-create" ]; then
+        COMPREPLY=( $(compgen -W "--add-list --add-list-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "group-info" ]; then
+        COMPREPLY=( $(compgen -W "--group-id --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "group-edit" ]; then
+        COMPREPLY=( $(compgen -W "--group-id --new-name --add-list --add-list-id --remove-list --remove-list-id --move-list --move-list-id --before-list --before-list-id --after-list --after-list-id --first --last --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "group-delete" ]; then
+        COMPREPLY=( $(compgen -W "--group-id --private --force --json" -- "$cur") )
+        return
     elif [ "$cmd" = "list-create" ]; then
-        COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --groceries --grocery-locale --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--color --private --symbol --emoji --groceries --grocery-locale --group --group-id --json" -- "$cur") )
         return
     elif [ "$cmd" = "smart-list-create" ]; then
         COMPREPLY=( $(compgen -W "--private --color --symbol --emoji --match --filter-json --flagged --priority --tags --tag-match --any-tag --date --date-today-include-past-due --date-on --date-before --date-after --date-range --time --include-list --include-list-id --vehicle --location-title --latitude --longitude --radius --proximity --json" -- "$cur") )
@@ -8034,6 +9302,11 @@ complete -F _remctl remctl
 
 FISH_COMPLETION = '''# Fish completion for remctl
 complete -c remctl -n "__fish_use_subcommand" -a lists -d "List all iCloud reminder lists"
+complete -c remctl -n "__fish_use_subcommand" -a groups -d "List Reminders list groups"
+complete -c remctl -n "__fish_use_subcommand" -a group-info -d "Show details for a Reminders list group"
+complete -c remctl -n "__fish_use_subcommand" -a group-create -d "Create a Reminders list group"
+complete -c remctl -n "__fish_use_subcommand" -a group-edit -d "Rename a group or add/remove child lists"
+complete -c remctl -n "__fish_use_subcommand" -a group-delete -d "Delete a Reminders list group"
 complete -c remctl -n "__fish_use_subcommand" -a smart-lists -d "Inspect Reminders smart lists"
 complete -c remctl -n "__fish_use_subcommand" -a templates -d "Inspect saved Reminders templates"
 complete -c remctl -n "__fish_use_subcommand" -a template-info -d "Show a saved Reminders template"
@@ -8104,6 +9377,8 @@ complete -c remctl -n "__fish_seen_subcommand_from list-create" -l symbol -d "Of
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l emoji -d "Private Reminders list emoji badge" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l groceries -d "Create as a Reminders Groceries list"
 complete -c remctl -n "__fish_seen_subcommand_from list-create" -l grocery-locale -d "Groceries locale identifier" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l group -d "Private metadata: create this list inside a group" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-create" -l group-id -d "Private metadata: create this list inside a group ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create" -l private -d "Use private ReminderKit smart-list creation"
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l color -d "Smart-list color name or #RRGGBB" -r
 complete -c remctl -n "__fish_seen_subcommand_from smart-list-create smart-list-edit" -l symbol -d "Official Reminders list symbol" -r
@@ -8145,6 +9420,32 @@ complete -c remctl -n "__fish_seen_subcommand_from sharees" -l list-id -d "Share
 complete -c remctl -n "__fish_seen_subcommand_from sharees" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from template-info" -l template-id -d "Read by numeric template ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from template-info" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from group-create" -l add-list -d "Move existing list into the new group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-create" -l add-list-id -d "Move existing list by numeric ID into the new group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-create" -l private -d "Use private ReminderKit group creation"
+complete -c remctl -n "__fish_seen_subcommand_from group-create" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from group-info" -l group-id -d "Read by numeric group ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-info" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l group-id -d "Edit group by numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l new-name -d "Rename the group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l add-list -d "Move existing list into the group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l add-list-id -d "Move existing list by numeric ID into the group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l remove-list -d "Move child list out of the group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l remove-list-id -d "Move child list by numeric ID out of the group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l move-list -d "Move or reorder a list in this group" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l move-list-id -d "Move or reorder a list by numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l before-list -d "Place moved list before this child list" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l before-list-id -d "Place moved list before this child list ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l after-list -d "Place moved list after this child list" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l after-list-id -d "Place moved list after this child list ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l first -d "Place moved list first in the group"
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l last -d "Place moved list last in the group"
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l private -d "Use private ReminderKit group editing"
+complete -c remctl -n "__fish_seen_subcommand_from group-edit" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from group-delete" -l group-id -d "Delete group by numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from group-delete" -l private -d "Use private ReminderKit group deletion"
+complete -c remctl -n "__fish_seen_subcommand_from group-delete" -l force -d "Skip confirmation prompt"
+complete -c remctl -n "__fish_seen_subcommand_from group-delete" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from template-create" -l from-list -d "Source list name" -r
 complete -c remctl -n "__fish_seen_subcommand_from template-create" -l from-list-id -d "Source list numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from template-create" -l include-completed -d "Include completed reminders"
@@ -8390,11 +9691,11 @@ def _print_show_payload(list_name, items, args):
     if args.json:
         _print_reminder_json(items)
         return
-    if getattr(args, "format", None) == "table":
-        print(fmt_table(reminders_to_table_data(items)))
-        return
     if not items:
         print(f"No {'active ' if not args.completed else ''}reminders in '{safe_display(list_name)}'")
+        return
+    if getattr(args, "format", None) == "table":
+        print_reminder_table(items, args=args)
         return
     print(f"{C.bold(color_list_name(list_name))}:")
     section_names = [item["section"] for item in items if item.get("section")]
@@ -8427,7 +9728,7 @@ def _print_search_payload(query, items, args):
         _print_reminder_json(items)
         return
     if getattr(args, "format", None) == "table":
-        print(fmt_table(reminders_to_table_data(items)))
+        print_reminder_table(items, args=args)
         return
     if not items:
         print(f"No reminders matching '{safe_display(query)}'")
@@ -8445,7 +9746,7 @@ def _print_today_payload(items, args):
         _print_reminder_json(items)
         return
     if getattr(args, "format", None) == "table":
-        print(fmt_table(reminders_to_table_data(items)))
+        print_reminder_table(items, args=args)
         return
     if not items:
         print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
@@ -8469,7 +9770,7 @@ def _print_simple_reminder_list(items, args, *, empty_message, heading, total_la
         _print_reminder_json(items)
         return
     if getattr(args, "format", None) == "table":
-        print(fmt_table(reminders_to_table_data(items)))
+        print_reminder_table(items, args=args)
         return
     if not items:
         print(empty_message)
@@ -8977,7 +10278,7 @@ def main():
             "for onboarding details.\n"
             "\n"
             "Private metadata writes are unsupported and opt-in: pass --private on "
-            "add/edit/list-create/list-edit/list-pin/list-unpin/smart-list-*/template-*."
+            "add/edit/list-create/list-edit/list-pin/list-unpin/group-*/smart-list-*/template-*."
         ),
         formatter_class=HelpFormatter,
     )
@@ -9010,6 +10311,98 @@ def main():
 
     # --- Existing commands ---
     c = sub.add_parser("lists", help="List all iCloud reminder lists"); js(c); display_format(c)
+
+    c = sub.add_parser("groups", help="List Reminders list groups"); js(c); display_format(c)
+
+    c = sub.add_parser(
+        "group-info",
+        help="Show details for a Reminders list group",
+        description="Show group ID, object UUID, child lists, reminder counts, and useful follow-up commands.",
+        epilog=(
+            "Examples:\n"
+            "  remctl group-info Writing\n"
+            "  remctl group-info --group-id 476 --json\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Group name")
+    c.add_argument("--group-id", type=int, help="Read by numeric group ID from groups")
+    js(c)
+
+    c = sub.add_parser(
+        "group-create",
+        help="Create a Reminders list group",
+        description=(
+            "Create a Reminders list group through unsupported private ReminderKit APIs. "
+            "Optionally move existing lists into the new group without moving or deleting their reminders."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl group-create Writing --private\n"
+            "  remctl group-create Writing --private --add-list Editorial --add-list-id 475 --json\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", help="Group name")
+    c.add_argument("--add-list", action="append", help="Move an existing list into the new group by name; repeatable")
+    c.add_argument("--add-list-id", action="append", type=int, help="Move an existing list into the new group by numeric ID; repeatable")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit group creation")
+    js(c)
+
+    c = sub.add_parser(
+        "group-edit",
+        help="Rename a group or add/remove child lists",
+        description=(
+            "Edit a Reminders list group through unsupported private ReminderKit APIs. "
+            "Adding or removing lists changes only the list container; reminders stay in their original lists."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl group-edit Writing --private --new-name Drafts\n"
+            "  remctl group-edit Writing --private --add-list Editorial --remove-list Socials\n"
+            "  remctl group-edit Writing --private --move-list Editorial --before-list Podcasts\n"
+            "  remctl group-edit Writing --private --move-list-id 137 --last\n"
+            "  remctl group-edit --group-id 476 --private --add-list-id 475 --json\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Group name")
+    c.add_argument("--group-id", type=int, help="Edit by numeric group ID from groups")
+    c.add_argument("--new-name", help="Rename the group")
+    c.add_argument("--add-list", action="append", help="Move an existing list into the group by name; repeatable")
+    c.add_argument("--add-list-id", action="append", type=int, help="Move an existing list into the group by numeric ID; repeatable")
+    c.add_argument("--remove-list", action="append", help="Move an existing child list out of the group by name; repeatable")
+    c.add_argument("--remove-list-id", action="append", type=int, help="Move an existing child list out of the group by numeric ID; repeatable")
+    c.add_argument("--move-list", help="Move or reorder a list in this group by name")
+    c.add_argument("--move-list-id", type=int, help="Move or reorder a list in this group by numeric ID")
+    c.add_argument("--before-list", help="Place --move-list before this child list")
+    c.add_argument("--before-list-id", type=int, help="Place --move-list before this child list ID")
+    c.add_argument("--after-list", help="Place --move-list after this child list")
+    c.add_argument("--after-list-id", type=int, help="Place --move-list after this child list ID")
+    c.add_argument("--first", action="store_true", help="Place --move-list first in the group")
+    c.add_argument("--last", action="store_true", help="Place --move-list last in the group")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit group editing")
+    js(c)
+
+    c = sub.add_parser(
+        "group-delete",
+        help="Delete a Reminders list group",
+        description=(
+            "Delete a Reminders list group through unsupported private ReminderKit APIs. "
+            "Child lists are first moved to the top level so their reminders are kept."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl group-delete Writing --private --force\n"
+            "  remctl group-delete --group-id 476 --private --force --json\n"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="Group name")
+    c.add_argument("--group-id", type=int, help="Delete by numeric group ID from groups")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit group deletion")
+    c.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    js(c)
 
     c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c)
 
@@ -9254,6 +10647,8 @@ def main():
     c.add_argument("--emoji", help="Private Reminders list emoji badge, e.g. 📌")
     c.add_argument("--groceries", action="store_true", help="Create as a Reminders Groceries list")
     c.add_argument("--grocery-locale", help="Groceries locale identifier, e.g. en_US or it_IT")
+    c.add_argument("--group", help="Private metadata: create this list inside a Reminders list group")
+    c.add_argument("--group-id", type=int, help="Private metadata: create this list inside a group by numeric ID")
     js(c)
 
     c = sub.add_parser(
@@ -9576,6 +10971,11 @@ def main():
     # Route to command handler
     cmds = {
         "lists": cmd_lists,
+        "groups": cmd_groups,
+        "group-info": cmd_group_info,
+        "group-create": cmd_group_create,
+        "group-edit": cmd_group_edit,
+        "group-delete": cmd_group_delete,
         "smart-lists": cmd_smart_lists,
         "templates": cmd_templates,
         "template-info": cmd_template_info,

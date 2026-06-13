@@ -377,6 +377,8 @@ class CliTests(unittest.TestCase):
             "CREATE TABLE ZREMCDBASELIST ("
             "Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER, Z_ENT INTEGER, "
             "ZBADGEEMBLEM TEXT, ZCOLOR BLOB, "
+            "ZISGROUP INTEGER, ZPARENTLIST INTEGER, ZPARENTLIST1 INTEGER, "
+            "Z_FOK_PARENTLIST INTEGER, Z_FOK_PARENTLIST1 INTEGER, ZDADISPLAYORDER INTEGER, "
             "ZISPINNEDBYCURRENTUSER INTEGER, ZPINNEDDATE REAL, "
             "ZSHOULDCATEGORIZEGROCERYITEMS INTEGER, ZSHOULDAUTOCATEGORIZEITEMS INTEGER, "
             "ZSHOULDSUGGESTCONVERSIONTOGROCERYLIST INTEGER, ZGROCERYLOCALEID TEXT, "
@@ -399,6 +401,41 @@ class CliTests(unittest.TestCase):
         db.execute(
             "CREATE TABLE ZREMCDBASESECTION ("
             "Z_PK INTEGER PRIMARY KEY, ZDISPLAYNAME TEXT, ZLIST INTEGER, ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER)"
+        )
+        return db
+
+    def _list_group_db(self):
+        db = self._list_db(["Writing", "Editorial", "iOS and iPadOS 27 Review", "Work"])
+        db.execute("UPDATE ZREMCDBASELIST SET ZISGROUP = 1 WHERE ZNAME = 'Writing'")
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZPARENTLIST = 1, Z_FOK_PARENTLIST = 2048 "
+            "WHERE ZNAME = 'Editorial'"
+        )
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZPARENTLIST = 1, Z_FOK_PARENTLIST = 3072 "
+            "WHERE ZNAME = 'iOS and iPadOS 27 Review'"
+        )
+        return db
+
+    def _add_group_reminders(self, db):
+        db.execute(
+            "CREATE TABLE ZREMCDREMINDER ("
+            "Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZCOMPLETED INTEGER, "
+            "ZMARKEDFORDELETION INTEGER DEFAULT 0, ZACCOUNT INTEGER, "
+            "ZPARENTREMINDER INTEGER, ZLIST INTEGER)"
+        )
+        db.executemany(
+            "INSERT INTO ZREMCDREMINDER "
+            "(Z_PK, ZTITLE, ZCOMPLETED, ZMARKEDFORDELETION, ZACCOUNT, ZPARENTREMINDER, ZLIST) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, "Editorial Active", 0, 0, 1, None, 2),
+                (2, "Editorial Completed", 1, 0, 1, None, 2),
+                (3, "Review Active", 0, 0, 1, None, 3),
+                (4, "Deleted", 0, 1, 1, None, 2),
+                (5, "Subtask", 0, 0, 1, 1, 2),
+                (6, "No Account", 0, 0, None, None, 3),
+            ],
         )
         return db
 
@@ -482,6 +519,71 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_list_resolution_rejects_group_targets_by_default(self):
+        db = self._list_group_db()
+        try:
+            result = self.remctl.resolve_list_ref(db, name="Writing")
+
+            self.assertEqual(result["error"], "group")
+            self.assertEqual(result["group"]["title"], "Writing")
+            self.assertEqual(
+                [child["title"] for child in result["group"]["children"]],
+                ["iOS and iPadOS 27 Review", "Editorial"],
+            )
+            self.assertNotIn("Writing", [row["ZNAME"] for row in self.remctl.q_lists(db)])
+        finally:
+            db.close()
+
+    def test_list_resolution_allows_group_targets_when_requested(self):
+        db = self._list_group_db()
+        try:
+            result = self.remctl.resolve_list_ref(db, name="Writing", allow_groups=True)
+
+            self.assertTrue(result["isGroup"])
+            self.assertEqual(result["listType"], "group")
+            self.assertEqual([child["id"] for child in result["children"]], [3, 2])
+        finally:
+            db.close()
+
+    def test_group_resolution_requires_group_rows(self):
+        db = self._list_group_db()
+        try:
+            result = self.remctl.resolve_group_ref(db, name="Writing")
+            not_group = self.remctl.resolve_group_ref(db, group_id=4)
+
+            self.assertTrue(result["isGroup"])
+            self.assertEqual(result["title"], "Writing")
+            self.assertEqual([child["title"] for child in result["children"]], ["iOS and iPadOS 27 Review", "Editorial"])
+            self.assertEqual(not_group["error"], "not_group")
+            self.assertEqual(not_group["list"]["title"], "Work")
+        finally:
+            db.close()
+
+    def test_list_and_group_resolution_can_disambiguate_same_visible_name(self):
+        db = self._list_db(["Shared", "Shared"])
+        db.execute("UPDATE ZREMCDBASELIST SET ZISGROUP = 1 WHERE Z_PK = 1")
+        try:
+            list_result = self.remctl.resolve_list_ref(db, name="Shared")
+            group_result = self.remctl.resolve_group_ref(db, name="Shared")
+
+            self.assertEqual(list_result["id"], 2)
+            self.assertFalse(list_result["isGroup"])
+            self.assertEqual(group_result["id"], 1)
+            self.assertTrue(group_result["isGroup"])
+        finally:
+            db.close()
+
+    def test_group_resolution_rejects_duplicate_group_names(self):
+        db = self._list_db(["Shared", "Shared"])
+        db.execute("UPDATE ZREMCDBASELIST SET ZISGROUP = 1")
+        try:
+            result = self.remctl.resolve_group_ref(db, name="Shared")
+
+            self.assertEqual(result["error"], "ambiguous")
+            self.assertEqual([candidate["id"] for candidate in result["candidates"]], [1, 2])
+        finally:
+            db.close()
+
     def test_list_to_dict_includes_private_appearance_fields(self):
         row = {
             "Z_PK": 1,
@@ -526,6 +628,82 @@ class CliTests(unittest.TestCase):
         self.assertFalse(work["isGroceries"])
         self.assertNotIn("grocery", work)
 
+    def test_lists_json_reports_group_hierarchy(self):
+        db = self._list_group_db()
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_lists(SimpleNamespace(json=True))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        group = next(item for item in payload if item["title"] == "Writing")
+        child = next(item for item in payload if item["title"] == "Editorial")
+        work = next(item for item in payload if item["title"] == "Work")
+        self.assertEqual(group["listType"], "group")
+        self.assertTrue(group["isGroup"])
+        self.assertEqual([item["title"] for item in group["children"]], ["iOS and iPadOS 27 Review", "Editorial"])
+        self.assertEqual(child["parentListId"], 1)
+        self.assertEqual(child["group"]["title"], "Writing")
+        self.assertNotIn("group", work)
+
+    def test_groups_json_reports_child_and_group_counts(self):
+        db = self._add_group_reminders(self._list_group_db())
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_groups(SimpleNamespace(json=True, format=None))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        group = payload[0]
+        self.assertEqual(group["title"], "Writing")
+        self.assertEqual(group["counts"], {"active": 2, "completed": 1, "total": 3})
+        counts_by_title = {child["title"]: child["counts"] for child in group["children"]}
+        self.assertEqual(counts_by_title["Editorial"], {"active": 1, "completed": 1, "total": 2})
+        self.assertEqual(counts_by_title["iOS and iPadOS 27 Review"], {"active": 1, "completed": 0, "total": 1})
+
+    def test_groups_table_includes_counts(self):
+        db = self._add_group_reminders(self._list_group_db())
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_groups(SimpleNamespace(json=False, format="table"))
+        finally:
+            db.close()
+
+        output = stdout.getvalue()
+        self.assertIn("Active", output)
+        self.assertIn("Done", output)
+        self.assertIn("Writing", output)
+        self.assertIn("Editorial", output)
+        self.assertIn("Total", output)
+
+    def test_group_info_reports_counts_and_commands(self):
+        db = self._add_group_reminders(self._list_group_db())
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_info(SimpleNamespace(name="Writing", group_id=None, json=True))
+        finally:
+            db.close()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["counts"], {"active": 2, "completed": 1, "total": 3})
+        self.assertEqual([child["title"] for child in payload["children"]], ["iOS and iPadOS 27 Review", "Editorial"])
+        self.assertIn("remctl show Writing --format table", payload["suggestedCommands"]["showTable"])
+        self.assertIn("remctl list-create LIST --private --group Writing", payload["suggestedCommands"]["createList"])
+
     def test_lists_human_output_marks_groceries_with_carrot(self):
         db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
         try:
@@ -540,6 +718,280 @@ class CliTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Groceries", output)
         self.assertIn("🥕", output)
+
+    def test_group_create_uses_private_helper_and_can_add_lists(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="New Group",
+            add_list=["Editorial"],
+            add_list_id=[4],
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_create_group_call", return_value={"status": "created", "id": "GROUP-CK"}) as create_group,
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_create(args)
+        finally:
+            db.close()
+
+        create_group.assert_called_once_with({"action": "create_group", "name": "New Group"}, "New Group")
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "set_list_parent_group", "listId": "CK-4", "groupId": "GROUP-CK"},
+                {"action": "set_list_parent_group", "listId": "CK-2", "groupId": "GROUP-CK"},
+            ],
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "created")
+        self.assertEqual([item["title"] for item in payload["addedLists"]], ["Work", "Editorial"])
+
+    def test_list_create_can_target_group(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="Research",
+            color=None,
+            private=True,
+            symbol=None,
+            emoji=None,
+            groceries=False,
+            standard=False,
+            grocery_locale=None,
+            group="Writing",
+            group_id=None,
+            json=True,
+        )
+
+        def create_list_side_effect(request, name):
+            db.execute(
+                "INSERT INTO ZREMCDBASELIST "
+                "(Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT) "
+                "VALUES (5, ?, 'CK-5', 0, 3)",
+                (name,),
+            )
+            return {"status": "created", "id": "CK-5"}
+
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_create_list_call", side_effect=create_list_side_effect) as create_list,
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                mock.patch.object(self.remctl.time, "sleep"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_list_create(args)
+        finally:
+            db.close()
+
+        create_list.assert_called_once_with({"action": "create_list", "name": "Research"}, "Research")
+        private_call.assert_called_once_with({"action": "set_list_parent_group", "listId": "CK-5", "groupId": "CK-1"})
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["id"], 5)
+        self.assertEqual(payload["objectUUID"], "CK-5")
+        self.assertEqual(payload["group"]["title"], "Writing")
+        self.assertEqual(payload["membership"], {"status": "updated"})
+
+    def test_group_edit_renames_and_adds_or_removes_lists(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="Writing",
+            group_id=None,
+            new_name="Drafts",
+            add_list=["Work"],
+            add_list_id=None,
+            remove_list=["Editorial"],
+            remove_list_id=None,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_edit(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "set_list_appearance", "listId": "CK-1", "name": "Drafts"},
+                {"action": "set_list_parent_group", "listId": "CK-4", "groupId": "CK-1"},
+                {"action": "set_list_parent_group", "listId": "CK-2"},
+            ],
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["renamed"]["oldName"], "Writing")
+        self.assertEqual(payload["renamed"]["newName"], "Drafts")
+        self.assertEqual(payload["addedLists"][0]["title"], "Work")
+        self.assertEqual(payload["removedLists"][0]["title"], "Editorial")
+
+    def test_group_edit_can_move_list_before_sibling(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="Writing",
+            group_id=None,
+            new_name=None,
+            add_list=None,
+            add_list_id=None,
+            remove_list=None,
+            remove_list_id=None,
+            move_list="Work",
+            move_list_id=None,
+            before_list="Editorial",
+            before_list_id=None,
+            after_list=None,
+            after_list_id=None,
+            first=False,
+            last=False,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_edit(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "set_list_parent_group", "listId": "CK-3"},
+                {"action": "set_list_parent_group", "listId": "CK-2"},
+                {"action": "set_list_parent_group", "listId": "CK-2", "groupId": "CK-1"},
+                {"action": "set_list_parent_group", "listId": "CK-4", "groupId": "CK-1"},
+                {"action": "set_list_parent_group", "listId": "CK-3", "groupId": "CK-1"},
+            ],
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["movedList"]["title"], "Work")
+        self.assertEqual(payload["movedList"]["position"], "before")
+        self.assertEqual(payload["movedList"]["relativeTo"]["title"], "Editorial")
+        self.assertEqual([item["title"] for item in payload["movedList"]["finalOrder"]], ["iOS and iPadOS 27 Review", "Work", "Editorial"])
+        self.assertEqual(payload["movedList"]["private"]["method"], "detach_reattach")
+
+    def test_group_edit_can_move_list_last(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="Writing",
+            group_id=None,
+            new_name=None,
+            add_list=None,
+            add_list_id=None,
+            remove_list=None,
+            remove_list_id=None,
+            move_list="iOS and iPadOS 27 Review",
+            move_list_id=None,
+            before_list=None,
+            before_list_id=None,
+            after_list=None,
+            after_list_id=None,
+            first=False,
+            last=True,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_edit(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "set_list_parent_group", "listId": "CK-3"},
+                {"action": "set_list_parent_group", "listId": "CK-2"},
+                {"action": "set_list_parent_group", "listId": "CK-3", "groupId": "CK-1"},
+                {"action": "set_list_parent_group", "listId": "CK-2", "groupId": "CK-1"},
+            ],
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["movedList"]["position"], "last")
+        self.assertEqual(payload["movedList"]["relativeTo"]["placement"], "after")
+        self.assertEqual([item["title"] for item in payload["movedList"]["finalOrder"]], ["Editorial", "iOS and iPadOS 27 Review"])
+
+    def test_group_edit_rejects_removing_list_that_is_not_a_child(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(
+            name="Writing",
+            group_id=None,
+            new_name=None,
+            add_list=None,
+            add_list_id=None,
+            remove_list=["Work"],
+            remove_list_id=None,
+            private=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                with self.assertRaises(SystemExit):
+                    self.remctl.cmd_group_edit(args)
+        finally:
+            db.close()
+
+        private_call.assert_not_called()
+        self.assertIn("is not currently in group", stderr.getvalue())
+
+    def test_group_delete_detaches_child_lists_before_deleting_group(self):
+        db = self._list_group_db()
+        args = SimpleNamespace(name="Writing", group_id=None, private=True, force=True, json=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    side_effect=[
+                        {"status": "updated"},
+                        {"status": "updated"},
+                        {"status": "deleted"},
+                    ],
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_group_delete(args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "set_list_parent_group", "listId": "CK-3"},
+                {"action": "set_list_parent_group", "listId": "CK-2"},
+                {"action": "delete_group", "groupId": "CK-1"},
+            ],
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "deleted")
+        self.assertEqual([item["title"] for item in payload["detachedLists"]], ["iOS and iPadOS 27 Review", "Editorial"])
 
     def _show_row(self, pk, title, ckid):
         return {
@@ -4486,6 +4938,103 @@ class CliTests(unittest.TestCase):
         self.assertIn("Test reminder", formatted)
         self.assertEqual(self.remctl._strip_ansi(table[0]["id"]), "#42")
         self.assertEqual(table[0]["title"], "Test reminder")
+
+    def test_completed_table_mode_uses_completion_date_column(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        due = self.remctl.to_ts(self.remctl.datetime(2026, 4, 1, 12, 0))
+        completed = self.remctl.to_ts(self.remctl.datetime(2026, 5, 27, 9, 30))
+        row = conn.execute(
+            "SELECT 42 AS Z_PK, 'Completed item' AS ZTITLE, 1 AS ZCOMPLETED, "
+            "0 AS ZFLAGGED, 0 AS ZPRIORITY, ? AS ZDUEDATE, NULL AS ZDISPLAYDATEDATE, "
+            "0 AS ZALLDAY, ? AS ZCOMPLETIONDATE, 'Work' AS list_name, NULL AS ZNOTES, "
+            "NULL AS ZICSURL",
+            (due, completed),
+        ).fetchone()
+        table_data = self.remctl.reminders_to_table_data([row], db=None)
+        rendered = self.remctl.fmt_table(table_data, date_mode="completed")
+        conn.close()
+
+        plain = self.remctl._strip_ansi(rendered)
+        self.assertIn("Completed", plain)
+        self.assertIn("2026-05-27 09:30", plain)
+        self.assertNotIn("Overdue", plain)
+
+    def test_table_width_accounts_for_emoji_cells(self):
+        rows = [{
+            "id": "#18396",
+            "title": "📅 Post 1.0.5",
+            "list": "Editorial",
+            "due": "Overdue 10d",
+            "repeat": "",
+            "pri": "",
+        }]
+        rendered = self.remctl.fmt_table(rows, max_width=100)
+        widths = {self.remctl._visible_len(line) for line in rendered.splitlines()}
+        self.assertEqual(len(widths), 1)
+
+    def test_group_table_mode_prints_child_list_and_section_tables(self):
+        children = [
+            {"Z_PK": 2, "ZNAME": "Editorial", "ZCKIDENTIFIER": "LIST-2", "ZISGROUP": 0},
+            {"Z_PK": 3, "ZNAME": "Podcasts", "ZCKIDENTIFIER": "LIST-3", "ZISGROUP": 0},
+        ]
+        completed = self.remctl.to_ts(self.remctl.datetime(2026, 5, 27, 9, 30))
+        items = [
+            {
+                "Z_PK": 42,
+                "ZTITLE": "Publish review",
+                "ZCOMPLETED": 1,
+                "ZFLAGGED": 0,
+                "ZPRIORITY": 0,
+                "ZDUEDATE": None,
+                "ZDISPLAYDATEDATE": None,
+                "ZALLDAY": 0,
+                "ZCOMPLETIONDATE": completed,
+                "ZLIST": 2,
+                "ZCKIDENTIFIER": "REM-1",
+                "list_name": "Editorial",
+            },
+            {
+                "Z_PK": 43,
+                "ZTITLE": "Record episode",
+                "ZCOMPLETED": 1,
+                "ZFLAGGED": 0,
+                "ZPRIORITY": 0,
+                "ZDUEDATE": None,
+                "ZDISPLAYDATEDATE": None,
+                "ZALLDAY": 0,
+                "ZCOMPLETIONDATE": completed,
+                "ZLIST": 3,
+                "ZCKIDENTIFIER": "REM-2",
+                "list_name": "Podcasts",
+            },
+        ]
+
+        def sections_for(_db, list_id):
+            return [{"ZDISPLAYNAME": "MacStories"}] if list_id == 2 else []
+
+        with (
+            mock.patch.object(self.remctl, "q_sections", side_effect=sections_for),
+            mock.patch.object(self.remctl, "color_list_name", side_effect=lambda name, db=None: name),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.print_group_reminder_tables(
+                {"id": 1, "title": "Writing"},
+                children,
+                items,
+                db=object(),
+                memberships_by_list={2: {"REM-1": "MacStories"}, 3: {}},
+                args=SimpleNamespace(completed=True),
+            )
+
+        plain = self.remctl._strip_ansi(stdout.getvalue())
+        self.assertIn("Writing (group):", plain)
+        self.assertIn("Editorial:", plain)
+        self.assertIn("[MacStories]", plain)
+        self.assertIn("Podcasts:", plain)
+        self.assertIn("Completed", plain)
+        self.assertIn("2026-05-27 09:30", plain)
+        self.assertNotIn("│ List ", plain)
 
     def test_human_reminder_output_sanitizes_terminal_controls(self):
         conn = sqlite3.connect(":memory:")

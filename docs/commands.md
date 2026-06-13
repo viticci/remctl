@@ -12,6 +12,11 @@ remctl overdue
 remctl flagged
 remctl urgent
 remctl lists
+remctl groups
+remctl group-info "Writing"
+remctl group-create "Writing" --private --add-list Editorial
+remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas --remove-list Socials
+remctl group-delete "Drafts" --private --force
 remctl smart-lists
 remctl templates
 remctl template-info "Rome: Things To See"
@@ -93,9 +98,9 @@ remctl template-delete "Packing Template" --private --force
 
 ## CLI Syntax Rules
 
-RemCTL uses nouns for read-only inspectors (`lists`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, `list-create`, `smart-list-edit`). List-management commands keep the `list-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
+RemCTL uses nouns for read-only inspectors (`lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, plus the `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands). List-management commands keep the `list-*` prefix; group writes keep the `group-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
 
-Use `--json` on subcommands when scripting. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command, so both `remctl --format table show Work` and `remctl show Work --format table` are valid. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
+Use `--json` on subcommands when scripting. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `groups`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command, so both `remctl --format table show Work` and `remctl show Work --format table` are valid. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
 ### Limited EventKit Read Fallback
 
@@ -136,6 +141,8 @@ Date-only `add -d` inputs create all-day reminders instead of midnight timed rem
 
 List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
 
+Reminders list groups are containers for lists. Use `groups` to inspect them, or `lists --json` to get group rows with `children` plus child list rows with `group` metadata. `show <group>` reads across child lists. `group-create`, `group-edit`, and `group-delete` use private ReminderKit and require `--private`; they move list containers only, so reminders stay in their existing lists. Write commands that need a real list reject group targets before making changes and report the child lists you can target instead.
+
 List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that ignores decorative punctuation and emoji. If more than one list matches, RemCTL fails before writing and prints the candidate IDs; pass `--list-id` to target one explicitly.
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL uses the only non-empty matching section when there is exactly one. If the duplicate is still ambiguous, use `--section-id`.
@@ -144,7 +151,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts before creating or editing a reminder; rich subtask URLs follow the same rule. Non-private `--url` remains a notes fallback.
 
@@ -223,6 +230,8 @@ remctl list-create "Project X" --color blue
 remctl list-create "Project X" --color orange --private --symbol education3
 remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
 remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl list-create "Ideas" --private --group Writing
+remctl list-create "References" --private --group-id 476
 remctl list-edit "Shopping" --private --groceries --grocery-locale it_IT
 remctl list-edit "Shopping" --private --standard
 remctl add "Milk" -l Groceries --private --grocery
@@ -246,6 +255,29 @@ List symbols, emoji badges, Groceries mode, and pin state are private Reminders 
 Groceries lists are detected from private list columns. Human `lists` and `show` output marks them with `🥕`, and `show` decorates known Groceries section headings with matching category emoji such as `🥛 Dairy, Eggs & Cheese`, `🥬 Produce`, and `🧻 Household Items`. `lists --json` includes `listType`, `isGroceries`, and `grocery` locale/categorization fields; `show --json` includes `sectionEmoji` when a reminder belongs to a known Groceries category. Use `list-create --private --groceries --grocery-locale en_US` for new Groceries lists, `list-edit --private --groceries` or `--standard` to convert existing lists, and `add/edit --private --grocery` to verify Reminders' automatic grocery sections, with an explicit ReminderKit categorizer fallback when needed.
 
 `list-symbols` prints the 71 official Reminders emblem names bundled in RemindersUICore. The terminal preview column is an approximate Unicode fallback, not the native icon. Use `list-symbols --preview` to generate and open a standalone HTML contact sheet from the native badge assets with interactive official color swatches, or `list-symbols --html PATH` to write that contact sheet without opening it. Reminders stores picker icons as private emblem names, not public SF Symbol names. For example, Reminders stores the pencil/ruler picker icon as `education3`. `--symbol` is intentionally restricted to official names because arbitrary SF Symbol strings can be accepted by ReminderKit but render as the default list icon in Reminders. Use `--emoji` for custom standard emoji badges.
+
+## List Groups
+
+```bash
+remctl groups
+remctl groups --json
+remctl groups --format table
+remctl group-info Writing
+remctl group-info --group-id 476 --json
+remctl show Writing --json
+remctl group-create "Writing" --private --add-list Editorial
+remctl group-create "Writing" --private --add-list-id 137 --json
+remctl list-create "Ideas" --private --group Writing
+remctl group-edit "Writing" --private --new-name "Drafts"
+remctl group-edit "Writing" --private --add-list Ideas --remove-list Socials
+remctl group-edit "Writing" --private --move-list Ideas --before-list Editorial
+remctl group-edit "Writing" --private --move-list-id 137 --last
+remctl group-edit --group-id 476 --private --add-list-id 475 --json
+remctl group-delete "Drafts" --private --force
+remctl group-delete --group-id 476 --private --force --json
+```
+
+Groups are Reminders list containers, not reminder containers. `groups` reports active/completed/total reminder counts for each group and child list. `group-info` shows IDs, object UUIDs, child lists, counts, and suggested follow-up commands. `show <group> --format table` prints separate tables for child lists and sections. With `--completed`, table output uses a `Completed` column instead of due status. `group-create` creates the group and can move existing lists into it. `list-create --private --group` creates a new list directly inside a group. `group-edit` can rename the group, add or remove lists, and reorder a list with `--move-list` plus `--before-list`, `--after-list`, `--first`, or `--last`. `group-delete` first detaches every child list to the top level, then deletes the empty group. These operations never move reminders between lists; verify with `show <list> --json` or `show <group> --json`.
 
 ## Smart Lists
 

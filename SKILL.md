@@ -13,7 +13,7 @@ RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreDat
 - Prefer JSON for automation and verification: `remctl today --json`, `remctl show Work --json`, `remctl info <id> --json`.
 - Never write directly to the Reminders SQLite database.
 - Do not use `--via-eventkit` by default. It is a limited read-only fallback for `show`, `search`, `today`, and `upcoming` when Full Disk Access blocks a basic read and the task can tolerate missing Reminders metadata.
-- For private reminder metadata, use regular `add` or `edit` with `--private`; for private list appearance, Groceries mode, or regular/smart-list pin state, use `list-create --private`, `list-edit --private`, `list-pin --private`, or `list-unpin --private`; for custom smart lists, use `smart-list-create`, `smart-list-edit`, or `smart-list-delete` with `--private`; for Reminders templates, use `template-create`, `template-apply`, or `template-delete` with `--private`. Do not use raw database mutation.
+- For private reminder metadata, use regular `add` or `edit` with `--private`; for private list appearance, Groceries mode, or regular/smart-list pin state, use `list-create --private`, `list-edit --private`, `list-pin --private`, or `list-unpin --private`; for list groups, use `group-create`, `group-edit`, `list-create --private --group`, or `group-delete` with `--private`; for custom smart lists, use `smart-list-create`, `smart-list-edit`, or `smart-list-delete` with `--private`; for Reminders templates, use `template-create`, `template-apply`, or `template-delete` with `--private`. Do not use raw database mutation.
 
 ## Agent Routing
 
@@ -21,12 +21,13 @@ Start by deciding the write path. Public EventKit writes are stable and do not n
 
 | User intent | Command path | Private? | Verify with |
 | --- | --- | --- | --- |
-| Read due items, lists, reminders, tags, sections, subtasks | `today`, `upcoming`, `overdue`, `lists`, `show`, `search`, `info`, `tags`, `sections`, `subtasks` | No | same command with `--json` |
+| Read due items, lists, groups, reminders, tags, sections, subtasks | `today`, `upcoming`, `overdue`, `lists`, `groups`, `group-info`, `show`, `search`, `info`, `tags`, `sections`, `subtasks` | No | same command with `--json` |
 | Create/edit ordinary reminder fields | `add`, `edit`, `done`, `undone`, `delete` | No | `info <id> --json` or `show <list> --json` |
 | Due date, priority, notes, recurrence, EventKit alarm | `add` or `edit` with `-d`, `-p`, `-n`, `--recurrence`, `--alarm` | No | `info <id> --json`; recurrence appears as `recurrence` |
 | Move an existing reminder to another list | `edit <id> -l LIST` or `edit <id> --list-id ID` | No | `info <id> --json` or `show <destination> --json` |
 | Synced rich URL, real tags, section, shared-list assignment, subtask, image, real flag, urgent, Early Reminder, location alarm | `add --private` or `edit --private` | Yes | `info <id> --json`; UI/device check when sync matters |
 | List appearance, Groceries metadata, list or smart-list pin state | `list-create --private`, `list-edit --private`, `list-pin --private`, `list-unpin --private` | Yes | `lists --json` for list color/badge/Groceries/pin state, `smart-lists --json` for smart-list appearance/pin state |
+| List group create/rename/membership/order/delete | `group-create`, `group-edit`, `list-create --private --group`, `group-delete` | Yes | `group-info <group> --json`, `groups --json`, `lists --json`, and `show <group-or-child-list> --json` |
 | Custom smart list create/edit/delete | `smart-list-create`, `smart-list-edit`, `smart-list-delete` | Yes | `smart-lists --json` |
 | Saved Reminders templates | `templates`, `template-info`, `template-create`, `template-apply`, `template-delete` | Reads no; writes yes | `templates --json`, `template-info`, then `show <new list> --json` after apply |
 
@@ -67,6 +68,8 @@ remctl today --json
 remctl upcoming 7 --json
 remctl overdue --json
 remctl lists --json
+remctl groups --json
+remctl group-info Writing --json
 remctl show Work --json
 remctl show --list-id 153 --json
 remctl search "query" --json
@@ -90,13 +93,18 @@ remctl export --list-id 153 --format json
 remctl list-symbols --preview
 remctl list-rename --list-id 123 --new-name "Project Archive" --json
 remctl list-delete --list-id 123 --force --json
+remctl group-create "Writing" --private --add-list Editorial --json
+remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas --remove-list Socials --json
+remctl list-create "Ideas" --private --group Writing --json
+remctl group-edit "Writing" --private --move-list Ideas --before-list Editorial --json
+remctl group-delete "Drafts" --private --force --json
 ```
 
 ## Syntax Rules
 
-- Use nouns for read-only inspectors: `lists`, `smart-lists`, `templates`, `today`, `stats`.
-- Use verb-style commands for writes: `add`, `edit`, `delete`, `list-create`, `smart-list-create`, `smart-list-edit`, `template-create`.
-- List-management commands use the `list-*` prefix; custom smart-list writes use the `smart-list-*` prefix; template writes use the `template-*` prefix.
+- Use nouns for read-only inspectors: `lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`.
+- Use verb-style commands for writes: `add`, `edit`, `delete`, plus the `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands.
+- List-management commands use the `list-*` prefix; group writes use the `group-*` prefix; custom smart-list writes use the `smart-list-*` prefix; template writes use the `template-*` prefix.
 - Use `--json` on subcommands for automation. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command; export's `--format json|csv` is separate and chooses a file format.
 - `export --format json|csv` chooses an export file format, not the display style.
 - List targets resolve exact name first, then case-insensitive, then normalized names such as `Weekly 513` for `🗓️ Weekly 513`. If multiple lists match, RemCTL fails before writing; use `--list-id`.
@@ -120,7 +128,7 @@ Use `info --json`, `show --json`, `today --json`, or `upcoming --json` to verify
 
 ## Private Metadata
 
-Use `--private` only when the user explicitly asks for private Reminders metadata or when a command needs synced web rich links, real tags, sections, shared-list assignment, subtasks, image attachments, real flags, urgent state, Early Reminders, location alarms, private list appearance metadata, Groceries mode/categorization verification, regular/smart-list pinning, custom smart-list creation/editing/deletion, or Reminders template creation/application/deletion.
+Use `--private` only when the user explicitly asks for private Reminders metadata or when a command needs synced web rich links, real tags, sections, shared-list assignment, subtasks, image attachments, real flags, urgent state, Early Reminders, location alarms, private list appearance metadata, Groceries mode/categorization verification, regular/smart-list pinning, list group create/edit/delete, custom smart-list creation/editing/deletion, or Reminders template creation/application/deletion.
 
 ```bash
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --section "Research" --json
@@ -144,6 +152,7 @@ remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --l
 remctl list-create "Research" --color orange --private --symbol education3 --json
 remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶 --json
 remctl list-create "Groceries" --private --groceries --grocery-locale en_US --json
+remctl list-create "Ideas" --private --group Writing --json
 remctl add "Milk" -l Groceries --private --grocery --json
 remctl edit 23880 --private --grocery --json
 remctl list-edit "Shopping" --private --standard --json
@@ -153,6 +162,10 @@ remctl list-pin "Project X" --private --json
 remctl list-pin "Flagged" --private --json
 remctl list-unpin --list-id 144 --private --json
 remctl list-unpin --smart-list-id 4 --private --json
+remctl group-create "Writing" --private --add-list Editorial --json
+remctl group-edit "Writing" --private --add-list Ideas --remove-list Socials --json
+remctl group-edit "Writing" --private --move-list Ideas --last --json
+remctl group-delete "Writing" --private --force --json
 remctl smart-list-create "Flagged Review" --private --flagged --json
 remctl smart-list-create "High Priority" --private --priority high --json
 remctl smart-list-create "Any Tag" --private --any-tag --json
@@ -182,6 +195,7 @@ Private metadata rules:
 - Rich-link and image attachment edits are additive. RemCTL can add synced rich links and images; it does not remove or replace existing rich links/images.
 - `add --private -f` writes the real private flag instead of the EventKit priority proxy.
 - `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges; verify those via `color`, `badge`, and `badgeEmblem` in `lists --json` or `smart-lists --json`. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` write Reminders' private Groceries list metadata and locale. `list-pin` and `list-unpin` require `--private` and save regular list or smart-list pin state through ReminderKit. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
+- List groups are visible through `groups`, `group-info`, `lists --json`, and `show <group>`. `groups` and `group-info` include active/completed/total counts for child lists. `show <group> --format table` prints child-list and section tables; `show <group> --completed --format table` uses completion timestamps rather than due status. `group-create`, `list-create --private --group`, `group-edit`, and `group-delete` require `--private`; they move list containers only, not reminders. `group-edit --move-list LIST --before-list SIBLING`, `--after-list`, `--first`, or `--last` reorders child lists. `group-delete` detaches child lists to the top level before deleting the empty group.
 - Groceries lists are visible in `lists --json` as `listType: "groceries"`, `isGroceries: true`, and `grocery.locale`; human list headings show `🥕`, and known Groceries section headings get matching category emoji. `show --json` includes `sectionEmoji` for known Groceries categories. Use `add --private --grocery` or `edit --private --grocery` only against detected Groceries lists. RemCTL first verifies Reminders' automatic grocery sorting and reports `source: "reminders_auto"` when the item is already sectioned; it falls back to the private categorizer only for unsectioned items.
 - `smart-lists` is read-only and safe. `smart-list-create`, `smart-list-edit`, and `smart-list-delete` use unsupported private ReminderKit APIs and require `--private`; filter writes support the Reminders.app filters that currently materialize through this write path.
 - Verify smart-list pinning with `smart-lists --json`, not `lists --json`. On macOS 26, smart-list pinning can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL reports `pinned: true` from a positive smart-list `pinnedDate`.
@@ -189,6 +203,7 @@ Private metadata rules:
 - `template-create`, `template-apply`, and `template-delete` use unsupported private ReminderKit APIs and require `--private`. They are whole-list operations only: RemCTL does not append individual reminders to existing templates, copy selected reminders into templates, or strip subtasks or due dates while saving. Verify template writes with `remctl templates --json` or `remctl template-info`; verify applied templates with `remctl show <new list> --json`.
 - Generic file/PDF attachments are rejected because Reminders does not reliably show them.
 - Verify private reminder writes with `remctl info <numeric-id> --json`.
+- Verify list group writes with `remctl group-info <group> --json`, `remctl groups --json`, `remctl lists --json`, and `remctl show <group-or-child-list> --json`.
 - Verify custom smart-list writes with `remctl smart-lists --json` and check the target custom smart list, decoded filter summary, `filter.supported`, and `minimumSupportedVersion`/`effectiveMinimumSupportedVersion` `20220430`; Reminders.app can show zero filters when those private version fields are left at `0`.
 - Verify template writes with `remctl templates --json` or `remctl template-info`. Verify `template-apply` with `remctl lists --json` and `remctl show <new list> --json`.
 - If cross-device sync matters, ask the user to check iPhone/iPad after CLI verification.

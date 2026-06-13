@@ -6,9 +6,9 @@ RemCTL is a fast, scriptable Reminders CLI for macOS designed for power users an
 
 RemCTL reads the user's local iCloud Reminders database directly (with native macOS permission access) for speed and detail, then writes through Apple's public EventKit APIs so changes sync normally to other devices.
 
-Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, shared-list assignments, subtasks, tags, image attachments, urgent state, Early Reminders, list appearance metadata, Groceries list metadata, custom smart lists, and Reminders templates by using the native ReminderKit framework. Location-based alarms are guarded by the same `--private` command surface, but are saved through the public EventKit bridge because that path materializes reliably on current macOS.
+Unlike other Reminders CLIs, RemCTL offers a special, optional integration with Reminders' Private API on macOS. This allows RemCTL to write proprietary metadata such as sections, shared-list assignments, subtasks, tags, image attachments, urgent state, Early Reminders, list appearance metadata, Groceries list metadata, list groups, custom smart lists, and Reminders templates by using the native ReminderKit framework. Location-based alarms are guarded by the same `--private` command surface, but are saved through the public EventKit bridge because that path materializes reliably on current macOS.
 
-As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 – without breaking iCloud sync.
+As a result, RemCTL is the only Reminders CLI that truly replicates the modern Reminders experience on macOS 26 and early macOS 27 Golden Gate builds without breaking iCloud sync.
 
 ## How It Works
 
@@ -58,9 +58,9 @@ Full setup details live in [docs/installation.md](docs/installation.md).
 | Task | Commands |
 | --- | --- |
 | See what is due | `today`, `upcoming`, `overdue` |
-| Browse reminders | `lists`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks`, `sharees` |
+| Browse reminders | `lists`, `groups`, `group-info`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks`, `sharees` |
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag` |
-| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
+| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
@@ -68,6 +68,7 @@ Common examples:
 
 ```bash
 remctl today
+remctl groups
 remctl show Work --format table
 remctl show --list-id 153 --json
 remctl today --via-eventkit --json
@@ -87,6 +88,12 @@ remctl list-symbols --preview
 remctl list-create "Research" --color orange --private --symbol education3
 remctl list-create "Cold Ideas" --color cyan --private --emoji 🥶
 remctl list-create "Groceries" --private --groceries --grocery-locale en_US
+remctl list-create "Ideas" --private --group Writing
+remctl group-info "Writing" --json
+remctl group-create "Writing" --private --add-list Editorial
+remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas
+remctl group-edit "Writing" --private --move-list Ideas --before-list Editorial
+remctl group-delete "Drafts" --private --force
 remctl add "Milk" -l Groceries --private --grocery
 remctl smart-lists --json
 remctl smart-list-create "Flagged Review" --private --flagged
@@ -127,6 +134,12 @@ remctl edit 23880 --private --unassign
 ```
 
 `--assign USER` resolves `USER` against the target list's sharees by display name, first/last name, email or phone address, numeric sharee ID, object UUID, or `me`. Names are convenient for humans; agents should call `remctl sharees LIST --json` first and prefer the returned `address`, numeric `id`, or `objectUUID` when duplicate names are possible. `--unassign` clears the current assignment. Verify the result with `remctl info ID --json`; assignment data appears under `assignment`.
+
+## List Groups
+
+Reminders stores list groups as list rows with `listType: "group"` and child lists linked by parent-list columns. `remctl groups` shows only groups with active/completed/total reminder counts, while `remctl lists --json` includes group rows with `children` and child list rows with `group` metadata. `remctl group-info <group>` prints the group ID, object UUID, child lists, counts, and suggested follow-up commands. `remctl show <group>` reads reminders from the group's child lists. In table mode, group output is split by child list and section; with `--completed`, the date column shows completion timestamps instead of due status.
+
+Group writes use private ReminderKit and require `--private`. `group-create` creates a group and can immediately move existing lists into it. `list-create --private --group <group>` creates a new list and assigns it to the group. `group-edit` renames a group, adds/removes child lists, and can reorder a child list with `--move-list` plus `--before-list`, `--after-list`, `--first`, or `--last`. `group-delete` first moves child lists back to the top level before deleting the empty group. These operations change list containers only; reminders stay in their lists.
 
 ## Groceries Lists
 
@@ -206,6 +219,10 @@ remctl list-pin "Project X" --private
 remctl list-pin "Flagged" --private
 remctl list-unpin --list-id 144 --private
 remctl list-unpin --smart-list-id 4 --private
+remctl group-create "Writing" --private --add-list Editorial
+remctl group-edit "Writing" --private --new-name "Drafts" --add-list Ideas --remove-list Socials
+remctl group-edit "Writing" --private --move-list Ideas --last
+remctl group-delete "Drafts" --private --force
 remctl smart-list-create "Flagged Review" --private --flagged
 remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
 remctl smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due
@@ -220,7 +237,7 @@ remctl template-delete "Packing Template" --private --force
 Private mode covers the parts of Reminders that EventKit does not expose:
 
 - Reminder metadata: synced web rich links, synced tags, sections, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, and location alarms.
-- List metadata: exact `#RRGGBB` colors, official list symbols, emoji badges, Groceries list conversion/locale metadata, and regular or smart-list pin state.
+- List metadata: exact `#RRGGBB` colors, official list symbols, emoji badges, Groceries list conversion/locale metadata, regular or smart-list pin state, and list group create/edit/delete.
 - Smart lists: custom smart-list create/edit/delete for the Reminders filters that RemCTL has verified to materialize correctly.
 - Templates: whole-list template create/apply/delete. Existing public template links can be read, but RemCTL does not create iCloud sharing links.
 
@@ -235,6 +252,7 @@ A few rules keep this safe and predictable:
 - `list-create --color` uses public EventKit for normal color names. Add `--private` for exact colors, official symbols, or emoji badges.
 - `list-symbols` prints the 71 official Reminders emblem names. Use `list-symbols --preview` for the native badge contact sheet. Use `--emoji` for custom emoji badges.
 - Groceries writes verify Reminders' automatic sorter first, then use the private categorizer only if needed.
+- Group writes move list containers, not reminders. `group-delete` detaches child lists before deleting the group so their reminders are preserved.
 - If a section name is duplicated in the same list, RemCTL uses the single non-empty match when possible. Otherwise, pass `--section-id`.
 
 Verify with:
@@ -335,7 +353,7 @@ For shared-list assignments, call `remctl sharees LIST --json` first. `--assign`
 
 Agents should pass deterministic due dates, using `YYYY-MM-DD` for all-day reminders and `YYYY-MM-DD HH:MM` for timed reminders after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
 
-List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and smart-list list filters. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
+List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, group membership/order edits, and smart-list list filters. Group commands target groups by name or `--group-id`; write commands that need a real list reject groups and name the child lists you can target. `list-create --private --group-id` is available when group names collide. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
 
 Do not mutate the Reminders SQLite database. Use RemCTL commands or EventKit.
 

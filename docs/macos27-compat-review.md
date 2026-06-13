@@ -107,7 +107,7 @@ Results:
 - Unit tests: 200 passed.
 - EventKit live matrix: passed.
 - Private ReminderKit live matrix: passed.
-- Installed CLI doctor: 11 checks, 1 warning, 0 failures. The warning is the existing zsh completion fpath warning.
+- Installed CLI doctor after the zsh `fpath` fix: 11 checks, 0 warnings, 0 failures.
 
 ## Current Take
 
