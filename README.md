@@ -53,6 +53,31 @@ PREFIX="$HOME/.local" ./install.sh --bootstrap
 
 Full setup details live in [docs/installation.md](docs/installation.md).
 
+## Uninstalling
+
+To remove RemCTL, run the uninstaller from the repo:
+
+```bash
+./uninstall.sh
+```
+
+By default the uninstaller checks **both** default install locations — `~/bin` and `~/.local/bin` — so it works whether you installed with the default prefix or with `PREFIX="$HOME/.local"`. You do not need to know or remember which one you used.
+
+It removes the files `install.sh` created (the `remctl` CLI, the shared Python helpers, the compiled `remctl-bridge` / `remctl-permissions` / `remctl-private` binaries, the permissions icon, and the zsh completion) plus the config directory.
+
+If you installed to a different custom prefix, pass the same one you used to install:
+
+```bash
+PREFIX="$HOME/.local" ./uninstall.sh
+```
+
+Useful flags:
+
+- `--dry-run` previews what would be removed without deleting anything.
+- `--keep-config` leaves the config directory (`~/.config/remctl`) in place.
+
+The uninstaller only deletes files RemCTL created; it never runs `rm -rf` on the bin directory, and it removes the `completions` directory only when it is empty. It does not edit your shell config or revoke macOS permissions. After uninstalling, remove any `remctl` lines you added to `~/.zshrc` (PATH or completion `fpath` wiring), run `hash -r` (or open a new Terminal), and optionally revoke Reminders, Automation, and Full Disk Access for your terminal under System Settings > Privacy & Security.
+
 ## Command Map
 
 | Task | Commands |
@@ -394,6 +419,7 @@ remctl doctor
 | `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
 | `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |
 | `install.sh` | Copy-based installer and bootstrap script |
+| `uninstall.sh` | Removes installed files and config (mirrors `install.sh`) |
 
 ## License
 
