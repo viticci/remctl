@@ -24,7 +24,7 @@ Start by deciding the write path. Public EventKit writes are stable and do not n
 | Read due items, lists, groups, reminders, tags, sections, subtasks | `today`, `upcoming`, `overdue`, `lists`, `groups`, `group-info`, `show`, `search`, `info`, `tags`, `sections`, `subtasks` | No | same command with `--json` |
 | Create/edit ordinary reminder fields | `add`, `edit`, `done`, `undone`, `delete` | No | `info <id> --json` or `show <list> --json` |
 | Due date, priority, notes, recurrence, EventKit alarm | `add` or `edit` with `-d`, `-p`, `-n`, `--recurrence`, `--alarm` | No | `info <id> --json`; recurrence appears as `recurrence` |
-| Move an existing reminder to another list | `edit <id> -l LIST` or `edit <id> --list-id ID` | No | `info <id> --json` or `show <destination> --json` |
+| Move an existing reminder to another list | `edit <id> -l LIST` or `edit <id> --list-id ID` | No | Use the returned `id`; clone-delete fallback may return a new ID plus `oldId` |
 | Synced rich URL, real tags, section, shared-list assignment, subtask, image, real flag, urgent, Early Reminder, location alarm | `add --private` or `edit --private` | Yes | `info <id> --json`; UI/device check when sync matters |
 | List appearance, Groceries metadata, list or smart-list pin state | `list-create --private`, `list-edit --private`, `list-pin --private`, `list-unpin --private` | Yes | `lists --json` for list color/badge/Groceries/pin state, `smart-lists --json` for smart-list appearance/pin state |
 | List group create/rename/membership/order/delete | `group-create`, `group-edit`, `list-create --private --group`, `group-delete` | Yes | `group-info <group> --json`, `groups --json`, `lists --json`, and `show <group-or-child-list> --json` |
@@ -185,7 +185,7 @@ Private metadata rules:
 
 - `--private --url` creates a synced web rich link and must resolve to a public `http` or `https` host. Without `--private`, `--url` is appended to notes.
 - `--private -t/--tags` creates real synced tags. On `add` without `--private`, tags are inline title hashtags. On `edit`, tags require `--private`.
-- `edit -l/--list` and `edit --list-id` move reminders through the normal EventKit bridge; they do not require `--private`.
+- `edit -l/--list` and `edit --list-id` use the normal EventKit bridge first; they do not require `--private`. If a pure move is rejected by a list/container boundary, RemCTL can use a verified ReminderKit clone-delete fallback. In JSON, treat `id` as the current reminder ID; `oldId` means the original was intentionally deleted.
 - `--section` resolves by name; if duplicates exist in the same list, RemCTL uses the single non-empty match when possible. Use `--section-id` for exact assignment.
 - `--assign` resolves a shared-list user by display name, first/last name, email/phone address, numeric sharee ID, object UUID, or `me`. Names are acceptable when unique; agents should inspect `remctl sharees LIST --json` first and prefer the returned `address`, `id`, or `objectUUID` when ambiguity matters. Use `--unassign` to clear the current assignment and verify with `remctl info ID --json` under `assignment`.
 - `--early-reminder` writes Reminders' private Early Reminder due-date delta alert. It accepts `15m`, `1h`, `2d`, `1w`, `1mo`, or `clear`; non-clear values require a due date and must be verified with `remctl info ID --json`.
@@ -248,12 +248,13 @@ remctl template-delete "Packing Template" --private --force --json
 ## Verification Rules
 
 - Treat `remctl doctor --json` as the first setup check.
-- For agents, prefer `remctl doctor --for-agent --json`; `doctor` must pass in the same execution context that will run the write.
+- For agents, prefer `remctl doctor --for-agent --json`; `doctor` must pass in the same execution context that will run the write and checks both database access and EventKit Reminders write authorization.
 - Check `private_helper` in `remctl doctor --json` before using `--private`.
 - Do not run `doctor` before every ordinary task once the current context is known-good; it is a setup/TCC diagnostic, not a per-write verification step.
 - For writes, verify against live Reminders data after the command succeeds.
 - `remctl search QUERY --completed --json` includes completed reminders and searches both titles and notes.
 - `remctl add --json` returns `numericId` when direct DB reads can resolve the new reminder. Use that for `remctl info <numericId> --json`. If `numericId` is absent, resolve the UUID-like `id` with `remctl show <list> --json` by matching the created title.
+- `remctl edit ID -l LIST --json` can return the same `id` after an EventKit move or a new `id` plus `oldId` after a verified clone-delete fallback. Continue with the returned `id`, not the original, when `oldId` is present.
 - Prefer deterministic due-date strings. If the user says "today at 3pm", either pass `today at 3pm` or normalize it to `YYYY-MM-DD HH:MM` in the user's timezone before calling `remctl`; do not invent broader natural-language phrases.
 - `add` and `edit` are atomic for due dates: if `-d/--due` is present and cannot be parsed, RemCTL exits before writing. With `--json`, parse failures are structured `invalid_due_date` errors on stderr with accepted examples. Retry with a corrected date instead of creating first and patching later.
 - Accepted dependency-free due-date forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`.
@@ -283,6 +284,6 @@ remctl doctor
 
 RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript fallback operations, and Full Disk Access for direct database reads. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
 
-macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`, or for a one-off unblock run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
+macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`; if the `eventkit` check fails, run `remctl onboard` from the same context to trigger Reminders access. For a one-off unblock, run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
 
 `doctor` reports `completion_fpath` when an installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files. Full Disk Access targets come from the current process context; when terminal engines are embedded, trust `host_app` and `host_app_path` from `doctor --for-agent --json` over inherited `TERM_PROGRAM` labels.

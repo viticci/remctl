@@ -160,7 +160,7 @@ Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopbac
 | Surface | Command | Private? | Notes |
 | --- | --- | --- | --- |
 | Title, notes, due date, priority | `edit --title`, `-n`, `-d`, `-p` | No | EventKit bridge with AppleScript fallback for ordinary fields |
-| Move to another list | `edit -l LIST` or `edit --list-id ID` | No | EventKit bridge for ordinary reminders; parent reminders with subtasks use a verified ReminderKit clone-delete fallback and return a new numeric `id` plus `oldId` |
+| Move to another list | `edit -l LIST` or `edit --list-id ID` | No | EventKit bridge first; if a pure move is rejected by a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback and returns a new numeric `id` plus `oldId` |
 | Recurrence and normal alarms | `edit --recurrence`, `edit --alarm` | No | EventKit bridge only; verify in `info --json` |
 | Notes URL fallback | `edit --url URL` | No | Appends the URL to notes, not a rich attachment |
 | Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
@@ -217,7 +217,7 @@ remctl delete 23880 --force
 
 `done --date WHEN` records an explicit completion date instead of "now". It also works on an already-completed reminder to correct the stored completion date. `WHEN` must be an absolute `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; recurring reminders reject `--date` because plain completion advances the series and EventKit discards a manually supplied completion date.
 
-For parent reminders with subtasks, Reminders rejects an in-place EventKit list move. RemCTL handles that shape by cloning the parent and subtasks into the destination list, verifying the cloned subtask count, then deleting the original. JSON output includes `method: "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved`. Move the parent first, then apply unrelated title/notes/due/private edits to the returned ID.
+For parent reminders with subtasks, Reminders rejects an in-place EventKit list move. Some ordinary reminders can also hit EventKit list/container boundaries when moving between private and shared CalDAV containers. For a pure list move, RemCTL handles those shapes by cloning the reminder into the destination list with ReminderKit, verifying the cloned reminder and subtask count, then deleting the original. JSON output includes `method: "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved` (`0` for ordinary reminders). Move first, then apply unrelated title/notes/due/private edits to the returned ID.
 
 ## Lists
 
@@ -435,7 +435,7 @@ remctl setup --shell auto --doctor
 remctl completion zsh
 ```
 
-Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor --for-agent`, then adding the printed target in System Settings. Run `doctor` from the same terminal, app, or agent runner that will run the RemCTL write.
+Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor --for-agent`, then adding the printed target in System Settings. Run `doctor` from the same terminal, app, or agent runner that will run the RemCTL write; `doctor` checks both direct database access and EventKit Reminders write authorization for that context.
 
 `doctor` also checks whether an installed zsh completion file appears in exported `FPATH` or the usual zsh startup files. If it warns, add the printed `fpath=(... $fpath)` and `compinit` lines to `~/.zshrc`, then open a new terminal.
 

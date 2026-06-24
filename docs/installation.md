@@ -62,11 +62,11 @@ See [private-metadata.md](private-metadata.md) for supported private fields and 
 
 `remctl permissions full-disk-access` is safe to run even if direct CLI reads already work. It is the clearest first-run path because it shows the Full Disk Access targets visually before you run `doctor`.
 
-## Full Disk Access
+## macOS Permission Scope
 
 macOS does not provide a native Full Disk Access prompt for command-line tools.
 
-Full Disk Access is scoped to the exact process context. The same Mac can have:
+Full Disk Access and Reminders/EventKit authorization are scoped to the exact process context. The same Mac can have:
 
 - Terminal green: `remctl doctor` passes from Terminal.
 - Agent runner red: `remctl doctor` fails from Codex or another app runner.
@@ -77,7 +77,7 @@ That is normal TCC behavior, not a broken RemCTL install. Run `doctor` from the 
 remctl doctor --for-agent --json
 ```
 
-Grant access to the target printed by that context, then relaunch the app or terminal that will run RemCTL.
+Grant Full Disk Access to the target printed by that context. If the `eventkit` check fails, run `remctl onboard` from that same context and approve the Reminders prompt. Then relaunch the app or terminal that will run RemCTL.
 
 If your terminal embeds another terminal engine, trust the `host_app` and target path from `doctor --for-agent`; RemCTL prefers the real bundle path over inherited variables such as `TERM_PROGRAM=ghostty`.
 
@@ -102,7 +102,7 @@ remctl doctor --for-agent
 
 Use the exact target printed by `doctor`. Open System Settings > Privacy & Security > Full Disk Access, click `+`, press `Command-Shift-G`, paste the path, press Return, then click Open.
 
-If an agent cannot get Full Disk Access but the user's Terminal already passes `doctor`, a one-off Terminal relay can unblock testing: ask the user for approval, run the requested `remctl` command in Terminal via AppleScript, and capture stdout/stderr through temporary files. Do not treat that as the default automation path; the durable fix is granting access to the actual runner.
+If an agent cannot get Full Disk Access or EventKit write access but the user's Terminal already passes `doctor`, a one-off Terminal relay can unblock testing: ask the user for approval, run the requested `remctl` command in Terminal via AppleScript, and capture stdout/stderr through temporary files. Do not treat that as the default automation path; the durable fix is granting access to the actual runner.
 
 For basic reads only, `show`, `search`, `today`, and `upcoming` also accept `--via-eventkit` as a limited read-only fallback when a host cannot get Full Disk Access. This is not a setup replacement and should never be the default for agents. It omits RemCTL numeric IDs, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, numeric list targeting, and table output. JSON returns `source: "eventkit"`, `fidelity: "limited"`, and per-item `eventKitId` values; those IDs cannot be passed to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any numeric-ID command.
 

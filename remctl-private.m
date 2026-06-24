@@ -1449,9 +1449,6 @@ int main(int argc, const char * argv[]) {
                 fail(@"listId is required");
             }
             NSArray<NSString *> *childIDs = stringArray(cmd[@"childIds"], @"childIds");
-            if (childIDs.count == 0) {
-                fail(@"At least one child reminder ID is required");
-            }
             NSURL *listObjectURL = listURL(listID);
             id listObjectID = [REMObjectID objectIDWithURL:listObjectURL];
             if (!listObjectID) {
@@ -1471,33 +1468,36 @@ int main(int argc, const char * argv[]) {
             if (!copiedParent) {
                 fail(@"Could not clone parent reminder into target list");
             }
-            id subtaskContext = [copiedParent subtaskContext];
-            if (!subtaskContext) {
-                fail(@"Cloned parent reminder does not support subtasks");
-            }
 
             NSMutableArray *clonedChildren = [NSMutableArray array];
-            for (NSString *childID in childIDs) {
-                id childObjectID = [REMObjectID objectIDWithURL:reminderURL(childID)];
-                if (!childObjectID) {
-                    fail([NSString stringWithFormat:@"Could not build ReminderKit child object ID: %@", childID]);
+            if (childIDs.count > 0) {
+                id subtaskContext = [copiedParent subtaskContext];
+                if (!subtaskContext) {
+                    fail(@"Cloned parent reminder does not support subtasks");
                 }
-                id childReminder = [store fetchReminderWithObjectID:childObjectID error:&error];
-                if (!childReminder) {
-                    fail(error.localizedDescription ?: [NSString stringWithFormat:@"Child reminder not found: %@", childID]);
+
+                for (NSString *childID in childIDs) {
+                    id childObjectID = [REMObjectID objectIDWithURL:reminderURL(childID)];
+                    if (!childObjectID) {
+                        fail([NSString stringWithFormat:@"Could not build ReminderKit child object ID: %@", childID]);
+                    }
+                    id childReminder = [store fetchReminderWithObjectID:childObjectID error:&error];
+                    if (!childReminder) {
+                        fail(error.localizedDescription ?: [NSString stringWithFormat:@"Child reminder not found: %@", childID]);
+                    }
+                    REMReminderChangeItem *copiedChild = [save _copyReminder:childReminder toReminderSubtaskContextChangeItem:subtaskContext];
+                    if (!copiedChild) {
+                        fail([NSString stringWithFormat:@"Could not clone child reminder: %@", childID]);
+                    }
+                    id childObjectIDOut = [copiedChild remObjectID];
+                    NSString *childUUID = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(uuid)] ? [[childObjectIDOut uuid] UUIDString] : @"";
+                    NSString *childURL = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(urlRepresentation)] ? [[childObjectIDOut urlRepresentation] absoluteString] : @"";
+                    [clonedChildren addObject:@{
+                        @"sourceId": childID,
+                        @"id": childUUID ?: @"",
+                        @"url": childURL ?: @"",
+                    }];
                 }
-                REMReminderChangeItem *copiedChild = [save _copyReminder:childReminder toReminderSubtaskContextChangeItem:subtaskContext];
-                if (!copiedChild) {
-                    fail([NSString stringWithFormat:@"Could not clone child reminder: %@", childID]);
-                }
-                id childObjectIDOut = [copiedChild remObjectID];
-                NSString *childUUID = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(uuid)] ? [[childObjectIDOut uuid] UUIDString] : @"";
-                NSString *childURL = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(urlRepresentation)] ? [[childObjectIDOut urlRepresentation] absoluteString] : @"";
-                [clonedChildren addObject:@{
-                    @"sourceId": childID,
-                    @"id": childUUID ?: @"",
-                    @"url": childURL ?: @"",
-                }];
             }
 
             if (![save saveSynchronouslyWithError:&error]) {

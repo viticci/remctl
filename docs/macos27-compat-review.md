@@ -107,7 +107,7 @@ Results:
 - Unit tests: 200 passed.
 - EventKit live matrix: passed.
 - Private ReminderKit live matrix: passed.
-- Installed CLI doctor after the zsh `fpath` fix: 11 checks, 0 warnings, 0 failures.
+- Installed CLI doctor after the zsh `fpath` fix: 11 checks, 0 warnings, 0 failures. Current RemCTL also reports an explicit `eventkit` write-access check, so modern healthy runs include that additional check.
 
 ## Current Take
 

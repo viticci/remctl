@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,6 +23,15 @@ class CliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.remctl = load_module("remctl_cli_test", "remctl")
+
+    @staticmethod
+    def _bridge_result(payload, returncode=0):
+        return {
+            "returncode": returncode,
+            "stdout": json.dumps(payload),
+            "stderr": "",
+            "payload": payload,
+        }
 
     def test_parse_alarm_normalizes_relative_and_absolute_values(self):
         self.assertEqual(self.remctl.parse_alarm("15m"), "-15m")
@@ -123,9 +133,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "created", "id": "REMINDER-1"},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "REMINDER-1"}),
+            ) as bridge_call_result,
             mock.patch.object(
                 self.remctl,
                 "open_db",
@@ -135,8 +145,8 @@ class CliTests(unittest.TestCase):
         ):
             self.remctl.cmd_add(args)
 
-        bridge_call.assert_called_once()
-        payload = bridge_call.call_args.args[0]
+        bridge_call_result.assert_called_once()
+        payload = bridge_call_result.call_args.args[0]
         self.assertEqual(payload["action"], "create")
         self.assertEqual(payload["due"], self.remctl.parse_due("today").isoformat())
         self.assertTrue(payload["allDay"])
@@ -1964,12 +1974,12 @@ class CliTests(unittest.TestCase):
             address=None,
             json=True,
         )
-        bridge_result = {"status": "created", "id": "REM-1"}
+        bridge_result = self._bridge_result({"status": "created", "id": "REM-1"})
         try:
             with (
                 mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
-                mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result),
+                mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call") as private_call,
                 mock.patch.object(self.remctl, "wait_for_grocery_section", return_value="Dairy, Eggs & Cheese"),
@@ -2017,13 +2027,13 @@ class CliTests(unittest.TestCase):
             address=None,
             json=True,
         )
-        bridge_result = {"status": "created", "id": "REM-1"}
+        bridge_result = self._bridge_result({"status": "created", "id": "REM-1"})
         section_results = iter([None, "Dairy, Eggs & Cheese"])
         try:
             with (
                 mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
-                mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result),
+                mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
                 mock.patch.object(self.remctl, "wait_for_grocery_section", side_effect=lambda *_args, **_kwargs: next(section_results)),
@@ -2931,7 +2941,12 @@ class CliTests(unittest.TestCase):
                 self.remctl,
                 "bridge_call",
                 return_value={"status": "created", "id": "ABC-123"},
-            ) as bridge_call,
+            ),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "ABC-123"}),
+            ) as bridge_call_result,
             mock.patch.object(
                 self.remctl,
                 "apply_private_changes",
@@ -2942,7 +2957,7 @@ class CliTests(unittest.TestCase):
         ):
             self.remctl.cmd_add(args)
 
-        bridge_payload = bridge_call.call_args.args[0]
+        bridge_payload = bridge_call_result.call_args.args[0]
         self.assertEqual(bridge_payload["title"], "Research")
         self.assertNotIn("url", bridge_payload)
         self.assertNotIn("flagged", bridge_payload)
@@ -2976,7 +2991,11 @@ class CliTests(unittest.TestCase):
         )
         with (
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
-            mock.patch.object(self.remctl, "bridge_call", return_value={"status": "created", "id": "UUID-1"}),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "UUID-1"}),
+            ),
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(
                 self.remctl,
@@ -3014,7 +3033,11 @@ class CliTests(unittest.TestCase):
         )
         with (
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
-            mock.patch.object(self.remctl, "bridge_call", return_value={"status": "created", "id": "UUID-1"}) as bridge_call,
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "UUID-1"}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(
                 self.remctl,
@@ -3026,10 +3049,70 @@ class CliTests(unittest.TestCase):
         ):
             self.remctl.cmd_add(args)
 
-        self.assertEqual(bridge_call.call_args.args[0]["list"], "🗓️ Weekly 513")
+        self.assertEqual(bridge_call_result.call_args.args[0]["list"], "🗓️ Weekly 513")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["resolvedList"]["title"], "🗓️ Weekly 513")
         self.assertEqual(payload["resolvedList"]["method"], "normalized")
+
+    def test_cmd_add_surfaces_eventkit_access_error_without_applescript_fallback(self):
+        args = SimpleNamespace(
+            title="Tarea de prueba",
+            list=None,
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm=None,
+            private=False,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            json=True,
+            flagged=None,
+            urgent=None,
+            early_reminder=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+        )
+        bridge_result = self._bridge_result(
+            {
+                "status": "error",
+                "message": "EventKit access error: The operation couldn’t be completed. (Mach error 4099 - unknown error code)",
+            },
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(
+                self.remctl,
+                "doctor_execution_context",
+                return_value={"effective_context": "Codex.app", "host_app": "Codex.app"},
+            ),
+            mock.patch.object(self.remctl, "osa") as osa,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(args)
+
+        osa.assert_not_called()
+        output = stderr.getvalue()
+        self.assertIn("remctl-bridge failed while trying to create the reminder", output)
+        self.assertIn("EventKit access error", output)
+        self.assertIn("remctl onboard", output)
+        self.assertIn("remctl doctor --for-agent", output)
 
     def test_subtask_accepts_json_metadata(self):
         specs = self.remctl.parse_subtask_specs([
@@ -3634,11 +3717,41 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "detect_shell_name", return_value="zsh"),
                 mock.patch.object(self.remctl, "completion_target_path", return_value=completion_path),
                 mock.patch.object(self.remctl, "zsh_completion_loadable", return_value=False),
+                mock.patch.object(
+                    self.remctl,
+                    "bridge_access_check_for_onboarding",
+                    return_value={"name": "eventkit", "status": "ok", "detail": "authorized", "fix": None},
+                ),
             ):
                 checks = self.remctl.gather_doctor_checks()
         fpath_check = next(check for check in checks if check["name"] == "completion_fpath")
         self.assertEqual(fpath_check["status"], "warn")
         self.assertIn("fpath=", fpath_check["fix"])
+
+    def test_gather_doctor_checks_includes_eventkit_write_access(self):
+        eventkit_check = {
+            "name": "eventkit",
+            "status": "fail",
+            "detail": "EventKit access error: The operation couldn’t be completed. (Mach error 4099 - unknown error code)",
+            "fix": "Run remctl onboard from this same context.",
+        }
+        with mock.patch.object(self.remctl, "bridge_access_check_for_onboarding", return_value=eventkit_check):
+            checks = self.remctl.gather_doctor_checks()
+
+        self.assertIn(eventkit_check, checks)
+        self.assertEqual(next(check for check in checks if check["name"] == "eventkit")["status"], "fail")
+
+    def test_bridge_call_result_timeout_reports_structured_error(self):
+        with mock.patch.object(
+            self.remctl.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd="remctl-bridge", timeout=3),
+        ):
+            result = self.remctl.bridge_call_result({"action": "authorize"}, timeout=3)
+
+        self.assertEqual(result["returncode"], -1)
+        self.assertEqual(result["payload"]["status"], "timeout")
+        self.assertIn("3s", result["payload"]["message"])
 
     def test_cmd_upcoming_rejects_non_positive_days_before_database_read(self):
         for days in (0, -1):
@@ -4151,16 +4264,16 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(args)
-        bridge_call.assert_called_once()
+        bridge_call_result.assert_called_once()
         osa_try.assert_not_called()
-        payload = bridge_call.call_args.args[0]
+        payload = bridge_call_result.call_args.args[0]
         self.assertEqual(payload["action"], "update")
         self.assertEqual(payload["due"], "2026-04-20T09:00:00")
         self.assertNotIn("allDay", payload)
@@ -4176,17 +4289,17 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(args)
 
-        bridge_call.assert_called_once()
+        bridge_call_result.assert_called_once()
         osa_try.assert_not_called()
-        payload = bridge_call.call_args.args[0]
+        payload = bridge_call_result.call_args.args[0]
         self.assertEqual(payload["action"], "update")
         self.assertEqual(payload["due"], "2026-06-21T00:00:00")
         self.assertTrue(payload["allDay"])
@@ -4246,9 +4359,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(SimpleNamespace(
@@ -4263,7 +4376,7 @@ class CliTests(unittest.TestCase):
                 alarm=None,
             ))
 
-        payload = bridge_call.call_args.args[0]
+        payload = bridge_call_result.call_args.args[0]
         self.assertEqual(payload["due"], "2026-05-26T16:00:00")
         self.assertEqual(payload["alarm"], "2026-05-26T16:00:00")
 
@@ -4353,9 +4466,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(SimpleNamespace(
@@ -4370,7 +4483,7 @@ class CliTests(unittest.TestCase):
                 alarm=None,
             ))
 
-        self.assertNotIn("alarm", bridge_call.call_args.args[0])
+        self.assertNotIn("alarm", bridge_call_result.call_args.args[0])
 
     def test_cmd_edit_due_date_noop_preserves_custom_absolute_alarm(self):
         from datetime import datetime
@@ -4406,9 +4519,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(SimpleNamespace(
@@ -4423,8 +4536,8 @@ class CliTests(unittest.TestCase):
                 alarm=None,
             ))
 
-        self.assertEqual(bridge_call.call_count, 2)
-        final_payload = bridge_call.call_args_list[-1].args[0]
+        self.assertEqual(bridge_call_result.call_count, 2)
+        final_payload = bridge_call_result.call_args_list[-1].args[0]
         self.assertEqual(final_payload["due"], "2026-05-26T16:00:00")
         self.assertNotIn("alarm", final_payload)
 
@@ -4461,9 +4574,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(SimpleNamespace(
@@ -4478,7 +4591,7 @@ class CliTests(unittest.TestCase):
                 alarm=None,
             ))
 
-        payload = bridge_call.call_args.args[0]
+        payload = bridge_call_result.call_args.args[0]
         self.assertIsNone(payload["due"])
         self.assertTrue(payload["clearAlarms"])
 
@@ -4493,13 +4606,13 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(args)
-        payload = bridge_call.call_args.args[0]
+        payload = bridge_call_result.call_args.args[0]
         self.assertTrue(payload["clearAlarms"])
         self.assertNotIn("alarm", payload)
 
@@ -4525,9 +4638,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "private_available") as private_available,
             mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
             contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -4535,8 +4648,8 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_edit(args)
 
         resolve_list.assert_called_once_with(mock.ANY, name="Projects", list_id=None)
-        bridge_call.assert_called_once()
-        self.assertEqual(bridge_call.call_args.args[0]["list"], "Projects")
+        bridge_call_result.assert_called_once()
+        self.assertEqual(bridge_call_result.call_args.args[0]["list"], "Projects")
         private_available.assert_not_called()
         osa_try.assert_not_called()
         self.assertEqual(json.loads(stdout.getvalue())["list"], "Projects")
@@ -4563,14 +4676,14 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             self.remctl.cmd_edit(args)
 
-        self.assertEqual(bridge_call.call_args.args[0]["list"], "Projects")
+        self.assertEqual(bridge_call_result.call_args.args[0]["list"], "Projects")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["resolvedList"]["id"], 9)
         self.assertEqual(payload["resolvedList"]["method"], "id")
@@ -4665,6 +4778,209 @@ class CliTests(unittest.TestCase):
         bridge_call.assert_not_called()
         self.assertIn("cannot currently be combined with other edits", stderr.getvalue())
 
+    def test_cmd_edit_clone_deletes_ordinary_list_move_after_container_rejection(self):
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["Z_PK"] = 1
+        reminder["ZLIST"] = 7
+        target = {"id": 9, "title": "Shared Tasks", "requested": "Shared Tasks", "method": "exact", "objectUUID": "LIST-UUID"}
+        args = SimpleNamespace(
+            id=1, json=True, title=None, list="Shared Tasks", list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result(
+            {"status": "error", "message": "Update failed: Cannot move reminder to a calendar in a different store"},
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=target),
+            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(
+                self.remctl,
+                "clone_reminder_tree_to_list_or_die",
+                return_value={
+                    "status": "updated",
+                    "id": 42,
+                    "oldId": 1,
+                    "list": "Shared Tasks",
+                    "objectUUID": "NEW-REMINDER",
+                    "subtasksMoved": 0,
+                    "method": "clone-delete",
+                    "delete": {"status": "deleted"},
+                },
+            ) as clone_move,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        clone_move.assert_called_once_with(mock.ANY, reminder, target, [])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["id"], 42)
+        self.assertEqual(payload["oldId"], 1)
+        self.assertEqual(payload["method"], "clone-delete")
+        self.assertEqual(payload["subtasksMoved"], 0)
+        self.assertTrue(payload["originalDeleted"])
+
+    def test_cmd_edit_does_not_clone_ordinary_move_when_eventkit_access_is_blocked(self):
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["Z_PK"] = 1
+        reminder["ZLIST"] = 7
+        args = SimpleNamespace(
+            id=1, json=True, title=None, list="Projects", list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result(
+            {
+                "status": "error",
+                "message": "EventKit access error: The operation couldn’t be completed. (Mach error 4099 - unknown error code)",
+            },
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
+            ),
+            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(
+                self.remctl,
+                "doctor_execution_context",
+                return_value={"effective_context": "Codex.app", "host_app": "Codex.app"},
+            ),
+            mock.patch.object(self.remctl, "clone_reminder_tree_to_list_or_die") as clone_move,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_edit(args)
+
+        clone_move.assert_not_called()
+        output = stderr.getvalue()
+        self.assertIn("EventKit access error", output)
+        self.assertIn("remctl onboard", output)
+
+    def test_cmd_edit_does_not_clone_combined_move_and_title_after_bridge_rejection(self):
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["Z_PK"] = 1
+        reminder["ZLIST"] = 7
+        args = SimpleNamespace(
+            id=1, json=True, title="New title", list="Projects", list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result(
+            {"status": "error", "message": "Update failed: Cannot move reminder to a calendar in a different store"},
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
+            ),
+            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(self.remctl, "clone_reminder_tree_to_list_or_die") as clone_move,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_edit(args)
+
+        clone_move.assert_not_called()
+        self.assertIn("remctl-bridge failed while trying to edit the reminder", stderr.getvalue())
+
+    def test_cmd_edit_does_not_clone_ordinary_move_for_generic_bridge_error(self):
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["Z_PK"] = 1
+        reminder["ZLIST"] = 7
+        args = SimpleNamespace(
+            id=1, json=True, title=None, list="Projects", list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result(
+            {"status": "error", "message": "Reminder not found for id: DEAD-BEEF"},
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(
+                self.remctl,
+                "resolve_required_list_target_or_die",
+                return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
+            ),
+            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(self.remctl, "clone_reminder_tree_to_list_or_die") as clone_move,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_edit(args)
+
+        clone_move.assert_not_called()
+        self.assertIn("Reminder not found", stderr.getvalue())
+
+    def test_clone_reminder_tree_to_list_or_die_allows_zero_child_rows(self):
+        reminder = {
+            "Z_PK": 1,
+            "ZCKIDENTIFIER": "SOURCE-REMINDER",
+            "ZTITLE": "Move me",
+            "list_name": "Inbox",
+        }
+        target = {"id": 9, "title": "Projects", "objectUUID": "TARGET-LIST"}
+        new_row = {"Z_PK": 42, "ZLIST": 9, "ZCKIDENTIFIER": "NEW-REMINDER"}
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "private_call",
+                return_value={"status": "cloned", "newId": "NEW-REMINDER", "children": []},
+            ) as private_call,
+            mock.patch.object(self.remctl, "wait_for_cloned_reminder_tree", return_value=(new_row, [])),
+            mock.patch.object(self.remctl, "delete_reminder_by_identifier_or_die", return_value={"status": "deleted"}),
+        ):
+            result = self.remctl.clone_reminder_tree_to_list_or_die(object(), reminder, target, [])
+
+        private_call.assert_called_once_with({
+            "action": "clone_reminder_tree_to_list",
+            "id": "SOURCE-REMINDER",
+            "listId": "TARGET-LIST",
+            "childIds": [],
+        })
+        self.assertEqual(result["id"], 42)
+        self.assertEqual(result["oldId"], 1)
+        self.assertEqual(result["subtasksMoved"], 0)
+
     def test_cmd_edit_resolves_private_section_against_destination_list(self):
         reminder = self._FAKE_REMINDER
         args = SimpleNamespace(
@@ -4688,8 +5004,8 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
-                "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
             ),
             mock.patch.object(
                 self.remctl,
@@ -4744,9 +5060,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -4754,10 +5070,10 @@ class CliTests(unittest.TestCase):
                 id=1, json=True, title=None, notes=None, priority=None,
                 due="2026-04-20 09:00", url=None, recurrence=None, alarm=None,
             ))
-        self.assertEqual(bridge_call.call_count, 2)
+        self.assertEqual(bridge_call_result.call_count, 2)
         nudge_payload, real_payload = (
-            bridge_call.call_args_list[0].args[0],
-            bridge_call.call_args_list[1].args[0],
+            bridge_call_result.call_args_list[0].args[0],
+            bridge_call_result.call_args_list[1].args[0],
         )
         self.assertEqual(nudge_payload["due"], "2026-04-20T10:00:00")  # +1h
         self.assertEqual(real_payload["due"], "2026-04-20T09:00:00")
@@ -4773,9 +5089,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -4784,10 +5100,10 @@ class CliTests(unittest.TestCase):
                 due="2026-06-21", url=None, recurrence=None, alarm=None,
             ))
 
-        self.assertEqual(bridge_call.call_count, 2)
+        self.assertEqual(bridge_call_result.call_count, 2)
         nudge_payload, real_payload = (
-            bridge_call.call_args_list[0].args[0],
-            bridge_call.call_args_list[1].args[0],
+            bridge_call_result.call_args_list[0].args[0],
+            bridge_call_result.call_args_list[1].args[0],
         )
         self.assertEqual(nudge_payload["due"], "2026-06-22T00:00:00")
         self.assertTrue(nudge_payload["allDay"])
@@ -4825,14 +5141,14 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={"status": "updated", "id": reminder["ZCKIDENTIFIER"]},
-            ) as bridge_call,
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.remctl.cmd_edit(args)
-        bridge_call.assert_called_once()
-        self.assertEqual(bridge_call.call_args.args[0]["alarm"], "-15m")
+        bridge_call_result.assert_called_once()
+        self.assertEqual(bridge_call_result.call_args.args[0]["alarm"], "-15m")
 
     def test_cmd_edit_falls_back_to_applescript_when_bridge_unavailable(self):
         """If bridge_available() is False, AppleScript path must run."""

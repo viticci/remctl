@@ -2957,6 +2957,16 @@ def bridge_available():
     """Check if remctl-bridge (Swift EventKit binary) is available."""
     return BRIDGE_PATH.exists() and BRIDGE_PATH.stat().st_mode & 0o111
 
+
+def bridge_error_payload(status, message, stderr=""):
+    return {
+        "returncode": -1,
+        "stdout": "",
+        "stderr": stderr,
+        "payload": {"status": status, "message": message},
+    }
+
+
 def bridge_call_result(data, timeout=30):
     """Call remctl-bridge and return raw subprocess + parsed JSON details."""
     try:
@@ -2964,8 +2974,15 @@ def bridge_call_result(data, timeout=30):
             [str(BRIDGE_PATH)], input=json.dumps(data),
             capture_output=True, text=True, timeout=timeout
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
+    except subprocess.TimeoutExpired:
+        return bridge_error_payload("timeout", f"remctl-bridge did not respond within {timeout}s.")
+    except FileNotFoundError:
+        return bridge_error_payload(
+            "missing_bridge",
+            f"remctl-bridge not found at {BRIDGE_PATH}. Reinstall remctl with ./install.sh.",
+        )
+    except OSError as exc:
+        return bridge_error_payload("exec_error", f"could not run remctl-bridge: {exc}", str(exc))
 
     payload = None
     if proc.stdout:
@@ -2973,6 +2990,12 @@ def bridge_call_result(data, timeout=30):
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
             payload = None
+    if not isinstance(payload, dict):
+        detail = (proc.stderr or proc.stdout or "").strip()
+        payload = {
+            "status": "error",
+            "message": detail or f"remctl-bridge exited {proc.returncode} with no JSON output.",
+        }
     return {
         "returncode": proc.returncode,
         "stdout": proc.stdout,
@@ -2986,6 +3009,107 @@ def bridge_call(data):
     if result and result["returncode"] == 0 and isinstance(result["payload"], dict):
         return result["payload"]
     return None
+
+
+def bridge_result_ok(result, *statuses):
+    if not result or result.get("returncode") != 0:
+        return False
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("status") in statuses
+
+
+def bridge_failure_message(result):
+    if not result:
+        return "remctl-bridge did not return a response."
+    payload = result.get("payload")
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("error")
+        if message:
+            return str(message)
+    detail = (result.get("stderr") or result.get("stdout") or "").strip()
+    if detail:
+        return detail
+    return f"remctl-bridge exited with status {result.get('returncode')}"
+
+
+def bridge_failure_is_access_error(result):
+    message = bridge_failure_message(result).lower()
+    needles = [
+        "eventkit access error",
+        "reminders access not granted",
+        "not authorized",
+        "authorization",
+        "not permitted",
+        "mach error 4099",
+    ]
+    return any(needle in message for needle in needles)
+
+
+def bridge_failure_is_list_move_rejection(result):
+    message = bridge_failure_message(result).lower()
+    if "update failed:" not in message and "save failed:" not in message:
+        return False
+    exclusions = [
+        "not found",
+        "invalid",
+        "required",
+        "calendar item",
+        "identifier",
+    ]
+    if any(exclusion in message for exclusion in exclusions):
+        return False
+    needles = [
+        "calendar",
+        "container",
+        "account",
+        "caldav",
+        "different store",
+        "different source",
+        "not editable",
+        "not writable",
+        "immutable",
+        "move",
+    ]
+    return any(needle in message for needle in needles)
+
+
+def bridge_failure_allows_clone_delete_fallback(result):
+    if not result or result.get("returncode") == 0 or bridge_failure_is_access_error(result):
+        return False
+    payload = result.get("payload")
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status in {"timeout", "missing_bridge", "exec_error"}:
+        return False
+    return bridge_failure_is_list_move_rejection(result)
+
+
+def bridge_failure_is_execution_error(result):
+    payload = result.get("payload") if result else None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    return status in {"timeout", "missing_bridge", "exec_error"}
+
+
+def eventkit_access_fix_text(*, rerun_command="remctl doctor --for-agent"):
+    context = doctor_execution_context()
+    effective_context = context.get("effective_context") or "this runner"
+    host_app = context.get("host_app") or "the app or terminal launching remctl"
+    return "\n".join([
+        f"EventKit writes are blocked in the current process context: {effective_context}.",
+        f"Host app: {host_app}.",
+        "Run `remctl onboard` from this same context so macOS can grant Reminders access.",
+        f"Then rerun `{rerun_command}` from the same context before writing.",
+        "If the same command works in Terminal but fails here, Terminal's permission grant does not carry over to this app or agent runner.",
+    ])
+
+
+def fail_bridge_write(result, *, operation):
+    message = bridge_failure_message(result)
+    print(f"Error: remctl-bridge failed while trying to {operation}: {message}", file=sys.stderr)
+    if bridge_failure_is_access_error(result):
+        print(eventkit_access_fix_text(), file=sys.stderr)
+    sys.exit(1)
 
 
 EVENTKIT_READ_ID_WARNING = (
@@ -3878,14 +4002,14 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
     reminder_ckid = _row_get(reminder, "ZCKIDENTIFIER")
     target_list_ckid = target_list_ref.get("objectUUID")
     if not reminder_ckid:
-        print("Error: cannot move parent with subtasks because it has no stable ReminderKit identifier.", file=sys.stderr)
+        print("Error: cannot clone-move reminder because it has no stable ReminderKit identifier.", file=sys.stderr)
         sys.exit(1)
     if not target_list_ckid:
-        print("Error: cannot move parent with subtasks because the target list has no stable ReminderKit identifier.", file=sys.stderr)
+        print("Error: cannot clone-move reminder because the target list has no stable ReminderKit identifier.", file=sys.stderr)
         sys.exit(1)
     if not private_available():
         print(
-            f"Error: moving #{reminder['Z_PK']} with subtasks requires remctl-private. "
+            f"Error: clone-moving #{reminder['Z_PK']} requires remctl-private. "
             "Reinstall remctl with ./install.sh, then retry.",
             file=sys.stderr,
         )
@@ -3907,7 +4031,7 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
     })
     if not result or result.get("status") != "cloned":
         message = result.get("message") if isinstance(result, dict) else "private helper failed"
-        print(f"Error: failed to clone reminder tree into target list: {message}", file=sys.stderr)
+        print(f"Error: failed to clone reminder into target list: {message}", file=sys.stderr)
         sys.exit(1)
     new_ckid = result.get("newId")
     if not new_ckid:
@@ -3933,6 +4057,32 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
         "private": result,
         "delete": delete_result,
     }
+
+
+def emit_clone_delete_move_result(args, move_result, target_list_ref):
+    if args.json:
+        payload = {
+            "status": "updated",
+            "id": move_result["id"],
+            "oldId": move_result["oldId"],
+            "list": move_result["list"],
+            "objectUUID": move_result["objectUUID"],
+            "subtasksMoved": move_result["subtasksMoved"],
+            "method": move_result["method"],
+            "originalDeleted": move_result.get("delete", {}).get("status") == "deleted",
+        }
+        if target_list_ref.get("method") != "exact":
+            payload["resolvedList"] = {
+                "requested": target_list_ref.get("requested"),
+                "title": target_list_ref["title"],
+                "id": target_list_ref["id"],
+                "method": target_list_ref["method"],
+            }
+        print(json.dumps(payload))
+    else:
+        print(f"Moved #{move_result['oldId']} -> #{move_result['id']}")
+        print(f"List: {safe_display(move_result['list'])}")
+        print(f"Subtasks: {move_result['subtasksMoved']}")
 
 
 def private_location_action(data):
@@ -5044,38 +5194,53 @@ def write_onboard_state(result, *, auto=False):
     }, indent=2) + "\n")
 
 
+def reminders_open_commands():
+    commands = []
+    app_path = find_app_bundle("Reminders.app")
+    if app_path:
+        commands.append(["open", str(app_path)])
+    commands.extend([
+        ["open", "-b", "com.apple.reminders"],
+        ["open", "-a", "Reminders"],
+    ])
+    deduped = []
+    seen = set()
+    for command in commands:
+        key = tuple(command)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(command)
+    return deduped
+
+
 def open_reminders_app_for_onboarding():
-    try:
-        proc = subprocess.run(
-            ["open", "-a", "Reminders"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        return check_result(
-            "open_reminders",
-            "warn",
-            "Opening Reminders.app timed out.",
-            "Open Reminders.app manually, then rerun `remctl onboard`.",
-        )
-    except OSError as exc:
-        return check_result(
-            "open_reminders",
-            "warn",
-            f"Could not open Reminders.app: {exc}",
-            "Open Reminders.app manually, then rerun `remctl onboard`.",
-        )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip() or "open -a Reminders failed."
-        return check_result(
-            "open_reminders",
-            "warn",
-            detail,
-            "Open Reminders.app manually, then rerun `remctl onboard`.",
-        )
-    time.sleep(1)
-    return check_result("open_reminders", "ok", "Opened Reminders.app.")
+    errors = []
+    for command in reminders_open_commands():
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"{shlex.join(command)} timed out")
+            continue
+        except OSError as exc:
+            errors.append(f"{shlex.join(command)}: {exc}")
+            continue
+        if proc.returncode == 0:
+            time.sleep(1)
+            return check_result("open_reminders", "ok", "Opened Reminders.app.")
+        detail = (proc.stderr or proc.stdout).strip()
+        errors.append(f"{shlex.join(command)}: {detail or f'exited {proc.returncode}'}")
+    detail = "\n".join(errors) if errors else "Could not locate or open Reminders.app."
+    return check_result(
+        "open_reminders",
+        "warn",
+        detail,
+        "Open Reminders.app manually, then rerun `remctl onboard`.",
+    )
 
 
 def bridge_access_check_for_onboarding():
@@ -7406,6 +7571,7 @@ def cmd_add(a):
             if h not in title:
                 title += f" {h}"
     # Try bridge first
+    bridge_result = None
     if bridge_available():
         data = {"action": "create", "title": title}
         if target_list_name: data["list"] = target_list_name
@@ -7422,8 +7588,9 @@ def cmd_add(a):
             data["recurrence"] = parsed_recurrence
         if parsed_alarm is not None:
             data["alarm"] = parsed_alarm
-        result = bridge_call(data)
-        if result and result.get("status") == "created":
+        bridge_result = bridge_call_result(data)
+        if bridge_result_ok(bridge_result, "created"):
+            result = bridge_result["payload"]
             private_results = []
             created_row = None
             if wants_private:
@@ -7464,6 +7631,12 @@ def cmd_add(a):
                 if private_results:
                     print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
             return
+        if bridge_failure_is_access_error(bridge_result):
+            fail_bridge_write(bridge_result, operation="create the reminder")
+        if bridge_failure_is_execution_error(bridge_result):
+            fail_bridge_write(bridge_result, operation="create the reminder")
+        if wants_private or parsed_recurrence is not None or parsed_alarm is not None:
+            fail_bridge_write(bridge_result, operation="create the reminder")
 
     if dt and due_all_day:
         message = "All-day due dates require remctl-bridge so Reminders can store date-only components."
@@ -7476,6 +7649,12 @@ def cmd_add(a):
     # Fall back to AppleScript. Warn about fields AppleScript can't express,
     # so users don't silently lose url/recurrence/alarm when the bridge is
     # unavailable.
+    if bridge_result and bridge_result.get("returncode") != 0:
+        print(
+            "Warning: remctl-bridge failed while creating the reminder; "
+            f"falling back to AppleScript for basic fields only. Bridge error: {bridge_failure_message(bridge_result)}",
+            file=sys.stderr,
+        )
     dropped = []
     if hasattr(a, 'url') and a.url: dropped.append("url")
     if hasattr(a, 'recurrence') and a.recurrence: dropped.append("recurrence")
@@ -7761,51 +7940,31 @@ def cmd_edit(a):
         and should_clear_matching_absolute_alarm(db, r)
     )
 
-    if target_list_ref and target_list_pk != r["ZLIST"]:
-        child_rows = subtask_rows_for_parent_move(db, r)
-        if child_rows:
-            has_other_changes = bool(
-                a.title
-                or a.notes is not None
-                or a.priority
-                or a.due
-                or (hasattr(a, 'url') and a.url)
-                or parsed_recurrence is not None
-                or clear_alarm
-                or parsed_alarm
-                or wants_private
-            )
-            if has_other_changes:
+    moving_to_different_list = bool(target_list_ref and target_list_pk != r["ZLIST"])
+    child_rows_for_move = []
+    has_other_changes_for_move = bool(
+        a.title
+        or a.notes is not None
+        or a.priority
+        or a.due
+        or (hasattr(a, 'url') and a.url)
+        or parsed_recurrence is not None
+        or clear_alarm
+        or parsed_alarm
+        or wants_private
+    )
+    if moving_to_different_list:
+        child_rows_for_move = subtask_rows_for_parent_move(db, r)
+        if child_rows_for_move:
+            if has_other_changes_for_move:
                 print(
                     "Error: moving a parent reminder with subtasks cannot currently be combined with other edits. "
                     "Move it first, then edit the cloned reminder returned by remctl.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            move_result = clone_reminder_tree_to_list_or_die(db, r, target_list_ref, child_rows)
-            if a.json:
-                payload = {
-                    "status": "updated",
-                    "id": move_result["id"],
-                    "oldId": move_result["oldId"],
-                    "list": move_result["list"],
-                    "objectUUID": move_result["objectUUID"],
-                    "subtasksMoved": move_result["subtasksMoved"],
-                    "method": move_result["method"],
-                    "originalDeleted": move_result.get("delete", {}).get("status") == "deleted",
-                }
-                if target_list_ref.get("method") != "exact":
-                    payload["resolvedList"] = {
-                        "requested": target_list_ref.get("requested"),
-                        "title": target_list_ref["title"],
-                        "id": target_list_ref["id"],
-                        "method": target_list_ref["method"],
-                    }
-                print(json.dumps(payload))
-            else:
-                print(f"Moved #{move_result['oldId']} -> #{move_result['id']}")
-                print(f"List: {safe_display(move_result['list'])}")
-                print(f"Subtasks: {move_result['subtasksMoved']}")
+            move_result = clone_reminder_tree_to_list_or_die(db, r, target_list_ref, child_rows_for_move)
+            emit_clone_delete_move_result(a, move_result, target_list_ref)
             return
 
     # Bridge-first for speed (post-2026-04-17 bridge fix: reminder.timeZone
@@ -7816,6 +7975,8 @@ def cmd_edit(a):
     # Double-tap defense: if the displayed date already equals the new target,
     # fire an intermediate update first so the CKRecord is forced to carry a
     # real dueDateComponents change.
+    bridge_write_result = None
+    bridge_write_attempted = False
     if bridge_available() and r["ZCKIDENTIFIER"]:
         if dt_nudge is not None:
             nudge_data = {
@@ -7825,7 +7986,9 @@ def cmd_edit(a):
             }
             if due_all_day:
                 nudge_data["allDay"] = True
-            bridge_call(nudge_data)
+            nudge_result = bridge_call_result(nudge_data)
+            if bridge_failure_is_access_error(nudge_result):
+                fail_bridge_write(nudge_result, operation="prepare the reminder edit")
         data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
@@ -7859,8 +8022,10 @@ def cmd_edit(a):
         elif carry_absolute_alarm:
             data["alarm"] = dt.isoformat(); has_changes = True
         if has_changes:
-            result = bridge_call(data)
-            if result and result.get("status") == "updated":
+            bridge_write_attempted = True
+            bridge_write_result = bridge_call_result(data)
+            if bridge_result_ok(bridge_write_result, "updated"):
+                result = bridge_write_result["payload"]
                 private_results = apply_private_changes(
                     r["ZCKIDENTIFIER"],
                     a,
@@ -7888,6 +8053,17 @@ def cmd_edit(a):
                     if private_results:
                         print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
                 return
+            if bridge_failure_is_access_error(bridge_write_result):
+                fail_bridge_write(bridge_write_result, operation="edit the reminder")
+            if (
+                moving_to_different_list
+                and not child_rows_for_move
+                and not has_other_changes_for_move
+                and bridge_failure_allows_clone_delete_fallback(bridge_write_result)
+            ):
+                move_result = clone_reminder_tree_to_list_or_die(db, r, target_list_ref, [])
+                emit_clone_delete_move_result(a, move_result, target_list_ref)
+                return
         elif wants_private:
             private_results = apply_private_changes(
                 r["ZCKIDENTIFIER"],
@@ -7901,6 +8077,20 @@ def cmd_edit(a):
                 print(f"Updated #{a.id}")
                 print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
             return
+
+    if (
+        bridge_write_attempted
+        and bridge_write_result
+        and bridge_write_result.get("returncode") != 0
+        and (
+            target_list_ref
+            or parsed_recurrence is not None
+            or clear_alarm
+            or parsed_alarm
+            or wants_private
+        )
+    ):
+        fail_bridge_write(bridge_write_result, operation="edit the reminder")
 
     if carry_absolute_alarm or clear_matching_absolute_alarm:
         print("Error: this edit requires remctl-bridge to keep due/display/alarm state aligned.", file=sys.stderr)
@@ -9004,8 +9194,8 @@ _remctl() {
                 '--radius[Location alarm radius meters]:radius:' \
                 '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
                 '--title[New title]:title:' \
-                '(-l --list)'{-l,--list}'[Move to list]:list:' \
-                '--list-id[Move to list by stable numeric ID]:id:' \
+                '(-l --list)'{-l,--list}'[Move to list; pure moves may return new id]:list:' \
+                '--list-id[Move to list by stable numeric ID; pure moves may return new id]:id:' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Synced tags with --private]:tags:' \
                 '(-n --notes)'{-n,--notes}'[Notes]:notes:' \
@@ -9509,8 +9699,8 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l latitude -d "Locatio
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l longitude -d "Location alarm longitude" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l radius -d "Location alarm radius" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Location trigger" -a "arriving leaving"
-complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list; pure moves may return new id" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID; pure moves may return new id" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
 '''
 
@@ -10009,6 +10199,15 @@ def gather_doctor_checks():
         str(bridge_path),
         bridge_fix,
     )
+    if bridge_ok:
+        checks.append(bridge_access_check_for_onboarding())
+    else:
+        add(
+            "eventkit",
+            "warn",
+            "EventKit write access was not checked because remctl-bridge is unavailable.",
+            bridge_fix,
+        )
 
     private_path = current_private_path()
     private_ok = private_path.exists() and os.access(private_path, os.X_OK)
@@ -10086,7 +10285,7 @@ def cmd_doctor(a):
         result["agent_note"] = (
             "This report only applies to the process context shown in `context`. "
             "`doctor` must pass in the same context that will run the write. "
-            "Terminal and Codex or other agent runners can have different Full Disk Access grants."
+            "Terminal and Codex or other agent runners can have different Full Disk Access and Reminders/EventKit grants."
         )
     if getattr(a, "json", False):
         print(json.dumps(result, indent=2))
@@ -10104,7 +10303,7 @@ def cmd_doctor(a):
         if getattr(a, "for_agent", False):
             print(
                 "Agent note: `doctor` must pass in the same context that will run the write; "
-                "Terminal may be green while this runner is blocked."
+                "Terminal may be green while this runner is blocked for Full Disk Access or Reminders/EventKit."
             )
         print()
         print_check_report(None, checks)
@@ -10535,14 +10734,15 @@ def main():
             "\n"
             "Without --private, --url is appended to notes. Synced tags, web rich links, sections, shared-list assignments, subtasks, images, "
             "real flag state, urgent state, and location alarms require --private. "
+            "A pure list move may return a new id plus oldId when RemCTL uses its verified clone-delete fallback across list/container boundaries. "
             "--assign USER accepts a unique name, email/phone, numeric sharee ID, object UUID, or me; use remctl sharees LIST --json before scripting. "
             "Location alarms are saved through the EventKit bridge as structured-location alarms."
         ),
         formatter_class=HelpFormatter,
     )
     c.add_argument("id", type=int); c.add_argument("--title")
-    c.add_argument("-l", "--list", help="Move to a list by name; parent reminders with subtasks use a verified clone-delete fallback")
-    c.add_argument("--list-id", type=int, help="Move to a list by stable numeric ID; parent reminders with subtasks use a verified clone-delete fallback")
+    c.add_argument("-l", "--list", help="Move to a list by name; pure moves can use verified clone-delete fallback and return a new id")
+    c.add_argument("--list-id", type=int, help="Move to a list by stable numeric ID; pure moves can use verified clone-delete fallback and return a new id")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="YYYY-MM-DD or 'clear'")
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
@@ -10833,7 +11033,7 @@ def main():
         help="Prompt for macOS Reminders permissions and verify readiness",
         description=(
             "Open Reminders.app, trigger the native EventKit and AppleScript permission prompts,\n"
-            "then verify whether direct database reads are ready.\n"
+            "then verify whether EventKit writes and direct database reads are ready.\n"
             "If Full Disk Access is still missing, remctl opens the guided permission helper."
         ),
         epilog=(
@@ -10852,7 +11052,7 @@ def main():
         "doctor",
         help="Diagnose setup and runtime issues",
         description=(
-            "Run environment and runtime checks for the CLI.\n"
+            "Run environment, direct database, helper, and EventKit write-access checks for the CLI.\n"
             "This is the first troubleshooting step after install or onboarding."
         ),
         epilog=(
@@ -10862,9 +11062,9 @@ def main():
             "  remctl doctor --for-agent --json\n"
             "\n"
             "If this is your first run on a new Mac, use `remctl onboard` first so macOS can\n"
-            "show the Reminders and Automation permission prompts. Full Disk Access is scoped\n"
-            "to the app or runner shown in the execution context; Terminal can pass while an\n"
-            "agent runner still fails."
+            "show the Reminders and Automation permission prompts. Full Disk Access and\n"
+            "Reminders/EventKit grants are scoped to the app or runner shown in the execution\n"
+            "context; Terminal can pass while an agent runner still fails."
         ),
         formatter_class=HelpFormatter,
     ); js(c)

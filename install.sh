@@ -22,7 +22,7 @@ Notes:
   The installer copies binaries into ~/bin by default.
   Use PREFIX="$HOME/.local" if you want ~/.local/bin instead.
   remctl-private is optional and only used by explicit --private writes.
-  Run `remctl onboard`, then `remctl permissions full-disk-access` for the visual Full Disk Access flow.
+  Run `remctl onboard`, then `remctl permissions full-disk-access` for EventKit and database access.
   Run `remctl doctor` after permissions, or pass --doctor when upgrading an already-authorized install.
 EOF
 }
@@ -197,6 +197,7 @@ if [[ "$RUN_DOCTOR" -eq 1 ]]; then
     if ! "$BIN_DIR/remctl" doctor; then
         echo -e "${YELLOW}⚠${RESET}  Doctor found setup issues. This is common before macOS permissions are granted."
         echo -e "${DIM}Run '$BIN_DIR/remctl onboard'. If Full Disk Access is missing, use '$BIN_DIR/remctl permissions full-disk-access'. Then run '$BIN_DIR/remctl doctor'.${RESET}"
+        echo -e "${DIM}For agent runners, use '$BIN_DIR/remctl doctor --for-agent' in the same context that will write reminders.${RESET}"
     fi
 fi
 
@@ -205,7 +206,7 @@ echo -e "${GREEN}${BOLD}Done!${RESET} RemCTL v$("$BIN_DIR/remctl" --version) ins
 if [[ "$BOOTSTRAP" -eq 1 ]]; then
     echo -e "${DIM}Bootstrap is ready. Next: run 'remctl onboard', then 'remctl permissions full-disk-access', then 'remctl doctor'.${RESET}"
 else
-    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual Full Disk Access setup.${RESET}"
+    echo -e "${DIM}Next: run 'remctl onboard' on a new Mac, then 'remctl permissions full-disk-access' for visual database-access setup.${RESET}"
 fi
 if [[ "$PATH_NEEDS_UPDATE" -eq 1 ]]; then
     echo -e "${YELLOW}${BOLD}Reminder:${RESET}${YELLOW} open a new Terminal window after adding $BIN_DIR to PATH, or run commands with the full path:${RESET}"
