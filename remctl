@@ -8883,6 +8883,93 @@ def cmd_list_delete(a):
         print(f"Error: Failed to delete list '{target_name}'" + (f": {message}" if message else ""), file=sys.stderr)
         sys.exit(1)
 
+
+def _section_list_ref_or_die(db, a):
+    return resolve_required_list_target_or_die(
+        db, name=getattr(a, "list", None), list_id=getattr(a, "list_id", None),
+    )
+
+
+def cmd_section_create(a):
+    require_private_metadata(a)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    list_ckid = q_list_ckid(db, list_ref["id"])
+    if not list_ckid:
+        print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    result = private_call({"action": "create_section", "listId": list_ckid, "name": a.name})
+    if not result or result.get("status") != "created":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    if a.json:
+        print(json.dumps(
+            {"status": "created", "list": list_ref["title"], "name": a.name, "private": result},
+            ensure_ascii=False,
+        ))
+    else:
+        print(f"Created section: {safe_display(a.name)} in {safe_display(list_ref['title'])}")
+
+
+def cmd_section_rename(a):
+    require_private_metadata(a)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    section_ckid = resolve_section_ckid(
+        db, list_ref["id"],
+        section_name=getattr(a, "name", None), section_id=getattr(a, "section_id", None),
+    )
+    if not section_ckid:
+        print("Error: pass the section to rename by name or --section-id.", file=sys.stderr)
+        sys.exit(1)
+    result = private_call({"action": "rename_section", "sectionId": section_ckid, "name": a.new_name})
+    if not result or result.get("status") != "renamed":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    if a.json:
+        print(json.dumps(
+            {"status": "renamed", "list": list_ref["title"], "sectionId": section_ckid,
+             "name": a.new_name, "private": result},
+            ensure_ascii=False,
+        ))
+    else:
+        print(f"Renamed section -> {safe_display(a.new_name)} in {safe_display(list_ref['title'])}")
+
+
+def cmd_section_delete(a):
+    require_private_metadata(a)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    section_ckid = resolve_section_ckid(
+        db, list_ref["id"],
+        section_name=getattr(a, "name", None), section_id=getattr(a, "section_id", None),
+    )
+    if not section_ckid:
+        print("Error: pass the section to delete by name or --section-id.", file=sys.stderr)
+        sys.exit(1)
+    if not a.force:
+        ans = input(
+            f"Delete a section in '{safe_display(list_ref['title'])}'? "
+            "Its reminders move to the list's default area. [y/N] "
+        )
+        if not ans.strip().lower().startswith("y"):
+            print("Cancelled.")
+            return
+    result = private_call({"action": "delete_section", "sectionId": section_ckid})
+    if not result or result.get("status") != "deleted":
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    if a.json:
+        print(json.dumps(
+            {"status": "deleted", "list": list_ref["title"], "sectionId": section_ckid, "private": result},
+            ensure_ascii=False,
+        ))
+    else:
+        print(f"Deleted section in {safe_display(list_ref['title'])}")
+
 def cmd_export(a):
     db = open_db()
     list_name = getattr(a, "list", None)
@@ -11019,6 +11106,34 @@ def main():
     c.add_argument("--list-id", type=int, help="Delete a list by stable numeric ID")
     c.add_argument("--force", action="store_true"); js(c)
 
+    c = sub.add_parser("section-create", help="Create a section in a list (requires --private)")
+    c.add_argument("name", help="New section name")
+    c.add_argument("-l", "--list", help="Target list name")
+    c.add_argument("--list-id", type=int, help="Target list by stable numeric ID")
+    c.add_argument("--private", action="store_true", help="Use guarded ReminderKit writes (required)")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
+    c = sub.add_parser("section-rename", help="Rename a section in a list (requires --private)")
+    c.add_argument("name", nargs="?", help="Existing section name (omit when using --section-id)")
+    c.add_argument("--new-name", required=True, help="New section name")
+    c.add_argument("-l", "--list", help="The section's list name")
+    c.add_argument("--list-id", type=int, help="The section's list by stable numeric ID")
+    c.add_argument("--section-id", help="Target the section by stable ID when names collide")
+    c.add_argument("--private", action="store_true", help="Use guarded ReminderKit writes (required)")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
+    c = sub.add_parser("section-delete", help="Delete a section in a list (requires --private)")
+    c.add_argument("name", nargs="?", help="Existing section name (omit when using --section-id)")
+    c.add_argument("-l", "--list", help="The section's list name")
+    c.add_argument("--list-id", type=int, help="The section's list by stable numeric ID")
+    c.add_argument("--section-id", help="Target the section by stable ID when names collide")
+    c.add_argument("--force", action="store_true", help="Skip the confirmation prompt")
+    c.add_argument("--private", action="store_true", help="Use guarded ReminderKit writes (required)")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
     c = sub.add_parser("export", help="Export reminders")
     c.add_argument("-l", "--list", help="Export only this list")
     c.add_argument("--list-id", type=int, help="Export only this list by stable numeric ID")
@@ -11193,6 +11308,9 @@ def main():
         "subtasks": cmd_subtasks,
         "info": cmd_info,
         "sections": cmd_sections,
+        "section-create": cmd_section_create,
+        "section-rename": cmd_section_rename,
+        "section-delete": cmd_section_delete,
         "sharees": cmd_sharees,
         "stats": cmd_stats,
         "link": cmd_link,

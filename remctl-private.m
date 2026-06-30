@@ -26,6 +26,7 @@
 - (id)updateAccount:(id)account;
 - (id)updateReminder:(id)reminder;
 - (id)updateList:(id)list;
+- (id)updateListSection:(id)section;
 - (id)updateSmartList:(id)smartList;
 - (id)updateTemplate:(id)templateObject;
 - (id)addReminderWithTitle:(NSString *)title toReminderSubtaskContextChangeItem:(id)context;
@@ -184,6 +185,8 @@
 
 @interface REMListSectionChangeItem : NSObject
 - (id)remObjectID;
+- (void)setDisplayName:(NSString *)displayName;
+- (void)removeFromList;
 @end
 
 @interface REMListSectionContextChangeItem : NSObject
@@ -696,6 +699,9 @@ int main(int argc, const char * argv[]) {
             @"create_group",
             @"set_list_parent_group",
             @"delete_group",
+            @"create_section",
+            @"rename_section",
+            @"delete_section",
             @"set_list_appearance",
             @"set_list_pinned",
             @"set_smart_list_pinned",
@@ -932,6 +938,90 @@ int main(int argc, const char * argv[]) {
                 @"status": @"deleted",
                 @"action": action,
                 @"groupId": groupID,
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"create_section"]) {
+            NSString *listID = cmd[@"listId"];
+            NSString *name = cmd[@"name"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) fail(@"listId is required");
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
+            id listObjectID = [REMObjectID objectIDWithURL:listURL(listID)];
+            if (!listObjectID) fail(@"Could not build ReminderKit list object ID");
+            REMStore *store = [REMStore new];
+            id list = [store fetchListWithObjectID:listObjectID error:&error];
+            if (!list) fail(error.localizedDescription ?: @"List not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id listChange = [save updateList:list];
+            if (!listChange) fail(@"Could not create ReminderKit list change item");
+            id sectionContext = [listChange sectionsContextChangeItem];
+            id sectionChange = [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
+            id sectionObjectID = [sectionChange remObjectID];
+            if (!sectionObjectID) fail(@"Could not create section object ID");
+            [sectionContext setUnsavedSectionIDsOrdering:@[sectionObjectID]];
+            [sectionContext setShouldUpdateSectionsOrdering:YES];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section create failed");
+            }
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"listId": listID,
+                @"name": name,
+                @"sectionURL": [[sectionObjectID urlRepresentation] absoluteString] ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"rename_section"]) {
+            NSString *sectionID = cmd[@"sectionId"];
+            NSString *name = cmd[@"name"];
+            if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
+            id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
+            if (!sectionObjectID) fail(@"Could not build ReminderKit section object ID");
+            REMStore *store = [REMStore new];
+            id section = [store fetchListSectionWithObjectID:sectionObjectID error:&error];
+            if (!section) fail(error.localizedDescription ?: @"Section not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListSectionChangeItem *change = [save updateListSection:section];
+            if (!change) fail(@"Could not create ReminderKit section change item");
+            if (![change respondsToSelector:@selector(setDisplayName:)]) {
+                fail(@"ReminderKit section change item does not support rename");
+            }
+            [change setDisplayName:name];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section rename failed");
+            }
+            output(@{
+                @"status": @"renamed",
+                @"action": action,
+                @"sectionId": sectionID,
+                @"name": name,
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"delete_section"]) {
+            NSString *sectionID = cmd[@"sectionId"];
+            if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
+            id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
+            if (!sectionObjectID) fail(@"Could not build ReminderKit section object ID");
+            REMStore *store = [REMStore new];
+            id section = [store fetchListSectionWithObjectID:sectionObjectID error:&error];
+            if (!section) fail(error.localizedDescription ?: @"Section not found");
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMListSectionChangeItem *change = [save updateListSection:section];
+            if (!change) fail(@"Could not create ReminderKit section change item");
+            if (![change respondsToSelector:@selector(removeFromList)]) {
+                fail(@"ReminderKit section change item does not support deletion");
+            }
+            [change removeFromList];
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit section delete failed");
+            }
+            output(@{
+                @"status": @"deleted",
+                @"action": action,
+                @"sectionId": sectionID,
             });
             return 0;
         }

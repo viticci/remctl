@@ -5896,5 +5896,64 @@ class CliTests(unittest.TestCase):
         self.assertEqual(identifiers, ["2C0EDC64-6294-488A-814F-46B44C8ABBD3"])
 
 
+class SectionCrudTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.remctl = load_module("remctl_sectioncrud_test", "remctl")
+
+    def _run(self, fn, a, *, list_ckid="LCK", section_ckid="SCK"):
+        captured = []
+
+        def record(payload):
+            captured.append(payload)
+            status = {
+                "create_section": "created",
+                "rename_section": "renamed",
+                "delete_section": "deleted",
+            }[payload["action"]]
+            return {"status": status}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.remctl, "open_db", return_value=object()))
+            stack.enter_context(mock.patch.object(
+                self.remctl, "resolve_required_list_target_or_die",
+                return_value={"id": 30, "title": "L"}))
+            stack.enter_context(mock.patch.object(self.remctl, "q_list_ckid", return_value=list_ckid))
+            stack.enter_context(mock.patch.object(self.remctl, "resolve_section_ckid", return_value=section_ckid))
+            stack.enter_context(mock.patch.object(self.remctl, "private_call", side_effect=record))
+            fn(a)
+        return captured
+
+    def test_section_create_builds_payload(self):
+        a = SimpleNamespace(private=True, private_metadata=False, name="Research",
+                            list="L", list_id=None, json=True)
+        self.assertEqual(
+            self._run(self.remctl.cmd_section_create, a),
+            [{"action": "create_section", "listId": "LCK", "name": "Research"}],
+        )
+
+    def test_section_rename_builds_payload(self):
+        a = SimpleNamespace(private=True, private_metadata=False, name="Research",
+                            section_id=None, new_name="Reading", list="L", list_id=None, json=True)
+        self.assertEqual(
+            self._run(self.remctl.cmd_section_rename, a),
+            [{"action": "rename_section", "sectionId": "SCK", "name": "Reading"}],
+        )
+
+    def test_section_delete_builds_payload(self):
+        a = SimpleNamespace(private=True, private_metadata=False, name="Reading",
+                            section_id=None, list="L", list_id=None, force=True, json=True)
+        self.assertEqual(
+            self._run(self.remctl.cmd_section_delete, a),
+            [{"action": "delete_section", "sectionId": "SCK"}],
+        )
+
+    def test_section_create_requires_private(self):
+        a = SimpleNamespace(private=False, private_metadata=False, name="Research",
+                            list="L", list_id=None, json=True)
+        with self.assertRaises(SystemExit):
+            self._run(self.remctl.cmd_section_create, a)
+
+
 if __name__ == "__main__":
     unittest.main()

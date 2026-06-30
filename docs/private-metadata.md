@@ -164,6 +164,29 @@ remctl group-delete --group-id 476 --private --force --json
 
 List groups are containers for lists, not containers for reminders. `groups` and `group-info` report active/completed/total counts from child lists. `group-create` creates the group and can move existing lists under it. `list-create --private --group` creates a new list directly under a group. `group-edit` renames the group, adds or removes child lists, and can reorder a child list with `--move-list` plus `--before-list`, `--after-list`, `--first`, or `--last`. `group-delete` detaches every child list to the top level before deleting the empty group. These operations update list parentage only; reminders stay in the same child lists and should be verified with `show <list> --json`, `groups --json`, or `show <group> --json`.
 
+## Section Examples
+
+Sections were previously read-only (`sections`) and writable only by assigning a
+reminder (`add/edit --private --section`/`--new-section`). These manage sections
+as first-class objects:
+
+```bash
+remctl section-create "Research" -l Projects --private
+remctl section-rename "Research" --new-name "Reading" -l Projects --private
+remctl section-rename --section-id 794C4076-... --new-name "Reading" -l Projects --private
+remctl section-delete "Reading" -l Projects --private --force
+remctl sections --json     # read (unchanged)
+```
+
+`section-create` adds an empty section to the target list via
+`REMSaveRequest addListSectionWithDisplayName:`. `section-rename` fetches the
+section, opens a change item with `updateListSection:`, and sets `displayName`.
+`section-delete` opens the same change item and calls `removeFromList`; its
+reminders fall back to the list's default (unsectioned) area. All three require
+`--private`, resolve the section by name within `-l/--list` (use `--section-id`
+when names collide), and write through ReminderKit, not SQLite. Verify with
+`sections --json` or `show <list> --json`.
+
 ## Groceries List Examples
 
 ```bash

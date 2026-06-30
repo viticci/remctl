@@ -165,6 +165,7 @@ Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopbac
 | Notes URL fallback | `edit --url URL` | No | Appends the URL to notes, not a rich attachment |
 | Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
 | Section assignment or creation | `edit --private --section`, `--section-id`, `--new-section` | Yes | If combined with `-l/--list`, section resolution uses the destination list |
+| Section create / rename / delete | `section-create NAME -l LIST`, `section-rename NAME --new-name NEW -l LIST`, `section-delete NAME -l LIST` | Yes | Manage sections as first-class objects; require `--private`; resolve by name within the list or `--section-id`; a deleted section's reminders move to the list's default area |
 | Shared-list assignment | `add/edit --private --assign USER`, `edit --private --unassign` | Yes | `USER` resolves against `remctl sharees LIST`; accepts unique name, email/phone, numeric sharee ID, object UUID, or `me`; agents should prefer address or ID |
 | Subtasks | `edit --private --subtask ...` | Yes | Additive; rich JSON subtasks can include public and private child metadata |
 | Image attachments | `edit --private --image PATH` | Yes | Additive; generic files/PDFs are rejected, and existing images are not removed/replaced |
