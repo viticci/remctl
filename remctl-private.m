@@ -127,6 +127,7 @@
 
 @interface REMReminderHashtagContextChangeItem : NSObject
 - (id)addHashtagWithType:(NSInteger)type name:(NSString *)name;
+- (void)removeAllHashtags;
 @end
 
 @interface REMReminderFlaggedContextChangeItem : NSObject
@@ -681,6 +682,7 @@ int main(int argc, const char * argv[]) {
             @"add_private_metadata",
             @"add_url_attachments",
             @"add_tags",
+            @"set_tags",
             @"add_subtasks",
             @"clone_reminder_tree_to_list",
             @"assign_section",
@@ -1542,6 +1544,16 @@ int main(int argc, const char * argv[]) {
             if (urls.count == 0) fail(@"At least one URL is required");
         } else if ([action isEqualToString:@"add_tags"]) {
             if (tags.count == 0) fail(@"At least one tag is required");
+        } else if ([action isEqualToString:@"set_tags"]) {
+            // Replace the reminder's entire synced tag set: clear all existing
+            // hashtags here, then the shared tag-apply block below adds `tags`
+            // (which may be empty to leave the reminder with no tags).
+            id hashtagContext = [change hashtagContext];
+            if (!hashtagContext || ![hashtagContext respondsToSelector:@selector(removeAllHashtags)]) {
+                fail(@"ReminderKit hashtag context does not support replacement");
+            }
+            [hashtagContext removeAllHashtags];
+            details[@"tagsReplaced"] = @YES;
         } else if ([action isEqualToString:@"add_subtasks"]) {
             NSArray<NSDictionary *> *subtaskSpecs = subtaskSpecArray(cmd);
             if (subtaskSpecs.count == 0) fail(@"At least one subtask is required");
@@ -1714,7 +1726,7 @@ int main(int argc, const char * argv[]) {
                 addedURLs += 1;
             }
         }
-        if (([action isEqualToString:@"add_private_metadata"] || [action isEqualToString:@"add_tags"]) && tags.count) {
+        if (([action isEqualToString:@"add_private_metadata"] || [action isEqualToString:@"add_tags"] || [action isEqualToString:@"set_tags"]) && tags.count) {
             id hashtagContext = [change hashtagContext];
             for (NSString *tag in tags) {
                 [hashtagContext addHashtagWithType:1 name:tag];

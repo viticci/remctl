@@ -17,7 +17,7 @@ The helper is still experimental. It links a private framework, so Apple can ren
 Verified on macOS/iCloud sync:
 
 - web rich URL attachments to public HTTP(S) hosts: `--private --url https://example.com`
-- synced tags: `--private -t remctl,work`
+- synced tags (add): `--private -t remctl,work`
 - section assignment: `--private --section "Research"`
 - section assignment by stable ID: `--private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8`
 - section creation and assignment: `--private --new-section "Research"`
@@ -33,6 +33,21 @@ Verified on macOS/iCloud sync:
 - list groups: `group-create "Writing" --private --add-list Editorial`, `list-create "Ideas" --private --group Writing`, `group-edit "Writing" --private --add-list Ideas --remove-list Socials`, `group-edit "Writing" --private --move-list Ideas --last`, and `group-delete "Writing" --private --force`
 - custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
 - Reminders templates: `template-create "Packing Template" --from-list Packing --private`, `template-apply "Packing Template" --private`, and exact cleanup via `template-delete "Packing Template" --private --force`
+
+Tag replacement and removal (new; verify on your store before relying on it):
+
+Unlike rich links and images, synced tags can be replaced or removed, because
+ReminderKit's `REMReminderHashtagContextChangeItem` exposes `removeAllHashtags`
+alongside `addHashtagWithType:name:`. The `set_tags` action clears the
+reminder's hashtags and then adds the requested set (an empty set clears all):
+
+- replace the whole set: `edit ID --private --set-tags remctl,work`
+- clear all tags: `edit ID --private --clear-tags`
+- remove specific tags: `edit ID --private --remove-tag work` (repeatable)
+
+`--remove-tag` reads the reminder's current tags and rewrites the survivors.
+These are mutually exclusive with each other and with additive `-t/--tags`.
+Verify with `info ID --json` and a second device, as with any private write.
 
 Not exposed:
 
@@ -72,6 +87,9 @@ With `--private`, `--url` creates a web rich link attachment and `-t/--tags` cre
 ```bash
 remctl edit 23880 --private --url "https://example.com"
 remctl edit 23880 --private -t remctl,work
+remctl edit 23880 --private --set-tags remctl,work
+remctl edit 23880 --private --clear-tags
+remctl edit 23880 --private --remove-tag work
 remctl edit 23880 --private --section "Research"
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 remctl edit 23880 --private --new-section "Inbox Zero"

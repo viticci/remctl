@@ -163,7 +163,8 @@ Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopbac
 | Move to another list | `edit -l LIST` or `edit --list-id ID` | No | EventKit bridge first; if a pure move is rejected by a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback and returns a new numeric `id` plus `oldId` |
 | Recurrence and normal alarms | `edit --recurrence`, `edit --alarm` | No | EventKit bridge only; verify in `info --json` |
 | Notes URL fallback | `edit --url URL` | No | Appends the URL to notes, not a rich attachment |
-| Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
+| Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; rich links are not removed/replaced. Tags can be replaced/removed (see next row) |
+| Replace or remove synced tags | `edit --private --set-tags a,b`, `--clear-tags`, `--remove-tag X` | Yes | Replaces the whole tag set via `set_tags` (clear-then-add); mutually exclusive with each other and additive `-t` |
 | Section assignment or creation | `edit --private --section`, `--section-id`, `--new-section` | Yes | If combined with `-l/--list`, section resolution uses the destination list |
 | Shared-list assignment | `add/edit --private --assign USER`, `edit --private --unassign` | Yes | `USER` resolves against `remctl sharees LIST`; accepts unique name, email/phone, numeric sharee ID, object UUID, or `me`; agents should prefer address or ID |
 | Subtasks | `edit --private --subtask ...` | Yes | Additive; rich JSON subtasks can include public and private child metadata |

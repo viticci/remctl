@@ -5896,5 +5896,86 @@ class CliTests(unittest.TestCase):
         self.assertEqual(identifiers, ["2C0EDC64-6294-488A-814F-46B44C8ABBD3"])
 
 
+class TagReplaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.remctl = load_module("remctl_tagreplace_test", "remctl")
+
+    def _edit_args(self, **over):
+        base = dict(
+            private=True, private_metadata=False, id=42,
+            tags=None, url=None, grocery=False,
+            section=None, section_id=None, new_section=None,
+            subtask=None, image=None, assign=None, unassign=False,
+            flag=False, flagged=None, urgent=None, early_reminder=None,
+            location_title=None, latitude=None, longitude=None,
+            set_tags=None, clear_tags=False, remove_tag=None,
+        )
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _capture(self, a, hashtags=None):
+        captured = []
+
+        def record(payload):
+            captured.append(payload)
+            return {"status": "ok"}
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.remctl, "private_action", side_effect=record))
+            if hashtags is not None:
+                stack.enter_context(mock.patch.object(
+                    self.remctl, "q_hashtags",
+                    return_value=[{"ZNAME": t} for t in hashtags],
+                ))
+            self.remctl.apply_private_changes("CKID", a, db=object())
+        return captured
+
+    def test_set_tags_replaces_entire_set(self):
+        a = self._edit_args(set_tags="work,home")
+        self.assertEqual(
+            self._capture(a),
+            [{"action": "set_tags", "id": "CKID", "tags": ["work", "home"]}],
+        )
+
+    def test_clear_tags_sends_empty_set(self):
+        a = self._edit_args(clear_tags=True)
+        self.assertEqual(
+            self._capture(a),
+            [{"action": "set_tags", "id": "CKID", "tags": []}],
+        )
+
+    def test_remove_tag_computes_survivors_from_current(self):
+        a = self._edit_args(remove_tag=["home"])
+        self.assertEqual(
+            self._capture(a, hashtags=["work", "home"]),
+            [{"action": "set_tags", "id": "CKID", "tags": ["work"]}],
+        )
+
+    def test_remove_tag_is_case_insensitive_and_strips_hash(self):
+        a = self._edit_args(remove_tag=["#HOME"])
+        self.assertEqual(
+            self._capture(a, hashtags=["work", "home"]),
+            [{"action": "set_tags", "id": "CKID", "tags": ["work"]}],
+        )
+
+    def test_additive_and_replace_are_mutually_exclusive(self):
+        a = self._edit_args(tags="x", set_tags="y")
+        with self.assertRaises(SystemExit):
+            self._capture(a)
+
+    def test_only_one_replace_mode_allowed(self):
+        a = self._edit_args(clear_tags=True, remove_tag=["x"])
+        with self.assertRaises(SystemExit):
+            self._capture(a)
+
+    def test_additive_tags_still_use_add_private_metadata(self):
+        a = self._edit_args(tags="work")
+        self.assertEqual(
+            self._capture(a),
+            [{"action": "add_private_metadata", "id": "CKID", "urls": [], "tags": ["work"]}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

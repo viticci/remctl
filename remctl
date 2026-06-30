@@ -4411,6 +4411,9 @@ def private_changes_from_args(a):
     return any([
         getattr(a, "url", None),
         getattr(a, "tags", None),
+        getattr(a, "set_tags", None) is not None,
+        getattr(a, "clear_tags", False),
+        getattr(a, "remove_tag", None),
         getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
@@ -4431,6 +4434,9 @@ def private_changes_from_args(a):
 
 def private_only_changes_from_args(a):
     return any([
+        getattr(a, "set_tags", None) is not None,
+        getattr(a, "clear_tags", False),
+        getattr(a, "remove_tag", None),
         getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
@@ -4568,6 +4574,45 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
     results = []
     tags = split_csv(getattr(a, "tags", None))
     urls = [getattr(a, "url")] if getattr(a, "url", None) else []
+
+    # Tag replacement/removal. `-t/--tags` is additive (append); --set-tags,
+    # --clear-tags, and --remove-tag replace the reminder's whole synced tag set
+    # via the `set_tags` action, which the helper applies as clear-then-add.
+    set_tags = getattr(a, "set_tags", None)
+    clear_tags = getattr(a, "clear_tags", False)
+    remove_tags = [t.lstrip("#") for t in (getattr(a, "remove_tag", None) or [])]
+    replace_modes = sum(bool(x) for x in (set_tags is not None, clear_tags, bool(remove_tags)))
+    if replace_modes and tags:
+        print(
+            "Error: -t/--tags (add) cannot be combined with --set-tags/--clear-tags/--remove-tag.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if replace_modes > 1:
+        print(
+            "Error: pass only one of --set-tags, --clear-tags, --remove-tag.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    replace_tags = None
+    if clear_tags:
+        replace_tags = []
+    elif set_tags is not None:
+        replace_tags = [t.lstrip("#") for t in split_csv(set_tags)]
+    elif remove_tags:
+        if db is None:
+            db = open_db()
+        current = [t["ZNAME"] for t in q_hashtags(db, a.id)]
+        drop = {t.lower() for t in remove_tags}
+        replace_tags = [t for t in current if t.lower() not in drop]
+
+    if replace_tags is not None:
+        results.append(private_action({
+            "action": "set_tags",
+            "id": reminder_ckid,
+            "tags": replace_tags,
+        }))
 
     if urls or tags:
         results.append(private_action({
@@ -9156,6 +9201,9 @@ _remctl() {
                 '--early-reminder[Set Early Reminder delta, e.g. 15m, 1h, clear]:delta:' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
+                '--set-tags[Replace all synced tags with --private]:tags:' \
+                '--clear-tags[Remove all synced tags with --private]' \
+                '--remove-tag[Remove a synced tag with --private]:tag:' \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
                 '--list-id[Target list by stable numeric ID]:id:' \
                 '(-d --due)'{-d,--due}'[Due date]:due:' \
@@ -9403,7 +9451,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -10751,6 +10799,9 @@ def main():
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
+    c.add_argument("--set-tags", help="Private metadata: replace ALL synced hashtag labels with this comma-separated set")
+    c.add_argument("--clear-tags", action="store_true", help="Private metadata: remove ALL synced hashtag labels")
+    c.add_argument("--remove-tag", action="append", metavar="TAG", help="Private metadata: remove a specific synced hashtag label (repeatable)")
     c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in its Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
