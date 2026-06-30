@@ -2,7 +2,7 @@
 
 RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`. Location alarms remain behind the private command guardrail because agents should treat them as Reminders-only metadata, but RemCTL saves them with EventKit structured-location alarms because that path materializes reliably on current macOS.
 
-This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private list appearance, pinning, and group commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
+This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, private section/list appearance, pinning, and group commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
 
 RemCTL still does not write directly to SQLite.
 
@@ -17,10 +17,11 @@ The helper is still experimental. It links a private framework, so Apple can ren
 Verified on macOS/iCloud sync:
 
 - web rich URL attachments to public HTTP(S) hosts: `--private --url https://example.com`
-- synced tags: `--private -t remctl,work`
+- synced tag add/replace/remove: `--private -t remctl,work`, `--private --set-tags remctl,work`, `--private --remove-tag stale`, or `--private --clear-tags`
 - section assignment: `--private --section "Research"`
 - section assignment by stable ID: `--private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8`
 - section creation and assignment: `--private --new-section "Research"`
+- section management: `section-create "Research" -l Projects --private`, `section-rename "Research" --new-name "Archive" -l Projects --private`, and `section-delete "Archive" -l Projects --private --force`
 - shared-list assignment: `--private --assign Alex`, `--private --assign alex@example.com`, or `--private --assign me`
 - subtasks: `--private --subtask "Follow up"` or rich JSON objects with child metadata
 - image attachments: `--private --image ~/Desktop/mockup.png`
@@ -72,6 +73,9 @@ With `--private`, `--url` creates a web rich link attachment and `-t/--tags` cre
 ```bash
 remctl edit 23880 --private --url "https://example.com"
 remctl edit 23880 --private -t remctl,work
+remctl edit 23880 --private --set-tags remctl,work
+remctl edit 23880 --private --remove-tag stale
+remctl edit 23880 --private --clear-tags
 remctl edit 23880 --private --section "Research"
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 remctl edit 23880 --private --new-section "Inbox Zero"
@@ -110,6 +114,19 @@ Subtask due dates, priority, recurrence, and alarms use the same validators as p
 Early Reminders are stored by Reminders as private `REMDueDateDeltaAlert` metadata and mirrored in `ZDUEDATEDELTAALERTSDATA`. RemCTL writes them with `REMReminderChangeItem.dueDateDeltaAlertContext`, removes existing due-date delta identifiers before replacing the value, and verifies readback through `remctl info ID --json`. Non-clear values require a due date because Reminders anchors the delta to the reminder's due date. The unit mapping is `0 = minutes`, `1 = hours`, `2 = days`, `3 = weeks`, `4 = months`; RemCTL accepts friendly forms such as `15m`, `1h`, `2d`, `1w`, and `1mo`.
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
+
+`-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other.
+
+## Section Management Examples
+
+```bash
+remctl sections --json
+remctl section-create "Research" -l Projects --private --json
+remctl section-rename "Research" --new-name "Reading" -l Projects --private --json
+remctl section-delete "Reading" -l Projects --private --force --json
+```
+
+Section management uses ReminderKit and requires `--private`. `section-create` refuses duplicate names in the target list, `section-rename` refuses collisions with another section in the same list, and `section-delete` moves reminders out of the section using Reminders' normal behavior. Verify with `sections --json` or `show <list> --json`.
 
 ## List Appearance Examples
 
@@ -250,6 +267,9 @@ remctl list-create "Ideas" --group Writing
 remctl group-edit "Writing" --add-list Ideas
 remctl group-edit "Writing" --move-list Ideas --last
 remctl group-delete "Writing" --force
+remctl section-create "Research" -l Projects
+remctl section-rename "Research" --new-name Reading -l Projects
+remctl section-delete "Research" -l Projects --force
 remctl template-create "Packing Template" --from-list Packing
 remctl template-apply "Packing Template"
 ```
@@ -258,7 +278,7 @@ These fail because they would otherwise look successful while silently dropping 
 
 Moving a reminder to another list is not private metadata: use `remctl edit ID -l LIST` or `remctl edit ID --list-id ID` through the normal EventKit bridge. If EventKit rejects a pure move across a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback. Parent reminders with subtasks also use that fallback because EventKit rejects moving only the parent. RemCTL clones the reminder and any child reminders into the destination list, verifies the cloned reminder and subtask count, then deletes the original. The returned JSON includes the new numeric `id`, `oldId`, `method: "clone-delete"`, and `subtasksMoved` (`0` for ordinary reminders). Move first, then apply other edits to the returned ID. For ordinary reminders, if a move is combined with `--private --section` or `--private --grocery`, RemCTL validates the private metadata against the destination list but does not clone-delete combined edits.
 
-`--private --url` and subtask `url`/`urls` accept only public `http` and `https` hosts. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving, then write through the EventKit bridge as structured-location alarms. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
+`--private --url` and subtask `url`/`urls` accept only public `http` and `https` hosts. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Tag replacement/removal is available through `edit --private --set-tags`, `--clear-tags`, and `--remove-tag`. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius, and proximity before saving, then write through the EventKit bridge as structured-location alarms. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
 
 ## Installation and Doctor
 

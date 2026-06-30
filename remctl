@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.2.0
+"""remctl — Power-user Reminders CLI v1.3.0
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
@@ -44,7 +44,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
@@ -162,6 +162,7 @@ def show_splash():
     print(C.dim("    urgent      Urgent reminders             stats       Statistics"))
     print(C.dim("    lists       All lists                    smart-lists Inspect smart lists"))
     print(C.dim("    templates   Saved templates              template-info Inspect template"))
+    print(C.dim("    sections    Inspect sections             section-*   Manage sections"))
     print()
     print(C.dim("  remctl --help for full command reference"))
     print()
@@ -1412,6 +1413,13 @@ def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_gr
     return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups)
 
 
+def bridge_list_target_payload(list_ref):
+    payload = {"list": list_ref["title"]}
+    if list_ref.get("objectUUID"):
+        payload["listId"] = list_ref["objectUUID"]
+    return payload
+
+
 def resolve_group_ref(db, name=None, group_id=None):
     if group_id is not None:
         columns = list_select_columns(db)
@@ -1984,6 +1992,18 @@ def q_sections(db, list_pk=None):
         "LEFT JOIN ZREMCDBASELIST l ON s.ZLIST = l.Z_PK "
         "WHERE s.ZMARKEDFORDELETION = 0 ORDER BY l.ZNAME, s.Z_PK"
     ).fetchall()
+
+
+def section_name_exists(db, list_pk, name, *, excluding_ckid=None):
+    needle = (name or "").casefold()
+    excluded = (excluding_ckid or "").casefold()
+    for row in q_sections(db, list_pk):
+        if (row["ZCKIDENTIFIER"] or "").casefold() == excluded:
+            continue
+        if (row["ZDISPLAYNAME"] or "").casefold() == needle:
+            return True
+    return False
+
 
 def q_section_memberships(db, list_pk):
     row = db.execute(
@@ -3519,6 +3539,51 @@ def split_csv(value):
     return [part.strip().lstrip("#") for part in value.split(",") if part.strip().lstrip("#")]
 
 
+def dedupe_tags(tags):
+    result = []
+    seen = set()
+    for tag in tags:
+        tag = tag.strip().lstrip("#")
+        if not tag:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(tag)
+    return result
+
+
+def remove_tag_values(values):
+    tags = []
+    for value in normalize_repeatable(values):
+        tags.extend(split_csv(value))
+    return dedupe_tags(tags)
+
+
+def validate_tag_replacement_args(a):
+    additive_tags = bool(getattr(a, "tags", None))
+    set_requested = getattr(a, "set_tags", None) is not None
+    clear_requested = bool(getattr(a, "clear_tags", False))
+    remove_requested = getattr(a, "remove_tag", None) is not None
+    replace_modes = sum([set_requested, clear_requested, remove_requested])
+    if replace_modes and additive_tags:
+        print(
+            "Error: -t/--tags adds synced tags and cannot be combined with --set-tags, --clear-tags, or --remove-tag.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if replace_modes > 1:
+        print("Error: pass only one of --set-tags, --clear-tags, or --remove-tag.", file=sys.stderr)
+        sys.exit(1)
+    if set_requested and not split_csv(getattr(a, "set_tags", None)):
+        print("Error: --set-tags requires at least one tag. Use --clear-tags to remove all tags.", file=sys.stderr)
+        sys.exit(1)
+    if remove_requested and not remove_tag_values(getattr(a, "remove_tag", None)):
+        print("Error: --remove-tag requires a non-empty tag.", file=sys.stderr)
+        sys.exit(1)
+
+
 def normalize_repeatable(values):
     result = []
     for value in values or []:
@@ -3818,6 +3883,8 @@ def is_web_url(value):
 
 
 def validate_private_args(a):
+    validate_tag_replacement_args(a)
+
     if getattr(a, "assign", None) and getattr(a, "unassign", False):
         print("Error: pass either --assign or --unassign, not both.", file=sys.stderr)
         sys.exit(1)
@@ -4411,6 +4478,9 @@ def private_changes_from_args(a):
     return any([
         getattr(a, "url", None),
         getattr(a, "tags", None),
+        getattr(a, "set_tags", None) is not None,
+        getattr(a, "clear_tags", False),
+        getattr(a, "remove_tag", None),
         getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
@@ -4431,6 +4501,9 @@ def private_changes_from_args(a):
 
 def private_only_changes_from_args(a):
     return any([
+        getattr(a, "set_tags", None) is not None,
+        getattr(a, "clear_tags", False),
+        getattr(a, "remove_tag", None),
         getattr(a, "grocery", False),
         getattr(a, "section", None),
         getattr(a, "section_id", None),
@@ -4451,7 +4524,7 @@ def private_only_changes_from_args(a):
 def refuse_private_args_without_opt_in(a):
     if private_only_changes_from_args(a) and not private_metadata_enabled(a):
         print(
-            "Error: grocery, section, assignment, subtask, image, urgent, early-reminder, flagged, and location writes require --private. "
+            "Error: synced tag replacement/removal, grocery, section, assignment, subtask, image, urgent, early-reminder, flagged, and location writes require --private. "
             "Example: remctl add \"Milk\" -l Groceries --private --grocery",
             file=sys.stderr,
         )
@@ -4565,9 +4638,29 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids):
 
 def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
     require_private_metadata(a)
+    validate_tag_replacement_args(a)
     results = []
     tags = split_csv(getattr(a, "tags", None))
     urls = [getattr(a, "url")] if getattr(a, "url", None) else []
+
+    replacement_tags = None
+    if getattr(a, "clear_tags", False):
+        replacement_tags = []
+    elif getattr(a, "set_tags", None) is not None:
+        replacement_tags = dedupe_tags(split_csv(getattr(a, "set_tags", None)))
+    elif getattr(a, "remove_tag", None) is not None:
+        if db is None:
+            db = open_db()
+        current = [row["ZNAME"] for row in q_hashtags(db, a.id)]
+        drop = {tag.casefold() for tag in remove_tag_values(getattr(a, "remove_tag", None))}
+        replacement_tags = [tag for tag in current if tag.casefold() not in drop]
+
+    if replacement_tags is not None:
+        results.append(private_action({
+            "action": "set_tags",
+            "id": reminder_ckid,
+            "tags": replacement_tags,
+        }))
 
     if urls or tags:
         results.append(private_action({
@@ -7574,7 +7667,10 @@ def cmd_add(a):
     bridge_result = None
     if bridge_available():
         data = {"action": "create", "title": title}
-        if target_list_name: data["list"] = target_list_name
+        if list_resolution:
+            data.update(bridge_list_target_payload(list_resolution))
+        elif target_list_name:
+            data["list"] = target_list_name
         if a.notes: data["notes"] = a.notes
         if dt:
             data["due"] = dt.isoformat()
@@ -7993,7 +8089,7 @@ def cmd_edit(a):
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
         if target_list_ref:
-            data["list"] = target_list_name
+            data.update(bridge_list_target_payload(target_list_ref))
             has_changes = True
         # Merge url into notes to keep URL-append semantics identical across
         # bridge and AppleScript paths.
@@ -8842,6 +8938,7 @@ def cmd_list_rename(a):
         sys.exit(1)
     target_name = list_ref["title"]
     data = {"action": "rename_list", "title": target_name, "newTitle": new_name}
+    data.update(bridge_list_target_payload(list_ref))
     result = bridge_call(data)
     if result and result.get("status") == "renamed":
         if a.json:
@@ -8870,9 +8967,8 @@ def cmd_list_delete(a):
             print("Cancelled.")
             return
     data = {"action": "delete_list", "title": target_name}
+    data.update(bridge_list_target_payload(list_ref))
     result = bridge_call(data) if bridge_available() else None
-    if not result or result.get("status") != "deleted":
-        result = delete_list_with_applescript(target_name)
     if result and result.get("status") == "deleted":
         if a.json:
             print(json.dumps({"status": "deleted", "id": list_ref["id"], "name": target_name}))
@@ -8882,6 +8978,139 @@ def cmd_list_delete(a):
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to delete list '{target_name}'" + (f": {message}" if message else ""), file=sys.stderr)
         sys.exit(1)
+
+
+def _section_list_ref_or_die(db, a):
+    return resolve_required_list_target_or_die(
+        db,
+        name=getattr(a, "list", None),
+        list_id=getattr(a, "list_id", None),
+    )
+
+
+def _section_private_call_or_die(payload, expected_status):
+    result = private_call(payload)
+    if result and result.get("status") == expected_status:
+        return result
+    message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_section_create(a):
+    require_private_metadata(a)
+    if not (getattr(a, "name", None) or "").strip():
+        print("Error: pass a section name.", file=sys.stderr)
+        sys.exit(1)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    if section_name_exists(db, list_ref["id"], a.name):
+        print(
+            f"Error: section already exists in {list_ref['title']!r}: {a.name}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    list_ckid = list_ref.get("objectUUID") or q_list_ckid(db, list_ref["id"])
+    if not list_ckid:
+        print("Error: target list has no stable CloudKit identifier.", file=sys.stderr)
+        sys.exit(1)
+    existing_section_ids = [
+        row["ZCKIDENTIFIER"] for row in q_sections(db, list_ref["id"]) if row["ZCKIDENTIFIER"]
+    ]
+    result = _section_private_call_or_die(
+        {
+            "action": "create_section",
+            "listId": list_ckid,
+            "name": a.name,
+            "existingSectionIds": existing_section_ids,
+        },
+        "created",
+    )
+    if a.json:
+        print(json.dumps({
+            "status": "created",
+            "list": list_ref["title"],
+            "name": a.name,
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Created section: {safe_display(a.name)} in {safe_display(list_ref['title'])}")
+
+
+def cmd_section_rename(a):
+    require_private_metadata(a)
+    if not (getattr(a, "new_name", None) or "").strip():
+        print("Error: pass a new section name.", file=sys.stderr)
+        sys.exit(1)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    section_ckid = resolve_section_ckid(
+        db,
+        list_ref["id"],
+        section_name=getattr(a, "name", None),
+        section_id=getattr(a, "section_id", None),
+    )
+    if not section_ckid:
+        print("Error: pass the section to rename by name or --section-id.", file=sys.stderr)
+        sys.exit(1)
+    if section_name_exists(db, list_ref["id"], a.new_name, excluding_ckid=section_ckid):
+        print(
+            f"Error: another section in {list_ref['title']!r} is already named {a.new_name!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    result = _section_private_call_or_die(
+        {"action": "rename_section", "sectionId": section_ckid, "name": a.new_name},
+        "renamed",
+    )
+    if a.json:
+        print(json.dumps({
+            "status": "renamed",
+            "list": list_ref["title"],
+            "sectionId": section_ckid,
+            "name": a.new_name,
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Renamed section: {safe_display(a.new_name)} in {safe_display(list_ref['title'])}")
+
+
+def cmd_section_delete(a):
+    require_private_metadata(a)
+    db = open_db()
+    list_ref = _section_list_ref_or_die(db, a)
+    section_ckid = resolve_section_ckid(
+        db,
+        list_ref["id"],
+        section_name=getattr(a, "name", None),
+        section_id=getattr(a, "section_id", None),
+    )
+    if not section_ckid:
+        print("Error: pass the section to delete by name or --section-id.", file=sys.stderr)
+        sys.exit(1)
+    label = getattr(a, "name", None) or section_ckid
+    if not a.force:
+        ans = input(
+            f"Delete section '{safe_display(label)}' in '{safe_display(list_ref['title'])}'? "
+            "Its reminders move to the list's default area. [y/N] "
+        )
+        if not ans.strip().lower().startswith("y"):
+            print("Cancelled.")
+            return
+    result = _section_private_call_or_die(
+        {"action": "delete_section", "sectionId": section_ckid},
+        "deleted",
+    )
+    if a.json:
+        print(json.dumps({
+            "status": "deleted",
+            "list": list_ref["title"],
+            "sectionId": section_ckid,
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Deleted section: {safe_display(label)} in {safe_display(list_ref['title'])}")
+
 
 def cmd_export(a):
     db = open_db()
@@ -9029,6 +9258,9 @@ _remctl() {
         'subtasks:Show subtasks'
         'info:Full detail view'
         'sections:Show sections'
+        'section-create:Create a section in a list'
+        'section-rename:Rename a section in a list'
+        'section-delete:Delete a section in a list'
         'sharees:Show people available for assignment in a shared list'
         'stats:Statistics'
         'link:Get deep links'
@@ -9198,6 +9430,9 @@ _remctl() {
                 '--list-id[Move to list by stable numeric ID; pure moves may return new id]:id:' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Synced tags with --private]:tags:' \
+                '--set-tags[Replace all synced tags with --private]:tags:' \
+                '--clear-tags[Remove all synced tags with --private]' \
+                '--remove-tag[Remove one synced tag with --private]:tag:' \
                 '(-n --notes)'{-n,--notes}'[Notes]:notes:' \
                 '(-d --due)'{-d,--due}'[Due date or clear]:due:' \
                 '(-p --priority)'{-p,--priority}'[Priority]:priority:(high medium low none)' \
@@ -9383,6 +9618,34 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        section-create)
+            _arguments \
+                '(-l --list)'{-l,--list}'[Target list]:list:' \
+                '--list-id[Target list by stable numeric ID]:id:' \
+                '--private[Use private ReminderKit section creation]' \
+                '--json[JSON output]'
+            return
+            ;;
+        section-rename)
+            _arguments \
+                '--new-name[New section name]:name:' \
+                '(-l --list)'{-l,--list}'[Section list]:list:' \
+                '--list-id[Section list by stable numeric ID]:id:' \
+                '--section-id[Target section by stable ID]:id:' \
+                '--private[Use private ReminderKit section renaming]' \
+                '--json[JSON output]'
+            return
+            ;;
+        section-delete)
+            _arguments \
+                '(-l --list)'{-l,--list}'[Section list]:list:' \
+                '--list-id[Section list by stable numeric ID]:id:' \
+                '--section-id[Target section by stable ID]:id:' \
+                '--force[Skip confirmation prompt]' \
+                '--private[Use private ReminderKit section deletion]' \
+                '--json[JSON output]'
+            return
+            ;;
     esac
     _describe 'command' commands
 }
@@ -9393,7 +9656,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -9403,7 +9666,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -9483,6 +9746,15 @@ BASH_COMPLETION = '''_remctl() {
     elif [ "$cmd" = "list-delete" ]; then
         COMPREPLY=( $(compgen -W "--list-id --force --json" -- "$cur") )
         return
+    elif [ "$cmd" = "section-create" ]; then
+        COMPREPLY=( $(compgen -W "--list -l --list-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "section-rename" ]; then
+        COMPREPLY=( $(compgen -W "--new-name --list -l --list-id --section-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "section-delete" ]; then
+        COMPREPLY=( $(compgen -W "--list -l --list-id --section-id --force --private --json" -- "$cur") )
+        return
     elif [ $COMP_CWORD -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     fi
@@ -9518,6 +9790,9 @@ complete -c remctl -n "__fish_use_subcommand" -a tags -d "List all tags"
 complete -c remctl -n "__fish_use_subcommand" -a subtasks -d "Show subtasks"
 complete -c remctl -n "__fish_use_subcommand" -a info -d "Full detail view"
 complete -c remctl -n "__fish_use_subcommand" -a sections -d "Show sections"
+complete -c remctl -n "__fish_use_subcommand" -a section-create -d "Create a section in a list"
+complete -c remctl -n "__fish_use_subcommand" -a section-rename -d "Rename a section in a list"
+complete -c remctl -n "__fish_use_subcommand" -a section-delete -d "Delete a section in a list"
 complete -c remctl -n "__fish_use_subcommand" -a sharees -d "Show people available for assignment in a shared list"
 complete -c remctl -n "__fish_use_subcommand" -a stats -d "Statistics"
 complete -c remctl -n "__fish_use_subcommand" -a link -d "Get deep links"
@@ -9665,6 +9940,22 @@ complete -c remctl -n "__fish_seen_subcommand_from list-rename" -l list-id -d "R
 complete -c remctl -n "__fish_seen_subcommand_from list-rename" -l new-name -d "New list name" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-delete" -l list-id -d "Delete list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from list-delete" -l force -d "Skip confirmation prompt"
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -s l -l list -d "Target list" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -l list-id -d "Target list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -l private -d "Use private ReminderKit section creation"
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l new-name -d "New section name" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -s l -l list -d "Section list" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l list-id -d "Section list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l section-id -d "Target section by stable ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l private -d "Use private ReminderKit section renaming"
+complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -s l -l list -d "Section list" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -l list-id -d "Section list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -l section-id -d "Target section by stable ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -l force -d "Skip confirmation prompt"
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -l private -d "Use private ReminderKit section deletion"
+complete -c remctl -n "__fish_seen_subcommand_from section-delete" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsupported private ReminderKit metadata writes"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign to section by stable ID" -r
@@ -9702,6 +9993,9 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Locati
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list; pure moves may return new id" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID; pure moves may return new id" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l set-tags -d "Replace all synced tags with --private" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l clear-tags -d "Remove all synced tags with --private"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l remove-tag -d "Remove one synced tag with --private" -r
 '''
 
 def get_completion_script(shell):
@@ -10751,6 +11045,9 @@ def main():
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("-t", "--tags", help="Private metadata: add comma-separated synced hashtag labels")
+    c.add_argument("--set-tags", help="Private metadata: replace all synced hashtag labels with this comma-separated set")
+    c.add_argument("--clear-tags", action="store_true", help="Private metadata: remove all synced hashtag labels")
+    c.add_argument("--remove-tag", action="append", metavar="TAG", help="Private metadata: remove a synced hashtag label (repeatable)")
     c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in its Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
@@ -11019,6 +11316,46 @@ def main():
     c.add_argument("--list-id", type=int, help="Delete a list by stable numeric ID")
     c.add_argument("--force", action="store_true"); js(c)
 
+    c = sub.add_parser(
+        "section-create",
+        help="Create a section in a list",
+        description="Create a Reminders list section through unsupported private ReminderKit APIs.",
+    )
+    c.add_argument("name", help="New section name")
+    c.add_argument("-l", "--list", help="Target list name")
+    c.add_argument("--list-id", type=int, help="Target list by stable numeric ID")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit section creation")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
+    c = sub.add_parser(
+        "section-rename",
+        help="Rename a section in a list",
+        description="Rename a Reminders list section through unsupported private ReminderKit APIs.",
+    )
+    c.add_argument("name", nargs="?", help="Existing section name; omit when using --section-id")
+    c.add_argument("--new-name", required=True, help="New section name")
+    c.add_argument("-l", "--list", help="The section's list name")
+    c.add_argument("--list-id", type=int, help="The section's list by stable numeric ID")
+    c.add_argument("--section-id", help="Target the section by stable ID when names collide")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit section renaming")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
+    c = sub.add_parser(
+        "section-delete",
+        help="Delete a section in a list",
+        description="Delete a Reminders list section through unsupported private ReminderKit APIs.",
+    )
+    c.add_argument("name", nargs="?", help="Existing section name; omit when using --section-id")
+    c.add_argument("-l", "--list", help="The section's list name")
+    c.add_argument("--list-id", type=int, help="The section's list by stable numeric ID")
+    c.add_argument("--section-id", help="Target the section by stable ID when names collide")
+    c.add_argument("--force", action="store_true", help="Skip the confirmation prompt")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit section deletion")
+    c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
+    js(c)
+
     c = sub.add_parser("export", help="Export reminders")
     c.add_argument("-l", "--list", help="Export only this list")
     c.add_argument("--list-id", type=int, help="Export only this list by stable numeric ID")
@@ -11214,6 +11551,9 @@ def main():
         "list-unpin": cmd_list_unpin,
         "list-rename": cmd_list_rename,
         "list-delete": cmd_list_delete,
+        "section-create": cmd_section_create,
+        "section-rename": cmd_section_rename,
+        "section-delete": cmd_section_delete,
         "export": cmd_export,
         "import": cmd_import,
         "onboard": cmd_onboard,

@@ -2135,7 +2135,13 @@ class CliTests(unittest.TestCase):
                 self.remctl.cmd_list_rename(rename_args)
             self.assertEqual(
                 rename_call.call_args.args[0],
-                {"action": "rename_list", "title": "Old", "newTitle": "New"},
+                {
+                    "action": "rename_list",
+                    "title": "Old",
+                    "newTitle": "New",
+                    "list": "Old",
+                    "listId": "CK-1",
+                },
             )
 
             with (
@@ -2147,10 +2153,38 @@ class CliTests(unittest.TestCase):
                 self.remctl.cmd_list_delete(delete_args)
             self.assertEqual(
                 delete_call.call_args.args[0],
-                {"action": "delete_list", "title": "Old"},
+                {
+                    "action": "delete_list",
+                    "title": "Old",
+                    "list": "Old",
+                    "listId": "CK-1",
+                },
             )
         finally:
             db.close()
+
+    def test_list_delete_does_not_fallback_to_applescript_after_bridge_failure(self):
+        db = self._list_db(["Old"])
+        args = SimpleNamespace(name=None, list_id=1, force=True, json=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "bridge_call",
+                    return_value={"status": "error", "message": "iCloud Reminders list not found for id: CK-1"},
+                ),
+                mock.patch.object(self.remctl, "delete_list_with_applescript") as delete_list_with_applescript,
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.remctl.cmd_list_delete(args)
+        finally:
+            db.close()
+
+        delete_list_with_applescript.assert_not_called()
+        self.assertIn("iCloud Reminders list not found", stderr.getvalue())
 
     def _smart_list_db(self):
         db = sqlite3.connect(":memory:")
@@ -3042,7 +3076,13 @@ class CliTests(unittest.TestCase):
             mock.patch.object(
                 self.remctl,
                 "resolve_list_or_die",
-                return_value={"id": 156, "title": "🗓️ Weekly 513", "requested": "Weekly 513", "method": "normalized"},
+                return_value={
+                    "id": 156,
+                    "title": "🗓️ Weekly 513",
+                    "objectUUID": "LIST-UUID-156",
+                    "requested": "Weekly 513",
+                    "method": "normalized",
+                },
             ),
             mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -3050,6 +3090,7 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_add(args)
 
         self.assertEqual(bridge_call_result.call_args.args[0]["list"], "🗓️ Weekly 513")
+        self.assertEqual(bridge_call_result.call_args.args[0]["listId"], "LIST-UUID-156")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["resolvedList"]["title"], "🗓️ Weekly 513")
         self.assertEqual(payload["resolvedList"]["method"], "normalized")
@@ -5894,6 +5935,310 @@ class CliTests(unittest.TestCase):
             identifiers = self.remctl.early_reminder_identifiers_for_reminder(object(), "REMINDER-ID")
 
         self.assertEqual(identifiers, ["2C0EDC64-6294-488A-814F-46B44C8ABBD3"])
+
+    def _private_edit_args(self, **overrides):
+        base = {
+            "id": 42,
+            "private": True,
+            "private_metadata": False,
+            "url": None,
+            "tags": None,
+            "set_tags": None,
+            "clear_tags": False,
+            "remove_tag": None,
+            "grocery": False,
+            "section": None,
+            "section_id": None,
+            "new_section": None,
+            "subtask": None,
+            "image": None,
+            "flag": False,
+            "flagged": None,
+            "urgent": None,
+            "early_reminder": None,
+            "location_title": None,
+            "latitude": None,
+            "longitude": None,
+            "radius": 100,
+            "proximity": "arriving",
+            "address": None,
+            "assign": None,
+            "unassign": False,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _insert_section(self, db, pk, name, ckid, list_pk=1):
+        db.execute(
+            "INSERT INTO ZREMCDBASESECTION "
+            "(Z_PK, ZDISPLAYNAME, ZLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (pk, name, list_pk, ckid),
+        )
+
+    def test_apply_private_changes_replaces_synced_tags(self):
+        args = self._private_edit_args(set_tags="work,#home,work")
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+        ):
+            result = self.remctl.apply_private_changes("REM-1", args)
+
+        self.assertEqual(result, [{"status": "updated"}])
+        private_action.assert_called_once_with({
+            "action": "set_tags",
+            "id": "REM-1",
+            "tags": ["work", "home"],
+        })
+
+    def test_apply_private_changes_clears_synced_tags(self):
+        args = self._private_edit_args(clear_tags=True)
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+        ):
+            self.remctl.apply_private_changes("REM-1", args)
+
+        private_action.assert_called_once_with({
+            "action": "set_tags",
+            "id": "REM-1",
+            "tags": [],
+        })
+
+    def test_apply_private_changes_removes_selected_synced_tags(self):
+        args = self._private_edit_args(remove_tag=["#work", "archive"])
+        db = object()
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "q_hashtags",
+                return_value=[{"ZNAME": "Work"}, {"ZNAME": "Home"}, {"ZNAME": "Archive"}],
+            ) as q_hashtags,
+            mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+        ):
+            self.remctl.apply_private_changes("REM-1", args, db=db)
+
+        q_hashtags.assert_called_once_with(db, 42)
+        private_action.assert_called_once_with({
+            "action": "set_tags",
+            "id": "REM-1",
+            "tags": ["Home"],
+        })
+
+    def test_tag_replacement_rejects_additive_tags(self):
+        args = self._private_edit_args(tags="new", set_tags="work")
+        with (
+            self.assertRaises(SystemExit),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.remctl.validate_tag_replacement_args(args)
+
+        self.assertIn("cannot be combined", stderr.getvalue())
+
+    def test_tag_replacement_requires_private_opt_in(self):
+        args = self._private_edit_args(private=False, set_tags="work")
+        with (
+            mock.patch.object(self.remctl, "private_available") as private_available,
+            self.assertRaises(SystemExit),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.remctl.refuse_private_args_without_opt_in(args)
+
+        private_available.assert_not_called()
+        self.assertIn("require --private", stderr.getvalue())
+
+    def test_section_create_uses_private_helper_with_existing_order(self):
+        db = self._list_db(["Projects"])
+        self._insert_section(db, 10, "Inbox", "SECTION-1")
+        args = SimpleNamespace(
+            name="Research",
+            list="Projects",
+            list_id=None,
+            private=True,
+            private_metadata=False,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "SECTION-2"}) as private_call,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_section_create(args)
+        finally:
+            db.close()
+
+        private_call.assert_called_once_with({
+            "action": "create_section",
+            "listId": "CK-1",
+            "name": "Research",
+            "existingSectionIds": ["SECTION-1"],
+        })
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "created")
+        self.assertEqual(payload["name"], "Research")
+
+    def test_section_create_refuses_duplicate_name_before_private_call(self):
+        db = self._list_db(["Projects"])
+        self._insert_section(db, 10, "Research", "SECTION-1")
+        args = SimpleNamespace(
+            name="research",
+            list="Projects",
+            list_id=None,
+            private=True,
+            private_metadata=False,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.remctl.cmd_section_create(args)
+        finally:
+            db.close()
+
+        private_call.assert_not_called()
+        self.assertIn("section already exists", stderr.getvalue())
+
+    def test_section_rename_and_delete_use_private_helper(self):
+        db = self._list_db(["Projects"])
+        self._insert_section(db, 10, "Research", "SECTION-1")
+        rename_args = SimpleNamespace(
+            name="Research",
+            section_id=None,
+            new_name="Reading",
+            list="Projects",
+            list_id=None,
+            private=True,
+            private_metadata=False,
+            json=True,
+        )
+        delete_args = SimpleNamespace(
+            name=None,
+            section_id="SECTION-1",
+            list="Projects",
+            list_id=None,
+            private=True,
+            private_metadata=False,
+            force=True,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    side_effect=[{"status": "renamed"}, {"status": "deleted"}],
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_section_rename(rename_args)
+                self.remctl.cmd_section_delete(delete_args)
+        finally:
+            db.close()
+
+        self.assertEqual(
+            [call.args[0] for call in private_call.call_args_list],
+            [
+                {"action": "rename_section", "sectionId": "SECTION-1", "name": "Reading"},
+                {"action": "delete_section", "sectionId": "SECTION-1"},
+            ],
+        )
+
+    def test_section_rename_refuses_name_collision_before_private_call(self):
+        db = self._list_db(["Projects"])
+        self._insert_section(db, 10, "Research", "SECTION-1")
+        self._insert_section(db, 11, "Reading", "SECTION-2")
+        args = SimpleNamespace(
+            name="Research",
+            section_id=None,
+            new_name="reading",
+            list="Projects",
+            list_id=None,
+            private=True,
+            private_metadata=False,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.remctl.cmd_section_rename(args)
+        finally:
+            db.close()
+
+        private_call.assert_not_called()
+        self.assertIn("already named", stderr.getvalue())
+
+    def _run_uninstall(self, tmp, *args):
+        root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env.pop("PREFIX", None)
+        env.update({
+            "HOME": str(tmp / "home"),
+            "REMCTL_BIN_DIR": str(tmp / "bin"),
+            "REMCTL_CONFIG_DIR": str(tmp / "home" / ".config" / "remctl"),
+        })
+        return subprocess.run(
+            ["bash", str(root / "uninstall.sh"), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+
+    def test_uninstall_dry_run_keeps_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            config_dir = tmp / "home" / ".config" / "remctl"
+            (bin_dir / "completions").mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            for rel in ["remctl", "remctl-bridge", "completions/_remctl"]:
+                (bin_dir / rel).write_text("installed")
+            (config_dir / "settings.json").write_text("{}")
+
+            result = self._run_uninstall(tmp, "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((bin_dir / "remctl").exists())
+            self.assertTrue((bin_dir / "remctl-bridge").exists())
+            self.assertTrue((bin_dir / "completions" / "_remctl").exists())
+            self.assertTrue(config_dir.exists())
+
+    def test_uninstall_removes_only_known_files_and_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            config_dir = tmp / "home" / ".config" / "remctl"
+            (bin_dir / "completions").mkdir(parents=True)
+            config_dir.mkdir(parents=True)
+            for rel in ["remctl", "remctl_runtime.py", "remctl-bridge", "completions/_remctl"]:
+                (bin_dir / rel).write_text("installed")
+            (bin_dir / "unrelated").write_text("keep")
+            (config_dir / "settings.json").write_text("{}")
+
+            result = self._run_uninstall(tmp)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((bin_dir / "remctl").exists())
+            self.assertFalse((bin_dir / "remctl_runtime.py").exists())
+            self.assertFalse((bin_dir / "remctl-bridge").exists())
+            self.assertFalse((bin_dir / "completions").exists())
+            self.assertTrue((bin_dir / "unrelated").exists())
+            self.assertFalse(config_dir.exists())
 
 
 if __name__ == "__main__":

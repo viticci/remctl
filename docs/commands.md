@@ -79,6 +79,11 @@ remctl add "Leave now" -l Work --private --urgent
 remctl add "Launch assets" -l Projects --private --subtask '{"title":"Export PNG","notes":"Use final crop","due":"tomorrow","url":"https://example.com","tags":["media"]}'
 remctl edit 23880 --private --section "Research"
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
+remctl edit 23880 --private --set-tags remctl,work
+remctl edit 23880 --private --remove-tag stale
+remctl section-create "Research" -l Projects --private
+remctl section-rename "Research" --new-name "Reading" -l Projects --private
+remctl section-delete "Reading" -l Projects --private --force
 remctl edit 23880 --private --subtask '{"title":"Follow up","notes":"Bring latest numbers","due":"next friday at 3pm","url":"https://example.com","tags":["work"]}'
 remctl edit 23880 --private --flagged --urgent
 remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090 --radius 200
@@ -98,7 +103,7 @@ remctl template-delete "Packing Template" --private --force
 
 ## CLI Syntax Rules
 
-RemCTL uses nouns for read-only inspectors (`lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, plus the `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands). List-management commands keep the `list-*` prefix; group writes keep the `group-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
+RemCTL uses nouns for read-only inspectors (`lists`, `groups`, `group-info`, `smart-lists`, `templates`, `today`, `stats`) and verb-style commands for writes (`add`, `edit`, `delete`, plus the `section-*`, `list-*`, `group-*`, `smart-list-*`, and `template-*` write commands). Section-management commands keep the `section-*` prefix; list-management commands keep the `list-*` prefix; group writes keep the `group-*` prefix; custom smart-list writes keep the `smart-list-*` prefix; template writes keep the `template-*` prefix.
 
 Use `--json` on subcommands when scripting. For tabular read commands (`today`, `upcoming`, `overdue`, `flagged`, `urgent`, `lists`, `groups`, `show`, and `search`), `--format json|table|plain` can be passed globally before the command or directly on the read command, so both `remctl --format table show Work` and `remctl show Work --format table` are valid. Export keeps its own `--format json|csv` because that chooses a file format, not display style.
 
@@ -139,7 +144,7 @@ Date-only `add -d` inputs create all-day reminders instead of midnight timed rem
 
 `upcoming DAYS` accepts 1 through 3650 days. Zero and negative ranges fail before RemCTL opens the Reminders database.
 
-List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
+List targets are consistent across commands that can safely resolve them: pass a list name positionally or with `-l/--list`, or pass `--list-id` when an exact numeric target matters. If both a name and `--list-id` are provided, RemCTL fails before writing or exporting. This applies to `show`, `add`, `edit`, `link`, `export`, `section-create`, `section-rename`, `section-delete`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter. For pinning, `list-pin` and `list-unpin` also accept smart-list names or `--smart-list-id`; if a name matches both a regular list and a smart list, RemCTL fails before writing and asks for an explicit ID.
 
 Reminders list groups are containers for lists. Use `groups` to inspect them, or `lists --json` to get group rows with `children` plus child list rows with `group` metadata. `show <group>` reads across child lists. `group-create`, `group-edit`, and `group-delete` use private ReminderKit and require `--private`; they move list containers only, so reminders stay in their existing lists. Write commands that need a real list reject group targets before making changes and report the child lists you can target instead.
 
@@ -147,11 +152,15 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL uses the only non-empty matching section when there is exactly one. If the duplicate is still ambiguous, use `--section-id`.
 
+`section-create`, `section-rename`, and `section-delete` manage list sections through private ReminderKit and require `--private`. Create and rename refuse duplicate names in the target list. Delete prompts unless `--force` is passed and leaves reminder movement to Reminders' normal section-delete behavior.
+
+`edit --private -t/--tags` adds synced tags. `edit --private --set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the reminder's synced tag set, cannot be combined with `-t`, and cannot be combined with each other.
+
 `--assign USER` assigns a reminder to a person in a shared list and requires `--private`. `USER` can be a unique name, email or phone address, numeric sharee ID, object UUID, or `me`; use `remctl sharees LIST --json` to inspect exact candidates. Names are fine for humans when unique, but agents should prefer email/address or IDs to avoid collisions. `--unassign` clears the current assignment.
 
 `--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
 
-`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, tags, sections, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
+`--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
 Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts before creating or editing a reminder; rich subtask URLs follow the same rule. Non-private `--url` remains a notes fallback.
 
@@ -163,8 +172,10 @@ Private rich URLs require public `http` or `https` hosts. RemCTL rejects loopbac
 | Move to another list | `edit -l LIST` or `edit --list-id ID` | No | EventKit bridge first; if a pure move is rejected by a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback and returns a new numeric `id` plus `oldId` |
 | Recurrence and normal alarms | `edit --recurrence`, `edit --alarm` | No | EventKit bridge only; verify in `info --json` |
 | Notes URL fallback | `edit --url URL` | No | Appends the URL to notes, not a rich attachment |
-| Rich web URL attachment and real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
+| Rich web URL attachment and additive real tags | `edit --private --url URL -t tags` | Yes | Additive; does not remove or replace existing rich links |
+| Replace or remove synced tags | `edit --private --set-tags tags`, `--clear-tags`, `--remove-tag tag` | Yes | Rewrites the complete tag set through ReminderKit; mutually exclusive with additive `-t/--tags` |
 | Section assignment or creation | `edit --private --section`, `--section-id`, `--new-section` | Yes | If combined with `-l/--list`, section resolution uses the destination list |
+| Section create, rename, delete | `section-create`, `section-rename`, `section-delete` | Yes | Private ReminderKit list-section management; verify with `sections --json` or `show <list> --json` |
 | Shared-list assignment | `add/edit --private --assign USER`, `edit --private --unassign` | Yes | `USER` resolves against `remctl sharees LIST`; accepts unique name, email/phone, numeric sharee ID, object UUID, or `me`; agents should prefer address or ID |
 | Subtasks | `edit --private --subtask ...` | Yes | Additive; rich JSON subtasks can include public and private child metadata |
 | Image attachments | `edit --private --image PATH` | Yes | Additive; generic files/PDFs are rejected, and existing images are not removed/replaced |

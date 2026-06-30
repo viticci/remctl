@@ -53,6 +53,16 @@ PREFIX="$HOME/.local" ./install.sh --bootstrap
 
 Full setup details live in [docs/installation.md](docs/installation.md).
 
+## Uninstalling
+
+To remove RemCTL files installed by `install.sh`, run:
+
+```bash
+./uninstall.sh
+```
+
+The uninstaller checks `~/bin` and `~/.local/bin` by default, or the single target from `PREFIX` / `REMCTL_BIN_DIR`. It removes only known RemCTL files, removes `completions` only when empty, and supports `--dry-run` and `--keep-config`. It does not edit shell config or revoke macOS privacy permissions.
+
 ## Command Map
 
 | Task | Commands |
@@ -60,7 +70,7 @@ Full setup details live in [docs/installation.md](docs/installation.md).
 | See what is due | `today`, `upcoming`, `overdue` |
 | Browse reminders | `lists`, `groups`, `group-info`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `flagged`, `urgent`, `info`, `subtasks`, `sharees` |
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag` |
-| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
+| Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `section-create`, `section-rename`, `section-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
@@ -78,6 +88,9 @@ remctl add "Pay rent" -d "2026-06-01" --recurrence monthly
 remctl done 23880 --date "2026-05-27 09:30"
 remctl edit 23880 -d clear
 remctl edit 23880 -l Work
+remctl edit 23880 --private --set-tags remctl,work
+remctl section-create "Research" -l Projects --private
+remctl section-rename "Research" --new-name "Reading" -l Projects --private
 remctl add "Research" -l Projects --private --url "https://example.com" -t remctl --new-section "Research"
 remctl sharees Shopping --json
 remctl add "Pick up groceries" -l Shopping --private --assign Alex
@@ -353,7 +366,7 @@ For shared-list assignments, call `remctl sharees LIST --json` first. `--assign`
 
 Agents should pass deterministic due dates, using `YYYY-MM-DD` for all-day reminders and `YYYY-MM-DD HH:MM` for timed reminders after resolving the user's request in their timezone. If a due date is invalid, RemCTL exits before writing and emits a structured `invalid_due_date` JSON error on stderr with examples. Retry with a corrected date; do not create a reminder first and patch the due date afterward.
 
-List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, group membership/order edits, and smart-list list filters. Group commands target groups by name or `--group-id`; write commands that need a real list reject groups and name the child lists you can target. `list-create --private --group-id` is available when group names collide. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
+List names are resolved conservatively: exact match first, then case-insensitive match, then a normalized fallback that can handle decorative prefixes such as emoji. If more than one list matches, RemCTL fails before writing and asks for `--list-id`. Commands that target lists use the same rule: pass a name, or use `--list-id` for exact agent-safe targeting on `show`, `add`, `edit`, `link`, `export`, `section-create`, `section-rename`, `section-delete`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, group membership/order edits, and smart-list list filters. Group commands target groups by name or `--group-id`; write commands that need a real list reject groups and name the child lists you can target. `list-create --private --group-id` is available when group names collide. `list-pin` and `list-unpin` can also target smart lists by name or `--smart-list-id`.
 
 Do not mutate the Reminders SQLite database. Use RemCTL commands or EventKit.
 
@@ -394,6 +407,7 @@ remctl doctor
 | `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
 | `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |
 | `install.sh` | Copy-based installer and bootstrap script |
+| `uninstall.sh` | Removes installed RemCTL files and optional config |
 
 ## License
 

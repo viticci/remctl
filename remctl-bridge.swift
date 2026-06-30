@@ -10,6 +10,7 @@ struct Command: Decodable {
     let title: String?
     let newTitle: String?
     let list: String?
+    let listId: String?
     let due: String?
     let priority: Int?
     let notes: String?
@@ -206,18 +207,73 @@ func findReminder(_ store: EKEventStore, id: String) -> EKReminder {
     return item
 }
 
-func findList(_ store: EKEventStore, name: String) -> EKCalendar {
-    guard let cal = store.calendars(for: .reminder).first(where: { $0.title == name }) else {
-        fail("List not found: \(name)")
+func normalizedReminderKitListIdentifier(_ raw: String) -> String {
+    raw
+        .replacingOccurrences(of: "x-apple-reminderkit://REMCDList/", with: "", options: [.caseInsensitive])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func isICloudReminderSource(_ source: EKSource?) -> Bool {
+    guard let source = source else { return false }
+    return source.sourceType == .calDAV && source.title.localizedCaseInsensitiveContains("icloud")
+}
+
+func iCloudReminderCalendars(_ store: EKEventStore) -> [EKCalendar] {
+    store.calendars(for: .reminder).filter { isICloudReminderSource($0.source) }
+}
+
+func findList(_ store: EKEventStore, name: String? = nil, listId: String? = nil) -> EKCalendar {
+    let calendars = store.calendars(for: .reminder)
+    if let rawListId = listId, !rawListId.isEmpty {
+        let wanted = normalizedReminderKitListIdentifier(rawListId)
+        let matches = calendars.filter {
+            normalizedReminderKitListIdentifier($0.calendarIdentifier).caseInsensitiveCompare(wanted) == .orderedSame
+        }
+        if matches.count == 1 {
+            let cal = matches[0]
+            guard isICloudReminderSource(cal.source) else {
+                fail("List \(wanted) is not in iCloud Reminders; RemCTL only writes iCloud Reminders lists")
+            }
+            return cal
+        }
+        if matches.count > 1 {
+            fail("Multiple EventKit reminder lists match id \(wanted)")
+        }
+        if name == nil || name?.isEmpty == true {
+            fail("iCloud Reminders list not found for id: \(wanted)")
+        }
+        // EventKit and ReminderKit identifiers have diverged across macOS releases.
+        // If the stable DB id cannot be matched, fall back to the unique iCloud title below.
     }
-    return cal
+
+    guard let name = name, !name.isEmpty else {
+        fail("List name or listId is required")
+    }
+    let iCloudMatches = iCloudReminderCalendars(store).filter { $0.title == name }
+    if iCloudMatches.count == 1 { return iCloudMatches[0] }
+    if iCloudMatches.count > 1 {
+        fail("Multiple iCloud Reminders lists named \(name); pass --list-id")
+    }
+    if calendars.contains(where: { $0.title == name }) {
+        fail("List \(name) is not in iCloud Reminders; RemCTL does not write non-iCloud Reminders accounts")
+    }
+    fail("iCloud Reminders list not found: \(name)")
+}
+
+func defaultICloudReminderList(_ store: EKEventStore) -> EKCalendar {
+    if let cal = store.defaultCalendarForNewReminders(), isICloudReminderSource(cal.source) {
+        return cal
+    }
+    fail("Default Reminders list is not in iCloud; pass -l/--list for an iCloud Reminders list")
 }
 
 func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
     if let t = cmd.title { reminder.title = t }
 
     if let list = cmd.list {
-        reminder.calendar = findList(store, name: list)
+        reminder.calendar = findList(store, name: list, listId: cmd.listId)
+    } else if let listId = cmd.listId {
+        reminder.calendar = findList(store, listId: listId)
     }
 
     // due: present string → set date, JSON null → clear.
@@ -450,12 +506,15 @@ func fetchReminders(_ store: EKEventStore, predicate: NSPredicate) -> [EKReminde
 
 func eventKitCalendars(_ store: EKEventStore, listName: String?) -> [EKCalendar]? {
     guard let listName = listName, !listName.isEmpty else { return nil }
-    let matches = store.calendars(for: .reminder).filter { $0.title == listName }
+    let matches = iCloudReminderCalendars(store).filter { $0.title == listName }
     if matches.isEmpty {
-        fail("List not found: \(listName)")
+        if store.calendars(for: .reminder).contains(where: { $0.title == listName }) {
+            fail("List \(listName) is not in iCloud Reminders; EventKit fallback is iCloud-only")
+        }
+        fail("iCloud Reminders list not found: \(listName)")
     }
     if matches.count > 1 {
-        fail("Multiple reminder lists named \(listName); EventKit fallback cannot disambiguate them")
+        fail("Multiple iCloud Reminders lists named \(listName); EventKit fallback cannot disambiguate them")
     }
     return matches
 }
@@ -585,9 +644,11 @@ case "create":
     let reminder = EKReminder(eventStore: store)
     reminder.title = title
     if let list = cmd.list {
-        reminder.calendar = findList(store, name: list)
+        reminder.calendar = findList(store, name: list, listId: cmd.listId)
+    } else if let listId = cmd.listId {
+        reminder.calendar = findList(store, listId: listId)
     } else {
-        reminder.calendar = store.defaultCalendarForNewReminders()
+        reminder.calendar = defaultICloudReminderList(store)
     }
     applyFields(reminder, cmd, store: store)
     do {
@@ -680,9 +741,8 @@ case "create_list":
     let cal = EKCalendar(for: .reminder, eventStore: store)
     cal.title = title
     // Use the local/iCloud source for reminders
-    guard let source = store.sources.first(where: { $0.sourceType == .calDAV })
-            ?? store.sources.first(where: { $0.sourceType == .local }) else {
-        fail("No suitable calendar source found")
+    guard let source = store.sources.first(where: { isICloudReminderSource($0) }) else {
+        fail("No iCloud Reminders source found")
     }
     cal.source = source
     if let colorName = cmd.color, let cg = colorForName(colorName) {
@@ -698,7 +758,7 @@ case "create_list":
 case "rename_list":
     guard let title = cmd.title else { fail("title is required for rename_list") }
     guard let newTitle = cmd.newTitle else { fail("newTitle is required for rename_list") }
-    let cal = findList(store, name: title)
+    let cal = findList(store, name: title, listId: cmd.listId)
     cal.title = newTitle
     do {
         try store.saveCalendar(cal, commit: true)
@@ -709,7 +769,7 @@ case "rename_list":
 
 case "delete_list":
     guard let title = cmd.title else { fail("title is required for delete_list") }
-    let cal = findList(store, name: title)
+    let cal = findList(store, name: title, listId: cmd.listId)
     do {
         try store.removeCalendar(cal, commit: true)
         output(["status": "deleted", "title": title])
