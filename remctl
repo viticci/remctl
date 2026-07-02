@@ -11125,8 +11125,8 @@ def main():
     c = sub.add_parser("flag", help="Flag a reminder"); c.add_argument("id", type=int); js(c)
     c = sub.add_parser("unflag", help="Unflag a reminder"); c.add_argument("id", type=int); js(c)
 
-    c = sub.add_parser("upcoming", help="Show reminders due in next N days (default 7)")
-    c.add_argument("days", type=int, nargs="?", default=7, help="Number of days to look ahead")
+    c = sub.add_parser("upcoming", help="Show reminders due from today through N more days (default 7)")
+    c.add_argument("days", type=int, nargs="?", default=7, help="Days to look ahead beyond today; the window always starts today (1 = today and tomorrow, 7 = today plus the next week)")
     eventkit_read(c); vb(c); js(c); display_format(c)
 
     c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c); display_format(c)
