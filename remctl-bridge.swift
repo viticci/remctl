@@ -100,7 +100,8 @@ func parseISO(_ s: String) -> Date? {
     if let d = isoDateOnly.date(from: s) {
         // Convert from UTC midnight to local midnight
         let cal = Calendar.current
-        let comps = cal.dateComponents(in: TimeZone(identifier: "UTC")!, from: d)
+        let utc = TimeZone(identifier: "UTC") ?? TimeZone(secondsFromGMT: 0)!
+        let comps = cal.dateComponents(in: utc, from: d)
         var local = DateComponents()
         local.year = comps.year; local.month = comps.month; local.day = comps.day
         local.hour = 0; local.minute = 0; local.second = 0
@@ -154,7 +155,9 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
     if let days = spec.daysOfWeek {
         // Input: 1=Sun, 2=Mon ... 7=Sat → EKWeekday raw values match
         guard !days.isEmpty, days.allSatisfy({ 1...7 ~= $0 }) else { return nil }
-        daysOfWeek = days.map { EKRecurrenceDayOfWeek(EKWeekday(rawValue: $0)!) }
+        let mapped = days.compactMap { EKWeekday(rawValue: $0).map { EKRecurrenceDayOfWeek($0) } }
+        guard mapped.count == days.count else { return nil }
+        daysOfWeek = mapped
     }
 
     var daysOfMonth: [NSNumber]?
@@ -361,6 +364,7 @@ func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
             : EKAlarmProximity.enter
         alarm.proximity = proximityValue
         var alarms = reminder.alarms ?? []
+        alarms.removeAll { $0.structuredLocation != nil || $0.proximity != .none }
         alarms.append(alarm)
         reminder.alarms = alarms
     }
@@ -378,7 +382,9 @@ func requestAccess(_ store: EKEventStore) {
         accessError = e
         sem.signal()
     }
-    sem.wait()
+    if sem.wait(timeout: .now() + 30) == .timedOut {
+        fail("Timed out waiting for Reminders authorization")
+    }
 
     if let e = accessError { fail("EventKit access error: \(e.localizedDescription)") }
     if !granted { fail("Reminders access not granted") }
@@ -504,19 +510,25 @@ func fetchReminders(_ store: EKEventStore, predicate: NSPredicate) -> [EKReminde
     return result
 }
 
-func eventKitCalendars(_ store: EKEventStore, listName: String?) -> [EKCalendar]? {
-    guard let listName = listName, !listName.isEmpty else { return nil }
-    let matches = iCloudReminderCalendars(store).filter { $0.title == listName }
-    if matches.isEmpty {
-        if store.calendars(for: .reminder).contains(where: { $0.title == listName }) {
-            fail("List \(listName) is not in iCloud Reminders; EventKit fallback is iCloud-only")
+func eventKitCalendars(_ store: EKEventStore, listName: String?) -> [EKCalendar] {
+    if let listName = listName, !listName.isEmpty {
+        let matches = iCloudReminderCalendars(store).filter { $0.title == listName }
+        if matches.isEmpty {
+            if store.calendars(for: .reminder).contains(where: { $0.title == listName }) {
+                fail("List \(listName) is not in iCloud Reminders; EventKit fallback is iCloud-only")
+            }
+            fail("iCloud Reminders list not found: \(listName)")
         }
-        fail("iCloud Reminders list not found: \(listName)")
+        if matches.count > 1 {
+            fail("Multiple iCloud Reminders lists named \(listName); EventKit fallback cannot disambiguate them")
+        }
+        return matches
     }
-    if matches.count > 1 {
-        fail("Multiple iCloud Reminders lists named \(listName); EventKit fallback cannot disambiguate them")
+    let calendars = iCloudReminderCalendars(store)
+    if calendars.isEmpty {
+        fail("No iCloud Reminders source found")
     }
-    return matches
+    return calendars
 }
 
 func containsQuery(_ reminder: EKReminder, _ query: String) -> Bool {
@@ -538,7 +550,9 @@ func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
     let now = Date()
     let calendar = Calendar.current
     let startOfToday = calendar.startOfDay(for: now)
-    let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday)!
+    guard let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday) else {
+        fail("Invalid date range")
+    }
     var reminders: [EKReminder]
 
     switch mode {

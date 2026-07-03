@@ -15,6 +15,7 @@ struct AfterCommand {
 enum PermissionStatus {
     case checking
     case verified
+    case helperStoreReadable
     case needsAccess
 }
 
@@ -217,7 +218,7 @@ func verifyPermissionTarget(_ target: PermissionTarget) -> PermissionStatus {
     if isPythonExecutable(target.path) {
         return pythonTargetCanReadRemindersStore(target.path) ? .verified : .needsAccess
     }
-    return remindersStoreReadable() ? .verified : .needsAccess
+    return remindersStoreReadable() ? .helperStoreReadable : .needsAccess
 }
 
 final class ActionButton: NSButton {
@@ -357,6 +358,9 @@ final class TargetRowView: NSView, NSDraggingSource {
             statusField.textColor = .secondaryLabelColor
         case .verified:
             statusField.stringValue = "✓ Access verified"
+            statusField.textColor = .systemGreen
+        case .helperStoreReadable:
+            statusField.stringValue = "Store readable (helper check — cannot verify \(target.title) directly)"
             statusField.textColor = .systemGreen
         case .needsAccess:
             statusField.stringValue = "Needs access"
@@ -541,11 +545,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.refreshInProgress = false
                 if logResult {
-                    let verified = statuses.filter {
-                        if case .verified = $0 { return true }
-                        return false
+                    let accessible = statuses.filter {
+                        switch $0 {
+                        case .verified, .helperStoreReadable: return true
+                        default: return false
+                        }
                     }.count
-                    self.log("Verified \(verified) of \(statuses.count) Full Disk Access targets.")
+                    self.log("Accessible \(accessible) of \(statuses.count) Full Disk Access targets.")
                 }
             }
         }
