@@ -45,6 +45,8 @@ except ImportError:
     _cal = None
 
 VERSION = "1.3.0"
+PRIVATE_PROTOCOL_VERSION = 1
+_private_protocol_probe = None
 
 APPLE_EPOCH = 978307200
 STORE_DIR = resolve_store_dir()
@@ -3575,6 +3577,31 @@ def private_create_group_call(request, name, attempts=3):
     return last_result
 
 
+def _probe_private_protocol_version():
+    global _private_protocol_probe
+    if _private_protocol_probe is not None:
+        return _private_protocol_probe
+    result = private_call_result({"action": "protocol_version"}, timeout=5)
+    payload = result.get("payload") if isinstance(result, dict) else None
+    if not isinstance(payload, dict):
+        _private_protocol_probe = {"ok": False, "reason": "broken"}
+        return _private_protocol_probe
+    version = payload.get("protocolVersion")
+    if payload.get("status") == "ok" and isinstance(version, int):
+        _private_protocol_probe = {"ok": True, "version": version}
+        return _private_protocol_probe
+    message = payload.get("message", "")
+    if payload.get("status") == "error" and "Unknown action" in message:
+        _private_protocol_probe = {"ok": False, "reason": "outdated", "version": 0}
+        return _private_protocol_probe
+    _private_protocol_probe = {
+        "ok": False,
+        "reason": "broken",
+        "message": message or "private helper protocol check failed",
+    }
+    return _private_protocol_probe
+
+
 def require_private_metadata(a=None):
     if not private_metadata_enabled(a):
         print(
@@ -3588,6 +3615,22 @@ def require_private_metadata(a=None):
             file=sys.stderr,
         )
         sys.exit(1)
+    probe = _probe_private_protocol_version()
+    if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
+        return
+    if probe.get("reason") == "outdated":
+        version = probe.get("version", 0)
+        print(
+            f"Error: remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    message = probe.get("message")
+    if message:
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    print("Error: remctl-private protocol check failed.", file=sys.stderr)
+    sys.exit(1)
 
 
 def split_csv(value):
@@ -4811,10 +4854,22 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
         }, partial_context=partial_context))
 
     if getattr(a, "new_section", None):
+        if db is None:
+            db = open_db()
+        if list_pk is None:
+            reminder_row = q_reminder_by_identifier(db, reminder_ckid)
+            if reminder_row is not None:
+                list_pk = reminder_row["ZLIST"]
+        existing_section_ids = []
+        if list_pk is not None:
+            existing_section_ids = [
+                row["ZCKIDENTIFIER"] for row in q_sections(db, list_pk) if row["ZCKIDENTIFIER"]
+            ]
         results.append(private_action({
             "action": "add_section_and_assign",
             "id": reminder_ckid,
             "name": a.new_section,
+            "existingSectionIds": existing_section_ids,
         }, partial_context=partial_context))
 
     subtasks = parse_subtask_specs(getattr(a, "subtask", None))
@@ -6507,11 +6562,11 @@ def smart_list_filter_payload_from_args(a, db):
             "proximity": getattr(a, "proximity", "enter"),
         }
     return build_supported_filter_payload(
-        match=getattr(a, "match", "all"),
+        match=getattr(a, "match", None) or "all",
         flagged=bool(getattr(a, "flagged", False)),
         priorities=_smart_list_csv_values(getattr(a, "priority", None)),
         tags=_smart_list_csv_values(getattr(a, "tags", None)),
-        tag_match=getattr(a, "tag_match", "any"),
+        tag_match=getattr(a, "tag_match", None) or "any",
         any_tag=bool(getattr(a, "any_tag", False)),
         untagged=bool(getattr(a, "untagged", False)),
         date_any=getattr(a, "date", None) == "any",
@@ -6642,8 +6697,21 @@ def cmd_smart_list_edit(a):
         for row in matches:
             print(f"  {row['Z_PK']}: {smart_list_display_name(row)}", file=sys.stderr)
         sys.exit(1)
-    has_filter_changes = smart_list_filter_changes_from_args(a)
+    has_non_match_filter_changes = smart_list_filter_changes_from_args(a)
+    has_match_flag_changes = (
+        getattr(a, "match", None) is not None
+        or getattr(a, "tag_match", None) is not None
+        or getattr(a, "list_match", None) is not None
+    )
+    has_filter_changes = has_non_match_filter_changes or has_match_flag_changes
     has_appearance_changes = list_appearance_changes_from_args(a)
+    if has_match_flag_changes and not has_non_match_filter_changes:
+        print(
+            "Error: --match, --tag-match, and --list-match modify how other filter options combine; "
+            "pass at least one filter option (for example --tags, --priority, or --date) with them.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if not has_filter_changes and not has_appearance_changes:
         print("Error: pass at least one smart-list filter or appearance option.", file=sys.stderr)
         sys.exit(1)
@@ -9477,13 +9545,13 @@ def cmd_import(a):
     else:
         print(f"\nImported {created}/{len(data)} reminders ({errors} errors)")
 
-def add_smart_list_filter_arguments(parser):
-    parser.add_argument("--match", choices=["all", "any"], default="all", help="Match all or any supplied filters")
+def add_smart_list_filter_arguments(parser, *, match_default="all", tag_match_default="any"):
+    parser.add_argument("--match", choices=["all", "any"], default=match_default, help="Match all or any supplied filters")
     parser.add_argument("--filter-json", help="Advanced: raw official smart-list filter JSON or @path")
     parser.add_argument("--flagged", action="store_true", help="Filter to flagged reminders")
     parser.add_argument("--priority", help="Priority filter: high, medium, low, or comma-separated values")
     parser.add_argument("--tags", help="Selected tag filter, comma-separated; # prefix optional")
-    parser.add_argument("--tag-match", choices=["all", "any"], default="any", help="Selected tag matching mode")
+    parser.add_argument("--tag-match", choices=["all", "any"], default=tag_match_default, help="Selected tag matching mode")
     parser.add_argument("--any-tag", action="store_true", help="Filter to reminders with any tag")
     parser.add_argument("--untagged", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--date", choices=["any", "today"], help="Date filter")
@@ -10785,11 +10853,26 @@ def gather_doctor_checks():
 
     private_path = current_private_path()
     private_ok = private_path.exists() and os.access(private_path, os.X_OK)
+    private_detail = str(private_path)
+    private_fix = None
+    if private_ok:
+        probe = _probe_private_protocol_version()
+        if probe.get("ok"):
+            private_detail = f"{private_path} (protocol {probe['version']})"
+        elif probe.get("reason") == "outdated":
+            private_ok = False
+            version = probe.get("version", 0)
+            private_detail = f"{private_path} (protocol {version} < required {PRIVATE_PROTOCOL_VERSION})"
+            private_fix = "Re-run ./install.sh to rebuild remctl-private."
+        elif probe.get("message"):
+            private_detail = f"{private_path} ({probe['message']})"
+    else:
+        private_fix = "Run ./install.sh to compile remctl-private, or avoid --private writes."
     add(
         "private_helper",
         "ok" if private_ok else "warn",
-        str(private_path),
-        None if private_ok else "Run ./install.sh to compile remctl-private, or avoid --private writes.",
+        private_detail,
+        private_fix,
     )
 
     permissions_path = current_permissions_path()
@@ -11480,7 +11563,7 @@ def main():
     c.add_argument("--color", help="Smart-list color name or #RRGGBB")
     c.add_argument("--symbol", help="Official Reminders list symbol name; run list-symbols")
     c.add_argument("--emoji", help="Private Reminders list emoji badge")
-    add_smart_list_filter_arguments(c)
+    add_smart_list_filter_arguments(c, match_default=None, tag_match_default=None)
     js(c)
 
     c = sub.add_parser(

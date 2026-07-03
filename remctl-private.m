@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 1
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -730,6 +731,10 @@ int main(int argc, const char * argv[]) {
         NSDictionary *cmd = (NSDictionary *)json;
         @try {
         NSString *action = cmd[@"action"];
+        if ([action isEqualToString:@"protocol_version"]) {
+            output(@{@"status": @"ok", @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION)});
+            return 0;
+        }
         NSSet<NSString *> *allowedActions = [NSSet setWithArray:@[
             @"add_private_metadata",
             @"add_url_attachments",
@@ -1667,6 +1672,7 @@ int main(int argc, const char * argv[]) {
             @"status": @"updated",
             @"id": reminderID,
             @"action": action ?: @"",
+            @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION),
         }];
 
         if ([action isEqualToString:@"add_private_metadata"]) {
@@ -1754,7 +1760,9 @@ int main(int argc, const char * argv[]) {
             id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
             id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
             [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
-            [sectionContext setUnsavedSectionIDsOrdering:@[sectionObjectID]];
+            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"])];
+            [ordering addObject:sectionObjectID];
+            [sectionContext setUnsavedSectionIDsOrdering:ordering];
             [sectionContext setShouldUpdateSectionsOrdering:YES];
             details[@"sectionURL"] = [[sectionObjectID urlRepresentation] absoluteString] ?: @"";
         } else if ([action isEqualToString:@"assign_sharee"]) {

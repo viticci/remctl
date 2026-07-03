@@ -23,6 +23,16 @@ class CliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.remctl = load_module("remctl_cli_test", "remctl")
+        cls._default_protocol_probe = mock.patch.object(
+            cls.remctl,
+            "_probe_private_protocol_version",
+            return_value={"ok": True, "version": 1},
+        )
+        cls._default_protocol_probe.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._default_protocol_probe.stop()
 
     @staticmethod
     def _bridge_result(payload, returncode=0):
@@ -6947,6 +6957,285 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["status"], "created")
         self.assertEqual(payload["name"], "Research")
+
+    def test_apply_private_changes_new_section_includes_existing_section_order(self):
+        db = self._list_db(["Projects"])
+        self._insert_section(db, 10, "Inbox", "SECTION-1")
+        self._insert_section(db, 11, "Active", "SECTION-2")
+        args = self._private_edit_args(new_section="Research")
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+            ):
+                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+        finally:
+            db.close()
+
+        private_action.assert_called_once_with({
+            "action": "add_section_and_assign",
+            "id": "REM-1",
+            "name": "Research",
+            "existingSectionIds": ["SECTION-1", "SECTION-2"],
+        }, partial_context=None)
+
+    def test_apply_private_changes_new_section_passes_empty_existing_section_ids(self):
+        db = self._list_db(["Projects"])
+        args = self._private_edit_args(new_section="Research")
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+            ):
+                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+        finally:
+            db.close()
+
+        private_action.assert_called_once_with({
+            "action": "add_section_and_assign",
+            "id": "REM-1",
+            "name": "Research",
+            "existingSectionIds": [],
+        }, partial_context=None)
+
+    def test_require_private_metadata_accepts_protocol_version_one(self):
+        self._default_protocol_probe.stop()
+        self.remctl._private_protocol_probe = None
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_metadata_enabled", return_value=True),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call_result",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": json.dumps({"status": "ok", "protocolVersion": 1}),
+                        "stderr": "",
+                        "payload": {"status": "ok", "protocolVersion": 1},
+                    },
+                ) as private_call_result,
+            ):
+                self.remctl.require_private_metadata(SimpleNamespace(private=True))
+        finally:
+            self.remctl._private_protocol_probe = None
+            self._default_protocol_probe.start()
+
+        private_call_result.assert_called_once_with({"action": "protocol_version"}, timeout=5)
+
+    def test_require_private_metadata_rejects_outdated_helper_unknown_action(self):
+        self._default_protocol_probe.stop()
+        self.remctl._private_protocol_probe = None
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_metadata_enabled", return_value=True),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call_result",
+                    return_value={
+                        "returncode": 1,
+                        "stdout": json.dumps({"status": "error", "message": "Unknown action"}),
+                        "stderr": "",
+                        "payload": {"status": "error", "message": "Unknown action"},
+                    },
+                ),
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.remctl.require_private_metadata(SimpleNamespace(private=True))
+        finally:
+            self.remctl._private_protocol_probe = None
+            self._default_protocol_probe.start()
+
+        self.assertIn("remctl-private is outdated", stderr.getvalue())
+        self.assertIn("protocol 0 < required 1", stderr.getvalue())
+
+    def test_require_private_metadata_memoizes_protocol_probe(self):
+        self._default_protocol_probe.stop()
+        self.remctl._private_protocol_probe = None
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_metadata_enabled", return_value=True),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call_result",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": json.dumps({"status": "ok", "protocolVersion": 1}),
+                        "stderr": "",
+                        "payload": {"status": "ok", "protocolVersion": 1},
+                    },
+                ) as private_call_result,
+            ):
+                self.remctl.require_private_metadata(SimpleNamespace(private=True))
+                self.remctl.require_private_metadata(SimpleNamespace(private=True))
+        finally:
+            self.remctl._private_protocol_probe = None
+            self._default_protocol_probe.start()
+
+        private_call_result.assert_called_once_with({"action": "protocol_version"}, timeout=5)
+
+    def test_smart_list_edit_match_with_tags_updates_filter_payload(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="High Priority",
+            smart_list_id=None,
+            private=True,
+            match="any",
+            flagged=False,
+            priority=None,
+            tags="work,home",
+            tag_match="any",
+            any_tag=False,
+            untagged=False,
+            date=None,
+            date_today_include_past_due=False,
+            date_on=None,
+            date_before=None,
+            date_after=None,
+            date_range=None,
+            date_relative=None,
+            time=None,
+            include_list=None,
+            exclude_list=None,
+            include_list_id=None,
+            exclude_list_id=None,
+            list_match=None,
+            vehicle=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100.0,
+            proximity="enter",
+            filter_json=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    return_value={"status": "updated", "id": "CUSTOM-1"},
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_smart_list_edit(args)
+        finally:
+            db.close()
+
+        payload = private_call.call_args.args[0]
+        decoded = json.loads(base64.b64decode(payload["filterData"]).decode("utf-8"))
+        self.assertEqual(decoded["operation"], "or")
+        self.assertEqual(
+            decoded["hashtags"],
+            {"hashtags": {"operation": "or", "include": ["work", "home"], "exclude": []}},
+        )
+
+    def test_smart_list_edit_match_only_reports_clear_error(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="High Priority",
+            smart_list_id=None,
+            private=True,
+            match="any",
+            flagged=False,
+            priority=None,
+            tags=None,
+            tag_match=None,
+            any_tag=False,
+            untagged=False,
+            date=None,
+            date_today_include_past_due=False,
+            date_on=None,
+            date_before=None,
+            date_after=None,
+            date_range=None,
+            date_relative=None,
+            time=None,
+            include_list=None,
+            exclude_list=None,
+            include_list_id=None,
+            exclude_list_id=None,
+            list_match=None,
+            vehicle=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100.0,
+            proximity="enter",
+            filter_json=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.remctl.cmd_smart_list_edit(args)
+        finally:
+            db.close()
+
+        private_call.assert_not_called()
+        self.assertIn("--match", stderr.getvalue())
+        self.assertIn("filter option", stderr.getvalue())
+
+    def test_smart_list_create_without_match_flags_builds_unchanged_payload(self):
+        db = self._smart_list_db()
+        args = SimpleNamespace(
+            name="Flagged Review",
+            private=True,
+            flagged=True,
+            priority=None,
+            tags=None,
+            tag_match="any",
+            any_tag=False,
+            untagged=False,
+            date=None,
+            date_today_include_past_due=False,
+            date_on=None,
+            date_before=None,
+            date_after=None,
+            date_range=None,
+            date_relative=None,
+            time=None,
+            include_list=None,
+            exclude_list=None,
+            include_list_id=None,
+            exclude_list_id=None,
+            list_match=None,
+            vehicle=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100.0,
+            proximity="enter",
+            filter_json=None,
+            json=True,
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(
+                    self.remctl,
+                    "private_call",
+                    return_value={"status": "created", "id": "SMART-1"},
+                ) as private_call,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.remctl.cmd_smart_list_create(args)
+        finally:
+            db.close()
+
+        payload = private_call.call_args.args[0]
+        self.assertEqual(payload["filterData"], "eyJmbGFnZ2VkIjp0cnVlfQ==")
 
     def test_section_create_refuses_duplicate_name_before_private_call(self):
         db = self._list_db(["Projects"])
