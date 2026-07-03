@@ -3028,6 +3028,7 @@ class CliTests(unittest.TestCase):
             args,
             db=fake_db,
             list_pk=7,
+            partial_context=mock.ANY,
         )
         self.assertEqual(json.loads(stdout.getvalue())["private"][0]["status"], "updated")
 
@@ -4090,6 +4091,128 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_add(args)
         bridge_call.assert_not_called()
         self.assertIn("public http or https", stderr.getvalue())
+
+    def _cmd_add_private_args(self, **overrides):
+        args = {
+            "title": "Research",
+            "list": "Projects",
+            "list_id": None,
+            "notes": None,
+            "due": None,
+            "priority": None,
+            "flag": False,
+            "tags": "remctl",
+            "url": None,
+            "recurrence": None,
+            "alarm": None,
+            "private": True,
+            "private_metadata": False,
+            "grocery": False,
+            "section": None,
+            "section_id": None,
+            "new_section": None,
+            "subtask": None,
+            "image": None,
+            "flagged": None,
+            "urgent": None,
+            "early_reminder": None,
+            "location_title": None,
+            "latitude": None,
+            "longitude": None,
+            "radius": 100,
+            "proximity": "arriving",
+            "address": None,
+            "assign": None,
+            "unassign": False,
+            "set_tags": None,
+            "clear_tags": False,
+            "remove_tag": None,
+            "json": True,
+        }
+        args.update(overrides)
+        return SimpleNamespace(**args)
+
+    def test_cmd_add_private_partial_failure_json_reports_created_id(self):
+        fake_row = {"Z_PK": 23880, "ZCKIDENTIFIER": "ABC-123", "list_name": "Projects"}
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 7, "title": "Projects", "requested": "Projects", "method": "exact"},
+            ),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "ABC-123"}),
+            ) as bridge_call_result,
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=fake_row),
+            mock.patch.object(
+                self.remctl,
+                "private_call",
+                return_value={"status": "error", "message": "private helper blew up"},
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(self._cmd_add_private_args())
+
+        bridge_call_result.assert_called_once()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual(payload["id"], "ABC-123")
+        self.assertEqual(payload["numericId"], 23880)
+        self.assertEqual(payload["failed"], "add_private_metadata")
+        self.assertEqual(payload["error"], "private helper blew up")
+
+    def test_cmd_add_private_partial_failure_text_warns_against_duplicate_add(self):
+        fake_row = {"Z_PK": 23880, "ZCKIDENTIFIER": "ABC-123", "list_name": "Projects"}
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(
+                self.remctl,
+                "resolve_list_or_die",
+                return_value={"id": 7, "title": "Projects", "requested": "Projects", "method": "exact"},
+            ),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "created", "id": "ABC-123"}),
+            ),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=fake_row),
+            mock.patch.object(
+                self.remctl,
+                "private_call",
+                return_value={"status": "error", "message": "private helper blew up"},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(self._cmd_add_private_args(json=False))
+
+        message = stderr.getvalue()
+        self.assertIn("#23880", message)
+        self.assertIn("Do NOT re-run add", message)
+        self.assertIn("add_private_metadata", message)
+
+    def test_cmd_add_private_unsafe_url_skips_bridge_call_result(self):
+        with (
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(self._cmd_add_private_args(url="http://127.0.0.1:631/"))
+
+        bridge_call_result.assert_not_called()
 
     def test_resolve_setup_shell_auto_skips_unsupported_shells(self):
         with mock.patch.dict("os.environ", {"SHELL": "/bin/tcsh"}, clear=False):
@@ -5542,6 +5665,166 @@ class CliTests(unittest.TestCase):
         self.assertEqual(real_payload["due"], "2026-06-21T00:00:00")
         self.assertTrue(real_payload["allDay"])
 
+    def _cmd_edit_private_args(self, **overrides):
+        args = {
+            "id": 1,
+            "json": True,
+            "title": None,
+            "notes": None,
+            "priority": None,
+            "due": None,
+            "url": None,
+            "recurrence": None,
+            "alarm": None,
+            "private": True,
+            "private_metadata": False,
+            "tags": "remctl",
+            "grocery": False,
+            "section": None,
+            "section_id": None,
+            "new_section": None,
+            "subtask": None,
+            "image": None,
+            "flagged": None,
+            "urgent": None,
+            "early_reminder": None,
+            "location_title": None,
+            "latitude": None,
+            "longitude": None,
+            "radius": 100,
+            "proximity": "arriving",
+            "address": None,
+            "assign": None,
+            "unassign": False,
+            "list": None,
+            "list_id": None,
+            "set_tags": None,
+            "clear_tags": False,
+            "remove_tag": None,
+        }
+        args.update(overrides)
+        return SimpleNamespace(**args)
+
+    def _cmd_edit_reminder_row(self, *, due_ts, ckid="DEAD-BEEF-0000-0000-0000-000000000000", pk=1, list_pk=7, list_name="Emails"):
+        db = self._due_window_db()
+        try:
+            db.execute("DELETE FROM ZREMCDBASELIST")
+            db.execute("INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME) VALUES (?, ?)", (list_pk, list_name))
+            db.execute(
+                "INSERT INTO ZREMCDREMINDER "
+                "(Z_PK, ZTITLE, ZNOTES, ZCOMPLETED, ZFLAGGED, ZPRIORITY, "
+                "ZISURGENTSTATEENABLEDFORCURRENTUSER, ZDUEDATEDELTAALERTSDATA, "
+                "ZDUEDATE, ZDISPLAYDATEDATE, ZALLDAY, ZCOMPLETIONDATE, ZCREATIONDATE, "
+                "ZPARENTREMINDER, ZLIST, ZICSURL, ZCKIDENTIFIER, ZACCOUNT, ZMARKEDFORDELETION) "
+                "VALUES (?, 'test', NULL, 0, 0, 0, 0, NULL, ?, ?, 0, NULL, NULL, NULL, ?, NULL, ?, 1, 0)",
+                (pk, due_ts, due_ts, list_pk, ckid),
+            )
+            row = self.remctl.q_reminder(db, pk)
+        finally:
+            db.close()
+        self.assertIsInstance(row, sqlite3.Row)
+        self.assertFalse(hasattr(row, "get"))
+        return row
+
+    def test_cmd_edit_rolls_back_nudged_due_when_bridge_only_edit_fails(self):
+        from datetime import datetime
+
+        target = datetime(2026, 4, 20, 9, 0, 0)
+        due_ts = target.timestamp() - 978307200
+        reminder = self._cmd_edit_reminder_row(due_ts=due_ts)
+        bridge_responses = [
+            self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            self._bridge_result({"status": "error", "message": "Save failed"}, returncode=1),
+            self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+        ]
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result", side_effect=bridge_responses,
+            ) as bridge_call_result,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_edit(self._cmd_edit_private_args(due="2026-04-20 09:00"))
+
+        self.assertEqual(bridge_call_result.call_count, 3)
+        nudge_payload, main_payload, rollback_payload = (
+            bridge_call_result.call_args_list[i].args[0] for i in range(3)
+        )
+        self.assertEqual(nudge_payload["due"], "2026-04-20T10:00:00")
+        self.assertEqual(main_payload["due"], "2026-04-20T09:00:00")
+        self.assertEqual(rollback_payload["due"], "2026-04-20T09:00:00")
+
+    def test_cmd_edit_nudge_rollback_failure_warns_about_wrong_due_date(self):
+        from datetime import datetime
+
+        target = datetime(2026, 4, 20, 9, 0, 0)
+        due_ts = target.timestamp() - 978307200
+        reminder = self._cmd_edit_reminder_row(due_ts=due_ts)
+        bridge_responses = [
+            self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            self._bridge_result({"status": "error", "message": "Save failed"}, returncode=1),
+            self._bridge_result({"status": "error", "message": "Rollback failed"}, returncode=1),
+        ]
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result", side_effect=bridge_responses,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_edit(self._cmd_edit_private_args(due="2026-04-20 09:00"))
+
+        warning = stderr.getvalue()
+        self.assertIn("due date may be wrong", warning)
+        self.assertIn(reminder["ZCKIDENTIFIER"], warning)
+
+    def test_cmd_edit_nudge_failure_warns_and_still_attempts_main_update(self):
+        from datetime import datetime
+
+        target = datetime(2026, 4, 20, 9, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["ZDUEDATE"] = target.timestamp() - 978307200
+        bridge_responses = [
+            self._bridge_result({"status": "timeout", "message": "timed out"}, returncode=-1),
+            self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+        ]
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result", side_effect=bridge_responses,
+            ) as bridge_call_result,
+            mock.patch.object(
+                self.remctl,
+                "apply_private_changes",
+                return_value=[{"status": "updated", "action": "add_private_metadata"}],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.remctl.cmd_edit(self._cmd_edit_private_args(due="2026-04-20 09:00"))
+
+        self.assertEqual(bridge_call_result.call_count, 2)
+        nudge_payload, main_payload = (
+            bridge_call_result.call_args_list[0].args[0],
+            bridge_call_result.call_args_list[1].args[0],
+        )
+        self.assertEqual(nudge_payload["due"], "2026-04-20T10:00:00")
+        self.assertEqual(main_payload["due"], "2026-04-20T09:00:00")
+        self.assertIn("due-date sync workaround", stderr.getvalue())
+
     def test_cmd_edit_rejects_unparseable_due(self):
         """An unparseable due-date string must exit non-zero rather than
         silently dropping the field and letting the rest of the update proceed."""
@@ -6521,7 +6804,7 @@ class CliTests(unittest.TestCase):
             "action": "set_tags",
             "id": "REM-1",
             "tags": ["work", "home"],
-        })
+        }, partial_context=None)
 
     def test_apply_private_changes_clears_synced_tags(self):
         args = self._private_edit_args(clear_tags=True)
@@ -6535,7 +6818,7 @@ class CliTests(unittest.TestCase):
             "action": "set_tags",
             "id": "REM-1",
             "tags": [],
-        })
+        }, partial_context=None)
 
     def test_apply_private_changes_removes_selected_synced_tags(self):
         args = self._private_edit_args(remove_tag=["#work", "archive"])
@@ -6556,7 +6839,7 @@ class CliTests(unittest.TestCase):
             "action": "set_tags",
             "id": "REM-1",
             "tags": ["Home"],
-        })
+        }, partial_context=None)
 
     def test_q_hashtags_excludes_soft_deleted_tag_links(self):
         conn = sqlite3.connect(":memory:")
@@ -6609,7 +6892,7 @@ class CliTests(unittest.TestCase):
             "action": "set_tags",
             "id": "REM-1",
             "tags": ["Home"],
-        })
+        }, partial_context=None)
 
     def test_tag_replacement_rejects_additive_tags(self):
         args = self._private_edit_args(tags="new", set_tags="work")

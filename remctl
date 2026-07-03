@@ -3159,6 +3159,36 @@ def fail_bridge_write(result, *, operation):
     sys.exit(1)
 
 
+NUDGE_PREP_WARNING = (
+    "Warning: could not prepare the due-date sync workaround; "
+    "the change may not push to iCloud immediately"
+)
+
+
+def rollback_nudged_due(reminder_ckid, original_dt, due_all_day):
+    if not reminder_ckid or original_dt is None:
+        return None
+    data = {"action": "update", "id": reminder_ckid, "due": original_dt.isoformat()}
+    if due_all_day:
+        data["allDay"] = True
+    result = bridge_call_result(data)
+    if bridge_result_ok(result, "updated"):
+        return None
+    offset = "1 day" if due_all_day else "1 hour"
+    return (
+        f"Warning: reminder due date may be wrong by {offset} "
+        f"(reminder id {reminder_ckid}); check it in Reminders."
+    )
+
+
+def warn_if_nudged_due_stranded(reminder, nudge_succeeded, original_dt, due_all_day):
+    if not nudge_succeeded:
+        return
+    warning = rollback_nudged_due(reminder["ZCKIDENTIFIER"], original_dt, due_all_day)
+    if warning:
+        print(warning, file=sys.stderr)
+
+
 EVENTKIT_READ_ID_WARNING = (
     "eventKitId is not a RemCTL numeric id and cannot be passed to info, edit, "
     "done, delete, link, open, subtasks, or any other numeric-id command."
@@ -4039,18 +4069,52 @@ IDEMPOTENT_PRIVATE_ACTIONS = {
 }
 
 
-def private_action(data):
+def fail_private_add_partial(partial_context, failed_action, error_message):
+    if partial_context.get("json"):
+        payload = {
+            "status": "partial",
+            "id": partial_context.get("id", ""),
+            "failed": failed_action,
+            "error": error_message,
+        }
+        numeric_id = partial_context.get("numericId")
+        if numeric_id is not None:
+            payload["numericId"] = numeric_id
+        completed = partial_context.get("completed")
+        if completed:
+            payload["completed"] = completed
+        print(json.dumps(payload))
+    else:
+        numeric_id = partial_context.get("numericId")
+        if numeric_id is not None:
+            ident = f"#{numeric_id}"
+        else:
+            ident = partial_context.get("id") or "(unknown)"
+        print(
+            f"Created reminder {ident} but failed to apply {failed_action}; "
+            "re-run edit to finish. Do NOT re-run add (would duplicate).",
+            file=sys.stderr,
+        )
+        print(f"Error: {error_message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def private_action(data, partial_context=None):
     attempts = 3 if data.get("action") in IDEMPOTENT_PRIVATE_ACTIONS else 1
     result = None
     for attempt in range(attempts):
         result = private_call(data)
         if result and result.get("status") == "updated":
+            if partial_context is not None:
+                partial_context.setdefault("completed", []).append(data.get("action", "private_action"))
             return result
         if not private_helper_error_is_transient(result) or attempt == attempts - 1:
             break
         time.sleep(0.5)
     if not result or result.get("status") != "updated":
         message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        if partial_context is not None:
+            fail_private_add_partial(partial_context, data.get("action", "private_action"), message)
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
     return result
@@ -4184,7 +4248,8 @@ def emit_clone_delete_move_result(args, move_result, target_list_ref):
         print(f"Subtasks: {move_result['subtasksMoved']}")
 
 
-def private_location_action(data):
+def private_location_action(data, partial_context=None):
+    action_name = data.get("action", "add_location_alarm")
     if bridge_available():
         bridge_payload = {
             "action": "update",
@@ -4197,13 +4262,17 @@ def private_location_action(data):
         }
         result = bridge_call(bridge_payload)
         if result and result.get("status") == "updated":
+            if partial_context is not None:
+                partial_context.setdefault("completed", []).append(action_name)
             return {
                 "status": "updated",
-                "action": "add_location_alarm",
+                "action": action_name,
                 "source": "eventkit_bridge",
                 "locationTitle": data.get("title"),
             }
         message = result.get("message") if isinstance(result, dict) else "remctl-bridge failed"
+        if partial_context is not None:
+            fail_private_add_partial(partial_context, action_name, message)
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
 
@@ -4211,6 +4280,8 @@ def private_location_action(data):
     for attempt in range(3):
         result = private_call(data)
         if result and result.get("status") == "updated":
+            if partial_context is not None:
+                partial_context.setdefault("completed", []).append(action_name)
             return result
         if private_helper_error_is_transient(result):
             for _ in range(8):
@@ -4220,9 +4291,11 @@ def private_location_action(data):
                     latitude=data.get("latitude"),
                     longitude=data.get("longitude"),
                 ):
+                    if partial_context is not None:
+                        partial_context.setdefault("completed", []).append(action_name)
                     return {
                         "status": "updated",
-                        "action": "add_location_alarm",
+                        "action": action_name,
                         "verifiedAfterTransientError": True,
                         "warning": result.get("message") if isinstance(result, dict) else "private helper failed",
                     }
@@ -4231,6 +4304,8 @@ def private_location_action(data):
                 continue
         break
     message = result.get("message") if isinstance(result, dict) else "private helper failed"
+    if partial_context is not None:
+        fail_private_add_partial(partial_context, action_name, message)
     print(f"Error: {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -4589,7 +4664,7 @@ def wait_for_grocery_section(list_pk, reminder_ckid, attempts=24, delay=0.25):
     return None
 
 
-def apply_private_grocery_categorization(db, list_pk, reminder_ckids):
+def apply_private_grocery_categorization(db, list_pk, reminder_ckids, partial_context=None):
     require_private_metadata(SimpleNamespace(private=True, private_metadata=False))
     require_grocery_list_target(db, list_pk)
     ckid = q_list_ckid(db, list_pk)
@@ -4665,10 +4740,28 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids):
         }
 
     print(f"Error: {message}", file=sys.stderr)
+    if partial_context is not None:
+        fail_private_add_partial(partial_context, "categorize_grocery_items", message)
     sys.exit(1)
 
 
-def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
+def validate_private_add_ready(a, db, list_pk):
+    if getattr(a, "section", None) or getattr(a, "section_id", None):
+        resolve_section_ckid(
+            db,
+            list_pk,
+            section_name=getattr(a, "section", None),
+            section_id=getattr(a, "section_id", None),
+        )
+    if getattr(a, "assign", None):
+        if list_pk is None:
+            print("Error: --assign requires a target shared list via -l/--list or --list-id.", file=sys.stderr)
+            sys.exit(1)
+        resolve_sharee_or_die(db, list_pk, a.assign)
+        resolve_assignment_originator_or_die(db, list_pk)
+
+
+def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_context=None):
     require_private_metadata(a)
     validate_tag_replacement_args(a)
     results = []
@@ -4692,7 +4785,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "action": "set_tags",
             "id": reminder_ckid,
             "tags": replacement_tags,
-        }))
+        }, partial_context=partial_context))
 
     if urls or tags:
         results.append(private_action({
@@ -4700,7 +4793,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "id": reminder_ckid,
             "urls": urls,
             "tags": tags,
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "section", None) or getattr(a, "section_id", None):
         if db is None:
@@ -4715,14 +4808,14 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "action": "assign_section",
             "id": reminder_ckid,
             "sectionId": section_id,
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "new_section", None):
         results.append(private_action({
             "action": "add_section_and_assign",
             "id": reminder_ckid,
             "name": a.new_section,
-        }))
+        }, partial_context=partial_context))
 
     subtasks = parse_subtask_specs(getattr(a, "subtask", None))
     if subtasks:
@@ -4734,7 +4827,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "action": "add_subtasks",
             "id": reminder_ckid,
             "subtasks": private_subtasks,
-        })
+        }, partial_context=partial_context)
         bridge_updates = []
         child_private_updates = []
         for spec, subtask in zip(subtasks, subtask_result.get("subtasks", [])):
@@ -4755,7 +4848,10 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
                         "status": bridge_update.get("status"),
                     })
         if subtask_specs_need_bridge(subtasks) and len(bridge_updates) < sum(1 for spec in subtasks if subtask_specs_need_bridge([spec])):
-            print("Error: private helper did not return subtask IDs for bridge metadata updates.", file=sys.stderr)
+            message = "private helper did not return subtask IDs for bridge metadata updates."
+            if partial_context is not None:
+                fail_private_add_partial(partial_context, "add_subtasks", message)
+            print(f"Error: {message}", file=sys.stderr)
             sys.exit(1)
         if bridge_updates:
             subtask_result["bridgeUpdates"] = bridge_updates
@@ -4770,7 +4866,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "id": reminder_ckid,
             "files": [],
             "images": images,
-        }))
+        }, partial_context=partial_context))
 
     flagged_value = getattr(a, "flagged", None)
     if flagged_value is None and getattr(a, "flag", False):
@@ -4780,14 +4876,14 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "action": "set_flagged",
             "id": reminder_ckid,
             "flagged": bool(flagged_value),
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "urgent", None) is not None:
         results.append(private_action({
             "action": "set_urgent",
             "id": reminder_ckid,
             "urgent": bool(a.urgent),
-        }))
+        }, partial_context=partial_context))
 
     early_reminder = getattr(a, "early_reminder", None)
     if early_reminder is not None:
@@ -4804,11 +4900,14 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
         else:
             payload["unit"] = early["unit"]
             payload["count"] = early["count"]
-        results.append(private_action(payload))
+        results.append(private_action(payload, partial_context=partial_context))
 
     if getattr(a, "latitude", None) is not None or getattr(a, "longitude", None) is not None:
         if getattr(a, "latitude", None) is None or getattr(a, "longitude", None) is None:
-            print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
+            message = "location alarms require both --latitude and --longitude"
+            if partial_context is not None:
+                fail_private_add_partial(partial_context, "add_location_alarm", message)
+            print(f"Error: {message}", file=sys.stderr)
             sys.exit(1)
         proximity = 2 if getattr(a, "proximity", "arriving") == "leaving" else 1
         results.append(private_location_action({
@@ -4820,7 +4919,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "radius": getattr(a, "radius", None) or 100,
             "proximity": proximity,
             "address": getattr(a, "address", None),
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "assign", None):
         if db is None:
@@ -4835,13 +4934,13 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
             "id": reminder_ckid,
             "assigneeId": _row_get(assignee, "ZCKIDENTIFIER"),
             "originatorId": _row_get(originator, "ZCKIDENTIFIER"),
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "unassign", False):
         results.append(private_action({
             "action": "clear_assignment",
             "id": reminder_ckid,
-        }))
+        }, partial_context=partial_context))
 
     if getattr(a, "grocery", False):
         if db is None:
@@ -4849,7 +4948,9 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None):
         if list_pk is None:
             print("Error: --grocery requires a target list.", file=sys.stderr)
             sys.exit(1)
-        results.append(apply_private_grocery_categorization(db, list_pk, [reminder_ckid]))
+        results.append(apply_private_grocery_categorization(
+            db, list_pk, [reminder_ckid], partial_context=partial_context,
+        ))
 
     return results
 
@@ -7727,6 +7828,11 @@ def cmd_add(a):
             sys.exit(1)
         require_grocery_list_target(db, target_list_pk)
 
+    if wants_private:
+        if db is None:
+            db = open_db()
+        validate_private_add_ready(a, db, target_list_pk)
+
     if a.tags and not wants_private:
         for t in a.tags.split(","):
             t = t.strip()
@@ -7761,18 +7867,30 @@ def cmd_add(a):
             if wants_private:
                 if db is None:
                     db = open_db()
+                try:
+                    created_row = q_reminder_by_identifier(db, result.get("id", ""))
+                except RemindersDBUnavailable:
+                    created_row = None
+                partial_context = {
+                    "id": result.get("id", ""),
+                    "numericId": created_row["Z_PK"] if created_row else None,
+                    "json": bool(getattr(a, "json", False)),
+                    "completed": [],
+                }
                 private_results = apply_private_changes(
                     result.get("id", ""),
                     a,
                     db=db,
                     list_pk=target_list_pk,
+                    partial_context=partial_context,
                 )
-            try:
-                if db is None:
-                    db = open_db()
-                created_row = q_reminder_by_identifier(db, result.get("id", ""))
-            except RemindersDBUnavailable:
-                created_row = None
+            else:
+                try:
+                    if db is None:
+                        db = open_db()
+                    created_row = q_reminder_by_identifier(db, result.get("id", ""))
+                except RemindersDBUnavailable:
+                    created_row = None
             if a.flag and not wants_private:
                 flag_list_name = None
                 if created_row:
@@ -8186,6 +8304,7 @@ def cmd_edit(a):
     # real dueDateComponents change.
     bridge_write_result = None
     bridge_write_attempted = False
+    nudge_succeeded = False
     if bridge_available() and r["ZCKIDENTIFIER"]:
         if dt_nudge is not None:
             nudge_data = {
@@ -8198,6 +8317,10 @@ def cmd_edit(a):
             nudge_result = bridge_call_result(nudge_data)
             if bridge_failure_is_access_error(nudge_result):
                 fail_bridge_write(nudge_result, operation="prepare the reminder edit")
+            elif bridge_result_ok(nudge_result, "updated"):
+                nudge_succeeded = True
+            else:
+                print(NUDGE_PREP_WARNING, file=sys.stderr)
         data = {"action": "update", "id": r["ZCKIDENTIFIER"]}
         has_changes = False
         if a.title: data["title"] = a.title; has_changes = True
@@ -8263,6 +8386,7 @@ def cmd_edit(a):
                         print(f"Private metadata: applied {len(private_results)} update{'s' if len(private_results) != 1 else ''}")
                 return
             if bridge_failure_is_access_error(bridge_write_result):
+                warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
                 fail_bridge_write(bridge_write_result, operation="edit the reminder")
             if (
                 moving_to_different_list
@@ -8299,12 +8423,15 @@ def cmd_edit(a):
             or wants_private
         )
     ):
+        warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
         fail_bridge_write(bridge_write_result, operation="edit the reminder")
 
     if carry_absolute_alarm or clear_matching_absolute_alarm:
+        warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
         print("Error: this edit requires remctl-bridge to keep due/display/alarm state aligned.", file=sys.stderr)
         sys.exit(1)
     if dt is not None and due_all_day:
+        warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
         print("Error: all-day due date edits require remctl-bridge so Reminders can store date-only components.", file=sys.stderr)
         sys.exit(1)
 
@@ -8349,6 +8476,7 @@ def cmd_edit(a):
         return
     if not r["ZCKIDENTIFIER"]:
         _refuse_unsafe_title_fallback(r, "edit it", "The reminder has no stable identifier")
+    warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
     _refuse_unsafe_title_fallback(
         r,
         "edit it",
