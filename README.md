@@ -299,7 +299,7 @@ RemCTL output is designed for both humans and agents:
 - `edit -d clear` removes a single matching absolute alarm/display time; `edit --alarm clear` removes normal alarms explicitly
 - normal EventKit alarms and location alarms appear in `info --json` as `alarms`
 - shared-list assignments appear in human output as `@Name` and in `info --json` as `assignment`
-- Early Reminders appear in verbose/info JSON as labels such as `15 minutes before`
+- Early Reminders appear in `info` output (text and JSON) as labels such as `15 minutes before`
 - recurring reminders show a repeat badge such as `↻ weekly Mon, Wed`
 - Groceries lists show `🥕` in list headings and list summaries
 - table output keeps a dedicated `Repeat` column when any row is recurring
@@ -328,7 +328,7 @@ remctl permissions full-disk-access
 remctl doctor
 ```
 
-The visual permission helper opens System Settings, copies the first target path, shows draggable targets for the current CLI process, and marks verified targets with a green check.
+The visual permission helper opens System Settings, copies the first target path, shows draggable targets for the current CLI process, and marks each target's status. It confirms Full Disk Access directly for the Python target and reports `Store readable (helper check)` for the helper binaries, since macOS TCC cannot be probed per app. The summary line reports how many targets are accessible.
 
 Full Disk Access and Reminders/EventKit access are scoped to the process context. A Terminal session can pass `remctl doctor` while Codex, another agent runner, or a different host app fails. Run `remctl doctor` from the same context that will run RemCTL commands; for agent setup, use `remctl doctor --for-agent`. When a terminal embeds another engine, RemCTL prefers the real host `.app` bundle over inherited terminal variables so the printed target matches the app macOS will authorize.
 
@@ -352,7 +352,7 @@ remctl doctor --for-agent --json
 
 Do not use `--via-eventkit` by default. Use it only when a supported basic read command is blocked by Full Disk Access and the task can tolerate limited EventKit fidelity. In this mode JSON returns a wrapper with `source: "eventkit"`, `fidelity: "limited"`, and `items`; item identifiers are `eventKitId`, not RemCTL numeric `id`. Never pass `eventKitId` to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any other numeric-ID command. If the task needs sections, tags, rich links, urgent state, templates, smart-list internals, or chainable IDs, fix Full Disk Access instead.
 
-For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. For list moves, use the `id` returned by `remctl edit ... -l ... --json`; a verified clone-delete fallback can replace the original reminder and return `oldId` plus a new `id`. `info` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so agents should not need raw SQLite checks for ordinary reminder metadata verification.
+For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `add --private` validates section/assignee/URL inputs before creating the reminder; if a private step still fails after creation, output is `{"status": "partial", "id", "numericId", "failed", "error"}` in JSON (text mode: `Created reminder #N but failed to apply <action>; re-run edit to finish. Do NOT re-run add (would duplicate).`). On `partial`, re-run `edit` to finish the metadata; never re-run `add`. For list moves, use the `id` returned by `remctl edit ... -l ... --json`; a verified clone-delete fallback can replace the original reminder and return `oldId` plus a new `id`. `info` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so agents should not need raw SQLite checks for ordinary reminder metadata verification.
 
 Use JSON for automation when exact raw text matters. Human output is terminal-safe and strips control characters; JSON preserves the underlying Reminders values.
 
@@ -381,6 +381,8 @@ hash -r
 remctl --version
 remctl doctor
 ```
+
+`./install.sh` recompiles the helpers when `swiftc`/`clang` are available. RemCTL checks a `remctl-private` protocol version on first `--private` use; an outdated helper refuses to run with `remctl-private is outdated (protocol N < required M); re-run install.sh to rebuild.`, so rebuild after updating. `remctl doctor` reports the helper protocol version under `private_helper`.
 
 ## Docs
 

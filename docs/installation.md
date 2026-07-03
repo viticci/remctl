@@ -118,6 +118,8 @@ remctl --version
 remctl doctor
 ```
 
+Re-running `install.sh` also rebuilds the helper binaries. RemCTL checks a `remctl-private` protocol version on first `--private` use; an outdated helper refuses `--private` writes with a "re-run install.sh to rebuild" error, and `doctor` reports the helper protocol version.
+
 If you installed to `~/.local/bin`:
 
 ```bash

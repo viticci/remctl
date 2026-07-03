@@ -50,6 +50,8 @@ These read paths returned valid JSON on macOS 27:
 
 Direct SQLite and EventKit fallback counts matched for `today` and `upcoming` in this context.
 
+> Follow-up: a later fix aligned the `stats` overdue count with the `overdue`/`today` semantics (display-date for all-day reminders, start-of-day cutoff, and excluding orphaned reminders).
+
 ## Write Compatibility
 
 The live EventKit edit matrix passed all 8 cases:
@@ -84,6 +86,8 @@ Two compatibility hardening changes were made:
 2. Early Reminder readback/removal now falls back to `ZREMCDDUEDATEDELTAALERT` if `ZDUEDATEDELTAALERTSDATA` is absent or stops being mirrored in a future macOS 27 build.
 
 This keeps the existing blob path as primary and only uses the normalized table when needed.
+
+> Follow-up: a later fix wired the `info` text output to the same `ZREMCDDUEDATEDELTAALERT` fallback, so both text and `--json` now show Early Reminders when only the normalized table is populated (previously only `--json` did).
 
 ## Verification
 

@@ -118,7 +118,7 @@ remctl today --via-eventkit --json
 remctl upcoming 14 --via-eventkit --json
 ```
 
-This mode uses EventKit through `remctl-bridge`, so it can return basic reminder fields without opening the Reminders SQLite database. It is not full RemCTL output. It does not support `--list-id`, table output, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, or exact numeric ID compatibility.
+This mode uses EventKit through `remctl-bridge`, so it can return basic reminder fields without opening the Reminders SQLite database. It is not full RemCTL output. It does not support `--list-id`, table output, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, or exact numeric ID compatibility. When no list target is given, these reads are scoped to iCloud reminders.
 
 JSON output is a wrapper object, not the normal read-command array:
 
@@ -140,7 +140,7 @@ JSON output is a wrapper object, not the normal read-command array:
 
 Treat `eventKitId` as display/readback data only. Never pass it to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any command that expects a RemCTL numeric `id`. If an automation needs chainable IDs or private Reminders metadata, fix Full Disk Access and use the normal read path.
 
-Date-only `add -d` inputs create all-day reminders instead of midnight timed reminders. This applies to forms such as `today`, `tomorrow`, `2026-06-01`, `+3d`, `in 2 weeks`, and `next friday`; inputs with explicit times remain timed reminders.
+Date-only `add -d` inputs create all-day reminders instead of midnight timed reminders. This applies to forms such as `today`, `tomorrow`, `2026-06-01`, `+3d`, `in 2 weeks`, and `next friday`, and to natural-language date-only inputs parsed by `parsedatetime` such as `March 30` or `next week`; only inputs that resolve to a specific clock time remain timed reminders.
 
 `upcoming DAYS` accepts 1 through 3650 days. Zero and negative ranges fail before RemCTL opens the Reminders database.
 
@@ -158,7 +158,7 @@ List names are resolved conservatively: exact match first, then case-insensitive
 
 `--assign USER` assigns a reminder to a person in a shared list and requires `--private`. `USER` can be a unique name, email or phone address, numeric sharee ID, object UUID, or `me`; use `remctl sharees LIST --json` to inspect exact candidates. Names are fine for humans when unique, but agents should prefer email/address or IDs to avoid collisions. `--unassign` clears the current assignment.
 
-`--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields.
+`--subtask` accepts either a plain child title or a JSON object with child metadata. Rich subtask fields include `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location alarm fields. A subtask `due` given as a date without a time creates an all-day subtask, matching the parent's date-only behavior.
 
 `--private` uses Apple's private ReminderKit framework through `remctl-private`. It does not write SQLite directly. Verified private writes include synced web rich links, synced tag add/replace/remove, section assignment/create/rename/delete, shared-list assignments, rich subtasks, image attachments, real flag state, urgent state, Early Reminders, location alarms, list appearance metadata, list and smart-list pin state, list group create/edit/delete, Groceries list metadata and categorization verification, custom smart-list creation/editing/deletion for verified materializing Reminders filters, and Reminders template create/apply/delete. Location alarms are guarded by `--private` but saved through the EventKit bridge as structured-location alarms because the private ReminderKit alarm mutation does not materialize reliably on current macOS. Generic file/PDF attachments are intentionally rejected because Reminders does not reliably show them even when private rows sync.
 
@@ -306,9 +306,11 @@ remctl smart-list-edit "Priority or Today" --private --priority high --color red
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-`smart-lists` is a read-only inspector. It reports built-in and custom smart lists with numeric ID, object UUID, smart-list type, pin state, pin date, filter byte length, and a decoded summary when RemCTL recognizes the filter payload. Smart-list pin verification should use `pinned`/`pinnedDate` from `smart-lists --json`; on macOS 26 smart-list pinning updates `ZPINNEDDATE` rather than the regular-list boolean.
+`smart-lists` is a read-only inspector. It reports built-in and custom smart lists with numeric ID, object UUID, smart-list type, pin state, pin date, filter byte length, and a decoded summary when RemCTL recognizes the filter payload. Unrecognized or corrupt filter blobs surface as an `error` field in `--json` instead of failing the command. Smart-list pin verification should use `pinned`/`pinnedDate` from `smart-lists --json`; on macOS 26 smart-list pinning updates `ZPINNEDDATE` rather than the regular-list boolean.
 
 `smart-list-create` and `smart-list-edit` are private ReminderKit support and always require `--private`. They support private appearance flags (`--color`, `--symbol`, and `--emoji`) plus the filters that currently materialize in Reminders.app through this write path: `--any-tag`, selected tags via `--tags` with optional `--tag-match all|any`, date filters (`--date any|today`, today+past-due, on/before/after/range), time filters (`morning`, `afternoon`, `evening`, `night`), priority filters including comma-separated Priority: Any, `--flagged`, `--vehicle connected`, specific `--location-title`/coordinates, one `--include-list` or one `--include-list-id`, and top-level `--match all|any`. Known zero-filter writes are rejected before saving: legacy short selected-tag JSON, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list.
+
+For advanced use, `--filter-json` accepts a raw official Reminders filter payload (inline JSON or `@path`). It bypasses the guarded flag builders above but is still validated: payloads with malformed date strings are rejected before writing on both `smart-list-create` and `smart-list-edit`. `--match`, `--tag-match`, and `--list-match` only change how other filters combine, so `smart-list-edit` rejects a match-only edit and asks for at least one filter option (for example `--tags`, `--priority`, or `--date`) alongside them.
 
 `smart-list-edit` replaces the filter for an existing custom smart list by exact name or `--smart-list-id`. `smart-list-delete` only matches custom smart lists by exact name or `--smart-list-id`, never built-in smart lists, and requires `--private`.
 
@@ -448,6 +450,8 @@ remctl completion zsh
 
 Use [installation.md](installation.md) for the first-run visual permission flow. The manual fallback is `remctl doctor --for-agent`, then adding the printed target in System Settings. Run `doctor` from the same terminal, app, or agent runner that will run the RemCTL write; `doctor` checks both direct database access and EventKit Reminders write authorization for that context.
 
+`doctor` reports the `remctl-private` protocol version alongside its path. After updating RemCTL you must rebuild the private helper; an outdated helper is flagged with a "re-run install.sh" message and `--private` writes fail until it is rebuilt.
+
 `doctor` also checks whether an installed zsh completion file appears in exported `FPATH` or the usual zsh startup files. If it warns, add the printed `fpath=(... $fpath)` and `compinit` lines to `~/.zshrc`, then open a new terminal.
 
 ## Agent Fast Path
@@ -460,6 +464,8 @@ remctl info <numericId> --json
 ```
 
 `add --json` returns `numericId` when the new reminder is immediately visible in the local database. Use that ID for `info`; fall back to resolving by title from `show <list> --json` only if `numericId` is absent. `info --json` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so raw SQLite verification should not be needed for normal reminder metadata tasks.
+
+If a `--private` write partially fails after the reminder already exists, `add --json` returns `{"status":"partial", ...}` (text mode prints an explicit "Do NOT re-run add" line) carrying the created `numericId`. Re-run `edit` on that ID to finish the remaining metadata; do not re-run `add`, which would duplicate the reminder.
 
 Agents must not use `--via-eventkit` by default. It is a limited read-only fallback only for `show`, `search`, `today`, and `upcoming` when Full Disk Access blocks a basic read and the task does not need chainable IDs or private metadata. Its `eventKitId` values are not RemCTL numeric IDs and must not be used with `info`, `edit`, `done`, `delete`, `link`, `open`, or `subtasks`.
 

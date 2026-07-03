@@ -209,7 +209,7 @@ Private metadata rules:
 - `--section`, `--new-section`, `--set-tags`, `--clear-tags`, `--remove-tag`, `--assign`, `--unassign`, `--subtask`, `--image`, `--flagged`, `--urgent`, `--early-reminder`, and location alarm fields require `--private` and should fail before writing if omitted.
 - `section-create`, `section-rename`, and `section-delete` require `--private`, refuse duplicate section names on create/rename, and should be verified with `sections --json` or `show <list> --json`.
 - Rich-link and image attachment edits are additive. RemCTL can add synced rich links and images; it does not remove or replace existing rich links/images.
-- `add --private -f` writes the real private flag instead of the EventKit priority proxy.
+- `add -f/--flag` sets the real flagged state via AppleScript after the create (no `--private` needed); if the flag-set fails the add still succeeds with a warning. `add --private` also sets the real flag through the private path.
 - `list-symbols` prints the 71 official Reminders emblem names; its terminal glyph column is only an approximation. Use `list-symbols --preview` to open a native-asset HTML contact sheet with interactive official color swatches, or `list-symbols --html PATH` to write one. `list-create --color NAME` uses public EventKit for normal colors. `list-create --private`, `list-edit --private`, `smart-list-create --private`, and `smart-list-edit --private` can write exact `#RRGGBB` colors, official list symbols, and emoji badges; verify those via `color`, `badge`, and `badgeEmblem` in `lists --json` or `smart-lists --json`. `list-create --private --groceries`, `list-edit --private --groceries`, and `list-edit --private --standard` write Reminders' private Groceries list metadata and locale. `list-pin` and `list-unpin` require `--private` and save regular list or smart-list pin state through ReminderKit. Reminders' picker icons use private emblem names such as `education3`; `--symbol` only accepts official names because arbitrary SF Symbol strings render as the default icon in Reminders. Use `--emoji` for custom standard emoji badges.
 - List groups are visible through `groups`, `group-info`, `lists --json`, and `show <group>`. `groups` and `group-info` include active/completed/total counts for child lists. `show <group> --format table` prints child-list and section tables; `show <group> --completed --format table` uses completion timestamps rather than due status. `group-create`, `list-create --private --group`, `group-edit`, and `group-delete` require `--private`; they move list containers only, not reminders. `group-edit --move-list LIST --before-list SIBLING`, `--after-list`, `--first`, or `--last` reorders child lists. `group-delete` detaches child lists to the top level before deleting the empty group.
 - Groceries lists are visible in `lists --json` as `listType: "groceries"`, `isGroceries: true`, and `grocery.locale`; human list headings show `🥕`, and known Groceries section headings get matching category emoji. `show --json` includes `sectionEmoji` for known Groceries categories. Use `add --private --grocery` or `edit --private --grocery` only against detected Groceries lists. RemCTL first verifies Reminders' automatic grocery sorting and reports `source: "reminders_auto"` when the item is already sectioned; it falls back to the private categorizer only for unsectioned items.
@@ -244,7 +244,7 @@ Supported materializing filter families are Any Tag (`--any-tag`), selected tags
 
 Known non-materializing writes are rejected before saving: untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list. Reminders.app currently materializes only one included-list filter at a time, so never try to aggregate multiple lists with smart-list list filters. Do not use `--filter-json` to force the legacy short selected-tag shape (`{"hashtags":{"hashtags":["tag"]}}`); Reminders.app can persist it but show zero filter rows. Use `--tags tag --date today` instead.
 
-`--filter-json` is an advanced escape hatch for raw official filter JSON or `@path`; unknown or unsupported smart-list filter shapes are rejected before writing. `smart-list-edit` and `smart-list-delete` target custom smart lists by exact name or `--smart-list-id` and never match built-in smart lists.
+`--filter-json` is an advanced escape hatch for raw official filter JSON or `@path`; unknown or unsupported filter shapes — and payloads with invalid date strings — are rejected before writing. Malformed stored blobs decode to an error entry rather than crashing `smart-lists`. `smart-list-edit` and `smart-list-delete` target custom smart lists by exact name or `--smart-list-id` and never match built-in smart lists. On `smart-list-edit`, `--match`/`--tag-match` count as changes only alongside filter options; a match-flag-only edit errors and explains they must accompany filter options.
 
 ## Templates
 
@@ -265,7 +265,7 @@ remctl template-delete "Packing Template" --private --force --json
 
 - Treat `remctl doctor --json` as the first setup check.
 - For agents, prefer `remctl doctor --for-agent --json`; `doctor` must pass in the same execution context that will run the write and checks both database access and EventKit Reminders write authorization.
-- Check `private_helper` in `remctl doctor --json` before using `--private`.
+- Check `private_helper` in `remctl doctor --json` before using `--private`; it reports the helper protocol version. An outdated `remctl-private` refuses `--private` writes (`remctl-private is outdated … re-run install.sh to rebuild`); tell the user to re-run `install.sh` after updating.
 - Do not run `doctor` before every ordinary task once the current context is known-good; it is a setup/TCC diagnostic, not a per-write verification step.
 - For writes, verify against live Reminders data after the command succeeds.
 - `remctl search QUERY --completed --json` includes completed reminders and searches both titles and notes.
@@ -285,6 +285,8 @@ Fast create path for agents:
 remctl add "Title" -l Projects --private --section "Section" -d "YYYY-MM-DD HH:MM" --url "https://example.com" --json
 remctl info <numericId> --json
 ```
+
+`add --private` validates section/assignee/URL inputs before creating the reminder. If a private step still fails after creation, JSON output is `{"status": "partial", "id", "numericId", "failed", "error"}` (text mode: `Created reminder #N but failed to apply <action>; re-run edit to finish. Do NOT re-run add (would duplicate).`). On `partial`, re-run `edit` to finish the metadata; never re-run `add`.
 
 `info --json` includes section, actual due date, optional display/alert date, tags, subtasks, parent and subtask attachments, EventKit alarms, location alarms, Early Reminders, deep link, and private rich-link `url` when present. Avoid raw SQLite checks unless the CLI output lacks a field you need.
 
