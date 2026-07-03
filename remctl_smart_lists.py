@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import xml.parsers.expat
 from datetime import datetime
 
 
@@ -112,7 +113,13 @@ def decode_smart_list_filter_blob(blob):
                 "summary": summarize_smart_list_filter(payload),
                 "error": None,
             }
-    except (UnicodeDecodeError, json.JSONDecodeError, plistlib.InvalidFileException, ValueError) as exc:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        plistlib.InvalidFileException,
+        ValueError,
+        xml.parsers.expat.ExpatError,
+    ) as exc:
         return {
             "encoding": None,
             "payload": None,
@@ -128,7 +135,7 @@ def decode_smart_list_filter_blob(blob):
     }
 
 
-def summarize_smart_list_filter(payload):
+def summarize_smart_list_filter(payload, *, strict=False):
     if payload is None:
         return None
     keys = sorted(str(key) for key in payload.keys())
@@ -168,7 +175,7 @@ def summarize_smart_list_filter(payload):
     parts = []
     unsupported = []
     for key, value in payload_without_operation.items():
-        summary = _summarize_filter_family(key, value)
+        summary = _summarize_filter_family(key, value, strict=strict)
         if summary.get("supported"):
             parts.append(summary)
         else:
@@ -196,7 +203,7 @@ def summarize_smart_list_filter(payload):
     }
 
 
-def _summarize_filter_family(key, value):
+def _summarize_filter_family(key, value, *, strict=False):
     if key == "flagged" and value is True:
         return {"kind": "flagged", "description": "Flagged reminders", "supported": True}
     if key == "priorities" and isinstance(value, list) and value:
@@ -247,7 +254,7 @@ def _summarize_filter_family(key, value):
                     "tagMatch": match,
                 }
     if key == "date" and isinstance(value, dict):
-        return _summarize_date_filter(value)
+        return _summarize_date_filter(value, strict=strict)
     if key == "time" and isinstance(value, dict):
         for time_key, label in (
             ("morning", "Morning"),
@@ -308,7 +315,20 @@ def _summarize_filter_family(key, value):
     }
 
 
-def _summarize_date_filter(value):
+def _is_valid_filter_date_string(value):
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            datetime.strptime(text, fmt)
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _summarize_date_filter(value, *, strict=False):
     if value == {"any": ""}:
         return {"kind": "date", "description": "Any date", "supported": True, "date": "any"}
     if value == {"noDate": ""}:
@@ -322,10 +342,14 @@ def _summarize_date_filter(value):
         ("afterDate", "After date"),
     ):
         if set(value.keys()) == {key} and isinstance(value[key], str):
+            if strict and not _is_valid_filter_date_string(value[key]):
+                return {"kind": "date", "description": "Unsupported date filter", "supported": False}
             return {"kind": "date", "description": f"{label}: {value[key]}", "supported": True, "date": key, "value": value[key]}
     if set(value.keys()) == {"dateRange"}:
         date_range = value["dateRange"]
         if isinstance(date_range, list) and len(date_range) == 2 and all(isinstance(item, str) for item in date_range):
+            if strict and not all(_is_valid_filter_date_string(item) for item in date_range):
+                return {"kind": "date", "description": "Unsupported date filter", "supported": False}
             return {"kind": "date", "description": f"Date range: {date_range[0]} to {date_range[1]}", "supported": True, "date": "dateRange", "range": date_range}
     relative = value.get("relativeRange")
     if isinstance(relative, dict):
@@ -625,7 +649,7 @@ def _build_location_filter(*, vehicle=None, location=None):
 
 
 def encode_supported_filter_payload(payload) -> bytes:
-    summary = summarize_smart_list_filter(payload)
+    summary = summarize_smart_list_filter(payload, strict=True)
     if not summary or not summary.get("supported") or summary.get("kind") == "all":
         raise SmartListFilterError("Unsupported smart list filter shape.")
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

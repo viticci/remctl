@@ -162,6 +162,36 @@ class SmartListFilterTests(unittest.TestCase):
 
         self.assertEqual(encode_supported_filter_payload(payload), b'{"priorities":["high"]}')
 
+    def test_decode_malformed_xml_plist_returns_error_dict(self):
+        blob = b'<?xml version="1.0"?><plist><dict><unclosed'
+
+        decoded = decode_smart_list_filter_blob(blob)
+
+        self.assertIsNone(decoded["payload"])
+        self.assertIsNone(decoded["summary"])
+        self.assertIsNotNone(decoded["error"])
+
+    def test_encode_rejects_invalid_date_string_in_filter_json_shape(self):
+        payload = {"date": {"onDate": "not-a-date"}}
+
+        with self.assertRaises(SmartListFilterError):
+            encode_supported_filter_payload(payload)
+
+    def test_encode_accepts_valid_date_string_in_filter_json_shape(self):
+        payload = {"date": {"onDate": "15-05-2026"}}
+
+        self.assertEqual(
+            encode_supported_filter_payload(payload),
+            b'{"date":{"onDate":"15-05-2026"}}',
+        )
+
+    def test_decode_lenient_summary_for_invalid_date_string_in_existing_blob(self):
+        decoded = decode_smart_list_filter_blob(b'{"date":{"onDate":"not-a-date"}}')
+
+        self.assertEqual(decoded["payload"], {"date": {"onDate": "not-a-date"}})
+        self.assertIsNotNone(decoded["summary"])
+        self.assertIn("not-a-date", decoded["summary"]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()
