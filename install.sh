@@ -111,17 +111,20 @@ chmod 644 "$BIN_DIR/completions/_remctl"
 echo -e "  ${GREEN}✓${RESET} _remctl → $BIN_DIR/completions/_remctl"
 
 # 2. Compile and install helpers
+COMPILE_LOG="$(mktemp -t remctl-compile)"
+trap 'rm -f "$COMPILE_LOG"' EXIT
 if command -v swiftc &>/dev/null; then
     echo -e "${BLUE}→${RESET} Compiling remctl-bridge (Swift/EventKit)..."
     if swiftc -O \
         -framework EventKit \
         -framework Foundation \
         -o "$BIN_DIR/remctl-bridge" \
-        "$SCRIPT_DIR/remctl-bridge.swift" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-bridge.swift" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-bridge"
         echo -e "  ${GREEN}✓${RESET} remctl-bridge → $BIN_DIR/remctl-bridge"
     else
         echo -e "  ${RED}✗${RESET} remctl-bridge failed to compile"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
         exit 1
     fi
 
@@ -130,7 +133,7 @@ if command -v swiftc &>/dev/null; then
         -framework AppKit \
         -framework Foundation \
         -o "$BIN_DIR/remctl-permissions" \
-        "$SCRIPT_DIR/remctl-permissions.swift" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-permissions.swift" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-permissions"
         echo -e "  ${GREEN}✓${RESET} remctl-permissions → $BIN_DIR/remctl-permissions"
         if [[ -f "$SCRIPT_DIR/assets/remctl-permissions-icon.png" ]]; then
@@ -140,6 +143,7 @@ if command -v swiftc &>/dev/null; then
         fi
     else
         echo -e "  ${YELLOW}⚠${RESET} remctl-permissions did not compile — guided permission UI unavailable"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
         echo -e "    ${DIM}remctl will still print manual Full Disk Access steps${RESET}"
     fi
 else
@@ -156,11 +160,12 @@ if command -v clang &>/dev/null; then
         -framework AppKit \
         -framework ReminderKit \
         -o "$BIN_DIR/remctl-private" \
-        "$SCRIPT_DIR/remctl-private.m" 2>/dev/null; then
+        "$SCRIPT_DIR/remctl-private.m" 2>"$COMPILE_LOG"; then
         chmod +x "$BIN_DIR/remctl-private"
         echo -e "  ${GREEN}✓${RESET} remctl-private → $BIN_DIR/remctl-private"
     else
         echo -e "  ${YELLOW}⚠${RESET} remctl-private did not compile — private metadata writes unavailable"
+        sed 's/^/    /' "$COMPILE_LOG" >&2
     fi
 else
     echo -e "  ${YELLOW}⚠${RESET} clang not found — private metadata writes unavailable"
