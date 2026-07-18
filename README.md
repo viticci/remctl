@@ -53,7 +53,7 @@ If you install to `~/.local/bin`, use the same prefix every time:
 PREFIX="$HOME/.local" ./install.sh --bootstrap
 ```
 
-Full setup details live in [docs/installation.md](docs/installation.md).
+Full setup details live in [docs/installation.md](docs/installation.md). Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Uninstalling
 
