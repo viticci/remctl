@@ -327,11 +327,21 @@ remctl today --images --verbose --image-mode halfblock --image-width 48
 
 `info --images` renders every image attachment inline. List commands (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) render attachments too, but only with `--verbose` so ordinary list output stays compact. Rendering happens only on a real TTY — never in pipes, `--json`, or table mode — so scripts are never surprised by escape sequences.
 
-RemCTL picks the best protocol for the current terminal automatically: the Kitty graphics protocol on Ghostty, Kitty, WezTerm, and Konsole; iTerm2's inline image protocol on iTerm2 (and Blink on iOS over SSH); a truecolor half-block renderer elsewhere; and ASCII art as the last resort. Override detection with `--image-mode kitty|iterm2|halfblock|ascii|none` and set the render width in cells with `--image-width N` (default 32). The matching environment variables are `REMCTL_IMAGES=1`, `REMCTL_IMAGE_MODE`, and `REMCTL_IMAGE_WIDTH`; flags win over env.
+RemCTL picks the best protocol for the current terminal automatically: the Kitty graphics protocol on Ghostty, Kitty, WezTerm, and Konsole; iTerm2's inline image protocol on iTerm2 (and Blink on iOS over SSH); a truecolor half-block renderer elsewhere. Terminals with no usable protocol simply skip inline rendering — the plain attachment filename lines always remain. Override detection with `--image-mode kitty|iterm2|halfblock|none` and set the render width in cells with `--image-width N` (default 32). The matching environment variables are `REMCTL_IMAGES=1`, `REMCTL_IMAGE_MODE`, and `REMCTL_IMAGE_WIDTH`; flags win over env.
 
 There is nothing new to install. Rendering uses Pillow if it is importable, otherwise macOS `sips` plus a small stdlib BMP decoder — either path works on a stock Mac.
 
 For agents, the same attachments are machine-readable instead: `info --json` and list-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`) include an `attachments` array on any reminder that has them. Each entry carries `filename`, `type`, `path`, `resolved`, `uti`, `width`, and `height`. `path` is the sha512-verified on-disk file under Reminders' group container, so a vision-capable agent can open the image directly; a legacy attachment that was never downloaded to this Mac reports `path: null` with `resolved: false`.
+
+## List Badges
+
+Plain human list output ends each reminder line with one or two trailing emoji badges when they apply: `🔗` means the reminder has at least one rich link, `🌄` means at least one image attachment. When both apply they print in that order, space-separated, after tags and any `[N subtasks]` count. Completed reminders keep their badges. The badges appear in `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `group show`, and on subtask lines in `subtasks`/`info` — plain human output only. They are never in `--json`, CSV export, `--format table`, or `--via-eventkit` payloads; agents should read the `attachments` and `url` JSON fields instead.
+
+```text
+[ ] #30165 Try Halo app on iOS again 🌄
+[ ] #30174 Read the new MacStories piece 🔗
+[ ] #30180 Review layout mockups 🔗 🌄
+```
 
 ## macOS Permissions
 

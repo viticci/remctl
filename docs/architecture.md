@@ -55,7 +55,7 @@ Attachment rows live in the store's attachment tables (`ZREMCDATTACHMENT` on par
 
 Resolution and rendering both live on the read side, in `remctl_images.py`. RemCTL maps a row to its on-disk file by trying candidate extensions (from the filename, the UTI, then a small fallback set) and trusting the file only when its sha512 matches `ZSHA512SUM`. The verified path is what JSON exposes as `attachments[].path` alongside `resolved`, `uti`, `width`, and `height`. Legacy rows have a NULL sha and no local file; they serialize as `path: null` with `resolved: false` instead of guessing a path that cannot be verified. Subtask attachments are resolved the same way but only surface through `info`.
 
-Inline rendering (`--images`) is purely a read-side display concern: it never involves `remctl-bridge` or `remctl-private`, and it only runs on a real TTY. RemCTL auto-detects the best protocol — Kitty graphics on Ghostty/Kitty/WezTerm/Konsole, iTerm2's inline protocol on iTerm2 and Blink, truecolor half-blocks elsewhere, ASCII as the last resort — with `--image-mode`/`REMCTL_IMAGE_MODE` and `--image-width`/`REMCTL_IMAGE_WIDTH` as overrides. The pipeline stays stdlib-only: Pillow is used when importable, otherwise macOS `sips` decodes pixels through a small stdlib BMP reader. Nothing about images adds a required dependency or touches the write path.
+Inline rendering (`--images`) is purely a read-side display concern: it never involves `remctl-bridge` or `remctl-private`, and it only runs on a real TTY. RemCTL auto-detects the best protocol — Kitty graphics on Ghostty/Kitty/WezTerm/Konsole, iTerm2's inline protocol on iTerm2 and Blink, truecolor half-blocks elsewhere — with `--image-mode`/`REMCTL_IMAGE_MODE` and `--image-width`/`REMCTL_IMAGE_WIDTH` as overrides. Terminals without a usable protocol simply skip inline rendering; there is no fallback renderer. The pipeline stays stdlib-only: Pillow is used when importable, otherwise macOS `sips` decodes pixels through a small stdlib BMP reader. Nothing about images adds a required dependency or touches the write path. Plain human list output also carries trailing `🔗`/`🌄` badges for reminders with rich links or image attachments, batch-loaded alongside the other one-line metadata and never present in JSON.
 
 ## Limited EventKit Read Fallback
 
@@ -194,7 +194,7 @@ REMCTL_PATH=/path/to/remctl
 REMCTL_STORE_DIR=/path/to/reminders/store
 REMCTL_CONFIG_DIR=/path/to/config
 REMCTL_IMAGES=1
-REMCTL_IMAGE_MODE=kitty|iterm2|halfblock|ascii|none
+REMCTL_IMAGE_MODE=kitty|iterm2|halfblock|none
 REMCTL_IMAGE_WIDTH=32
 NO_COLOR=1
 ```

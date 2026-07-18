@@ -60,6 +60,7 @@ High-value guardrails:
 - Location alarms use the `edit --private --location-*` guardrail but are saved through the EventKit bridge as structured-location alarms; verify them in `info --json` under `alarms`.
 - Private rich URLs require public `http` or `https` hosts; loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts fail before writing. Non-private `--url` is only a notes fallback.
 - Human output strips terminal control characters from Reminders text; use JSON when exact raw values matter.
+- Plain human list output may end reminder lines with trailing `🔗` (rich link) and/or `🌄` (image attachment) badges. Those badges are never in JSON — read the `attachments` and `url` JSON fields instead.
 - Invalid due dates, recurrence, normal alarms, priorities, and location payloads fail before writing. `upcoming DAYS` accepts 1 through 3650 days.
 - Date-only `add -d` inputs such as `today`, `tomorrow`, `2026-06-01`, `+3d`, and `next friday` create all-day reminders; explicit times create timed reminders.
 - Do not verify smart-list pinning with `lists --json`; use `smart-lists --json`.

@@ -446,7 +446,7 @@ Two flags control the render, with matching environment variables (flags win ove
 | Flag | Env | Default | Notes |
 | --- | --- | --- | --- |
 | `--images` | `REMCTL_IMAGES=1` | off | Render image attachments inline |
-| `--image-mode MODE` | `REMCTL_IMAGE_MODE` | auto-detect | One of `kitty`, `iterm2`, `halfblock`, `ascii`, `none` |
+| `--image-mode MODE` | `REMCTL_IMAGE_MODE` | auto-detect | One of `kitty`, `iterm2`, `halfblock`, `none` |
 | `--image-width N` | `REMCTL_IMAGE_WIDTH` | `32` | Render width in terminal cells |
 
 Without `--image-mode`, RemCTL picks the best protocol for the current terminal:
@@ -456,14 +456,34 @@ Without `--image-mode`, RemCTL picks the best protocol for the current terminal:
 | `kitty` | Ghostty, Kitty, WezTerm, Konsole (Kitty graphics protocol) | — |
 | `iterm2` | iTerm2; Blink on iOS over SSH (iTerm2 inline image protocol) | — |
 | `halfblock` | Terminals advertising truecolor/256color | Used when no graphics protocol is detected |
-| `ascii` | Any other real TTY | Last-resort ASCII art rendering |
 | `none` | — | Disables rendering explicitly |
 
-Rendering has no required dependencies: Pillow is used when it is importable, otherwise macOS `sips` decodes pixels through a stdlib BMP path, so a stock macOS install works out of the box. Attachments larger than 16 MB are reported in JSON but skipped for inline rendering (`(preview unavailable)`), and `halfblock`/`ascii` rendering assumes a dark terminal background.
+Terminals without a usable protocol skip inline rendering entirely — there is no ASCII fallback. The plain attachment filename lines always print regardless of mode.
+
+Rendering has no required dependencies: Pillow is used when it is importable, otherwise macOS `sips` decodes pixels through a stdlib BMP path, so a stock macOS install works out of the box. Attachments larger than 16 MB are reported in JSON but skipped for inline rendering (`(preview unavailable)`), and `halfblock` rendering assumes a dark terminal background.
 
 Two failure markers can appear in place of a render: `(file not downloaded on this Mac)` for legacy attachments whose file is not present locally, and `(preview unavailable)` when a resolved file cannot be rendered.
 
 `REMCTL_IMAGES_FORCE=1` bypasses the TTY check. It exists for tests only; do not use it in scripts or normal output, since it can emit escape sequences into non-terminal consumers.
+
+## List Badges
+
+Plain human list output can end a reminder's one-line summary with up to two trailing emoji badges:
+
+- `🔗` — the reminder has at least one rich link (a `ZREMCDOBJECT` URL row, or a legacy saved attachment typed `url`).
+- `🌄` — the reminder has at least one image attachment.
+
+When both apply they print in that order, space-separated, at the end of the line after tags and any `[N subtasks]` count:
+
+```text
+[ ] #30165 Try Halo app on iOS again 🌄
+[ ] #30174 Read the new MacStories piece 🔗
+[ ] #30180 Review layout mockups 🔗 🌄
+```
+
+The badges appear in `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `group show`, and on subtask lines in `subtasks` and `info`. Completed reminders keep their badges. They are loaded in batch alongside the other list metadata, so they add no per-reminder queries.
+
+Badges are a plain human output affordance only: they are never present in `--json`, CSV export, `--format table`, or `--via-eventkit` payloads. Agents should read the `attachments` and `url` JSON fields instead.
 
 ## Attachments in JSON
 

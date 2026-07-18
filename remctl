@@ -12199,6 +12199,9 @@ def main():
         env_mode = os.environ.get("REMCTL_IMAGE_MODE", "").strip().lower()
         if env_mode in IMAGE_MODES:
             a.image_mode = None if env_mode == "none" else env_mode
+        elif env_mode:
+            print(f"remctl: ignoring unknown REMCTL_IMAGE_MODE {env_mode!r} "
+                  f"(expected one of: {', '.join(m for m in IMAGE_MODES if m != 'none')}, none)", file=sys.stderr)
     if a.image_mode == "none":
         a.images = False
         a.image_mode = None
