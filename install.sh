@@ -98,6 +98,10 @@ cp "$SCRIPT_DIR/remctl_runtime.py" "$BIN_DIR/remctl_runtime.py"
 chmod 644 "$BIN_DIR/remctl_runtime.py"
 echo -e "  ${GREEN}✓${RESET} remctl_runtime.py → $BIN_DIR/remctl_runtime.py"
 
+cp "$SCRIPT_DIR/remctl_images.py" "$BIN_DIR/remctl_images.py"
+chmod 644 "$BIN_DIR/remctl_images.py"
+echo -e "  ${GREEN}✓${RESET} remctl_images.py → $BIN_DIR/remctl_images.py"
+
 echo -e "${BLUE}→${RESET} Installing shared serialization helpers..."
 cp "$SCRIPT_DIR/remctl_serialization.py" "$BIN_DIR/remctl_serialization.py"
 chmod 644 "$BIN_DIR/remctl_serialization.py"

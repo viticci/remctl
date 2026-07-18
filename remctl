@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.4.1
+"""remctl — Power-user Reminders CLI v1.5.0
 
 Reads from the iCloud Reminders CoreData database (sections, subtasks, tags,
 attachments, completion status, list colors). Writes via remctl-bridge (EventKit)
 with AppleScript fallback. Zero Python dependencies with small shared helpers.
 """
 
-import argparse, base64, csv, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+import argparse, base64, csv, hashlib, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
 
 CLI_NAME = os.path.basename(sys.argv[0])
 from datetime import datetime, timedelta
@@ -14,8 +14,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
 
+from remctl_images import (
+    IMAGE_MODES,
+    detect_image_mode,
+    render_attachment,
+    resolve_attachment_file,
+)
 from remctl_runtime import (
     due_today_window,
+    env_bool,
     is_safe_remote_url,
     resolve_binary_path,
     resolve_config_dir,
@@ -46,7 +53,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 PRIVATE_PROTOCOL_VERSION = 1
 _private_protocol_probe = None
 
@@ -2119,13 +2126,53 @@ def q_assignment(db, reminder_pk):
     except (AttributeError, sqlite3.OperationalError):
         return None
 
+def _attachment_sha_capability(db):
+    """Per-db cache of which attachment tables expose ZSHA512SUM (schema drift guard)."""
+    try:
+        cache = db._remctl_attachment_sha_cap
+    except AttributeError:
+        cache = {}
+    result = {}
+    for table in ("ZREMCDSAVEDATTACHMENT", "ZREMCDOBJECT"):
+        if table not in cache:
+            try:
+                columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                cache[table] = "ZSHA512SUM" in columns
+            except Exception:
+                cache[table] = False
+        result[table] = cache[table]
+    try:
+        db._remctl_attachment_sha_cap = cache
+    except AttributeError:
+        pass
+    return result
+
+
 def q_attachments(db, pk):
+    capability = _attachment_sha_capability(db)
+    if capability.get("ZREMCDSAVEDATTACHMENT") and capability.get("ZREMCDOBJECT"):
+        return db.execute(
+            "SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE, ZSHA512SUM, "
+            "NULL AS ZWIDTH, NULL AS ZHEIGHT FROM ZREMCDSAVEDATTACHMENT "
+            "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0 "
+            "UNION ALL "
+            "SELECT ZFILENAME, ZUTI, "
+            "CASE WHEN ZWIDTH IS NOT NULL OR ZHEIGHT IS NOT NULL THEN 'image' ELSE 'file' END AS ZATTACHMENTTYPERAWVALUE, "
+            "ZSHA512SUM, ZWIDTH, ZHEIGHT "
+            "FROM ZREMCDOBJECT "
+            "WHERE ZREMINDER2 = ? AND ZFILENAME IS NOT NULL AND ZFILENAME != '' AND ZMARKEDFORDELETION = 0 "
+            "ORDER BY ZFILENAME", (pk, pk)
+        ).fetchall()
+    saved_sha = "ZSHA512SUM" if capability.get("ZREMCDSAVEDATTACHMENT") else "NULL AS ZSHA512SUM"
+    object_sha = "ZSHA512SUM" if capability.get("ZREMCDOBJECT") else "NULL AS ZSHA512SUM"
     return db.execute(
-        "SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE FROM ZREMCDSAVEDATTACHMENT "
+        f"SELECT ZFILENAME, ZUTI, ZATTACHMENTTYPERAWVALUE, {saved_sha}, "
+        "NULL AS ZWIDTH, NULL AS ZHEIGHT FROM ZREMCDSAVEDATTACHMENT "
         "WHERE ZREMINDER = ? AND ZMARKEDFORDELETION = 0 "
         "UNION ALL "
         "SELECT ZFILENAME, ZUTI, "
-        "CASE WHEN ZWIDTH IS NOT NULL OR ZHEIGHT IS NOT NULL THEN 'image' ELSE 'file' END AS ZATTACHMENTTYPERAWVALUE "
+        "CASE WHEN ZWIDTH IS NOT NULL OR ZHEIGHT IS NOT NULL THEN 'image' ELSE 'file' END AS ZATTACHMENTTYPERAWVALUE, "
+        f"{object_sha}, ZWIDTH, ZHEIGHT "
         "FROM ZREMCDOBJECT "
         "WHERE ZREMINDER2 = ? AND ZFILENAME IS NOT NULL AND ZFILENAME != '' AND ZMARKEDFORDELETION = 0 "
         "ORDER BY ZFILENAME", (pk, pk)
@@ -2186,11 +2233,25 @@ def q_due_date_delta_alerts(db, reminder_ckid):
     ).fetchall()
 
 
-def attachment_rows_to_json(rows):
-    return [
-        {"filename": row["ZFILENAME"], "type": row["ZATTACHMENTTYPERAWVALUE"]}
-        for row in rows
-    ]
+def attachment_rows_to_json(rows, db=None):
+    return [attachment_row_to_json(row, db=db) for row in rows]
+
+def attachment_row_to_json(row, db=None):
+    filename = _row_get(row, "ZFILENAME")
+    uti = _row_get(row, "ZUTI")
+    sha = _row_get(row, "ZSHA512SUM")
+    path = None
+    if sha:
+        path = resolve_attachment_file(STORE_DIR, sha, filename=filename, uti=uti)
+    return {
+        "filename": filename,
+        "type": _row_get(row, "ZATTACHMENTTYPERAWVALUE"),
+        "path": path,
+        "resolved": path is not None,
+        "uti": uti,
+        "width": _row_get(row, "ZWIDTH"),
+        "height": _row_get(row, "ZHEIGHT"),
+    }
 
 def _date_components_dict(value):
     if value in (None, ""):
@@ -2384,7 +2445,7 @@ def should_clear_matching_absolute_alarm(db, reminder):
     return any(_same_datetime_second(alarm_dt, candidate) for candidate in (old_due, old_display))
 
 def hydrate_reminder_detail(db, payload, reminder_id):
-    attachments = attachment_rows_to_json(q_attachments(db, reminder_id))
+    attachments = attachment_rows_to_json(q_attachments(db, reminder_id), db=db)
     if attachments:
         payload["attachments"] = attachments
     alarms = alarm_rows_to_json(q_alarms(db, reminder_id))
@@ -2662,7 +2723,7 @@ def recurrence_badge(item):
     return C.magenta(f"↻ {summary}") if summary else ""
 
 
-def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
+def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None, _img=None):
     completed = r["ZCOMPLETED"] if _item_has(r, "ZCOMPLETED") else bool(_item_get(r, "completed"))
     if completed:
         status = C.green("[x]")
@@ -2724,6 +2785,26 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None):
             parts.append(f"{indent}    Flagged: {C.yellow('Yes')}")
         if _item_is_urgent(r):
             parts.append(f"{indent}    Urgent: {C.red('Yes')}")
+        if _img and db is not None and _item_has(r, "Z_PK"):
+            mode, width = _img
+            try:
+                att_rows = q_attachments(db, r["Z_PK"])
+            except Exception:
+                att_rows = []
+            for a2 in att_rows:
+                rendered = _render_attachment_row(a2, mode, width)
+                if rendered == "unresolved":
+                    suffix = C.dim(" (file not downloaded on this Mac)")
+                elif rendered is None:
+                    suffix = C.dim(" (preview unavailable)")
+                else:
+                    suffix = ""
+                parts.append(
+                    f"{indent}    Attachment: {safe_display(a2['ZFILENAME'] or 'untitled')}"
+                    f" ({safe_display(a2['ZATTACHMENTTYPERAWVALUE'] or '?')}){suffix}"
+                )
+                if rendered not in (None, "unresolved"):
+                    parts.append(rendered)
     return "\n".join(parts)
 
 def to_dict(r, db=None, section=None, _sc=None, _ht=None):
@@ -2740,6 +2821,12 @@ def to_dict(r, db=None, section=None, _sc=None, _ht=None):
         fallback_hashtags=lambda inner_db, pk: [t["ZNAME"] for t in q_hashtags(inner_db, pk)],
     )
     if db is not None and _item_has(r, "Z_PK"):
+        try:
+            attachment_payload = attachment_rows_to_json(q_attachments(db, r["Z_PK"]), db=db)
+        except Exception:
+            attachment_payload = []
+        if attachment_payload:
+            payload["attachments"] = attachment_payload
         assignment = assignment_to_dict(q_assignment(db, r["Z_PK"]))
         if assignment:
             payload["assignment"] = assignment
@@ -2760,6 +2847,9 @@ def reminders_to_dicts(items, db=None, memberships=None):
         rich_link_resolver=q_rich_link,
         fallback_subtask_count=q_subtask_count,
         fallback_hashtags=lambda inner_db, pk: [t["ZNAME"] for t in q_hashtags(inner_db, pk)],
+        attachment_rows_to_json=(
+            (lambda rows: attachment_rows_to_json(rows, db=db)) if db is not None else None
+        ),
     )
     if db is not None:
         for item, payload in zip(items, payloads):
@@ -2773,6 +2863,52 @@ def reminders_to_dicts(items, db=None, memberships=None):
                         payload["earlyReminder"] = alerts[0]
                         payload["earlyReminders"] = alerts
     return payloads
+
+# ── Inline Images ────────────────────────────────────────────────────────────
+
+def _image_render_enabled(a):
+    """True when inline image rendering is allowed for this invocation."""
+    if not getattr(a, "images", False):
+        return False
+    if getattr(a, "json", False) or getattr(a, "format", "plain") == "table":
+        return False
+    if not C.enabled:
+        return False
+    # REMCTL_IMAGES_FORCE bypasses ONLY the isatty check (test-only escape hatch).
+    if not sys.stdout.isatty() and not env_bool("REMCTL_IMAGES_FORCE"):
+        return False
+    return True
+
+
+def _image_render_config(a):
+    """(mode, width) when inline rendering is active, else None."""
+    if not _image_render_enabled(a):
+        return None
+    mode = getattr(a, "image_mode", None) or detect_image_mode()
+    if not mode:
+        return None
+    return mode, getattr(a, "image_width", 32) or 32
+
+
+def _image_render_config_verbose(a):
+    """Image config for list commands: only with --verbose (quiet by default)."""
+    if not getattr(a, "verbose", False):
+        return None
+    return _image_render_config(a)
+
+
+def _render_attachment_row(row, mode, width):
+    """Rendered string for one attachment row, or None.
+
+    Unresolved files yield the 'not downloaded' suffix marker; resolved but
+    unrenderable files yield the 'preview unavailable' marker.
+    """
+    payload = attachment_row_to_json(row)
+    path = payload.get("path")
+    if not path:
+        return "unresolved"
+    return render_attachment(path, mode, width)
+
 
 # ── Table Format ─────────────────────────────────────────────────────────────
 
@@ -7751,6 +7887,7 @@ def cmd_show_group(a, db, group_ref):
     if not items:
         print(f"No {'active ' if not a.completed else ''}reminders in group '{safe_display(group_ref['title'])}'")
         return
+    img = _image_render_config_verbose(a)
     print(f"{C.bold(color_list_name(group_ref['title'], db))} {C.dim('(group)')}:")
     for child in children:
         child_items = [item for item in items if _row_get(item, "ZLIST") == child["Z_PK"]]
@@ -7772,16 +7909,16 @@ def cmd_show_group(a, db, group_ref):
                 else:
                     unsectioned.append(item)
             for item in unsectioned:
-                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht, _img=img))
             for section_name in [section["ZDISPLAYNAME"] for section in secs]:
                 if section_name in sec_items:
                     heading = safe_display(format_grocery_section_name(section_name, is_groceries=bool(child_ref.get("isGroceries"))))
                     print(f"\n    {C.bold(f'[{heading}]')}")
                     for item in sec_items[section_name]:
-                        print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+                        print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht, _img=img))
         else:
             for item in child_items:
-                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht))
+                print(fmt(item, db, verbose=a.verbose, indent="    ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
 
 
@@ -7829,6 +7966,7 @@ def cmd_show(a):
     if list_ref.get("isGroceries"):
         list_heading = f"{list_heading} {GROCERY_LIST_MARKER}"
     print(f"{C.bold(list_heading)}:")
+    img = _image_render_config_verbose(a)
     if secs:
         sec_items, unsectioned = {}, []
         for item in items:
@@ -7838,16 +7976,16 @@ def cmd_show(a):
             else:
                 unsectioned.append(item)
         for item in unsectioned:
-            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
+            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht, _img=img))
         for sn in [s["ZDISPLAYNAME"] for s in secs]:
             if sn in sec_items:
                 heading = safe_display(format_grocery_section_name(sn, is_groceries=bool(list_ref.get("isGroceries"))))
                 print(f"\n  {C.bold(f'[{heading}]')}")
                 for item in sec_items[sn]:
-                    print(fmt(item, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+                    print(fmt(item, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht, _img=img))
     else:
         for item in items:
-            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht))
+            print(fmt(item, db, verbose=a.verbose, _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
 
 def cmd_add(a):
@@ -8580,8 +8718,9 @@ def cmd_search(a):
         print(f"No reminders matching '{safe_display(a.query)}'")
         return
     print(f"Search: {C.bold(safe_display(a.query))}")
+    img = _image_render_config_verbose(a)
     for i in items:
-        print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht))
+        print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
 
 def cmd_today(a):
@@ -8605,15 +8744,16 @@ def cmd_today(a):
     overdue = [i for i in items if ts(row_effective_due(i)) < sod]
     overdue_pks = {i["Z_PK"] for i in overdue}
     due = [i for i in items if i["Z_PK"] not in overdue_pks]
+    img = _image_render_config_verbose(a)
     if overdue:
         print(C.red(f"Overdue ({len(overdue)}):"))
         for i in overdue:
-            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
+            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht, _img=img))
         print()
     if due:
         print(C.bold(f"Due Today ({len(due)}):"))
         for i in due:
-            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht))
+            print(fmt(i, db, indent="  ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} total")
 
 def cmd_flagged(a):
@@ -8631,8 +8771,9 @@ def cmd_flagged(a):
         print("No flagged reminders")
         return
     print(C.bold("Flagged:"))
+    img = _image_render_config_verbose(a)
     for i in items:
-        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} flagged")
 
 def cmd_urgent(a):
@@ -8650,8 +8791,9 @@ def cmd_urgent(a):
         print("No urgent reminders")
         return
     print(C.bold("Urgent:"))
+    img = _image_render_config_verbose(a)
     for i in items:
-        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht))
+        print(fmt(i, db, verbose=a.verbose, indent="  ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} urgent")
 
 def cmd_tags(a):
@@ -8688,8 +8830,9 @@ def cmd_subtasks(a):
     if not subs:
         print("  No subtasks")
     else:
+        img = _image_render_config_verbose(a)
         for s in subs:
-            print(fmt(s, db, indent="  ", _sc=sc, _ht=ht))
+            print(fmt(s, db, indent="  ", _sc=sc, _ht=ht, _img=img))
         print(f"\n{len(subs)} subtask{'s' if len(subs) != 1 else ''}")
 
 def cmd_info(a):
@@ -8776,12 +8919,41 @@ def cmd_info(a):
         print(f"  Subtasks ({len(subs)}):")
         sub_pks = [s["Z_PK"] for s in subs]
         sc, ht = preload_extras(db, sub_pks)
+        image_cfg = _image_render_config(a)
         for s in subs:
             print(fmt(s, db, indent="    ", _sc=sc, _ht=ht))
+            if image_cfg:
+                mode, width = image_cfg
+                try:
+                    sub_atts = q_attachments(db, s["Z_PK"])
+                except Exception:
+                    sub_atts = []
+                for a2 in sub_atts:
+                    rendered = _render_attachment_row(a2, mode, width)
+                    if rendered == "unresolved":
+                        suffix = C.dim(" (file not downloaded on this Mac)")
+                    elif rendered is None:
+                        suffix = C.dim(" (preview unavailable)")
+                    else:
+                        suffix = ""
+                    print(f"      - {safe_display(a2['ZFILENAME'] or 'untitled')} ({safe_display(a2['ZATTACHMENTTYPERAWVALUE'] or '?')}){suffix}")
+                    if rendered not in (None, "unresolved"):
+                        sys.stdout.write(rendered + "\n")
     if atts:
         print(f"  Attachments ({len(atts)}):")
+        image_cfg = _image_render_config(a)
         for a2 in atts:
-            print(f"    - {safe_display(a2['ZFILENAME'] or 'untitled')} ({safe_display(a2['ZATTACHMENTTYPERAWVALUE'] or '?')})")
+            suffix = ""
+            if image_cfg:
+                mode, width = image_cfg
+                rendered = _render_attachment_row(a2, mode, width)
+                if rendered == "unresolved":
+                    suffix = C.dim(" (file not downloaded on this Mac)")
+                elif rendered is None:
+                    suffix = C.dim(" (preview unavailable)")
+            print(f"    - {safe_display(a2['ZFILENAME'] or 'untitled')} ({safe_display(a2['ZATTACHMENTTYPERAWVALUE'] or '?')}){suffix}")
+            if image_cfg and rendered not in (None, "unresolved"):
+                sys.stdout.write(rendered + "\n")
     if alarms:
         print(f"  Alarms ({len(alarms)}):")
         for alarm in alarm_rows_to_json(alarms):
@@ -9040,8 +9212,9 @@ def cmd_upcoming(a):
         groups.setdefault((day_key, day_label), []).append(i)
     for (day_key, day_label), day_items in sorted(groups.items()):
         print(f"\n  {C.bold(day_label)}:")
+        img = _image_render_config_verbose(a)
         for i in day_items:
-            print(fmt(i, db, indent="    ", _sc=sc, _ht=ht))
+            print(fmt(i, db, indent="    ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} upcoming")
 
 def cmd_overdue(a):
@@ -9059,8 +9232,9 @@ def cmd_overdue(a):
         print("No overdue reminders")
         return
     print(C.red(C.bold(f"Overdue ({len(items)}):")))
+    img = _image_render_config_verbose(a)
     for i in items:
-        print(fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  ", _sc=sc, _ht=ht))
+        print(fmt(i, db, verbose=getattr(a, 'verbose', False), indent="  ", _sc=sc, _ht=ht, _img=img))
     print(f"\n{len(items)} overdue")
 
 def cmd_list_create(a):
@@ -10006,6 +10180,10 @@ _remctl() {
             ;;
     esac
     _describe 'command' commands
+    _arguments \
+        '--images[Render image attachments inline]' \
+        '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock ascii none)' \
+        '--image-width[Image render width in cells]:width:'
 }
 compdef _remctl remctl
 '''
@@ -10115,6 +10293,8 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ $COMP_CWORD -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -W "--images --image-mode --image-width" -- "$cur") )
     fi
 }
 complete -F _remctl remctl
@@ -10175,6 +10355,9 @@ complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose setup and r
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
 complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Open guided macOS permission helper"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
+complete -c remctl -l images -d "Render image attachments inline"
+complete -c remctl -l image-mode -d "Image rendering protocol" -x -a "kitty iterm2 halfblock ascii none"
+complete -c remctl -l image-width -d "Image render width in cells" -x
 complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Print agent-focused context and TCC guidance"
 complete -c remctl -n "__fish_seen_subcommand_from show" -l list-id -d "Show list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l completed -d "Include completed reminders"
@@ -11140,6 +11323,7 @@ def main():
             f"  {CLI_NAME} onboard\n"
             f"  {CLI_NAME} today\n"
             f"  {CLI_NAME} add \"Buy milk\" -d tomorrow\n"
+            f"  {CLI_NAME} info 847 --images\n"
             f"  {CLI_NAME} setup --shell auto --doctor\n"
             f"  {CLI_NAME} permissions full-disk-access\n"
             "\n"
@@ -11155,10 +11339,21 @@ def main():
     p.add_argument("--no-color", action="store_true", help="Disable color output")
     p.add_argument("--format", choices=["plain", "table", "json"], default="plain",
                    help="Output format")
+    p.add_argument("--images", action="store_true",
+                   help="Render image attachments inline (info always; list commands with --verbose)")
+    p.add_argument("--image-mode", choices=list(IMAGE_MODES), default=None,
+                   help="Image rendering protocol (default: auto-detect)")
+    p.add_argument("--image-width", type=int, default=None,
+                   help="Image render width in terminal cells (default: 32)")
 
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
     def js(c): c.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    def img(c):
+        # Re-declare the global image flags so they also parse after the command name.
+        c.add_argument("--images", action="store_true", help=argparse.SUPPRESS)
+        c.add_argument("--image-mode", choices=list(IMAGE_MODES), default=None, help=argparse.SUPPRESS)
+        c.add_argument("--image-width", type=int, default=None, help=argparse.SUPPRESS)
     def display_format(c):
         c.add_argument(
             "--format",
@@ -11298,7 +11493,7 @@ def main():
     c.add_argument("list", nargs="?", help="List name")
     c.add_argument("--list-id", type=int, help="Show a list by stable numeric ID")
     c.add_argument("--completed", action="store_true", help="Include completed")
-    eventkit_read(c); vb(c); js(c); display_format(c)
+    eventkit_read(c); vb(c); js(c); display_format(c); img(c)
 
     c = sub.add_parser(
         "add",
@@ -11452,20 +11647,21 @@ def main():
     c.add_argument("query"); c.add_argument("--completed", action="store_true"); vb(c); js(c)
     eventkit_read(c)
     display_format(c)
+    img(c)
 
     c = sub.add_parser("today", help="Due today + overdue")
-    c.add_argument("--no-overdue", action="store_true"); eventkit_read(c); vb(c); js(c); display_format(c)
+    c.add_argument("--no-overdue", action="store_true"); eventkit_read(c); vb(c); js(c); display_format(c); img(c)
 
-    c = sub.add_parser("flagged", help="Flagged reminders"); vb(c); js(c); display_format(c)
+    c = sub.add_parser("flagged", help="Flagged reminders"); vb(c); js(c); display_format(c); img(c)
 
-    c = sub.add_parser("urgent", help="Urgent reminders"); vb(c); js(c); display_format(c)
+    c = sub.add_parser("urgent", help="Urgent reminders"); vb(c); js(c); display_format(c); img(c)
 
     c = sub.add_parser("tags", help="List all hashtag labels"); js(c)
 
     c = sub.add_parser("subtasks", help="Show subtasks of a reminder")
-    c.add_argument("id", type=int); vb(c); js(c)
+    c.add_argument("id", type=int); vb(c); js(c); img(c)
 
-    c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c); img(c)
 
     c = sub.add_parser("sections", help="Show sections across lists"); js(c)
 
@@ -11505,9 +11701,9 @@ def main():
 
     c = sub.add_parser("upcoming", help="Show reminders due from today through N more days (default 7)")
     c.add_argument("days", type=int, nargs="?", default=7, help="Days to look ahead beyond today; the window always starts today (1 = today and tomorrow, 7 = today plus the next week)")
-    eventkit_read(c); vb(c); js(c); display_format(c)
+    eventkit_read(c); vb(c); js(c); display_format(c); img(c)
 
-    c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c); display_format(c)
+    c = sub.add_parser("overdue", help="Show all overdue reminders"); vb(c); js(c); display_format(c); img(c)
 
     c = sub.add_parser("list-symbols", help="List official Reminders list symbols")
     c.add_argument("--html", nargs="?", const="", metavar="PATH", help="Write a standalone HTML preview contact sheet")
@@ -11857,6 +12053,25 @@ def main():
     command_format = getattr(a, "command_format", None)
     if command_format:
         a.format = command_format
+
+    # Image rendering: env vars provide defaults, CLI flags win.
+    if not a.images:
+        a.images = env_bool("REMCTL_IMAGES")
+    if a.image_mode is None:
+        env_mode = os.environ.get("REMCTL_IMAGE_MODE", "").strip().lower()
+        if env_mode in IMAGE_MODES:
+            a.image_mode = None if env_mode == "none" else env_mode
+    if a.image_mode == "none":
+        a.images = False
+        a.image_mode = None
+    if a.image_width is None:
+        env_width = os.environ.get("REMCTL_IMAGE_WIDTH", "").strip()
+        try:
+            a.image_width = int(env_width) if env_width else 32
+        except ValueError:
+            a.image_width = 32
+    if a.image_width < 1:
+        a.image_width = 32
 
     # Set up color
     if a.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():

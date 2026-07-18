@@ -6446,23 +6446,23 @@ class CliTests(unittest.TestCase):
         db.execute("CREATE TABLE ZREMCDHASHTAGLABEL (Z_PK INTEGER, ZNAME TEXT)")
         db.execute(
             "CREATE TABLE ZREMCDSAVEDATTACHMENT ("
-            "ZFILENAME TEXT, ZUTI TEXT, ZATTACHMENTTYPERAWVALUE TEXT, "
+            "ZFILENAME TEXT, ZUTI TEXT, ZATTACHMENTTYPERAWVALUE TEXT, ZSHA512SUM TEXT, "
             "ZREMINDER INTEGER, ZMARKEDFORDELETION INTEGER)"
         )
         db.execute(
             "CREATE TABLE ZREMCDOBJECT ("
             "Z_PK INTEGER, Z_ENT INTEGER, ZREMINDER INTEGER, ZTRIGGER INTEGER, "
             "ZREMINDER2 INTEGER, ZREMINDER3 INTEGER, ZHASHTAGLABEL INTEGER, ZMARKEDFORDELETION INTEGER, "
-            "ZFILENAME TEXT, ZUTI TEXT, ZWIDTH INTEGER, ZHEIGHT INTEGER, ZURL TEXT, "
+            "ZFILENAME TEXT, ZUTI TEXT, ZWIDTH INTEGER, ZHEIGHT INTEGER, ZSHA512SUM TEXT, ZURL TEXT, "
             "ZTIMEINTERVAL REAL, ZDATECOMPONENTSDATA BLOB, ZTITLE TEXT, ZLATITUDE REAL, "
             "ZLONGITUDE REAL, ZRADIUS REAL, ZADDRESS TEXT, ZPROXIMITY INTEGER)"
         )
         db.executemany(
-            "INSERT INTO ZREMCDOBJECT VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ZREMCDOBJECT VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (1, 25, None, None, 43, None, None, 0, "child.png", "public.png", 100, 100, None, None, None, None, None, None, None, None, None),
-                (2, 15, 43, 3, None, None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None),
-                (3, 19, None, None, None, None, None, 0, None, None, None, None, None, -600, None, None, None, None, None, None, None),
+                (1, 25, None, None, 43, None, None, 0, "child.png", "public.png", 100, 100, None, None, None, None, None, None, None, None, None, None),
+                (2, 15, 43, 3, None, None, None, 0, None, None, None, None, None, None, None, None, None, None, None, None, None, None),
+                (3, 19, None, None, None, None, None, 0, None, None, None, None, None, None, -600, None, None, None, None, None, None, None),
             ],
         )
         parent = {
@@ -6517,20 +6517,20 @@ class CliTests(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE ZREMCDSAVEDATTACHMENT ("
-            "ZFILENAME TEXT, ZUTI TEXT, ZATTACHMENTTYPERAWVALUE TEXT, "
+            "ZFILENAME TEXT, ZUTI TEXT, ZATTACHMENTTYPERAWVALUE TEXT, ZSHA512SUM TEXT, "
             "ZREMINDER INTEGER, ZMARKEDFORDELETION INTEGER)"
         )
         conn.execute(
             "CREATE TABLE ZREMCDOBJECT ("
-            "ZFILENAME TEXT, ZUTI TEXT, ZWIDTH INTEGER, ZHEIGHT INTEGER, "
+            "ZFILENAME TEXT, ZUTI TEXT, ZWIDTH INTEGER, ZHEIGHT INTEGER, ZSHA512SUM TEXT, "
             "ZREMINDER2 INTEGER, ZMARKEDFORDELETION INTEGER)"
         )
         conn.execute(
             "INSERT INTO ZREMCDOBJECT VALUES "
-            "('first.png', 'public.png', 512, 512, 42, 0), "
-            "('second.png', 'public.png', 512, 512, 42, 0), "
-            "('deleted.png', 'public.png', 512, 512, 42, 1), "
-            "(NULL, 'public.url', NULL, NULL, 42, 0)"
+            "('first.png', 'public.png', 512, 512, NULL, 42, 0), "
+            "('second.png', 'public.png', 512, 512, NULL, 42, 0), "
+            "('deleted.png', 'public.png', 512, 512, NULL, 42, 1), "
+            "(NULL, 'public.url', NULL, NULL, NULL, 42, 0)"
         )
 
         attachments = [dict(row) for row in self.remctl.q_attachments(conn, 42)]
@@ -6539,8 +6539,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             attachments,
             [
-                {"ZFILENAME": "first.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image"},
-                {"ZFILENAME": "second.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image"},
+                {"ZFILENAME": "first.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image",
+                 "ZSHA512SUM": None, "ZWIDTH": 512, "ZHEIGHT": 512},
+                {"ZFILENAME": "second.png", "ZUTI": "public.png", "ZATTACHMENTTYPERAWVALUE": "image",
+                 "ZSHA512SUM": None, "ZWIDTH": 512, "ZHEIGHT": 512},
             ],
         )
 
