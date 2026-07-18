@@ -2936,6 +2936,22 @@ def _image_render_enabled(a):
     return True
 
 
+def _default_image_width(mode=None):
+    """Terminal-relative default render width in cells.
+
+    Used when neither --image-width nor REMCTL_IMAGE_WIDTH is set. Aims for
+    ~40% of the terminal, capped to [24, 100]; half-block gets a lower cap
+    because two pixel rows per cell make it read large. Falls back to 48
+    when the terminal size can't be determined.
+    """
+    cap = 64 if mode == "halfblock" else 100
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        return 48
+    return max(24, min(cap, int(cols * 0.4)))
+
+
 def _image_render_config(a):
     """(mode, width) when inline rendering is active, else None."""
     if not _image_render_enabled(a):
@@ -2943,7 +2959,15 @@ def _image_render_config(a):
     mode = getattr(a, "image_mode", None) or detect_image_mode()
     if not mode:
         return None
-    return mode, getattr(a, "image_width", 32) or 32
+    return mode, _resolve_image_width(a, mode)
+
+
+def _resolve_image_width(a, mode):
+    """Explicit flag/env width wins; otherwise the terminal-relative default."""
+    explicit = getattr(a, "image_width", None)
+    if explicit:
+        return explicit
+    return _default_image_width(mode)
 
 
 def _image_render_config_verbose(a):
@@ -11486,7 +11510,7 @@ def build_parser():
     p.add_argument("--image-mode", choices=list(IMAGE_MODES), default=None,
                    help="Image rendering protocol (default: auto-detect)")
     p.add_argument("--image-width", type=int, default=None,
-                   help="Image render width in terminal cells (default: 32)")
+                   help="Image render width in terminal cells (default: ~40% of terminal width, capped 24-100)")
 
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
@@ -12208,11 +12232,13 @@ def main():
     if a.image_width is None:
         env_width = os.environ.get("REMCTL_IMAGE_WIDTH", "").strip()
         try:
-            a.image_width = int(env_width) if env_width else 32
+            a.image_width = int(env_width) if env_width else None
         except ValueError:
-            a.image_width = 32
-    if a.image_width < 1:
-        a.image_width = 32
+            a.image_width = None
+        if env_width and a.image_width is None:
+            print(f"remctl: ignoring invalid REMCTL_IMAGE_WIDTH {env_width!r} (expected a positive integer)", file=sys.stderr)
+    if a.image_width is not None and a.image_width < 1:
+        a.image_width = None
 
     # Set up color
     if a.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():

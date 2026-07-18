@@ -447,7 +447,7 @@ Two flags control the render, with matching environment variables (flags win ove
 | --- | --- | --- | --- |
 | `--images` | `REMCTL_IMAGES=1` | off | Render image attachments inline |
 | `--image-mode MODE` | `REMCTL_IMAGE_MODE` | auto-detect | One of `kitty`, `iterm2`, `halfblock`, `none` |
-| `--image-width N` | `REMCTL_IMAGE_WIDTH` | `32` | Render width in terminal cells |
+| `--image-width N` | `REMCTL_IMAGE_WIDTH` | ~40% of terminal width | Render width in terminal cells |
 
 Without `--image-mode`, RemCTL picks the best protocol for the current terminal:
 

@@ -7974,6 +7974,48 @@ class InlineImageTests(unittest.TestCase):
             self._detect_mode({"REMCTL_IMAGE_MODE": "none", "TERM_PROGRAM": "kitty"})
         )
 
+    def test_default_image_width_scales_with_terminal(self):
+        cases = [
+            # (columns, mode, expected)
+            (200, "kitty", 80),      # 40% of 200
+            (120, "kitty", 48),      # 40% of 120
+            (80, "kitty", 32),       # 40% of 80
+            (40, "kitty", 24),       # floor
+            (1000, "kitty", 100),    # cap
+            (1000, "halfblock", 64), # halfblock cap
+            (200, "halfblock", 64),  # 40% = 80, clamped to 64
+        ]
+        for cols, mode, expected in cases:
+            with self.subTest(cols=cols, mode=mode):
+                size = os.terminal_size((cols, 24))
+                with mock.patch.object(os, "get_terminal_size", return_value=size):
+                    self.assertEqual(self.remctl._default_image_width(mode), expected)
+
+    def test_default_image_width_fallback_when_size_unknown(self):
+        with mock.patch.object(os, "get_terminal_size", side_effect=OSError):
+            self.assertEqual(self.remctl._default_image_width("kitty"), 48)
+            self.assertEqual(self.remctl._default_image_width(None), 48)
+
+    def test_explicit_image_width_still_wins(self):
+        size = os.terminal_size((300, 24))
+        args = SimpleNamespace(images=True, image_mode="kitty", image_width=32,
+                               json=False, format="plain", verbose=False)
+        with mock.patch.object(os, "get_terminal_size", return_value=size), \
+             mock.patch.object(sys.stdout, "isatty", return_value=True), \
+             mock.patch.object(self.remctl.C, "enabled", True):
+            mode, width = self.remctl._image_render_config(args)
+        self.assertEqual((mode, width), ("kitty", 32))
+
+    def test_unset_image_width_uses_terminal_default(self):
+        size = os.terminal_size((300, 24))  # 40% = 120 -> cap 100
+        args = SimpleNamespace(images=True, image_mode="kitty", image_width=None,
+                               json=False, format="plain", verbose=False)
+        with mock.patch.object(os, "get_terminal_size", return_value=size), \
+             mock.patch.object(sys.stdout, "isatty", return_value=True), \
+             mock.patch.object(self.remctl.C, "enabled", True):
+            mode, width = self.remctl._image_render_config(args)
+        self.assertEqual((mode, width), ("kitty", 100))
+
     def test_detect_image_mode_terminals(self):
         self.assertEqual(self._detect_mode({"TERM_PROGRAM": "ghostty"}), "kitty")
         self.assertEqual(self._detect_mode({"TERM_PROGRAM": "kitty"}), "kitty")
