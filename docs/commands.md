@@ -193,9 +193,12 @@ remctl add "Weekly report" --recurrence weekly
 remctl add "Standup" --recurrence "weekly mon,wed,fri" --alarm 15m
 remctl add "Pay rent" --recurrence monthly
 remctl add "Annual review" --recurrence yearly
+remctl add "Check PO box" --recurrence "monthly 4th-fri"
+remctl add "Renew passport" --recurrence "yearly x10"
+remctl add "Clean water pitcher" --recurrence "weekly x2 thu"
 ```
 
-Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, and `yearly`; invalid recurrence, alarm, and priority values fail before writing. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
+Recurring schedules and normal alarms use EventKit and work on both `add` and `edit`. Accepted recurrence forms are `daily`, `weekly`, `weekly mon,wed,fri`, `monthly`, `monthly 1,15`, `monthly 4th-fri` (the Nth weekday of each month; `-1-fri` is the last Friday), and `yearly`. Any form takes an optional `xN` interval token right after the frequency — `yearly x2` is every 2 years, `weekly x2 thu` is every other Thursday. Note that `monthly 5th-fri` follows EventKit semantics: months without a fifth Friday are silently skipped, so prefer `-1-fri` when you mean "last Friday". Invalid recurrence, alarm, and priority values fail before writing. `info --json`, `show --json`, and other read commands decode the stored recurrence rows back into a stable `recurrence` object. Normal alarms appear in `info --json` as `alarms` entries; relative alarms include `relativeOffset`, `relativeOffsetMinutes`, and a label such as `15 minutes before due date`. Use `edit ID --alarm clear --json` to remove normal alarms.
 
 Early Reminders:
 

@@ -193,6 +193,99 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(self.remctl.parse_recurrence("weekly funday"))
         self.assertIsNone(self.remctl.parse_recurrence("monthly 0,32"))
 
+    def test_parse_recurrence_interval_token(self):
+        self.assertEqual(
+            self.remctl.parse_recurrence("yearly x2"),
+            {"frequency": "yearly", "interval": 2},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("weekly x2 thu"),
+            {"frequency": "weekly", "interval": 2, "daysOfWeek": [5]},
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly x6"),
+            {"frequency": "monthly", "interval": 6},
+        )
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x0"))
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x"))
+        self.assertIsNone(self.remctl.parse_recurrence("daily x2 extra"))
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x1000"))
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x²"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly ²"))
+        self.assertIsNone(self.remctl.parse_recurrence("yearly x" + "9" * 5000))
+
+    def test_parse_recurrence_nth_weekday_of_month(self):
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly 4th-fri"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [4],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly 1st-mon,3rd-mon"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [2, 2],
+                "weekNumbers": [1, 3],
+            },
+        )
+        self.assertEqual(
+            self.remctl.parse_recurrence("monthly -1-fri"),
+            {
+                "frequency": "monthly",
+                "interval": 1,
+                "daysOfWeek": [6],
+                "weekNumbers": [-1],
+            },
+        )
+        self.assertIsNone(self.remctl.parse_recurrence("monthly 6th-fri"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly 0th-fri"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly 4th-funday"))
+        self.assertIsNone(self.remctl.parse_recurrence("monthly 4th-fri,15"))
+
+    def test_recurrence_summary_renders_nth_weekday(self):
+        self.assertEqual(
+            self.remctl.recurrence_summary(
+                {"frequency": "monthly", "interval": 1, "daysOfWeek": [6], "weekNumbers": [4]}
+            ),
+            "monthly 4th Fri",
+        )
+        self.assertEqual(
+            self.remctl.recurrence_summary(
+                {"frequency": "monthly", "interval": 1, "daysOfWeek": [6], "weekNumbers": [-1]}
+            ),
+            "monthly last Fri",
+        )
+        self.assertEqual(
+            self.remctl.recurrence_summary(
+                {"frequency": "monthly", "interval": 2, "daysOfWeek": [3], "weekNumbers": [4]}
+            ),
+            "every 2 months 4th Tue",
+        )
+        # SQLite read path delivers daysOfWeekDetailed instead of parallel arrays
+        self.assertEqual(
+            self.remctl.recurrence_summary(
+                {
+                    "frequency": "monthly",
+                    "interval": 1,
+                    "daysOfWeekDetailed": [{"dayOfTheWeek": 6, "weekNumber": 4}],
+                    "daysOfWeek": [6],
+                }
+            ),
+            "monthly 4th Fri",
+        )
+        # weekly rendering is unchanged
+        self.assertEqual(
+            self.remctl.recurrence_summary(
+                {"frequency": "weekly", "interval": 1, "daysOfWeek": [2, 4]}
+            ),
+            "weekly Mon, Wed",
+        )
+
     def test_private_call_returns_structured_error_payload(self):
         with mock.patch.object(
             self.remctl,

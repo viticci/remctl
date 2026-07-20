@@ -2730,6 +2730,37 @@ def _recurrence_from_item(item):
     return recurrence_from_row(item, ts=ts)
 
 
+def _recurrence_weekday_specs(recurrence):
+    """Return [(dayOfTheWeek, weekNumber)] pairs; weekNumber 0 means every week."""
+    detailed = recurrence.get("daysOfWeekDetailed") or []
+    if detailed:
+        return [
+            (int(item.get("dayOfTheWeek", 0)), int(item.get("weekNumber") or 0))
+            for item in detailed
+            if isinstance(item, dict) and item.get("dayOfTheWeek")
+        ]
+    days = recurrence.get("daysOfWeek") or []
+    weeks = recurrence.get("weekNumbers") or []
+    return [
+        (int(day), int(weeks[idx]) if idx < len(weeks) else 0)
+        for idx, day in enumerate(days)
+    ]
+
+
+def _weekday_spec_label(day, week):
+    name = RECURRENCE_DAY_NAMES.get(day, str(day))
+    if not week:
+        return name
+    if week == -1:
+        return f"last {name}"
+    if week < 0:
+        week = abs(week)
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(week if week < 20 else week % 10, "th")
+        return f"{week}{suffix}-last {name}"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(week if week < 20 else week % 10, "th")
+    return f"{week}{suffix} {name}"
+
+
 def recurrence_summary(recurrence):
     if not recurrence:
         return ""
@@ -2749,10 +2780,9 @@ def recurrence_summary(recurrence):
     else:
         label = f"every {interval} {plural}"
 
-    days = recurrence.get("daysOfWeek") or []
-    if frequency == "weekly" and days:
-        names = [RECURRENCE_DAY_NAMES.get(int(day), str(day)) for day in days]
-        label += " " + ", ".join(names)
+    day_specs = _recurrence_weekday_specs(recurrence)
+    if frequency in ("weekly", "monthly", "yearly") and day_specs:
+        label += " " + ", ".join(_weekday_spec_label(day, week) for day, week in day_specs)
 
     days_of_month = recurrence.get("daysOfMonth") or []
     if frequency == "monthly" and days_of_month:
@@ -4016,7 +4046,8 @@ def parse_subtask_specs(values):
             if recurrence is None:
                 print(
                     "Error: subtask recurrence must be daily, weekly, monthly, yearly, "
-                    "'weekly mon,wed,fri', or 'monthly 1,15'.",
+                    "'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', or any "
+                    "with an 'xN' interval like 'yearly x2'.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -6277,8 +6308,13 @@ def due_spec_is_all_day(s):
 
 # ── Recurrence / Alarm Parsing ───────────────────────────────────────────────
 
+RECURRENCE_DAY_MAP = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
+# digit runs are length-bounded so int() can never trip CPython's int/str conversion limit
+NTH_WEEKDAY_RE = re.compile(r"^(-?\d{1,2})(?:st|nd|rd|th)?-(sun|mon|tue|wed|thu|fri|sat)$")
+
+
 def parse_recurrence(spec):
-    """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15'."""
+    """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'yearly x2'."""
     if not spec:
         return None
     parts = spec.lower().split()
@@ -6287,26 +6323,50 @@ def parse_recurrence(spec):
     freq = parts[0]
     if freq not in {"daily", "weekly", "monthly", "yearly"}:
         return None
-    result = {"frequency": freq, "interval": 1}
+    interval = 1
+    # optional 'xN' interval token, e.g. 'yearly x2' = every 2 years
+    if len(parts) > 1 and parts[1].startswith("x") and parts[1][1:].isdecimal():
+        token = parts[1][1:]
+        if len(token) > 3:
+            return None
+        interval = int(token)
+        if interval < 1:
+            return None
+        parts = [freq] + parts[2:]
+    result = {"frequency": freq, "interval": interval}
     if freq == "weekly" and len(parts) > 1:
         if len(parts) != 2:
             return None
-        day_map = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}
         tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
-        if not tokens or any(token not in day_map for token in tokens):
+        if not tokens or any(token not in RECURRENCE_DAY_MAP for token in tokens):
             return None
-        days = [day_map[token] for token in tokens]
+        days = [RECURRENCE_DAY_MAP[token] for token in tokens]
         if days: result["daysOfWeek"] = days
     elif freq == "monthly" and len(parts) > 1:
         if len(parts) != 2:
             return None
         tokens = [d.strip() for d in parts[1].split(",") if d.strip()]
-        if not tokens or not all(token.isdigit() for token in tokens):
+        if not tokens:
             return None
-        days = [int(token) for token in tokens]
-        if any(day < 1 or day > 31 for day in days):
+        if all(token.isdecimal() and len(token) <= 2 for token in tokens):
+            days = [int(token) for token in tokens]
+            if any(day < 1 or day > 31 for day in days):
+                return None
+            if days: result["daysOfMonth"] = days
+        elif all(NTH_WEEKDAY_RE.match(token) for token in tokens):
+            # 'monthly 4th-fri' = the 4th Friday of every month; '-1-fri' = last
+            days, weeks = [], []
+            for token in tokens:
+                m = NTH_WEEKDAY_RE.match(token)
+                week = int(m.group(1))
+                if week == 0 or week > 5 or week < -5:
+                    return None
+                days.append(RECURRENCE_DAY_MAP[m.group(2)])
+                weeks.append(week)
+            result["daysOfWeek"] = days
+            result["weekNumbers"] = weeks
+        else:
             return None
-        if days: result["daysOfMonth"] = days
     elif len(parts) > 1:
         return None
     return result
@@ -6315,7 +6375,9 @@ def parse_recurrence(spec):
 def fail_invalid_recurrence(value):
     print(
         f"Error: could not parse recurrence {value!r}. Use daily, weekly, "
-        "'weekly mon,wed,fri', 'monthly 1,15', monthly, or yearly.",
+        "'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri' ('-1-fri' = "
+        "last Friday), monthly, yearly, or add an 'xN' interval like "
+        "'yearly x2'.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -11705,7 +11767,7 @@ def build_parser():
     c.add_argument("-f", "--flag", action="store_true", help="Set the reminder's real flagged state")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
-    c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', yearly (bridge only)")
+    c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri' ('-1-fri' = last Friday), yearly, or any with an 'xN' interval like 'yearly x2' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
     c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/assignments/subtasks/images")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
@@ -11781,7 +11843,7 @@ def build_parser():
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders, or clear")
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
-    c.add_argument("--recurrence", help="Recurrence (bridge only)")
+    c.add_argument("--recurrence", help="Recurrence: daily, weekly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri' ('-1-fri' = last Friday), yearly, or any with an 'xN' interval like 'yearly x2' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, ISO datetime, or clear (bridge only)")
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)

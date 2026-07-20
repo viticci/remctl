@@ -39,6 +39,7 @@ struct RecurrenceSpec: Decodable {
     let frequency: String
     let interval: Int?
     let daysOfWeek: [Int]?
+    let weekNumbers: [Int]?
     let daysOfMonth: [Int]?
     let end: String?
 }
@@ -155,7 +156,26 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
     if let days = spec.daysOfWeek {
         // Input: 1=Sun, 2=Mon ... 7=Sat → EKWeekday raw values match
         guard !days.isEmpty, days.allSatisfy({ 1...7 ~= $0 }) else { return nil }
-        let mapped = days.compactMap { EKWeekday(rawValue: $0).map { EKRecurrenceDayOfWeek($0) } }
+        // Optional parallel weekNumbers pin each day to the Nth week of the
+        // month/year (e.g. monthly + Fri week 4 = "4th Friday"); -1 = last.
+        // EventKit raises an uncatchable NSException for out-of-range or
+        // wrong-frequency weekNumbers, so validate here like the sibling fields.
+        let weeks = spec.weekNumbers ?? []
+        guard weeks.isEmpty || weeks.count == days.count else { return nil }
+        if weeks.contains(where: { $0 != 0 }) {
+            switch freq {
+            case .monthly: guard weeks.allSatisfy({ (-5...5).contains($0) }) else { return nil }
+            case .yearly:  guard weeks.allSatisfy({ (-53...53).contains($0) }) else { return nil }
+            default: return nil
+            }
+        }
+        let mapped = days.enumerated().compactMap { idx, raw -> EKRecurrenceDayOfWeek? in
+            guard let day = EKWeekday(rawValue: raw) else { return nil }
+            if idx < weeks.count, weeks[idx] != 0 {
+                return EKRecurrenceDayOfWeek(dayOfTheWeek: day, weekNumber: weeks[idx])
+            }
+            return EKRecurrenceDayOfWeek(day)
+        }
         guard mapped.count == days.count else { return nil }
         daysOfWeek = mapped
     }
@@ -449,6 +469,10 @@ func recurrencePayload(_ rule: EKRecurrenceRule) -> [String: Any] {
     ]
     if let days = rule.daysOfTheWeek, !days.isEmpty {
         payload["daysOfWeek"] = days.map { $0.dayOfTheWeek.rawValue }
+        // weekNumber 0 = every week; nonzero pins the Nth weekday ("4th Friday")
+        if days.contains(where: { $0.weekNumber != 0 }) {
+            payload["weekNumbers"] = days.map { $0.weekNumber }
+        }
     }
     if let days = rule.daysOfTheMonth, !days.isEmpty {
         payload["daysOfMonth"] = days.map { $0.intValue }
