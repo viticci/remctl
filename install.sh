@@ -123,7 +123,7 @@ for name in remctl rctl reminders; do
 done
 
 # 2. Compile and install helpers
-COMPILE_LOG="$(mktemp -t remctl-compile)"
+COMPILE_LOG="$(mktemp -t remctl-compile.XXXXXX)"
 trap 'rm -f "$COMPILE_LOG"' EXIT
 if command -v swiftc &>/dev/null; then
     echo -e "${BLUE}→${RESET} Compiling remctl-bridge (Swift/EventKit)..."
