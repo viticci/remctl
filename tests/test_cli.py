@@ -5867,6 +5867,63 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["subtasksMoved"], 0)
         self.assertTrue(payload["originalDeleted"])
 
+    def test_cmd_edit_clone_deletes_ordinary_list_move_after_bare_reminderkit_3002(self):
+        # macOS does not always describe why it refused the move. When it
+        # rejects reassigning EKReminder.calendar it can return nothing but a
+        # numeric code, which is the exact message reported in issue #13.
+        reminder = dict(self._FAKE_REMINDER)
+        reminder["Z_PK"] = 1
+        reminder["ZLIST"] = 7
+        target = {"id": 9, "title": "Shared Tasks", "requested": "Shared Tasks", "method": "exact", "objectUUID": "LIST-UUID"}
+        args = SimpleNamespace(
+            id=1, json=True, title=None, list="Shared Tasks", list_id=None,
+            notes=None, priority=None, due=None, url=None, recurrence=None,
+            alarm=None, private=False, private_metadata=False, tags=None,
+            grocery=False, section=None, section_id=None, new_section=None,
+            subtask=None, image=None, flagged=None, urgent=None,
+            early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result(
+            {
+                "status": "error",
+                "message": "Update failed: The operation couldn’t be completed. (com.apple.reminderkit error -3002.)",
+            },
+            returncode=1,
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=target),
+            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(
+                self.remctl,
+                "clone_reminder_tree_to_list_or_die",
+                return_value={
+                    "status": "updated",
+                    "id": 42,
+                    "oldId": 1,
+                    "list": "Shared Tasks",
+                    "objectUUID": "NEW-REMINDER",
+                    "subtasksMoved": 0,
+                    "method": "clone-delete",
+                    "delete": {"status": "deleted"},
+                },
+            ) as clone_move,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_edit(args)
+
+        clone_move.assert_called_once_with(mock.ANY, reminder, target, [])
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["id"], 42)
+        self.assertEqual(payload["oldId"], 1)
+        self.assertEqual(payload["method"], "clone-delete")
+        self.assertEqual(payload["subtasksMoved"], 0)
+        self.assertTrue(payload["originalDeleted"])
+
     def test_cmd_edit_does_not_clone_ordinary_move_when_eventkit_access_is_blocked(self):
         reminder = dict(self._FAKE_REMINDER)
         reminder["Z_PK"] = 1

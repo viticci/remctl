@@ -3387,6 +3387,9 @@ def bridge_failure_is_list_move_rejection(result):
         "not writable",
         "immutable",
         "move",
+        # macOS returns a bare numeric code with no descriptive text when it
+        # rejects reassigning EKReminder.calendar on an existing reminder.
+        "reminderkit error -3002",
     ]
     return any(needle in message for needle in needles)
 
