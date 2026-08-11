@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added an optional, locally built `RemCTL Agent Helper.app` for agent hosts that should not receive Full Disk Access themselves. The helper bundles the installed RemCTL runtime, receives Reminders and database permissions, and accepts bounded argument arrays only through a custom macOS Apple Event. Each caller therefore needs a separate Automation grant; no network listener or Unix socket is exposed.
+- Added the `remctl-agent` client, portable ad-hoc or developer signing, explicit macOS 14 deployment targeting, setup documentation, and regression checks for the helper bundle contract.
+
 ## 1.6.1 — 2026-07-30
 
 Two things: flagging is now honest end-to-end (it writes the real flag or fails — no more reporting success while writing nothing), and the recurrence grammar learned intervals and Nth-weekday rules.

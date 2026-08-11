@@ -364,6 +364,16 @@ The visual permission helper opens System Settings, copies the first target path
 
 Full Disk Access and Reminders/EventKit access are scoped to the process context. A Terminal session can pass `remctl doctor` while Codex, another agent runner, or a different host app fails. Run `remctl doctor` from the same context that will run RemCTL commands; for agent setup, use `remctl doctor --for-agent`. When a terminal embeds another engine, RemCTL prefers the real host `.app` bundle over inherited terminal variables so the printed target matches the app macOS will authorize.
 
+If you do not want to grant Full Disk Access to an entire agent host, install the optional, background-only Agent Helper after the normal install:
+
+```bash
+scripts/install-agent-helper.sh
+remctl-agent onboard
+remctl-agent doctor --json
+```
+
+Grant Reminders and Full Disk Access only to `RemCTL Agent Helper.app`. `remctl-agent` talks to it through a custom Apple Event, so macOS gives each calling host a separate Automation permission rather than exposing a reusable socket or local server. See [Agent Helper setup](docs/installation.md#optional-agent-helper) for signing, paths, and relaunch instructions.
+
 Manual fallback: run `remctl doctor --for-agent`, then add the printed target in System Settings > Privacy & Security > Full Disk Access. In the file picker, press `Command-Shift-G`, paste the path, press Return, then click Open. If the `eventkit` check fails, run `remctl onboard` from the same app or agent runner and approve the Reminders prompt.
 
 If Full Disk Access cannot be granted to an automation host, `show`, `search`, `today`, and `upcoming` support `--via-eventkit` as a limited read-only fallback through the EventKit bridge. This does not replace normal setup: it omits RemCTL numeric IDs, sections, synced tags, private metadata, smart-list/template internals, numeric list targeting, and table output.
@@ -437,12 +447,15 @@ remctl doctor
 | `remctl-bridge.swift` | Swift/EventKit write helper source |
 | `remctl-private.m` | Unsupported private ReminderKit metadata helper source |
 | `remctl-permissions.swift` | Swift/AppKit guided Full Disk Access helper source |
+| `agent-helper/` | Optional Apple Event Agent Helper app and client sources |
 | `remctl_runtime.py` | Shared paths, config, date windows, safety helpers |
 | `remctl_images.py` | Attachment file resolution and inline terminal image rendering |
 | `remctl_serialization.py` | Shared reminder JSON serialization |
 | `remctl_smart_lists.py` | Smart-list filter decoding and safe v1 encoding |
 | `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
 | `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |
+| `scripts/install-agent-helper.sh` | Builds and installs the optional signed Agent Helper and client |
+| `scripts/uninstall-agent-helper.sh` | Removes only the optional Agent Helper files |
 | `install.sh` | Copy-based installer and bootstrap script |
 | `uninstall.sh` | Removes installed RemCTL files and optional config |
 

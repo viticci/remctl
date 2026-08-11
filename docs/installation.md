@@ -104,6 +104,28 @@ Use the exact target printed by `doctor`. Open System Settings > Privacy & Secur
 
 If an agent cannot get Full Disk Access or EventKit write access but the user's Terminal already passes `doctor`, a one-off Terminal relay can unblock testing: ask the user for approval, run the requested `remctl` command in Terminal via AppleScript, and capture stdout/stderr through temporary files. Do not treat that as the default automation path; the durable fix is granting access to the actual runner.
 
+### Optional Agent Helper
+
+If granting Full Disk Access to an entire agent host is too broad, install the optional helper after the normal RemCTL install:
+
+```bash
+./install.sh --bootstrap
+scripts/install-agent-helper.sh
+remctl-agent onboard
+remctl-agent doctor --json
+```
+
+The installer builds and signs two local components:
+
+- `~/Applications/RemCTL Agent Helper.app`, which contains a private copy of the installed RemCTL runtime and receives Reminders plus Full Disk Access permissions.
+- `~/bin/remctl-agent`, which forwards only a bounded RemCTL argument array and returns stdout, stderr, and exit status.
+
+The transport is a custom macOS Apple Event, not a socket or network service. macOS therefore requires the current host app to receive Automation permission specifically for `RemCTL Agent Helper`; another app cannot silently reuse that grant. The helper still has complete access to the user's reminders, so install it only from a trusted checkout and grant Full Disk Access only to the signed app bundle.
+
+After changing either Reminders or Full Disk Access permissions, quit and relaunch the helper before rerunning `remctl-agent doctor --json`. Use `REMCTL_AGENT_HELPER_APP` to point the client at a non-default app path. Use `REMCTL_CODESIGN_IDENTITY` during installation to select a Developer ID or Apple Development identity; otherwise the installer uses an ad-hoc signature, and rebuilding the app may require granting permissions again.
+
+Remove only the optional helper with `scripts/uninstall-agent-helper.sh`. Add `--dry-run` to inspect the exact app and client paths first. The script does not remove the normal RemCTL install and does not revoke privacy grants.
+
 For basic reads only, `show`, `search`, `today`, and `upcoming` also accept `--via-eventkit` as a limited read-only fallback when a host cannot get Full Disk Access. This is not a setup replacement and should never be the default for agents. It omits RemCTL numeric IDs, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, numeric list targeting, and table output. JSON returns `source: "eventkit"`, `fidelity: "limited"`, and per-item `eventKitId` values; those IDs cannot be passed to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any numeric-ID command.
 
 ## Upgrading

@@ -5,7 +5,7 @@ description: Use when an agent needs to read, create, edit, complete, inspect, o
 
 # RemCTL
 
-RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreData database for fast, detailed output and writes normally through `remctl-bridge` using EventKit; the real flagged state is the one exception and is written through AppleScript. Unsupported private metadata writes are available only when explicitly requested with `--private`; those go through `remctl-private` and Apple's private ReminderKit APIs. It is CLI-only: there is no local API server, token, launch agent, or service command.
+RemCTL is a power-user Apple Reminders CLI. It reads the local Reminders CoreData database for fast, detailed output and writes normally through `remctl-bridge` using EventKit; the real flagged state is the one exception and is written through AppleScript. Unsupported private metadata writes are available only when explicitly requested with `--private`; those go through `remctl-private` and Apple's private ReminderKit APIs. The default install is CLI-only. An optional `RemCTL Agent Helper.app` can hold Reminders and Full Disk Access permissions when the agent host itself should not receive them; call that path with `remctl-agent`.
 
 The installed command can be invoked as `remctl`, `rctl`, or `reminders`; all three names behave identically and produce the same output.
 
@@ -324,8 +324,18 @@ remctl permissions full-disk-access
 remctl doctor
 ```
 
-RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript operations, and Full Disk Access for direct database reads. `flag`, `unflag`, and `add --flag` are AppleScript-only, not a fallback: without Automation access they fail instead of degrading. The guided permission helper only handles CLI targets; there is no service target. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
+RemCTL may need Reminders access for EventKit writes and private ReminderKit writes, Automation access for AppleScript operations, and Full Disk Access for direct database reads. `flag`, `unflag`, and `add --flag` are AppleScript-only, not a fallback: without Automation access they fail instead of degrading. `remctl-private` does not have its own first-run flow; it depends on the same Reminders access and must be installed next to `remctl`.
 
 macOS TCC permissions are scoped to the process context. Terminal can pass `remctl doctor` while Codex or another agent runner fails from its own context. If agent-side `doctor` fails but the user's Terminal passes, treat that as expected TCC scoping rather than a broken install. Ask the user to grant Full Disk Access to the target printed by `remctl doctor --for-agent`; if the `eventkit` check fails, run `remctl onboard` from the same context to trigger Reminders access. For a one-off unblock, run the requested `remctl` command through Terminal via AppleScript and capture stdout/stderr in temp files.
+
+When the user does not want to grant broad Reminders or Full Disk Access permissions to the agent host, use the optional Agent Helper instead:
+
+```bash
+scripts/install-agent-helper.sh
+remctl-agent onboard
+remctl-agent doctor --json
+```
+
+Grant Reminders and Full Disk Access only to `RemCTL Agent Helper.app`. The caller receives only macOS Automation permission to control that helper; each other app must obtain its own Automation grant. Run all later commands through `remctl-agent`, and verify `doctor` in that same path. Relaunch the helper after changing privacy permissions. Do not expose an FDA-enabled RemCTL process through an unauthenticated localhost or Unix-socket server.
 
 `doctor` reports `completion_fpath` when an installed zsh completion file does not appear in exported `FPATH` or the usual zsh startup files. Full Disk Access targets come from the current process context; when terminal engines are embedded, trust `host_app` and `host_app_path` from `doctor --for-agent --json` over inherited `TERM_PROGRAM` labels.

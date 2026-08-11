@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="RemCTL Agent Helper Terminology">
+    <suite name="RemCTL Agent Helper Suite" code="RCTL" description="Run bounded RemCTL commands.">
+        <command name="run remctl" code="RCTLEXEC" description="Run a RemCTL argument array encoded as JSON.">
+            <direct-parameter type="text" description="A JSON array of RemCTL arguments."/>
+            <result type="text" description="JSON containing exitCode, stdout, and stderr."/>
+        </command>
+    </suite>
+</dictionary>

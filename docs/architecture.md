@@ -21,7 +21,7 @@ remctl-permissions (Swift/AppKit)
   └─ guides Full Disk Access setup with draggable targets
 ```
 
-There is no daemon, localhost API, launch agent, or token setup in RemCTL. The CLI is the only runtime surface.
+The default install has no daemon, localhost API, launch agent, or token setup; the CLI is its only runtime surface. The optional Agent Helper is a separately installed, background-only app. It accepts bounded RemCTL argument arrays through macOS Apple Events, so TCC requires every calling host to receive a separate Automation grant. It does not expose a network listener or Unix socket.
 
 ## Reads
 
