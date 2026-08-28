@@ -184,6 +184,10 @@ Then remove `RemCTL Capability Host` from System Settings › Privacy & Security
 
 The host runs as the same macOS user. The Unix socket is created in `~/Library/Application Support/RemCTL/` with mode `0600` inside a mode `0700` directory. RemCTL verifies socket ownership and mode before connecting, and refuses symlinks. The RPC is closed and read-only; no write operations are exposed through the socket.
 
+See [Capability Host design](docs/capability-host-design.md) for the
+permission boundary, protocol invariants, runtime sealing, routing, and
+failure model.
+
 ## Command Map
 
 | Task | Commands |

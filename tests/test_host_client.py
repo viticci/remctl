@@ -152,7 +152,7 @@ class HostClientTests(unittest.TestCase):
     def test_poll_condition_computes_read_timeout_from_server_bounds(self):
         with mock.patch.object(remctl_host, "call_host", return_value={"result": {"met": True}}) as call_host:
             result = remctl_host.poll_condition(
-                Path("/Users/ninja-matt/Projects/remctl/fake.sock"),
+                Path("/tmp/remctl-test.sock"),
                 "list_state",
                 "LIST-1",
                 attempts=100,
@@ -164,7 +164,7 @@ class HostClientTests(unittest.TestCase):
     def test_poll_condition_preserves_explicit_read_timeout(self):
         with mock.patch.object(remctl_host, "call_host", return_value={"result": {"met": False}}) as call_host:
             remctl_host.poll_condition(
-                Path("/Users/ninja-matt/Projects/remctl/fake.sock"),
+                Path("/tmp/remctl-test.sock"),
                 "list_state",
                 "LIST-1",
                 read_timeout=99,

@@ -169,7 +169,7 @@ class ReadBrokerTests(unittest.TestCase):
     def test_main_requires_manifest_arguments(self):
         stderr = StringIO()
         with redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
-            broker.main(["--socket", "/Users/ninja-matt/Projects/remctl/broker.sock"])
+            broker.main(["--socket", "/tmp/remctl-test.sock"])
         self.assertNotEqual(caught.exception.code, 0)
         self.assertIn("--manifest", stderr.getvalue())
 

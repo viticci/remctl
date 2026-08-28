@@ -1204,7 +1204,7 @@ class TransientVerificationTests(unittest.TestCase):
         db.close.assert_called_once()
 
     def test_typed_location_alarm_exists_hosted_calls_host(self):
-        backend = self.remctl.HostedReadBackend(socket_path="/Users/ninja-matt/Projects/remctl/fake.sock")
+        backend = self.remctl.HostedReadBackend(socket_path="/tmp/remctl-test.sock")
         with mock.patch.object(
             remctl_host,
             "snapshot_location_alarm",
@@ -1217,7 +1217,7 @@ class TransientVerificationTests(unittest.TestCase):
         self.assertTrue(result)
 
     def test_typed_location_alarm_exists_hosted_returns_false_on_no_match(self):
-        backend = self.remctl.HostedReadBackend(socket_path="/Users/ninja-matt/Projects/remctl/fake.sock")
+        backend = self.remctl.HostedReadBackend(socket_path="/tmp/remctl-test.sock")
         with mock.patch.object(
             remctl_host,
             "snapshot_location_alarm",
@@ -1228,7 +1228,7 @@ class TransientVerificationTests(unittest.TestCase):
 
     def test_typed_location_alarm_exists_hosted_returns_false_on_host_unavailable(self):
         from remctl_host import HostUnavailable
-        backend = self.remctl.HostedReadBackend(socket_path="/Users/ninja-matt/Projects/remctl/fake.sock")
+        backend = self.remctl.HostedReadBackend(socket_path="/tmp/remctl-test.sock")
         with mock.patch.object(
             remctl_host,
             "snapshot_location_alarm",
@@ -1238,14 +1238,14 @@ class TransientVerificationTests(unittest.TestCase):
         self.assertFalse(result)
 
     def test_typed_list_exists_by_name_hosted_uses_resolve_list(self):
-        backend = self.remctl.HostedReadBackend(socket_path="/Users/ninja-matt/Projects/remctl/fake.sock")
+        backend = self.remctl.HostedReadBackend(socket_path="/tmp/remctl-test.sock")
         with mock.patch.object(backend, "resolve_list", return_value={"id": 7, "title": "Groceries"}) as resolve_list:
             result = backend.typed_list_exists_by_name("Groceries")
         resolve_list.assert_called_once_with(name="Groceries")
         self.assertTrue(result)
 
     def test_typed_group_exists_by_name_hosted_uses_group_resolution(self):
-        backend = self.remctl.HostedReadBackend(socket_path="/Users/ninja-matt/Projects/remctl/fake.sock")
+        backend = self.remctl.HostedReadBackend(socket_path="/tmp/remctl-test.sock")
         with mock.patch.object(backend, "typed_group_ref", return_value={"id": 9, "title": "Work"}) as resolve_group:
             result = backend.typed_group_exists_by_name("Work")
         resolve_group.assert_called_once_with(name="Work")
