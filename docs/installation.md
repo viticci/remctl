@@ -33,7 +33,14 @@ Install to `~/.local/bin`:
 PREFIX="$HOME/.local" ./install.sh --bootstrap
 ```
 
-`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, compiles the optional `remctl-private` helper when `clang` is available, creates `~/.config/remctl`, installs shell completion when supported, and creates `rctl` and `reminders` aliases that behave identically to `remctl`.
+`--bootstrap` copies files, compiles `remctl-bridge` and `remctl-permissions` when `swiftc` is available, compiles the optional `remctl-private` helper when `clang` is available, builds and installs the **Capability Host** app when `swiftc` is available, creates `~/.config/remctl`, installs shell completion when supported, and creates `rctl` and `reminders` aliases that behave identically to `remctl`.
+
+To control Capability Host installation:
+
+```bash
+./install.sh --host       # build and install the Capability Host (default if swiftc is available)
+./install.sh --no-host    # skip Capability Host installation
+```
 
 It does not grant macOS permissions. Apple requires those grants to happen interactively.
 
@@ -67,6 +74,8 @@ See [private-metadata.md](private-metadata.md) for supported private fields and 
 ## macOS Permission Scope
 
 macOS does not provide a native Full Disk Access prompt for command-line tools.
+
+**Grant Full Disk Access only to `~/Applications/RemCTL Capability Host.app`** — never to Python, Terminal, Copilot, `remctl-bridge`, `remctl-private`, or `remctl-permissions`. The Capability Host is a named macOS app bundle that keeps FDA between reboots and serves read requests to restricted callers over a private Unix socket.
 
 Full Disk Access and Reminders/EventKit authorization are scoped to the exact process context. The same Mac can have:
 
@@ -106,7 +115,7 @@ Use the exact target printed by `doctor`. Open System Settings > Privacy & Secur
 
 If an agent cannot get Full Disk Access or EventKit write access but the user's Terminal already passes `doctor`, a one-off Terminal relay can unblock testing: ask the user for approval, run the requested `remctl` command in Terminal via AppleScript, and capture stdout/stderr through temporary files. Do not treat that as the default automation path; the durable fix is granting access to the actual runner.
 
-For basic reads only, `show`, `search`, `today`, and `upcoming` also accept `--via-eventkit` as a limited read-only fallback when a host cannot get Full Disk Access. This is not a setup replacement and should never be the default for agents. It omits RemCTL numeric IDs, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, numeric list targeting, and table output. JSON returns `source: "eventkit"`, `fidelity: "limited"`, and per-item `eventKitId` values; those IDs cannot be passed to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any numeric-ID command.
+For basic reads only, `show`, `search`, `today`, and `upcoming` also accept `--via-eventkit` as a limited read-only fallback when the Capability Host is not installed and a host cannot get Full Disk Access. This is not a setup replacement and should never be the default for agents. It omits RemCTL numeric IDs, sections, synced tags, private rich links, urgent state, template internals, smart-list internals, numeric list targeting, and table output. JSON returns `source: "eventkit"`, `fidelity: "limited"`, and per-item `eventKitId` values; those IDs cannot be passed to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any numeric-ID command.
 
 ## Upgrading
 
@@ -120,7 +129,9 @@ remctl --version
 remctl doctor
 ```
 
-Re-running `install.sh` also rebuilds the helper binaries. RemCTL checks a `remctl-private` protocol version on first `--private` use; an outdated helper refuses `--private` writes with a "re-run install.sh to rebuild" error, and `doctor` reports the helper protocol version.
+Re-running `install.sh` also rebuilds the helper binaries and the Capability Host. RemCTL checks a `remctl-private` protocol version on first `--private` use; an outdated helper refuses `--private` writes with a "re-run install.sh to rebuild" error, and `doctor` reports the helper protocol version.
+
+> **Ad-hoc CDHash warning:** The Capability Host is ad-hoc signed by default. Every rebuild changes its CDHash, which invalidates the Full Disk Access grant. After each upgrade you must remove and re-add `~/Applications/RemCTL Capability Host.app` in System Settings › Privacy & Security › Full Disk Access. To avoid this, sign with a Developer ID: `REMCTL_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' ./install.sh`. A Developer ID grant survives upgrades.
 
 If you installed to `~/.local/bin`:
 

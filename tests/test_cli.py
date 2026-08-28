@@ -22,6 +22,23 @@ from unittest import mock
 from helpers import load_module
 
 
+class _NoCloseConnection:
+    """Wraps a sqlite3.Connection so repeated backend open/close cycles in a
+    single test don't tear down a shared in-memory fixture prematurely.
+    ``sqlite3.Connection.close`` cannot be monkeypatched (immutable C type),
+    so tests that exercise multiple typed_* backend calls against one mocked
+    ``open_db`` return value wrap it with this proxy instead."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 class CliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -36,6 +53,17 @@ class CliTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._default_protocol_probe.stop()
+
+    def setUp(self):
+        # main()-invoking tests call configure_read_backend(), which can leave
+        # a HostedReadBackend active globally. Pin the direct backend before
+        # each test so command tests that mock module-level open_db keep
+        # exercising the direct read path regardless of prior test order.
+        self._saved_read_backend = self.remctl.get_read_backend()
+        self.remctl.set_read_backend(self.remctl.DIRECT_READ_BACKEND)
+
+    def tearDown(self):
+        self.remctl.set_read_backend(self._saved_read_backend)
 
     @staticmethod
     def _bridge_result(payload, returncode=0):
@@ -101,6 +129,27 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(self.remctl.parse_completion_date("today"))
         self.assertIsNone(self.remctl.parse_completion_date("+3d"))
         self.assertIsNone(self.remctl.parse_completion_date("2026-02-31"))
+
+    def test_open_db_uses_active_read_backend(self):
+        sentinel = object()
+
+        class FakeReadBackend(self.remctl.ReadBackend):
+            route_name = "test"
+
+            def open_db(self):
+                return sentinel
+
+        original = self.remctl.get_read_backend()
+        try:
+            self.remctl.set_read_backend(FakeReadBackend())
+            self.assertIs(self.remctl.open_db(), sentinel)
+            self.assertEqual(self.remctl.get_read_backend().route_name, "test")
+        finally:
+            self.remctl.set_read_backend(original)
+
+    def test_set_read_backend_rejects_untyped_backend(self):
+        with self.assertRaisesRegex(TypeError, "ReadBackend"):
+            self.remctl.set_read_backend(object())
 
     def test_due_spec_is_all_day_for_date_only_inputs(self):
         self.assertTrue(self.remctl.due_spec_is_all_day("today"))
@@ -436,9 +485,10 @@ class CliTests(unittest.TestCase):
             "message": "Couldn’t communicate with a helper application.",
         }
         created = {"status": "created", "name": "Project X"}
+        db = mock.Mock()
         with (
             mock.patch.object(self.remctl, "private_call", side_effect=[transient, created]) as private_call,
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "open_db", return_value=db),
             mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=0),
             mock.patch.object(self.remctl.time, "sleep"),
         ):
@@ -452,9 +502,10 @@ class CliTests(unittest.TestCase):
             "status": "error",
             "message": "Couldn’t communicate with a helper application.",
         }
+        db = mock.Mock()
         with (
             mock.patch.object(self.remctl, "private_call", return_value=transient) as private_call,
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "open_db", return_value=db),
             mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=1),
             mock.patch.object(self.remctl.time, "sleep"),
         ):
@@ -869,7 +920,7 @@ class CliTests(unittest.TestCase):
         db = self._list_group_db()
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_lists(SimpleNamespace(json=True))
@@ -891,7 +942,7 @@ class CliTests(unittest.TestCase):
         db = self._add_group_reminders(self._list_group_db())
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_groups(SimpleNamespace(json=True, format=None))
@@ -910,7 +961,7 @@ class CliTests(unittest.TestCase):
         db = self._add_group_reminders(self._list_group_db())
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_groups(SimpleNamespace(json=False, format="table"))
@@ -945,7 +996,7 @@ class CliTests(unittest.TestCase):
         db = self._list_db(["Groceries"], grocery_locales={"Groceries": "en_US"})
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_lists(SimpleNamespace(json=False, format=None))
@@ -967,7 +1018,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_create_group_call", return_value={"status": "created", "id": "GROUP-CK"}) as create_group,
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
@@ -1016,7 +1067,7 @@ class CliTests(unittest.TestCase):
 
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_create_list_call", side_effect=create_list_side_effect) as create_list,
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
@@ -1050,7 +1101,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -1096,7 +1147,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -1145,7 +1196,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -1183,7 +1234,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call") as private_call,
                 contextlib.redirect_stderr(io.StringIO()) as stderr,
@@ -1276,7 +1327,7 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "open_db", return_value=db),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 7, "title": "Projects"},
             ),
             mock.patch.object(self.remctl, "q_reminders", return_value=[]) as q_reminders,
@@ -1294,6 +1345,7 @@ class CliTests(unittest.TestCase):
             completed=False,
             top_level=True,
             manual_order=True,
+            return_truncated=True,
         )
         self.assertEqual(json.loads(stdout.getvalue()), [])
 
@@ -1329,6 +1381,7 @@ class CliTests(unittest.TestCase):
             completed=False,
             top_level=True,
             manual_order=True,
+            return_truncated=True,
         )
         self.assertEqual(json.loads(stdout.getvalue()), [])
 
@@ -1342,7 +1395,7 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 1, "title": "Groceries", "isGroceries": True},
             ),
             mock.patch.object(self.remctl, "q_reminders", return_value=rows),
@@ -1391,7 +1444,7 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 1, "title": "Groceries", "isGroceries": True},
             ),
             mock.patch.object(self.remctl, "q_reminders", return_value=rows),
@@ -1549,7 +1602,7 @@ class CliTests(unittest.TestCase):
         db = self._template_db()
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.remctl.cmd_template_info(SimpleNamespace(name="Rome: Things To See", template_id=None, json=True))
@@ -1596,7 +1649,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "TEMPLATE-2"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -1620,7 +1673,7 @@ class CliTests(unittest.TestCase):
         args = SimpleNamespace(name="Rome: Things To See", template_id=None, private=True, json=True)
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "LIST-2"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -1853,7 +1906,10 @@ class CliTests(unittest.TestCase):
         )
 
     def test_list_create_groceries_uses_private_helper(self):
-        db = self._list_db(["Groceries"], grocery_locales={})
+        # Seed an unrelated list so the schema is populated without colliding
+        # with the "Groceries" list being created (cmd_list_create now checks
+        # existing lists via the real backend.resolve_list, not a mock).
+        db = self._list_db(["Other List"], grocery_locales={})
         args = SimpleNamespace(
             name="Groceries",
             color=None,
@@ -1867,7 +1923,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=0),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "created"}) as private_call,
@@ -1955,7 +2011,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2003,7 +2059,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as groceries_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2020,7 +2076,7 @@ class CliTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as standard_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2043,7 +2099,7 @@ class CliTests(unittest.TestCase):
         unpin_args = SimpleNamespace(name=None, list_id=1, smart_list_id=None, private=True, json=True)
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": True}) as pin_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2055,7 +2111,7 @@ class CliTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": False}) as unpin_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2293,7 +2349,7 @@ class CliTests(unittest.TestCase):
         bridge_result = self._bridge_result({"status": "created", "id": "REM-1"})
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
                 mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
@@ -2347,7 +2403,7 @@ class CliTests(unittest.TestCase):
         section_results = iter([None, "Dairy, Eggs & Cheese"])
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
                 mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
@@ -2377,10 +2433,13 @@ class CliTests(unittest.TestCase):
         try:
             result = None
             with (
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "error", "message": "Couldn’t communicate with a helper application."}),
                 mock.patch.object(self.remctl, "wait_for_grocery_section", side_effect=lambda *_args, **_kwargs: next(section_results)),
             ):
-                result = self.remctl.apply_private_grocery_categorization(db, 1, ["REM-1"])
+                result = self.remctl.apply_private_grocery_categorization(
+                    self.remctl.get_read_backend(), 1, ["REM-1"]
+                )
         finally:
             db.close()
 
@@ -2443,7 +2502,7 @@ class CliTests(unittest.TestCase):
         delete_args = SimpleNamespace(name=None, list_id=1, force=True, json=True)
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
                 mock.patch.object(self.remctl, "bridge_call", return_value={"status": "renamed"}) as rename_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2461,7 +2520,7 @@ class CliTests(unittest.TestCase):
             )
 
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "bridge_available", return_value=True),
                 mock.patch.object(self.remctl, "bridge_call", return_value={"status": "deleted"}) as delete_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2566,7 +2625,7 @@ class CliTests(unittest.TestCase):
         unpin_args = SimpleNamespace(name=None, list_id=None, smart_list_id=2, private=True, json=True)
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": True}) as pin_call,
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -2584,7 +2643,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(stdout.getvalue())["kind"], "smart-list")
 
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "updated", "pinned": False}) as unpin_call,
                 contextlib.redirect_stdout(io.StringIO()),
@@ -2620,7 +2679,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(
                     self.remctl,
@@ -2675,7 +2734,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(
                     self.remctl,
@@ -2821,7 +2880,7 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(
                     self.remctl,
                     "private_call",
@@ -2947,7 +3006,7 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(
                     self.remctl,
                     "private_call",
@@ -3422,7 +3481,7 @@ class CliTests(unittest.TestCase):
         apply_private_changes.assert_called_once_with(
             "ABC-123",
             args,
-            db=fake_db,
+            backend=self.remctl.get_read_backend(),
             list_pk=7,
             partial_context=mock.ANY,
         )
@@ -3685,9 +3744,12 @@ class CliTests(unittest.TestCase):
     def test_list_create_falls_back_to_applescript_when_list_absent_after_generic_bridge_error(self):
         args = SimpleNamespace(name="Project X", color=None, private=False, symbol=None, emoji=None, json=True)
         bridge_result = self._bridge_result({"status": "error", "message": "Save failed"}, returncode=1)
+        backend = mock.Mock()
+        backend.resolve_list.return_value = None
         with (
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+            mock.patch.object(self.remctl, "get_read_backend", return_value=backend),
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(self.remctl, "q_list_exact_name_count", return_value=0),
             mock.patch.object(
@@ -4126,6 +4188,8 @@ class CliTests(unittest.TestCase):
         )
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=mock.Mock()),
+            mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=None),
             mock.patch.object(
                 self.remctl,
                 "private_action",
@@ -4169,6 +4233,7 @@ class CliTests(unittest.TestCase):
         }
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=mock.Mock()),
             mock.patch.object(self.remctl, "q_reminder_by_identifier", return_value=row),
             mock.patch.object(
                 self.remctl,
@@ -4176,7 +4241,7 @@ class CliTests(unittest.TestCase):
                 return_value={"status": "updated", "action": "set_early_reminder"},
             ) as private_action,
         ):
-            self.remctl.apply_private_changes("PARENT-ID", args, db=object())
+            self.remctl.apply_private_changes("PARENT-ID", args)
 
         self.assertEqual(private_action.call_args.args[0], {
             "action": "set_early_reminder",
@@ -4413,7 +4478,7 @@ class CliTests(unittest.TestCase):
         args = SimpleNamespace(list="Shopping", list_id=None, json=True)
         with (
             mock.patch.object(self.remctl, "open_db", return_value=db),
-            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=list_ref),
+            mock.patch.object(self.remctl, "_backend_resolve_list_or_die", return_value=list_ref),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             self.remctl.cmd_sharees(args)
@@ -4438,7 +4503,7 @@ class CliTests(unittest.TestCase):
         args = SimpleNamespace(list="Shopping", list_id=None, json=True)
         with (
             mock.patch.object(self.remctl, "open_db", return_value=db),
-            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=list_ref),
+            mock.patch.object(self.remctl, "_backend_resolve_list_or_die", return_value=list_ref),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             self.remctl.cmd_sharees(args)
@@ -4470,13 +4535,14 @@ class CliTests(unittest.TestCase):
         )
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
             mock.patch.object(
                 self.remctl,
                 "private_action",
                 return_value={"status": "updated", "action": "assign_sharee"},
             ) as private_action,
         ):
-            result = self.remctl.apply_private_changes("REMINDER-1", args, db=db, list_pk=7)
+            result = self.remctl.apply_private_changes("REMINDER-1", args, list_pk=7)
 
         self.assertEqual(result[0]["action"], "assign_sharee")
         payload = private_action.call_args.args[0]
@@ -4878,6 +4944,9 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "doctor_execution_context", return_value=context),
             mock.patch.object(self.remctl, "detect_terminal_app_name", return_value="Ghostty.app"),
             mock.patch.object(self.remctl, "find_app_bundle", return_value=Path("/Applications/Ghostty.app")),
+            # Test the "host not installed" path; without this mock the live
+            # installed host causes an early return with only the host app.
+            mock.patch.object(self.remctl, "capability_host_installed", return_value=False),
         ):
             targets = self.remctl.full_disk_access_target_specs(include_cli=True)
         titles = [target["title"] for target in targets]
@@ -4948,6 +5017,8 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl.sys, "executable", "/tmp/python3"),
             mock.patch.object(self.remctl, "full_disk_access_targets", return_value=["Terminal.app", "/tmp/python3"]),
             mock.patch.object(self.remctl, "copy_to_clipboard", return_value=True) as copy_to_clipboard,
+            # Host not installed for this test — guidance should copy the Python path.
+            mock.patch.object(self.remctl, "capability_host_installed", return_value=False),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             self.remctl.print_full_disk_access_guidance(settings_opened=True)
@@ -5133,11 +5204,25 @@ class CliTests(unittest.TestCase):
         "ZDUEDATE": None,
     }
 
+    def _patch_reminder_backend(self, reminder):
+        """Patch the active read backend so ``typed_reminder_by_pk`` returns
+        *reminder* directly. Reminder mutation commands now fetch the row via
+        ``get_read_backend().typed_reminder_by_pk`` instead of a caller-local
+        ``open_db()`` + ``q_reminder`` pair.
+        """
+        backend = mock.Mock()
+        backend.typed_reminder_by_pk.return_value = reminder
+        # Sensible defaults for cmd_edit paths; tests that exercise list-move
+        # or subtask-move override these explicitly.
+        backend.typed_subtasks_for_move.return_value = []
+        backend.resolve_list.return_value = None
+        return mock.patch.object(self.remctl, "get_read_backend", return_value=backend)
+
     def _assert_bridge_first(self, cmd_name, args, expected_action):
         reminder = self._FAKE_REMINDER
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call",
@@ -5161,8 +5246,8 @@ class CliTests(unittest.TestCase):
     def _assert_applescript_first(self, cmd_name, args, script_contains):
         reminder = self._FAKE_REMINDER
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
@@ -5180,8 +5265,8 @@ class CliTests(unittest.TestCase):
     def _done_with_date(self, reminder, args, *, bridge_available=True, bridge_result=None):
         out, err = io.StringIO(), io.StringIO()
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=bridge_available) as bridge_available_mock,
             mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result) as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
@@ -5303,11 +5388,11 @@ class CliTests(unittest.TestCase):
     def test_all_delete_commands_share_noninteractive_confirmation_guard(self):
         reminder = {"ZTITLE": "Throwaway", "list_name": "Reminders", "ZCKIDENTIFIER": "REM-1"}
         list_ref = {"id": 10, "title": "Throwaway", "objectUUID": "LIST-1"}
-        smart_row = {
-            "Z_PK": 12,
-            "ZNAME": "Focus",
-            "ZCKIDENTIFIER": "SMART-1",
-            "ZSMARTLISTTYPE": "custom",
+        smart_ref = {
+            "id": 12,
+            "title": "Focus",
+            "objectUUID": "SMART-1",
+            "kind": "custom",
         }
         template_ref = {"id": 13, "name": "Packing", "objectUUID": "TEMPLATE-1"}
         group_ref = {
@@ -5316,14 +5401,15 @@ class CliTests(unittest.TestCase):
             "objectUUID": "GROUP-1",
             "children": [{"id": 15, "title": "Editorial", "objectUUID": "LIST-3"}],
         }
+        backend = mock.Mock()
+        backend.typed_reminder_by_pk.return_value = reminder
+        backend.resolve_list.return_value = list_ref
+        backend.typed_resolve_section.return_value = "SECTION-1"
+        backend.typed_smart_list_ref.return_value = smart_ref
         with (
             mock.patch.object(self.remctl, "confirm_destructive_action", return_value=False) as confirm,
             mock.patch.object(self.remctl, "require_private_metadata"),
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
-            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=list_ref),
-            mock.patch.object(self.remctl, "resolve_section_ckid", return_value="SECTION-1"),
-            mock.patch.object(self.remctl, "q_custom_smart_list_delete_matches", return_value=[smart_row]),
+            mock.patch.object(self.remctl, "get_read_backend", return_value=backend),
             mock.patch.object(self.remctl, "resolve_required_template_target_or_die", return_value=template_ref),
             mock.patch.object(self.remctl, "resolve_required_group_target_or_die", return_value=group_ref),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
@@ -5354,8 +5440,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         out, err = io.StringIO(), io.StringIO()
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl, "osa_set_flagged_result", return_value=set_result
             ) as set_flag,
@@ -5451,8 +5536,7 @@ class CliTests(unittest.TestCase):
             due="2026-04-20 09:00", url=None, recurrence=None, alarm=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -5476,8 +5560,7 @@ class CliTests(unittest.TestCase):
             due="2026-06-21", url=None, recurrence=None, alarm=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -5502,8 +5585,7 @@ class CliTests(unittest.TestCase):
             due="2026-06-21", url=None, recurrence=None, alarm=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
@@ -5526,6 +5608,7 @@ class CliTests(unittest.TestCase):
             "Z_PK": 1,
             "ZDUEDATE": self.remctl.to_ts(old_due),
             "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+            "absoluteAlarmMatchesDue": True,
         })
         alarm_rows = [{
             "alarm_id": 7,
@@ -5544,8 +5627,7 @@ class CliTests(unittest.TestCase):
         }]
 
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
@@ -5580,6 +5662,7 @@ class CliTests(unittest.TestCase):
             "Z_PK": 1,
             "ZDUEDATE": self.remctl.to_ts(old_due),
             "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+            "absoluteAlarmMatchesDue": True,
         })
         alarm_rows = [{
             "alarm_id": 7,
@@ -5598,8 +5681,7 @@ class CliTests(unittest.TestCase):
         }]
 
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
@@ -5651,8 +5733,7 @@ class CliTests(unittest.TestCase):
         }]
 
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
@@ -5704,8 +5785,7 @@ class CliTests(unittest.TestCase):
         }]
 
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
@@ -5741,6 +5821,7 @@ class CliTests(unittest.TestCase):
             "Z_PK": 1,
             "ZDUEDATE": self.remctl.to_ts(old_due),
             "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+            "absoluteAlarmMatchesDueOrDisplay": True,
         })
         alarm_rows = [{
             "alarm_id": 7,
@@ -5759,8 +5840,7 @@ class CliTests(unittest.TestCase):
         }]
 
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
@@ -5793,8 +5873,7 @@ class CliTests(unittest.TestCase):
             due=None, url=None, recurrence=None, alarm="clear",
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -5825,8 +5904,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(title="Renamed")
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
@@ -5846,8 +5924,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(priority="high")
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
@@ -5864,8 +5941,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(title="Renamed")
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -5880,8 +5956,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(private=True, flagged=True)
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
@@ -5904,8 +5979,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args()
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
             contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -5924,8 +5998,7 @@ class CliTests(unittest.TestCase):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(json=False)
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
@@ -5945,11 +6018,10 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact"},
             ) as resolve_list,
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
@@ -5964,7 +6036,7 @@ class CliTests(unittest.TestCase):
         ):
             self.remctl.cmd_edit(args)
 
-        resolve_list.assert_called_once_with(mock.ANY, name="Projects", list_id=None)
+        resolve_list.assert_called_once_with(name="Projects", list_id=None)
         bridge_call_result.assert_called_once()
         self.assertEqual(bridge_call_result.call_args.args[0]["list"], "Projects")
         private_available.assert_not_called()
@@ -5983,11 +6055,10 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "9", "method": "id"},
             ),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
@@ -6024,14 +6095,12 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "get_read_backend") as _get_backend,
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value=target,
             ),
-            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=children) as subtask_rows,
             mock.patch.object(
                 self.remctl,
                 "clone_reminder_tree_to_list_or_die",
@@ -6049,10 +6118,12 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
+            _get_backend.return_value.typed_reminder_by_pk.return_value = reminder
+            _get_backend.return_value.typed_subtasks_for_move.return_value = children
+            _get_backend.return_value.resolve_list.return_value = None
             self.remctl.cmd_edit(args)
 
-        subtask_rows.assert_called_once_with(mock.ANY, reminder)
-        clone_move.assert_called_once_with(mock.ANY, reminder, target, children)
+        clone_move.assert_called_once_with(None, reminder, target, children)
         bridge_call.assert_not_called()
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["id"], 42)
@@ -6076,19 +6147,20 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "get_read_backend") as _get_backend,
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "9", "method": "id", "objectUUID": "LIST-UUID"},
             ),
-            mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[{"Z_PK": 2, "ZCKIDENTIFIER": "CHILD-1"}]),
             mock.patch.object(self.remctl, "clone_reminder_tree_to_list_or_die") as clone_move,
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             contextlib.redirect_stderr(io.StringIO()) as stderr,
             self.assertRaises(SystemExit),
         ):
+            _get_backend.return_value.typed_reminder_by_pk.return_value = reminder
+            _get_backend.return_value.typed_subtasks_for_move.return_value = [{"Z_PK": 2, "ZCKIDENTIFIER": "CHILD-1"}]
+            _get_backend.return_value.resolve_list.return_value = None
             self.remctl.cmd_edit(args)
 
         clone_move.assert_not_called()
@@ -6114,9 +6186,8 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
-            mock.patch.object(self.remctl, "resolve_required_list_target_or_die", return_value=target),
+            self._patch_reminder_backend(reminder),
+            mock.patch.object(self.remctl, "_backend_resolve_list_or_die", return_value=target),
             mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
@@ -6167,11 +6238,10 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
             ),
             mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
@@ -6211,11 +6281,10 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
             ),
             mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
@@ -6248,11 +6317,10 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact", "objectUUID": "LIST-UUID"},
             ),
             mock.patch.object(self.remctl, "subtask_rows_for_parent_move", return_value=[]),
@@ -6332,11 +6400,10 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact"},
             ),
             mock.patch.object(self.remctl, "private_available", return_value=True),
@@ -6358,7 +6425,7 @@ class CliTests(unittest.TestCase):
         apply_private_changes.assert_called_once_with(
             reminder["ZCKIDENTIFIER"],
             args,
-            db=mock.ANY,
+            backend=mock.ANY,
             list_pk=9,
         )
 
@@ -6373,8 +6440,7 @@ class CliTests(unittest.TestCase):
             longitude=None, radius=100, proximity="arriving", address=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+            self._patch_reminder_backend(self._FAKE_REMINDER),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             contextlib.redirect_stderr(io.StringIO()) as stderr,
             self.assertRaises(SystemExit),
@@ -6395,8 +6461,7 @@ class CliTests(unittest.TestCase):
         reminder = dict(self._FAKE_REMINDER)
         reminder["ZDUEDATE"] = target.timestamp() - apple_epoch
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -6424,8 +6489,7 @@ class CliTests(unittest.TestCase):
         reminder = dict(self._FAKE_REMINDER)
         reminder["ZDUEDATE"] = self.remctl.to_ts(target)
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -6522,8 +6586,7 @@ class CliTests(unittest.TestCase):
             self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
         ]
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(
@@ -6555,8 +6618,7 @@ class CliTests(unittest.TestCase):
             self._bridge_result({"status": "error", "message": "Rollback failed"}, returncode=1),
         ]
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(
@@ -6583,8 +6645,7 @@ class CliTests(unittest.TestCase):
             self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
         ]
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(
@@ -6613,8 +6674,7 @@ class CliTests(unittest.TestCase):
         """An unparseable due-date string must exit non-zero rather than
         silently dropping the field and letting the rest of the update proceed."""
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+            self._patch_reminder_backend(self._FAKE_REMINDER),
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
@@ -6636,8 +6696,7 @@ class CliTests(unittest.TestCase):
             due=None, url=None, recurrence=None, alarm="15m",
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl, "bridge_call_result",
@@ -6657,8 +6716,7 @@ class CliTests(unittest.TestCase):
             due="2026-04-20 09:00", url=None, recurrence=None, alarm=None,
         )
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
@@ -6673,8 +6731,8 @@ class CliTests(unittest.TestCase):
         reminder = dict(self._FAKE_REMINDER)
         reminder["ZCKIDENTIFIER"] = None
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=None),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            self._patch_reminder_backend(reminder),
+            self._patch_reminder_backend(reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=False),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
@@ -7108,7 +7166,7 @@ class CliTests(unittest.TestCase):
             "recurrence_set_positions": None,
         }
         with (
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "open_db", return_value=mock.MagicMock()),
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "q_reminders", return_value=[]),
             mock.patch.object(self.remctl, "q_attachments", return_value=[]),
@@ -7272,7 +7330,7 @@ class CliTests(unittest.TestCase):
         child = dict(parent, Z_PK=43, ZTITLE="Child", ZPARENTREMINDER=42, ZCKIDENTIFIER="CHILD")
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "q_reminder", return_value=parent),
                 mock.patch.object(self.remctl, "q_reminders", return_value=[child]),
                 mock.patch.object(self.remctl, "q_section_memberships", return_value={}),
@@ -7501,7 +7559,7 @@ class CliTests(unittest.TestCase):
         }
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=conn),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(conn)),
                 mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
                 mock.patch.object(self.remctl, "q_reminders", return_value=[]),
                 mock.patch.object(self.remctl, "q_attachments", return_value=[]),
@@ -7608,9 +7666,10 @@ class CliTests(unittest.TestCase):
 
     def test_apply_private_changes_removes_selected_synced_tags(self):
         args = self._private_edit_args(remove_tag=["#work", "archive"])
-        db = object()
+        db = mock.Mock()
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "open_db", return_value=db),
             mock.patch.object(
                 self.remctl,
                 "q_hashtags",
@@ -7618,7 +7677,7 @@ class CliTests(unittest.TestCase):
             ) as q_hashtags,
             mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
         ):
-            self.remctl.apply_private_changes("REM-1", args, db=db)
+            self.remctl.apply_private_changes("REM-1", args)
 
         q_hashtags.assert_called_once_with(db, 42)
         private_action.assert_called_once_with({
@@ -7668,9 +7727,10 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
             ):
-                self.remctl.apply_private_changes("REM-1", args, db=db)
+                self.remctl.apply_private_changes("REM-1", args)
         finally:
             db.close()
 
@@ -7715,7 +7775,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call", return_value={"status": "created", "id": "SECTION-2"}) as private_call,
                 contextlib.redirect_stdout(io.StringIO()) as stdout,
@@ -7742,9 +7802,10 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
             ):
-                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+                self.remctl.apply_private_changes("REM-1", args, list_pk=1)
         finally:
             db.close()
 
@@ -7761,9 +7822,10 @@ class CliTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
             ):
-                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+                self.remctl.apply_private_changes("REM-1", args, list_pk=1)
         finally:
             db.close()
 
@@ -8009,19 +8071,19 @@ class CliTests(unittest.TestCase):
             private_metadata=False,
             json=True,
         )
-        reminders = {
-            101: {
-                "ZCKIDENTIFIER": "MOVING",
-                "ZLIST": 12,
-                "ZTITLE": "Review proposal",
-                "list_name": "Work",
-            },
-            202: {
-                "ZCKIDENTIFIER": "ANCHOR",
-                "ZLIST": 4,
-                "ZTITLE": "Plan launch",
-                "list_name": "Projects",
-            },
+        moving_reminder = {
+            "ZCKIDENTIFIER": "MOVING",
+            "ZLIST": 12,
+            "ZTITLE": "Review proposal",
+            "list_name": "Work",
+            "Z_PK": 101,
+        }
+        anchor_reminder = {
+            "ZCKIDENTIFIER": "ANCHOR",
+            "ZLIST": 4,
+            "ZTITLE": "Plan launch",
+            "list_name": "Projects",
+            "Z_PK": 202,
         }
         hint = {
             "objectUUID": "HINT",
@@ -8032,19 +8094,19 @@ class CliTests(unittest.TestCase):
         }
         with (
             mock.patch.object(self.remctl, "require_private_metadata"),
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", side_effect=lambda _db, pk: reminders.get(pk)),
-            mock.patch.object(
-                self.remctl,
-                "resolve_smart_list_or_die",
-                return_value={"id": 7, "title": "Focus", "objectUUID": "SMART", "kind": "custom"},
-            ),
-            mock.patch.object(self.remctl, "q_manual_sort_hint", return_value=hint),
-            mock.patch.object(self.remctl, "q_smart_list_sections", return_value=[]),
+            mock.patch.object(self.remctl, "get_read_backend") as _get_backend,
             mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"}) as private_call,
             mock.patch.object(self.remctl, "_wait_for_order", return_value=True),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
+            _get_backend.return_value.typed_reminder_by_pk.side_effect = (
+                lambda pk: moving_reminder if pk == 101 else anchor_reminder if pk == 202 else None
+            )
+            _get_backend.return_value.typed_smart_list_ref.return_value = {
+                "id": 7, "title": "Focus", "objectUUID": "SMART", "kind": "custom",
+            }
+            _get_backend.return_value.typed_manual_sort_hint.return_value = hint
+            _get_backend.return_value.typed_smart_list_sections_by_pk.return_value = []
             self.remctl.cmd_reminder_move(args)
 
         private_call.assert_called_once_with({
@@ -8079,6 +8141,7 @@ class CliTests(unittest.TestCase):
             "ZLIST": 12,
             "ZTITLE": "Review proposal",
             "list_name": "Work",
+            "Z_PK": 101,
         }
         hint = {
             "objectUUID": "HINT",
@@ -8089,19 +8152,17 @@ class CliTests(unittest.TestCase):
         }
         with (
             mock.patch.object(self.remctl, "require_private_metadata"),
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
-            mock.patch.object(
-                self.remctl,
-                "resolve_smart_list_or_die",
-                return_value={"id": 7, "title": "Focus", "objectUUID": "SMART", "kind": "custom"},
-            ),
-            mock.patch.object(self.remctl, "q_manual_sort_hint", return_value=hint),
-            mock.patch.object(self.remctl, "q_smart_list_sections", return_value=[{"Z_PK": 1}]),
+            mock.patch.object(self.remctl, "get_read_backend") as _get_backend,
             mock.patch.object(self.remctl, "private_call") as private_call,
             self.assertRaises(SystemExit),
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
+            _get_backend.return_value.typed_reminder_by_pk.return_value = reminder
+            _get_backend.return_value.typed_smart_list_ref.return_value = {
+                "id": 7, "title": "Focus", "objectUUID": "SMART", "kind": "custom",
+            }
+            _get_backend.return_value.typed_manual_sort_hint.return_value = hint
+            _get_backend.return_value.typed_smart_list_sections_by_pk.return_value = [{"Z_PK": 1}]
             self.remctl.cmd_reminder_move(args)
 
         self.assertIn("sectioned custom smart lists is not supported", stderr.getvalue())
@@ -8121,17 +8182,17 @@ class CliTests(unittest.TestCase):
             json=True,
         )
         reminders = {
-            1: {"ZCKIDENTIFIER": "A", "ZLIST": 10, "ZTITLE": "A", "list_name": "One"},
-            2: {"ZCKIDENTIFIER": "B", "ZLIST": 20, "ZTITLE": "B", "list_name": "Two"},
+            1: {"ZCKIDENTIFIER": "A", "ZLIST": 10, "ZTITLE": "A", "list_name": "One", "Z_PK": 1},
+            2: {"ZCKIDENTIFIER": "B", "ZLIST": 20, "ZTITLE": "B", "list_name": "Two", "Z_PK": 2},
         }
         with (
             mock.patch.object(self.remctl, "require_private_metadata"),
-            mock.patch.object(self.remctl, "open_db", return_value=object()),
-            mock.patch.object(self.remctl, "q_reminder", side_effect=lambda _db, pk: reminders.get(pk)),
+            mock.patch.object(self.remctl, "get_read_backend") as _get_backend,
             mock.patch.object(self.remctl, "private_call") as private_call,
             self.assertRaises(SystemExit),
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
+            _get_backend.return_value.typed_reminder_by_pk.side_effect = lambda pk: reminders.get(pk)
             self.remctl.cmd_reminder_move(args)
 
         self.assertIn("different lists require --smart-list", stderr.getvalue())
@@ -8405,7 +8466,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call") as private_call,
                 self.assertRaises(SystemExit),
@@ -8443,7 +8504,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(
                     self.remctl,
@@ -8481,7 +8542,7 @@ class CliTests(unittest.TestCase):
         )
         try:
             with (
-                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "open_db", return_value=_NoCloseConnection(db)),
                 mock.patch.object(self.remctl, "private_available", return_value=True),
                 mock.patch.object(self.remctl, "private_call") as private_call,
                 self.assertRaises(SystemExit),
@@ -8821,7 +8882,7 @@ class InlineImageTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(
                     self.remctl,
-                    "resolve_required_list_target_or_die",
+                    "_backend_resolve_list_or_die",
                     return_value={"id": 1, "title": "Projects"},
                 ),
                 mock.patch.object(self.remctl, "q_reminders", return_value=rows),
@@ -9404,7 +9465,7 @@ class InlineImageTests(unittest.TestCase):
                     mock.patch.object(self.remctl, "open_db", return_value=db),
                     mock.patch.object(
                         self.remctl,
-                        "resolve_required_list_target_or_die",
+                        "_backend_resolve_list_or_die",
                         return_value={"id": 1, "title": "Projects"},
                     ),
                     mock.patch.object(
@@ -9496,7 +9557,7 @@ class InlineImageTests(unittest.TestCase):
             mock.patch.object(self.remctl, "open_db", return_value=db),
             mock.patch.object(
                 self.remctl,
-                "resolve_required_list_target_or_die",
+                "_backend_resolve_list_or_die",
                 return_value={"id": 1, "title": "Projects"},
             ),
             mock.patch.object(
@@ -9749,7 +9810,7 @@ class InlineImageTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "open_db", return_value=counting),
                 mock.patch.object(
                     self.remctl,
-                    "resolve_required_list_target_or_die",
+                    "_backend_resolve_list_or_die",
                     return_value={"id": 1, "title": "Projects"},
                 ),
                 mock.patch.object(self.remctl, "q_reminders", return_value=rows),
@@ -9889,6 +9950,16 @@ class ImageFlagParsingTests(unittest.TestCase):
         a = self._parse(["--image-width", "64", "today"])
         self.assertEqual(a.image_width, 64)
         self.assertEqual(a.cmd, "today")
+
+    def test_read_route_before_subcommand_is_not_mistaken_for_command(self):
+        a = self._parse(["--read-route", "host", "lists"])
+        self.assertEqual(a.read_route, "host")
+        self.assertEqual(a.cmd, "lists")
+
+    def test_read_route_equals_form_before_subcommand(self):
+        a = self._parse(["--read-route=host", "lists"])
+        self.assertEqual(a.read_route, "host")
+        self.assertEqual(a.cmd, "lists")
 
     def test_image_mode_before_subcommand(self):
         a = self._parse(["--image-mode", "kitty", "show", "Work"])
@@ -10218,7 +10289,7 @@ class TrailingBadgeTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "open_db", return_value=db),
                 mock.patch.object(
                     self.remctl,
-                    "resolve_required_list_target_or_die",
+                    "_backend_resolve_list_or_die",
                     return_value={"id": 1, "title": "Projects"},
                 ),
                 mock.patch.object(self.remctl, "q_reminders", return_value=rows),
@@ -10299,7 +10370,7 @@ class TrailingBadgeTests(unittest.TestCase):
                 mock.patch.object(self.remctl, "open_db", return_value=counting),
                 mock.patch.object(
                     self.remctl,
-                    "resolve_required_list_target_or_die",
+                    "_backend_resolve_list_or_die",
                     return_value={"id": 1, "title": "Projects"},
                 ),
                 mock.patch.object(self.remctl, "q_reminders", return_value=rows),

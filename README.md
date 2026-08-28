@@ -14,7 +14,8 @@ As a result, RemCTL is the only Reminders CLI that truly replicates the modern R
 
 ```text
 remctl
-  reads:  ~/Library/Group Containers/group.com.apple.reminders/.../Data-*.sqlite
+  reads (auto):  RemCTL Capability Host (background app, FDA-authorized) -> full-fidelity SQLite
+  reads (direct): ~/Library/Group Containers/group.com.apple.reminders/.../Data-*.sqlite
   fallback reads: remctl-bridge -> EventKit (--via-eventkit, limited)
   writes: remctl-bridge -> EventKit
   private: remctl-private -> private ReminderKit APIs (--private only)
@@ -22,8 +23,9 @@ remctl
 
 Why this architecture exists:
 
-- **Direct SQLite reads** expose sections, subtasks, tags, attachments (with sha512-verified local file paths), deep links, list colors and badges, recurrence metadata, normal alarms, location alarms, and Early Reminder metadata in tens of milliseconds.
-- **Limited EventKit reads** are available only with `--via-eventkit` on `show`, `search`, `today`, and `upcoming`. This is a fallback for automation hosts that cannot get Full Disk Access. It is never the default and does not return RemCTL numeric IDs.
+- **Capability Host reads** (v1.7.1+) route read commands through a dedicated background macOS app (`~/Applications/RemCTL Capability Host.app`) that holds Full Disk Access. Restricted callers — Copilot, Terminal, Homebrew Python, and other automation hosts — connect over a private Unix socket and receive the same full-fidelity data as a direct read: sections, subtasks, tags, sharees, smart-list and template internals, grocery categories, display ordering, and all other metadata. No FDA is needed in the caller's process. Writes remain in the EventKit bridge, private helper, and AppleScript paths; the host is read-only.
+- **Direct SQLite reads** expose sections, subtasks, tags, attachments (with sha512-verified local file paths), deep links, list colors and badges, recurrence metadata, normal alarms, location alarms, and Early Reminder metadata in tens of milliseconds. Used when the host is unavailable or `--read-route direct` is set.
+- **Limited EventKit reads** are available only with `--via-eventkit` on `show`, `search`, `today`, and `upcoming`. This is a last-resort fallback for automation hosts that cannot get Full Disk Access and where the Capability Host is not installed. It is never the default and does not return RemCTL numeric IDs.
 - **EventKit writes** keep Reminders and iCloud in charge of mutations. RemCTL does not write directly to the database.
 - **Private metadata writes** are unsupported and explicitly opt-in with `--private`. They use Apple's private ReminderKit APIs, not direct SQLite mutation, and should be treated as experimental power-user functionality.
 
@@ -63,7 +65,124 @@ To remove RemCTL files installed by `install.sh`, run:
 ./uninstall.sh
 ```
 
-The uninstaller checks `~/bin` and `~/.local/bin` by default, or the single target from `PREFIX` / `REMCTL_BIN_DIR`. It removes only known RemCTL files, removes `completions` only when empty, and supports `--dry-run` and `--keep-config`. It does not edit shell config or revoke macOS privacy permissions.
+The uninstaller checks `~/bin` and `~/.local/bin` by default, or the single target from `PREFIX` / `REMCTL_BIN_DIR`. It removes only known RemCTL files, removes `completions` only when empty, and supports `--dry-run` and `--keep-config`. It also removes the Capability Host app, LaunchAgent, and support directory if present. It does not edit shell config or revoke macOS privacy permissions. After uninstalling, revoke Full Disk Access from `RemCTL Capability Host` in System Settings › Privacy & Security › Full Disk Access.
+
+## Capability Host
+
+The **RemCTL Capability Host** (`~/Applications/RemCTL Capability Host.app`) is a dedicated background macOS app introduced in v1.7.1 that holds Full Disk Access on behalf of restricted callers. It runs as a LaunchAgent and exposes a read-only Unix socket that the `remctl` CLI connects to automatically.
+
+### Why it exists
+
+macOS TCC scopes Full Disk Access to the process that is granted it. AI agents, Copilot CLI, Homebrew Python, and most automation hosts cannot receive a meaningful FDA grant, or the grant breaks when the process restarts. The Capability Host solves this by running as a named macOS app bundle that keeps FDA between reboots and survives upgrades when signed with a Developer ID.
+
+The host is **read-only**. All writes — EventKit, private ReminderKit, AppleScript flag writes — continue through their existing paths outside the host.
+
+### Read route selection
+
+RemCTL picks a read route automatically:
+
+| Route | When used |
+|-------|-----------|
+| `auto` (default) | Prefers `direct` if the current process can read the database; falls back to `host` if the Capability Host is reachable; lazy-fails to `direct` if neither is available |
+| `direct` | Forces direct SQLite reads; fails if the current process lacks FDA |
+| `host` | Forces Capability Host reads; fails if the host is not running or the store probe fails |
+
+Override the route for a single command:
+
+```bash
+remctl show "Grocery List" --read-route host
+remctl today --read-route direct
+```
+
+Or set it for the session:
+
+```bash
+export REMCTL_READ_ROUTE=host
+```
+
+Set `REMCTL_CAPABILITY_HOST_DISABLED=1` to disable the host entirely (equivalent to `--read-route direct`).
+
+`--via-eventkit` is a separate, last-resort fallback that bypasses both routes and is documented in [docs/installation.md](docs/installation.md). Never use `--via-eventkit` when the Capability Host is available.
+
+### What the host provides
+
+The host serves every read operation at full fidelity — identical to a direct SQLite read — including:
+
+- **sections**, grocery categories, and display ordering
+- **tags**, sharees, and group membership
+- **smart-list** and **template** internals
+- **subtasks**, attachments metadata, rich links, urgent state, Early Reminders
+- all existing mutation preflight and readback (reminder detail, section counts, list stats)
+
+No new mutation operations are added. Writes remain in EventKit, `remctl-private`, and AppleScript.
+
+> **Known limitation:** inline image rendering (`--images`) and emoji list badges (`🔗 🌄`) may be reduced when reads are routed through the host. Attachment metadata — `filename`, `type`, `path`, `resolved`, `uti`, `width`, `height` — is always included in JSON output and remains available for agents.
+
+### Installation
+
+`./install.sh` builds and installs the Capability Host by default when `swiftc` is available. To skip or force:
+
+```bash
+./install.sh --host       # build and install the Capability Host (default)
+./install.sh --no-host    # skip Capability Host installation
+```
+
+The app is built in a staging area, sealed with `codesign`, verified with `--verify`, then published to `~/Applications/RemCTL Capability Host.app`. A LaunchAgent (`net.macstories.remctl.read-broker`) is registered and started automatically.
+
+### Granting Full Disk Access
+
+Grant FDA **only to the Capability Host app**, not to Python, Terminal, Copilot, `remctl-bridge`, `remctl-private`, or `remctl-permissions`:
+
+```bash
+remctl permissions full-disk-access
+```
+
+The helper shows `~/Applications/RemCTL Capability Host.app` as the primary target when the host is installed. In the System Settings file picker:
+
+1. Click `+`.
+2. Drag the target row from the RemCTL helper into the picker, or press `Command-Shift-G`, paste the path, press Return, then click Open.
+3. Confirm with `remctl doctor`.
+
+`doctor` reports `viaCapabilityHost: true` when both the transport identity check and the store probe pass. `effectiveReadRoute` is `"host"` only after the store probe confirms database access.
+
+### Ad-hoc signing and CDHash re-grant
+
+By default the host is **ad-hoc signed** (identity `-`). Ad-hoc signatures include the binary's CDHash. Every rebuild — including `./install.sh` upgrades — changes the CDHash, which invalidates the FDA grant:
+
+> After every install or upgrade you must remove and re-add the app in System Settings › Privacy & Security › Full Disk Access.
+
+To avoid this, sign with a Developer ID so the FDA grant survives upgrades:
+
+```bash
+REMCTL_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' ./install.sh
+```
+
+The installer prints `✓ Stable identity — FDA grant survives upgrades` when a Developer ID is used.
+
+### Troubleshooting
+
+**`remctl doctor` shows `viaCapabilityHost: false`:**
+- Check that the LaunchAgent is loaded: `launchctl list net.macstories.remctl.read-broker`
+- Re-grant FDA after a rebuild: open System Settings › Privacy & Security › Full Disk Access, remove the old entry, and add the app again.
+- If the host won't start: check `~/Library/Logs/` for `remctl-read-broker` entries, or run `remctl doctor` and inspect the `capability_host` check detail.
+
+**Protocol mismatch after an upgrade:**
+Run `./install.sh` to rebuild the host. If the socket is stale, `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/net.macstories.remctl.read-broker.plist` then `./install.sh`.
+
+**To disable the host temporarily:**
+```bash
+REMCTL_CAPABILITY_HOST_DISABLED=1 remctl doctor
+```
+
+**To uninstall the host only (keep the CLI):**
+```bash
+./uninstall.sh
+```
+Then remove `RemCTL Capability Host` from System Settings › Privacy & Security › Full Disk Access.
+
+### Security model
+
+The host runs as the same macOS user. The Unix socket is created in `~/Library/Application Support/RemCTL/` with mode `0600` inside a mode `0700` directory. RemCTL verifies socket ownership and mode before connecting, and refuses symlinks. The RPC is closed and read-only; no write operations are exposed through the socket.
 
 ## Command Map
 
@@ -358,7 +477,7 @@ RemCTL may need three macOS permission grants:
 
 - Reminders access for EventKit writes
 - Automation access for AppleScript operations, including `flag`, `unflag`, and `add --flag`, which have no EventKit path
-- Full Disk Access for direct database reads
+- Full Disk Access — granted **only to `~/Applications/RemCTL Capability Host.app`** (never to Python, Terminal, Copilot, or the helper binaries)
 
 Run:
 
@@ -368,13 +487,13 @@ remctl permissions full-disk-access
 remctl doctor
 ```
 
-The visual permission helper opens System Settings, copies the first target path, shows draggable targets for the current CLI process, and marks each target's status. It confirms Full Disk Access directly for the Python target and reports `Store readable (helper check)` for the helper binaries, since macOS TCC cannot be probed per app. The summary line reports how many targets are accessible.
+The visual permission helper shows `~/Applications/RemCTL Capability Host.app` as the primary FDA target when the host is installed. In the System Settings file picker, click `+`, then drag the target row from the RemCTL helper, or press `Command-Shift-G`, paste the path, press Return, and click Open. The summary line reports how many targets are accessible and `doctor` reports `viaCapabilityHost: true` when the store probe confirms database access.
 
 Full Disk Access and Reminders/EventKit access are scoped to the process context. A Terminal session can pass `remctl doctor` while Codex, another agent runner, or a different host app fails. Run `remctl doctor` from the same context that will run RemCTL commands; for agent setup, use `remctl doctor --for-agent`. When a terminal embeds another engine, RemCTL prefers the real host `.app` bundle over inherited terminal variables so the printed target matches the app macOS will authorize.
 
 Manual fallback: run `remctl doctor --for-agent`, then add the printed target in System Settings > Privacy & Security > Full Disk Access. In the file picker, press `Command-Shift-G`, paste the path, press Return, then click Open. If the `eventkit` check fails, run `remctl onboard` from the same app or agent runner and approve the Reminders prompt.
 
-If Full Disk Access cannot be granted to an automation host, `show`, `search`, `today`, and `upcoming` support `--via-eventkit` as a limited read-only fallback through the EventKit bridge. This does not replace normal setup: it omits RemCTL numeric IDs, sections, synced tags, private metadata, smart-list/template internals, numeric list targeting, and table output.
+If the Capability Host is not installed and Full Disk Access cannot be granted to an automation host, `show`, `search`, `today`, and `upcoming` support `--via-eventkit` as a limited read-only fallback through the EventKit bridge. This does not replace normal setup: it omits RemCTL numeric IDs, sections, synced tags, private metadata, smart-list/template internals, numeric list targeting, and table output.
 
 ## For Agents
 
@@ -390,7 +509,15 @@ remctl doctor --for-agent --json
 
 `search` matches reminder titles and notes. By default it searches active reminders; pass `--completed` to include completed reminders too.
 
-Do not use `--via-eventkit` by default. Use it only when a supported basic read command is blocked by Full Disk Access and the task can tolerate limited EventKit fidelity. In this mode JSON returns a wrapper with `source: "eventkit"`, `fidelity: "limited"`, and `items`; item identifiers are `eventKitId`, not RemCTL numeric `id`. Never pass `eventKitId` to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any other numeric-ID command. If the task needs sections, tags, rich links, urgent state, templates, smart-list internals, or chainable IDs, fix Full Disk Access instead.
+**Read route:** In v1.7.1+, `remctl` automatically routes reads through the Capability Host when it is reachable (`auto` mode). Most agents do not need to think about this. Check the current route with `remctl doctor --for-agent --json` and inspect the `directReadable`, `viaCapabilityHost`, and `effectiveReadRoute` fields:
+
+- `directReadable`: `true` when the calling process can read the database directly (FDA granted to the process).
+- `viaCapabilityHost`: `true` when the Capability Host is running, its socket identity passes, and the store probe confirms database access.
+- `effectiveReadRoute`: `"direct"` if `directReadable`, `"host"` if `viaCapabilityHost`, `"unavailable"` otherwise.
+
+`doctor` runs two separate checks: a **transport probe** (can the CLI connect to the socket?) and a **store probe** (can the host actually read the database?). `viaCapabilityHost` is `true` only when both pass. The `effectiveReadRoute` is `"host"` only after the store probe succeeds.
+
+Do not use `--via-eventkit` by default. Use it only when a supported basic read command is blocked by Full Disk Access, the Capability Host is not installed, and the task can tolerate limited EventKit fidelity. In this mode JSON returns a wrapper with `source: "eventkit"`, `fidelity: "limited"`, and `items`; item identifiers are `eventKitId`, not RemCTL numeric `id`. Never pass `eventKitId` to `info`, `edit`, `done`, `delete`, `link`, `open`, `subtasks`, or any other numeric-ID command. If the task needs sections, tags, rich links, urgent state, templates, smart-list internals, or chainable IDs, install the Capability Host or fix Full Disk Access instead.
 
 For fast agent writes, call `remctl add ... --json`, use the returned `numericId` when present, then verify with `remctl info <numericId> --json`. `add --private` validates section/assignee/URL inputs before creating the reminder; if a private step still fails after creation, output is `{"status": "partial", "id", "numericId", "failed", "error"}` in JSON (text mode: `Created reminder #N but failed to apply <action>; re-run edit to finish. Do NOT re-run add (would duplicate).`). On `partial`, re-run `edit` to finish the metadata; never re-run `add`. For list moves, use the `id` returned by `remctl edit ... -l ... --json`; a verified clone-delete fallback can replace the original reminder and return `oldId` plus a new `id`. `info` includes private rich-link URLs, parent and subtask image attachments, EventKit alarms, location alarms, Early Reminders, and recurrence metadata, so agents should not need raw SQLite checks for ordinary reminder metadata verification. Parent reminder attachments also appear in list-command JSON (`show`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `search`); each `attachments` entry includes a sha512-verified `path` to the local file that vision-capable agents can open directly, or `path: null` with `resolved: false` when the attachment is a legacy row that was never downloaded to this Mac.
 
