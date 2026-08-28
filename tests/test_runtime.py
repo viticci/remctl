@@ -19,6 +19,109 @@ class RuntimeTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"REMCTL_CONFIG_DIR": "/tmp/remctl-config"}, clear=False):
             self.assertEqual(remctl_runtime.resolve_config_dir(), Path("/tmp/remctl-config"))
 
+    def test_resolve_host_socket_path_honors_override(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"REMCTL_HOST_SOCKET": "/tmp/remctl-host.sock"},
+            clear=False,
+        ):
+            self.assertEqual(
+                remctl_runtime.resolve_host_socket_path(),
+                Path("/tmp/remctl-host.sock"),
+            )
+
+    def test_requested_read_route_prefers_cli_value(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"REMCTL_READ_ROUTE": "host"},
+            clear=False,
+        ):
+            self.assertEqual(remctl_runtime.requested_read_route("direct"), "direct")
+
+    def test_requested_read_route_uses_environment(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"REMCTL_READ_ROUTE": "HOST"},
+            clear=False,
+        ):
+            self.assertEqual(remctl_runtime.requested_read_route(), "host")
+
+    def test_requested_read_route_rejects_unknown_value(self):
+        with self.assertRaisesRegex(ValueError, "invalid read route"):
+            remctl_runtime.requested_read_route("fallback")
+
+    def test_capability_host_killswitch(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"REMCTL_CAPABILITY_HOST_DISABLED": "yes"},
+            clear=False,
+        ):
+            self.assertTrue(remctl_runtime.capability_host_disabled())
+
+    def test_auto_read_route_prefers_direct_then_host(self):
+        self.assertEqual(
+            remctl_runtime.select_read_route(
+                "auto",
+                direct_readable=True,
+                host_ready=True,
+                host_disabled=False,
+            ),
+            "direct",
+        )
+        self.assertEqual(
+            remctl_runtime.select_read_route(
+                "auto",
+                direct_readable=False,
+                host_ready=True,
+                host_disabled=False,
+            ),
+            "host",
+        )
+
+    def test_forced_read_routes_fail_closed(self):
+        with self.assertRaisesRegex(
+            remctl_runtime.ReadRouteUnavailable,
+            "direct Reminders database access is unavailable",
+        ):
+            remctl_runtime.select_read_route(
+                "direct",
+                direct_readable=False,
+                host_ready=True,
+                host_disabled=False,
+            )
+        with self.assertRaisesRegex(
+            remctl_runtime.ReadRouteUnavailable,
+            "Capability Host is unavailable",
+        ):
+            remctl_runtime.select_read_route(
+                "host",
+                direct_readable=True,
+                host_ready=False,
+                host_disabled=False,
+            )
+
+    def test_host_killswitch_blocks_host_routes(self):
+        with self.assertRaisesRegex(
+            remctl_runtime.ReadRouteUnavailable,
+            "Capability Host is disabled",
+        ):
+            remctl_runtime.select_read_route(
+                "host",
+                direct_readable=False,
+                host_ready=True,
+                host_disabled=True,
+            )
+        with self.assertRaisesRegex(
+            remctl_runtime.ReadRouteUnavailable,
+            "direct Reminders database access is unavailable.*disabled",
+        ):
+            remctl_runtime.select_read_route(
+                "auto",
+                direct_readable=False,
+                host_ready=True,
+                host_disabled=True,
+            )
+
     def test_resolve_config_dir_uses_xdg(self):
         with mock.patch.dict(
             "os.environ",

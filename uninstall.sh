@@ -56,6 +56,8 @@ RESET='\033[0m'
 FILES=(
     remctl
     remctl_runtime.py
+    remctl_host.py
+    remctl_host_protocol.py
     remctl_serialization.py
     remctl_smart_lists.py
     remctl_images.py
@@ -64,6 +66,8 @@ FILES=(
     remctl-permissions
     remctl-permissions-icon.png
     completions/_remctl
+    completions/_rctl
+    completions/_reminders
 )
 
 if [[ -n "${REMCTL_BIN_DIR:-}" ]]; then
@@ -182,6 +186,79 @@ elif [[ -d "$CONFIG_DIR" ]]; then
     REMOVED=$((REMOVED + 1))
 fi
 
+# ─── Capability Host ──────────────────────────────────────────────────────────
+
+LAUNCHAGENT_LABEL="net.macstories.remctl.read-broker"
+LAUNCHAGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCHAGENT_LABEL}.plist"
+HOST_APP_DIR="${REMCTL_HOST_APP_DIR:-$HOME/Applications}"
+HOST_APP="${HOST_APP_DIR}/RemCTL Capability Host.app"
+HOST_SUPPORT_DIR="${HOME}/Library/Application Support/RemCTL"
+HOST_SOCKET="${HOST_SUPPORT_DIR}/read-broker.sock"
+HOST_HEALTH_FILE="${HOST_SUPPORT_DIR}/host-health.json"
+HOST_MANIFEST_FILE="${HOST_SUPPORT_DIR}/host-manifest.json"
+
+_safe_host_app() {
+    local p="$1"
+    # Refuse to remove if: symlink, not a directory, name doesn't match, or not owned by user.
+    [[ ! -L "$p" ]] || return 1
+    [[ -d "$p" ]] || return 1
+    [[ "$(basename "$p")" == "RemCTL Capability Host.app" ]] || return 1
+    local owner; owner=$(stat -f "%u" "$p" 2>/dev/null) || return 1
+    [[ "$owner" == "$(id -u)" ]] || return 1
+}
+
+echo -e "${BLUE}->${RESET} Checking Capability Host"
+
+# Unload the LaunchAgent first.
+if launchctl list "$LAUNCHAGENT_LABEL" &>/dev/null; then
+    LA_UID=$(id -u)
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo -e "  ${YELLOW}would unload${RESET} gui/$LA_UID/$LAUNCHAGENT_LABEL"
+    else
+        launchctl bootout "gui/$LA_UID/$LAUNCHAGENT_LABEL" 2>/dev/null || true
+        echo -e "  ${GREEN}unloaded${RESET} $LAUNCHAGENT_LABEL"
+    fi
+    REMOVED=$((REMOVED + 1))
+fi
+
+remove_file "$LAUNCHAGENT_PLIST"
+
+# Remove app bundle (after ownership/type safety check).
+if [[ -e "$HOST_APP" || -L "$HOST_APP" ]]; then
+    if _safe_host_app "$HOST_APP"; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            echo -e "  ${YELLOW}would remove app${RESET} $HOST_APP"
+        else
+            rm -rf -- "$HOST_APP"
+            echo -e "  ${GREEN}removed app${RESET} $HOST_APP"
+        fi
+        REMOVED=$((REMOVED + 1))
+    else
+        echo -e "  ${RED}refusing to remove suspicious path${RESET} $HOST_APP" >&2
+    fi
+fi
+
+# Remove the socket (if it's a socket file, not a symlink, owned by user).
+if [[ -e "$HOST_SOCKET" ]]; then
+    SOCK_OWNER=$(stat -f "%u" "$HOST_SOCKET" 2>/dev/null) || SOCK_OWNER=""
+    if [[ ! -L "$HOST_SOCKET" && -S "$HOST_SOCKET" && "$SOCK_OWNER" == "$(id -u)" ]]; then
+        remove_file "$HOST_SOCKET"
+    else
+        echo -e "  ${DIM}left non-socket or foreign file${RESET} $HOST_SOCKET"
+    fi
+fi
+
+# Remove host health and manifest state files (safe plain files).
+for state_file in "$HOST_HEALTH_FILE" "$HOST_MANIFEST_FILE"; do
+    if [[ -f "$state_file" && ! -L "$state_file" ]]; then
+        remove_file "$state_file"
+    fi
+done
+
+# Remove the support directory only if it is now empty.
+remove_empty_dir "${HOST_SUPPORT_DIR}/build"
+remove_empty_dir "$HOST_SUPPORT_DIR"
+
 echo ""
 if [[ "$REMOVED" -eq 0 ]]; then
     echo -e "${YELLOW}Nothing found to remove.${RESET}"
@@ -198,4 +275,5 @@ echo -e "${BOLD}Manual cleanup not performed:${RESET}"
 echo -e "  ${DIM}- Shell config:${RESET} remove any remctl PATH or completion lines from ~/.zshrc if you added them."
 echo -e "  ${DIM}- macOS permissions:${RESET} revoke Reminders, Automation, or Full Disk Access in System Settings if desired."
 echo -e "  ${DIM}- Shell cache:${RESET} run hash -r or open a new terminal."
+echo -e "  ${DIM}- TCC database:${RESET} Full Disk Access entries for the Capability Host remain; remove manually in System Settings."
 echo ""

@@ -13,7 +13,15 @@ from urllib.parse import urlparse
 DEFAULT_STORE_SUBPATH = Path(
     "Library/Group Containers/group.com.apple.reminders/Container_v1/Stores"
 )
+DEFAULT_HOST_SOCKET_SUBPATH = Path(
+    "Library/Application Support/RemCTL/read-broker.sock"
+)
 TRUTHY = {"1", "true", "yes", "on"}
+READ_ROUTES = ("auto", "direct", "host")
+
+
+class ReadRouteUnavailable(RuntimeError):
+    """Raised when the requested Reminders read route cannot be used."""
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -28,6 +36,63 @@ def resolve_store_dir() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / DEFAULT_STORE_SUBPATH
+
+
+def resolve_host_socket_path() -> Path:
+    override = os.environ.get("REMCTL_HOST_SOCKET")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / DEFAULT_HOST_SOCKET_SUBPATH
+
+
+def requested_read_route(cli_value: str | None = None) -> str:
+    value = cli_value
+    if value is None:
+        value = os.environ.get("REMCTL_READ_ROUTE", "auto")
+    route = str(value).strip().lower()
+    if route not in READ_ROUTES:
+        choices = ", ".join(READ_ROUTES)
+        raise ValueError(f"invalid read route {value!r}; expected one of: {choices}")
+    return route
+
+
+def capability_host_disabled() -> bool:
+    return env_bool("REMCTL_CAPABILITY_HOST_DISABLED")
+
+
+def select_read_route(
+    requested: str,
+    *,
+    direct_readable: bool,
+    host_ready: bool,
+    host_disabled: bool | None = None,
+) -> str:
+    route = requested_read_route(requested)
+    disabled = capability_host_disabled() if host_disabled is None else host_disabled
+
+    if route == "direct":
+        if direct_readable:
+            return "direct"
+        raise ReadRouteUnavailable("direct Reminders database access is unavailable")
+
+    if route == "host":
+        if disabled:
+            raise ReadRouteUnavailable("RemCTL Capability Host is disabled")
+        if host_ready:
+            return "host"
+        raise ReadRouteUnavailable("RemCTL Capability Host is unavailable")
+
+    if direct_readable:
+        return "direct"
+    if not disabled and host_ready:
+        return "host"
+    if disabled:
+        raise ReadRouteUnavailable(
+            "direct Reminders database access is unavailable and RemCTL Capability Host is disabled"
+        )
+    raise ReadRouteUnavailable(
+        "direct Reminders database access and RemCTL Capability Host are unavailable"
+    )
 
 
 def resolve_config_dir(app_name: str = "remctl") -> Path:
