@@ -10,6 +10,7 @@ import argparse, base64, csv, hashlib, html as html_lib, io, json, os, platform,
 
 CLI_NAME = os.path.basename(sys.argv[0])
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
@@ -3283,12 +3284,51 @@ def bridge_error_payload(status, message, stderr=""):
     }
 
 
+ACCOUNTS_DB = Path.home() / "Library/Accounts/Accounts4.sqlite"
+
+
+@lru_cache(maxsize=1)
+def icloud_source_titles():
+    """Titles of every iCloud account on this Mac, for recognising a renamed one.
+
+    EventKit reports a reminder source's title, not its provider, and an iCloud account
+    renamed in System Settings keeps its CalDAV source type while reporting the new
+    name — so matching the title against "iCloud" makes an ordinary iCloud account look
+    like a third-party CalDAV server and blocks every write to it.
+
+    The accounts database knows the provider. Reading it needs no permission RemCTL does
+    not already have: Full Disk Access is required for the Reminders store regardless.
+    Failure is silent and returns nothing, leaving the bridge's own title heuristic in
+    charge, so a locked-down Mac behaves exactly as before.
+    """
+    titles = set()
+    override = os.environ.get("REMCTL_ICLOUD_SOURCE_TITLES", "")
+    titles.update(t.strip() for t in override.split(",") if t.strip())
+    try:
+        uri = f"file:{ACCOUNTS_DB}?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT a.ZACCOUNTDESCRIPTION FROM ZACCOUNT a "
+                "JOIN ZACCOUNTTYPE t ON a.ZACCOUNTTYPE = t.Z_PK "
+                "WHERE t.ZACCOUNTTYPEDESCRIPTION = 'iCloud' "
+                "AND a.ZACCOUNTDESCRIPTION IS NOT NULL"
+            ).fetchall()
+        titles.update(row[0] for row in rows if row[0])
+    except Exception:
+        pass
+    return frozenset(titles)
+
+
 def bridge_call_result(data, timeout=30):
     """Call remctl-bridge and return raw subprocess + parsed JSON details."""
+    env = dict(os.environ)
+    titles = icloud_source_titles()
+    if titles:
+        env["REMCTL_ICLOUD_SOURCE_TITLES"] = ",".join(sorted(titles))
     try:
         proc = subprocess.run(
             [str(BRIDGE_PATH)], input=json.dumps(data),
-            capture_output=True, text=True, timeout=timeout
+            capture_output=True, text=True, timeout=timeout, env=env
         )
     except subprocess.TimeoutExpired:
         return bridge_error_payload("timeout", f"remctl-bridge did not respond within {timeout}s.")
