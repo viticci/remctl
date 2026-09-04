@@ -417,6 +417,20 @@ Manual fallback: run `remctl doctor --for-agent`, then add the printed `RemCTL C
 
 If Full Disk Access cannot yet be granted to the signed host, `show`, `search`, `today`, and `upcoming` support `--via-eventkit` as a limited read-only recovery path through EventKit. It stays hosted in normal `auto` mode and runs in the caller only in `direct` mode or with `REMCTL_STORE_DIR`; RemCTL never selects it automatically. This does not replace normal setup: it omits RemCTL numeric IDs, sections, synced tags, private metadata, smart-list/template internals, numeric list targeting, and table output.
 
+### Renamed iCloud accounts
+
+RemCTL writes only to iCloud Reminders lists. EventKit reports a source's title rather
+than its provider, so an iCloud account renamed in System Settings → Internet Accounts
+is indistinguishable from a third-party CalDAV server by name alone.
+
+RemCTL resolves this by reading each account's provider from the macOS accounts
+database, which needs no permission beyond the Full Disk Access it already requires for
+the Reminders store. Renamed accounts work normally, with nothing to configure.
+
+If that lookup is unavailable, writes to the renamed account are refused with an error
+naming the remedy, and `REMCTL_ICLOUD_SOURCE_TITLES="My Account Name"` (comma-separated)
+overrides it.
+
 ## For Agents
 
 Use JSON when scripting:

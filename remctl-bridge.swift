@@ -243,9 +243,27 @@ func normalizedReminderKitListIdentifier(_ raw: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// CalDAV source titles the CLI has confirmed belong to iCloud accounts.
+///
+/// EventKit reports a reminder source's title, never its provider, so an iCloud account
+/// renamed in System Settings → Internet Accounts is indistinguishable here from a
+/// third-party CalDAV server. The bridge cannot resolve that itself: ACAccountStore was
+/// deprecated in macOS 12 and returns nothing, and the Reminders store records only an
+/// account UUID. The CLI can — it already holds Full Disk Access — so it looks the
+/// providers up and passes the confirmed titles down through the environment.
+let confirmedICloudSourceTitles: Set<String> = {
+    guard let raw = ProcessInfo.processInfo.environment["REMCTL_ICLOUD_SOURCE_TITLES"] else {
+        return []
+    }
+    return Set(raw.split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty })
+}()
+
 func isICloudReminderSource(_ source: EKSource?) -> Bool {
-    guard let source = source else { return false }
-    return source.sourceType == .calDAV && source.title.localizedCaseInsensitiveContains("icloud")
+    guard let source = source, source.sourceType == .calDAV else { return false }
+    return source.title.localizedCaseInsensitiveContains("icloud")
+        || confirmedICloudSourceTitles.contains(source.title)
 }
 
 func iCloudReminderCalendars(_ store: EKEventStore) -> [EKCalendar] {
@@ -262,7 +280,7 @@ func findList(_ store: EKEventStore, name: String? = nil, listId: String? = nil)
         if matches.count == 1 {
             let cal = matches[0]
             guard isICloudReminderSource(cal.source) else {
-                fail("List \(wanted) is not in iCloud Reminders; RemCTL only writes iCloud Reminders lists")
+                fail("List \(wanted) is not in iCloud Reminders; RemCTL only writes iCloud Reminders lists. If this is a renamed iCloud account, RemCTL could not read ~/Library/Accounts to confirm it; grant Full Disk Access, or set REMCTL_ICLOUD_SOURCE_TITLES to the account name")
             }
             return cal
         }
@@ -285,7 +303,7 @@ func findList(_ store: EKEventStore, name: String? = nil, listId: String? = nil)
         fail("Multiple iCloud Reminders lists named \(name); pass --list-id")
     }
     if calendars.contains(where: { $0.title == name }) {
-        fail("List \(name) is not in iCloud Reminders; RemCTL does not write non-iCloud Reminders accounts")
+        fail("List \(name) is not in iCloud Reminders; RemCTL does not write non-iCloud Reminders accounts. If this is a renamed iCloud account, RemCTL could not read ~/Library/Accounts to confirm it; grant Full Disk Access, or set REMCTL_ICLOUD_SOURCE_TITLES to the account name")
     }
     fail("iCloud Reminders list not found: \(name)")
 }
