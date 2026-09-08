@@ -12778,6 +12778,12 @@ def build_parser():
             "template-create/template-apply/template-delete."
         ),
         formatter_class=HelpFormatter,
+        # The subcommands define --image, and the root parser defines --images,
+        # --image-mode and --image-width. argparse classifies every token against
+        # the root parser before the subparser runs, so prefix matching reads
+        # --image as an ambiguous abbreviation of those three and exits. Exact
+        # option names stay unaffected, so subcommands keep their own flags.
+        allow_abbrev=False,
     )
     p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--no-color", action="store_true", help="Disable color output")
