@@ -11478,6 +11478,21 @@ class ImageFlagParsingTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("unknown command", stderr.getvalue())
 
+    def test_subcommand_image_is_not_an_ambiguous_abbreviation(self):
+        """--image on add/edit must not resolve against the global --image* options.
+
+        The main parser defines --images, --image-mode and --image-width. With
+        argparse prefix matching, --image matches all three and the parser exits
+        before the subcommand sees it, so image attachments become unreachable.
+        """
+        for argv in (
+            ["add", "Title", "-l", "Work", "--private", "--image", "/tmp/a.png"],
+            ["add", "Title", "-l", "Work", "--private", "--image=/tmp/a.png"],
+            ["edit", "847", "--private", "--image", "/tmp/a.png"],
+        ):
+            a = self._parse(argv)
+            self.assertEqual(a.image, ["/tmp/a.png"], argv)
+
 
 class TrailingBadgeTests(unittest.TestCase):
     """Trailing 🔗/🌄 one-liner badges: human output only, batch loaded."""
