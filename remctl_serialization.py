@@ -143,8 +143,9 @@ def due_date_delta_alerts_from_row(row, *, ts=None):
 def preload_extras(db, pks):
     """Batch-load subtask counts and hashtags to avoid N+1 queries.
 
-    Each table is queried under its own try/except so a minimal fixture
-    missing one table still gets the other extra.
+    Successful queries include zero/empty entries so callers do not requery
+    reminders without extras. Failed queries leave their map empty, preserving
+    per-reminder fallback independently for each table.
     """
     if not pks:
         return {}, {}
@@ -158,7 +159,8 @@ def preload_extras(db, pks):
             f"AND ZCOMPLETED = 0 GROUP BY ZPARENTREMINDER",
             pks,
         ).fetchall()
-        subtask_counts = {row[0]: row[1] for row in subtask_rows}
+        subtask_counts = dict.fromkeys(pks, 0)
+        subtask_counts.update({row[0]: row[1] for row in subtask_rows})
     except Exception:
         # Minimal test fixtures omit this table; extras are best-effort.
         pass
@@ -169,6 +171,7 @@ def preload_extras(db, pks):
             f"WHERE o.ZREMINDER3 IN ({placeholders}) AND o.ZMARKEDFORDELETION = 0",
             pks,
         ).fetchall()
+        hashtags = {pk: [] for pk in pks}
         for row in hashtag_rows:
             hashtags.setdefault(row[0], []).append(row[1])
     except Exception:

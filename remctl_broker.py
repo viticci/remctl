@@ -333,10 +333,7 @@ def _socket_metadata(path: Path) -> dict[str, Any]:
 
 
 def should_route(parsed_args: Any) -> bool:
-    try:
-        hosted = command_scope(getattr(parsed_args, "cmd", None)) == "hosted"
-    except CapabilityPolicyError:
-        raise
+    hosted = command_scope(getattr(parsed_args, "cmd", None)) == "hosted"
     if not hosted:
         return False
     requested = mode()
@@ -375,7 +372,7 @@ def _send_frame(
     if sent <= 0:
         raise OSError("failed to send capability request")
     if sent < len(framed):
-        connection.sendall(framed[sent:])
+        connection.sendall(memoryview(framed)[sent:])
 
 
 def _recv_exact(
@@ -721,17 +718,18 @@ def dispatch(
     forwarded_signals: list[int] = []
     try:
         with capabilities:
+            metadata = capabilities.metadata
             has_prompt_capability = any(
                 isinstance(item, dict)
                 and item.get("kind") == "tty"
                 and item.get("purpose") in {"stdin", "stderr"}
-                for item in capabilities.metadata
+                for item in metadata
             )
             request = {
                 "protocolVersion": PROTOCOL_VERSION,
                 "operation": "run",
                 "argv": capabilities.argv,
-                "capabilities": capabilities.metadata,
+                "capabilities": metadata,
                 "stdinBase64": capabilities.stdin_base64,
                 "mergeOutput": bool(
                     not has_prompt_capability and _output_streams_share_sink()
@@ -1838,10 +1836,16 @@ def _native_permission_socket() -> socket.socket:
             "native permission channel descriptor is not a socket",
             code="permission_channel_invalid",
         )
+    duplicate: int | None = None
     try:
         duplicate = os.dup(NATIVE_PERMISSION_FD)
         os.set_inheritable(duplicate, False)
     except OSError as exc:
+        if duplicate is not None:
+            try:
+                os.close(duplicate)
+            except OSError:
+                pass
         raise _ServerError(
             "native permission channel could not be opened",
             code="permission_channel_unavailable",
@@ -2473,16 +2477,18 @@ def _permission_status_snapshot(runtime: HostedRuntime) -> dict[str, Any]:
     now = time.monotonic()
     with _PERMISSION_STATUS_LOCK:
         cached = _PERMISSION_STATUS_CACHE.get(key)
-        if cached is not None and now - cached[0] <= PERMISSION_STATUS_TTL_SECONDS:
-            return _with_effective_full_disk_access(cached[1])
+        snapshot = dict(cached[1]) if cached is not None else None
+    if cached is not None and now - cached[0] <= PERMISSION_STATUS_TTL_SECONDS:
+        return _with_effective_full_disk_access(snapshot)
     completed = _schedule_permission_status_refresh(runtime)
-    if cached is not None:
-        return _with_effective_full_disk_access(cached[1])
+    if snapshot is not None:
+        return _with_effective_full_disk_access(snapshot)
     completed.wait(timeout=PERMISSION_STATUS_INITIAL_WAIT_SECONDS)
     with _PERMISSION_STATUS_LOCK:
         refreshed = _PERMISSION_STATUS_CACHE.get(key)
-        if refreshed is not None:
-            return _with_effective_full_disk_access(refreshed[1])
+        snapshot = dict(refreshed[1]) if refreshed is not None else None
+    if snapshot is not None:
+        return _with_effective_full_disk_access(snapshot)
     return _unknown_permission_status()
 
 

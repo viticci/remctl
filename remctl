@@ -38,8 +38,8 @@ from remctl_serialization import (
     DUE_DATE_DELTA_UNITS,
     due_date_delta_alerts_from_row,
     preload_attachments,
-    preload_extras as shared_preload_extras,
-    preload_indicators as shared_preload_indicators,
+    preload_extras,
+    preload_indicators,
     recurrence_from_row,
     serialize_reminder,
     serialize_reminders,
@@ -1653,10 +1653,6 @@ def resolve_smart_list_or_die(db, name=None, smart_list_id=None):
     sys.exit(1)
 
 
-def q_list_pk(db, name):
-    result = resolve_list_ref(db, name=name)
-    return result["id"] if result and not result.get("error") else None
-
 def q_list_ckid(db, list_pk):
     row = db.execute(
         "SELECT ZCKIDENTIFIER FROM ZREMCDBASELIST "
@@ -2833,12 +2829,6 @@ def fmt_due(v, colored=True, all_day=False):
         return C.red(label) if colored else label
     return f" ({dt.strftime('%Y-%m-%d')})"
 
-def preload_extras(db, pks):
-    return shared_preload_extras(db, pks)
-
-def preload_indicators(db, pks):
-    return shared_preload_indicators(db, pks)
-
 def _color_priority(pri_val):
     """Color a priority marker based on level."""
     p = PRI.get(pri_val or 0, "")
@@ -3326,7 +3316,10 @@ def _cell_width_char(ch):
 
 def _visible_len(s):
     """Terminal cell width of string as displayed (without ANSI codes)."""
-    return sum(_cell_width_char(ch) for ch in _strip_ansi(str(s)))
+    plain = _strip_ansi(str(s))
+    if plain.isascii() and plain.isprintable():
+        return len(plain)
+    return sum(_cell_width_char(ch) for ch in plain)
 
 def _pad(s, width):
     """Pad string to width, accounting for ANSI codes."""
@@ -6451,25 +6444,6 @@ def create_list_with_applescript(name):
     return {"status": "created", "id": rid, "fallback": "applescript"}
 
 
-def delete_list_with_applescript(name):
-    osa(
-        f'tell application "Reminders"\n'
-        f'delete list "{esc(name)}"\n'
-        f'end tell'
-    )
-    return {"status": "deleted", "fallback": "applescript"}
-
-def osa_by_id(list_name, rem_id, action):
-    """Run AppleScript action on a reminder matched by its x-apple-reminder ID."""
-    return osa(
-        f'tell application "Reminders"\n'
-        f'tell list "{esc(list_name)}"\n'
-        f'set r to (first reminder whose id is "{esc(rem_id)}")\n'
-        f'{action}\n'
-        f'end tell\n'
-        f'end tell'
-    )
-
 def osa_by_id_try(list_name, rem_id, action, timeout=120):
     """Non-fatal variant: returns True on success, False on failure.
     Used for AppleScript-first write paths that want to fall back to bridge.
@@ -8908,19 +8882,6 @@ def cmd_add(a):
 def _rem_id(r):
     """Build the x-apple-reminder:// ID that AppleScript uses for matching."""
     return f"x-apple-reminder://{r['ZCKIDENTIFIER']}" if r["ZCKIDENTIFIER"] else None
-
-def _bridge_write(action, pk, db, extra=None):
-    """Attempt a bridge write operation. Returns True on success."""
-    if not bridge_available():
-        return False
-    r = q_reminder(db, pk)
-    if not r or not r["ZCKIDENTIFIER"]:
-        return False
-    data = {"action": action, "id": r["ZCKIDENTIFIER"]}
-    if extra:
-        data.update(extra)
-    result = bridge_call(data)
-    return result is not None and result.get("status") in ("completed", "uncompleted", "deleted", "updated", "flagged", "unflagged")
 
 
 def _refuse_unsafe_title_fallback(reminder, operation, reason):
@@ -11720,10 +11681,6 @@ def current_cli_path():
     return Path(__file__).resolve()
 
 
-def current_python_path():
-    return Path(sys.executable).resolve()
-
-
 def current_bridge_path():
     override = os.environ.get("REMCTL_BRIDGE_PATH")
     if override:
@@ -11758,270 +11715,6 @@ def current_permissions_path():
     if discovered:
         return Path(discovered).resolve()
     return PERMISSIONS_PATH.resolve()
-
-
-def _item_due_datetime(item):
-    value = item.get("dueDate")
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def _item_is_overdue(item):
-    if "overdue" in item:
-        return bool(item["overdue"])
-    due_dt = _item_due_datetime(item)
-    return bool(due_dt and due_dt < start_of_day())
-
-
-def _print_reminder_json(items):
-    print(json.dumps(items, indent=2))
-
-
-def _print_list_payload(rows, json_mode=False, table_mode=False):
-    if json_mode:
-        print(json.dumps([{"id": row["id"], "title": row["name"]} for row in rows], indent=2))
-        return
-    if table_mode:
-        data = [{"id": row["id"], "title": row["name"], "list": "", "due": "", "pri": ""} for row in rows]
-        print(fmt_table(data))
-        return
-    print(C.bold("Reminder Lists:"))
-    for row in rows:
-        list_name = color_list_name(row["name"])
-        sec_count = row.get("sectionCount", 0) or 0
-        sec_info = C.dim(f" [{sec_count} sections]") if sec_count else ""
-        id_dim = C.dim(f"(id: {row['id']})")
-        print(f"  {list_name} {id_dim}{sec_info}")
-    print(f"\n{len(rows)} list{'s' if len(rows) != 1 else ''}")
-
-
-def _print_show_payload(list_name, items, args):
-    if args.json:
-        _print_reminder_json(items)
-        return
-    if not items:
-        print(f"No {'active ' if not args.completed else ''}reminders in '{safe_display(list_name)}'")
-        return
-    if getattr(args, "format", None) == "table":
-        print_reminder_table(items, args=args)
-        return
-    print(f"{C.bold(color_list_name(list_name))}:")
-    section_names = [item["section"] for item in items if item.get("section")]
-    if section_names:
-        sec_items, unsectioned = {}, []
-        for item in items:
-            section = item.get("section")
-            if section:
-                sec_items.setdefault(section, []).append(item)
-            else:
-                unsectioned.append(item)
-        for item in unsectioned:
-            print(fmt(item, verbose=args.verbose))
-        seen = []
-        for section in section_names:
-            if section not in seen:
-                seen.append(section)
-        for section in seen:
-            print(f"\n  {C.bold(f'[{safe_display(section)}]')}")
-            for item in sec_items[section]:
-                print(fmt(item, verbose=args.verbose, indent="  "))
-    else:
-        for item in items:
-            print(fmt(item, verbose=args.verbose))
-    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
-
-
-def _print_search_payload(query, items, args):
-    if args.json:
-        _print_reminder_json(items)
-        return
-    if getattr(args, "format", None) == "table":
-        print_reminder_table(items, args=args)
-        return
-    if not items:
-        print(f"No reminders matching '{safe_display(query)}'")
-        return
-    print(f"Search: {C.bold(safe_display(query))}")
-    for item in items:
-        print(fmt(item, verbose=args.verbose))
-    print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
-
-
-def _print_today_payload(items, args):
-    if args.no_overdue:
-        items = [item for item in items if not _item_is_overdue(item)]
-    if args.json:
-        _print_reminder_json(items)
-        return
-    if getattr(args, "format", None) == "table":
-        print_reminder_table(items, args=args)
-        return
-    if not items:
-        print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
-        return
-    overdue = [item for item in items if _item_is_overdue(item)]
-    due = [item for item in items if not _item_is_overdue(item)]
-    if overdue:
-        print(C.red(f"Overdue ({len(overdue)}):"))
-        for item in overdue:
-            print(fmt(item, indent="  "))
-        print()
-    if due:
-        print(C.bold(f"Due Today ({len(due)}):"))
-        for item in due:
-            print(fmt(item, indent="  "))
-    print(f"\n{len(items)} total")
-
-
-def _print_simple_reminder_list(items, args, *, empty_message, heading, total_label, group_by_day=False):
-    if args.json:
-        _print_reminder_json(items)
-        return
-    if getattr(args, "format", None) == "table":
-        print_reminder_table(items, args=args)
-        return
-    if not items:
-        print(empty_message)
-        return
-    if group_by_day:
-        print(C.bold(heading))
-        groups = {}
-        today = start_of_day()
-        for item in items:
-            due_dt = _item_due_datetime(item)
-            if not due_dt:
-                continue
-            day_key = due_dt.strftime("%Y-%m-%d")
-            day_label = due_dt.strftime("%A, %b %d")
-            if due_dt.date() == today.date():
-                day_label = "Today"
-            elif due_dt.date() == (today + timedelta(days=1)).date():
-                day_label = "Tomorrow"
-            groups.setdefault((day_key, day_label), []).append(item)
-        for (_, day_label), day_items in sorted(groups.items()):
-            print(f"\n  {C.bold(day_label)}:")
-            for item in day_items:
-                print(fmt(item, indent="    "))
-        print(f"\n{len(items)} {total_label}")
-        return
-    print(heading)
-    for item in items:
-        print(fmt(item, verbose=getattr(args, "verbose", False), indent="  "))
-    print(f"\n{len(items)} {total_label}")
-
-
-def _print_tags_payload(rows, json_mode=False):
-    if json_mode:
-        print(json.dumps(rows, indent=2))
-        return
-    if not rows:
-        print("No tags found")
-        return
-    print(C.bold("Tags:"))
-    for row in rows:
-        print(f"  {C.magenta('#' + safe_display(row['name']))}")
-    print(f"\n{len(rows)} tag{'s' if len(rows) != 1 else ''}")
-
-
-def _print_sections_payload(grouped, json_mode=False):
-    if json_mode:
-        print(json.dumps(grouped, indent=2))
-        return
-    if not grouped:
-        print("No sections found")
-        return
-    count = 0
-    for list_name, names in grouped.items():
-        print(f"{C.bold(color_list_name(list_name))}:")
-        for name in names:
-            count += 1
-            print(f"  - {safe_display(name)}")
-        print()
-    print(f"{count} section{'s' if count != 1 else ''}")
-
-
-def _print_stats_payload(stats, json_mode=False):
-    if json_mode:
-        print(json.dumps(stats, indent=2))
-        return
-    print(C.bold("Reminders Stats"))
-    print(f"  Total:      {stats['total']}")
-    print(f"  Active:     {C.green(str(stats['active']))}")
-    print(f"  Completed:  {C.dim(str(stats['completed']))}")
-    print(f"  Overdue:    {C.red(str(stats['overdue'])) if stats['overdue'] else '0'}")
-    print(f"  Flagged:    {C.yellow(str(stats['flagged'])) if stats['flagged'] else '0'}")
-    print(f"  Urgent:     {C.red(str(stats.get('urgent', 0))) if stats.get('urgent') else '0'}")
-    print(f"  Lists:      {stats['lists']}")
-    print(f"  Sections:   {stats['sections']}")
-
-
-def _print_info_payload(item, args):
-    if args.json:
-        print(json.dumps(item, indent=2))
-        return
-    print(f"{C.bold('Reminder')} {reminder_id_text(item['id'], item.get('list'))}")
-    print(f"  Title:     {safe_display(item.get('title') or '(untitled)')}")
-    print(f"  List:      {color_list_name(item.get('list'))}")
-    if item.get("section"):
-        print(f"  Section:   {C.bold(safe_display(item['section']))}")
-    status_str = C.green("Completed") if item.get("completed") else C.yellow("Active")
-    print(f"  Status:    {status_str}")
-    pri_display = item.get("priority", "none")
-    if pri_display == "high":
-        pri_display = C.red(pri_display)
-    elif pri_display == "medium":
-        pri_display = C.yellow(pri_display)
-    elif pri_display == "low":
-        pri_display = C.green(pri_display)
-    print(f"  Priority:  {pri_display}")
-    print(f"  Flagged:   {C.yellow('Yes') if item.get('flagged') else 'No'}")
-    print(f"  Urgent:    {C.red('Yes') if item.get('urgent') else 'No'}")
-    if item.get("dueDate"):
-        due_dt = _item_due_datetime(item)
-        if due_dt:
-            print(f"  Due:       {due_dt.strftime('%b %d, %Y at %I:%M %p')}")
-    recurrence = recurrence_summary(_recurrence_from_item(item))
-    if recurrence:
-        print(f"  Repeats:   {C.magenta(recurrence)}")
-    if item.get("createdDate"):
-        print(f"  Created:   {datetime.fromisoformat(item['createdDate']).strftime('%b %d, %Y at %I:%M %p')}")
-    if item.get("completionDate"):
-        print(f"  Completed: {datetime.fromisoformat(item['completionDate']).strftime('%b %d, %Y at %I:%M %p')}")
-    if item.get("notes"):
-        print(f"  Notes:     {safe_display(item['notes'])}")
-    if item.get("url"):
-        print(f"  URL:       {safe_display(item['url'])}")
-    if item.get("tags"):
-        print(f"  Tags:      {', '.join(C.magenta('#' + safe_display(tag)) for tag in item['tags'])}")
-    if item.get("parentTitle"):
-        print(f"  Parent:    #{item['parentID']} ({safe_display(item['parentTitle'])})")
-    elif item.get("parentID"):
-        print(f"  Parent:    #{item['parentID']}")
-    if item.get("subtasks"):
-        print(f"  Subtasks ({len(item['subtasks'])}):")
-        for sub in item["subtasks"]:
-            print(fmt(sub, indent="    "))
-    if item.get("attachments"):
-        print(f"  Attachments ({len(item['attachments'])}):")
-        for attachment in item["attachments"]:
-            print(
-                f"    - {safe_display(attachment.get('filename') or 'untitled')} "
-                f"({safe_display(attachment.get('type') or '?')})"
-            )
-    if item.get("deepLink"):
-        print(f"  Deep link: {C.dim(item['deepLink'])}")
-
-
-def _normalize_write_result(result, *, status, reminder_id, title=None, include_title=True):
-    payload = {"status": status, "id": reminder_id}
-    final_title = title if title is not None else result.get("title")
-    if include_title and final_title:
-        payload["title"] = final_title
-    return payload
 
 
 def run_handler_with_fallback(args, handler):
@@ -13630,9 +13323,7 @@ def main():
         C.enabled = False
 
     # Propagate global --format to json flag where needed
-    if a.format == "json" and not hasattr(a, 'json'):
-        a.json = True
-    elif a.format == "json" and hasattr(a, 'json'):
+    if a.format == "json":
         a.json = True
 
     route_via_host = _should_route_capability_host(a)
@@ -13662,10 +13353,6 @@ def main():
     if route_via_host:
         _dispatch_capability_host(_normalized_host_argv(original_argv, a), a)
         return
-
-    # Propagate --format table to subcommand
-    if a.format == "table" and not hasattr(a, 'format_override'):
-        pass  # format is already on the namespace
 
     # Route to command handler
     cmds = {

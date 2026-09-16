@@ -9,7 +9,6 @@ import json
 import os
 import re
 import stat
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -157,6 +156,7 @@ def _open_tty(
     identifier: str,
     purpose: str,
 ) -> DescriptorCapability | None:
+    fd: int | None = None
     try:
         if not stream.isatty():
             return None
@@ -164,7 +164,6 @@ def _open_tty(
         fd = os.dup(original)
         details = os.fstat(fd)
         if not stat.S_ISCHR(details.st_mode) or not os.isatty(fd):
-            os.close(fd)
             raise CapabilityError("interactive stdin is not a terminal character device")
         access_mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
         allowed_modes = (
@@ -173,7 +172,6 @@ def _open_tty(
             else {os.O_WRONLY, os.O_RDWR}
         )
         if access_mode not in allowed_modes:
-            os.close(fd)
             raise CapabilityError(f"{purpose} terminal has an incompatible access mode")
         try:
             columns = os.get_terminal_size(fd).columns
@@ -181,7 +179,7 @@ def _open_tty(
             columns = None
         if columns is not None and not MIN_TERMINAL_COLUMNS <= columns <= MAX_TERMINAL_COLUMNS:
             columns = None
-        return DescriptorCapability(
+        capability = DescriptorCapability(
             identifier=identifier,
             fd=fd,
             kind="tty",
@@ -192,8 +190,16 @@ def _open_tty(
             size=0,
             columns=columns,
         )
+        fd = None  # The returned capability now owns the duplicate.
+        return capability
     except (AttributeError, OSError):
         return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 class _Planner:
@@ -711,12 +717,3 @@ def materialize_inputs(
     if any(count != 1 for count in used.values()):
         raise CapabilityError("input capability was not materialized exactly once")
     return rewritten, tty_fd, stdout_columns, stderr_fd
-
-
-def private_scratch_directory(parent: Path | None = None) -> tempfile.TemporaryDirectory[str]:
-    """Create an owner-only staging directory for one hosted invocation."""
-
-    if parent is not None:
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        parent.chmod(0o700)
-    return tempfile.TemporaryDirectory(prefix="remctl-host-", dir=parent)

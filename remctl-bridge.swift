@@ -571,10 +571,6 @@ func containsQuery(_ reminder: EKReminder, _ query: String) -> Bool {
     return false
 }
 
-func dueDateForSort(_ reminder: EKReminder) -> Date? {
-    dateFromComponents(reminder.dueDateComponents).0
-}
-
 func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
     guard let mode = cmd.readMode else { fail("readMode is required") }
     let calendars = eventKitCalendars(store, listName: cmd.list)
@@ -619,9 +615,13 @@ func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
         fail("Unsupported EventKit read mode: \(mode)")
     }
 
-    reminders.sort {
-        let leftDue = dueDateForSort($0)
-        let rightDue = dueDateForSort($1)
+    // Convert date components once per reminder, rather than on each comparison.
+    var sortableReminders = reminders.map {
+        (reminder: $0, dueDate: dateFromComponents($0.dueDateComponents).0, title: $0.title ?? "")
+    }
+    sortableReminders.sort {
+        let leftDue = $0.dueDate
+        let rightDue = $1.dueDate
         if let leftDue = leftDue, let rightDue = rightDue {
             if leftDue != rightDue { return leftDue < rightDue }
         } else if leftDue != nil {
@@ -629,9 +629,9 @@ func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
         } else if rightDue != nil {
             return false
         }
-        return ($0.title ?? "") < ($1.title ?? "")
+        return $0.title < $1.title
     }
-    let items = reminders.prefix(limit).map { reminderPayload($0) }
+    let items = sortableReminders.prefix(limit).map { reminderPayload($0.reminder) }
     output([
         "status": "ok",
         "source": "eventkit",

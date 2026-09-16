@@ -3124,7 +3124,7 @@ class CliTests(unittest.TestCase):
                     "bridge_call",
                     return_value={"status": "error", "message": "iCloud Reminders list not found for id: CK-1"},
                 ),
-                mock.patch.object(self.remctl, "delete_list_with_applescript") as delete_list_with_applescript,
+                mock.patch.object(self.remctl.subprocess, "run") as subprocess_run,
                 self.assertRaises(SystemExit),
                 contextlib.redirect_stderr(io.StringIO()) as stderr,
             ):
@@ -3132,7 +3132,7 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
-        delete_list_with_applescript.assert_not_called()
+        subprocess_run.assert_not_called()
         self.assertIn("iCloud Reminders list not found", stderr.getvalue())
 
     def _smart_list_db(self):
@@ -8006,6 +8006,21 @@ class CliTests(unittest.TestCase):
         widths = {self.remctl._visible_len(line) for line in rendered.splitlines()}
         self.assertEqual(len(widths), 1)
 
+    def test_visible_len_preserves_unicode_and_control_widths(self):
+        cases = [
+            ("", 0),
+            ("ASCII title", 11),
+            ("\033[31mRed\033[0m", 3),
+            ("a\t\n\x00\x7fb", 2),
+            ("cafe\u0301", 4),
+            ("日本語", 6),
+            ("👨\u200d👩\u200d👧", 6),
+            ("❤\ufe0f", 1),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.remctl._visible_len(text), expected)
+
     def test_group_table_mode_prints_child_list_and_section_tables(self):
         children = [
             {"Z_PK": 2, "ZNAME": "Editorial", "ZCKIDENTIFIER": "LIST-2", "ZISGROUP": 0},
@@ -10327,8 +10342,6 @@ class InlineImageTests(unittest.TestCase):
     )
 
     def _detect_mode(self, env):
-        scrubbed = {key: "" for key in self._IMAGE_ENV_KEYS}
-        # Empty strings keep keys present but inert; remove them instead.
         with mock.patch.dict(os.environ, clear=False):
             for key in self._IMAGE_ENV_KEYS:
                 os.environ.pop(key, None)
@@ -11210,6 +11223,7 @@ class PermissionHelperTests(unittest.TestCase):
         host_source = cls.root / "signed-host.swift"
         host_source.write_text("import Foundation\n")
         host_binary = cls.root / "signed-host"
+        cls.host_binary = host_binary
         subprocess.run(
             [swiftc, "-o", str(host_binary), str(host_source)],
             check=True,
@@ -11217,24 +11231,6 @@ class PermissionHelperTests(unittest.TestCase):
             text=True,
         )
         cls.valid_app = cls._create_host_app(cls.root / "valid", host_binary, sign=True)
-        identities = subprocess.run(
-            ["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        ).stdout
-        match = re.search(r'(?m)^\s*\d+\)\s+([0-9A-F]{40})\s+"Apple Development:', identities)
-        cls.development_identity = match.group(1) if match else None
-        cls.stable_app = (
-            cls._create_host_app(
-                cls.root / "stable",
-                host_binary,
-                sign=cls.development_identity,
-            )
-            if cls.development_identity
-            else None
-        )
         cls.unsigned_app = cls._create_host_app(cls.root / "unsigned", host_binary)
         cls.invalid_signature_app = cls._create_host_app(
             cls.root / "invalid-signature", host_binary, sign=True
@@ -11314,11 +11310,23 @@ class PermissionHelperTests(unittest.TestCase):
         self.assertIn("stable signing identity", result.stderr)
 
     def test_matching_preserved_development_identity_passes_preflight(self):
-        if self.stable_app is None or self.development_identity is None:
+        identities = subprocess.run(
+            ["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+        match = re.search(r'(?m)^\s*\d+\)\s+([0-9A-F]{40})\s+"Apple Development:', identities)
+        if match is None:
             self.skipTest("Apple Development signing identity is unavailable")
-        self.marker.write_text(f"{self.stable_app}\n")
-        self.identity_marker.write_text(f"{self.development_identity}\n")
-        result = self._run_target(self.stable_app)
+        development_identity = match.group(1)
+        stable_app = self._create_host_app(
+            self.root / "stable", self.host_binary, sign=development_identity
+        )
+        self.marker.write_text(f"{stable_app}\n")
+        self.identity_marker.write_text(f"{development_identity}\n")
+        result = self._run_target(stable_app)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "valid\n")
 

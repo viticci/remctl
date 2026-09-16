@@ -68,7 +68,6 @@
 - (void)setName:(NSString *)name;
 - (void)setParentOwnerID:(id)objectID;
 - (void)setSmartListType:(NSString *)smartListType;
-- (void)setSortingStyle:(NSString *)sortingStyle;
 - (void)updateManualOrdering:(id)manualOrdering;
 - (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
 @end
@@ -149,7 +148,6 @@
 
 @interface REMListChangeItem : NSObject
 - (id)remObjectID;
-- (id)sublistContext;
 - (id)sectionsContextChangeItem;
 - (id)appearanceContext;
 - (id)groceryContextChangeItem;
@@ -167,7 +165,6 @@
 @interface REMList : NSObject
 - (id)account;
 - (id)remObjectID;
-- (id)parentList;
 - (NSOrderedSet *)reminderIDsOrdering;
 @end
 

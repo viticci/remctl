@@ -32,10 +32,6 @@ _UTI_EXTENSIONS = {
 _FALLBACK_EXTS = (".png", ".jpg", ".jpeg", ".heic")
 
 
-def _truthy(value) -> bool:
-    return value is not None and str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def detect_image_mode() -> str | None:
     """Pick the best rendering protocol for the current terminal.
 
@@ -233,7 +229,7 @@ def _flatten_over_black(rgb_rows):
     return flat
 
 
-def _sips(path: Path, *args: str) -> bool:
+def _sips(*args: str) -> bool:
     if not shutil.which("sips"):
         return False
     try:
@@ -271,7 +267,7 @@ def _pixel_rows_via_sips(path: Path, target_w: int):
     try:
         bmp_path = Path(tmpdir) / "out.bmp"
         # sips -Z preserves aspect; upscaling to target width is harmless here.
-        if not _sips(path, "-Z", str(target_w), "-s", "format", "bmp",
+        if not _sips("-Z", str(target_w), "-s", "format", "bmp",
                      str(path), "--out", str(bmp_path)):
             return None
         if not bmp_path.is_file():
@@ -342,7 +338,7 @@ def _render_kitty(path: Path, width_cells: int) -> str | None:
     tmpdir = tempfile.mkdtemp(prefix="remctl-img-")
     try:
         png_path = Path(tmpdir) / "out.png"
-        if not _sips(path, "-s", "format", "png", str(path), "--out", str(png_path)):
+        if not _sips("-s", "format", "png", str(path), "--out", str(png_path)):
             return None
         if not png_path.is_file():
             return None

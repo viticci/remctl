@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Avoid repeated per-reminder tag and subtask-count queries when batch reads find no extras.
+- Reduce repeated work in ASCII table-width measurement, limited EventKit read sorting, and Capability Host request handling.
+- Close duplicated file handles if terminal or permission-channel setup fails. Slow Full Disk Access checks no longer hold the permission-status cache lock.
+- Remove unused internal helpers and declarations.
+
 ## 1.8.0 — 2026-09-04
 
 ### Signed Capability Host

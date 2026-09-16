@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +119,57 @@ def _wait_for(
             f"; stderr={stderr.decode(errors='replace')!r}"
         )
     raise AssertionError(f"timed out waiting for {path}{detail}")
+
+
+def _run_window_test(
+    app: Path, flag: str, output_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Reap only this window test's exact invocation, even if open times out."""
+    executable = app / f"Contents/MacOS/{EXECUTABLE_NAME}"
+    expected_command = f"{executable} {flag} {output_path}"
+
+    def exact_test_processes():
+        rows = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.splitlines()
+        matches = []
+        for row in rows:
+            fields = row.strip().split(maxsplit=1)
+            if len(fields) == 2 and fields[1] == expected_command:
+                matches.append(int(fields[0]))
+        return matches
+
+    try:
+        return subprocess.run(
+            ["/usr/bin/open", "-W", "-n", str(app), "--args", flag, str(output_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        # open is only the launcher; its child may survive a launcher timeout.
+        leaked = exact_test_processes()
+        for pid in leaked:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 2
+        while leaked and time.monotonic() < deadline:
+            time.sleep(0.05)
+            leaked = exact_test_processes()
+        for pid in leaked:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if exact_test_processes():
+            raise AssertionError(expected_command)
 
 
 def _identity_probe(app: Path, root: Path) -> subprocess.Popen[bytes]:
@@ -279,6 +331,7 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         swiftc, _codesign = _mac_tools()
+        cls.permission_gate_payload = None
         cls.compiled_temp = tempfile.TemporaryDirectory()
         compiled_root = Path(cls.compiled_temp.name)
         cls.compiled_host = compiled_root / EXECUTABLE_NAME
@@ -497,20 +550,8 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
             bundle_identifier=WINDOW_TEST_BUNDLE_ID,
         )
         output_path = self.root / "permission-window.json"
-        result = subprocess.run(
-            [
-                "/usr/bin/open",
-                "-W",
-                "-n",
-                str(app),
-                "--args",
-                "--test-permission-window-output",
-                str(output_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
+        result = _run_window_test(
+            app, "--test-permission-window-output", output_path
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -528,7 +569,10 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["bundleIdentifier"], WINDOW_TEST_BUNDLE_ID)
         self.assertGreater(payload["pid"], 0)
 
-    def test_permission_gate_requires_every_predicate_and_one_fresh_click(self):
+    def _permission_gate_payload(self):
+        """Run the shared gate simulation once for both sets of assertions."""
+        if type(self).permission_gate_payload is not None:
+            return type(self).permission_gate_payload
         app = _signed_app(self.root, self.compiled_host)
         executable = app / f"Contents/MacOS/{EXECUTABLE_NAME}"
         result = subprocess.run(
@@ -540,6 +584,11 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
+        type(self).permission_gate_payload = payload
+        return payload
+
+    def test_permission_gate_requires_every_predicate_and_one_fresh_click(self):
+        payload = self._permission_gate_payload()
         self.assertTrue(payload["ready"])
         self.assertEqual(
             payload["blocked"],
@@ -569,17 +618,7 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["restoreRejectsLostFocus"])
 
     def test_post_dispatch_timeout_wins_once_and_rejects_late_callback(self):
-        app = _signed_app(self.root, self.compiled_host)
-        executable = app / f"Contents/MacOS/{EXECUTABLE_NAME}"
-        result = subprocess.run(
-            [str(executable), "--test-permission-gate"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+        payload = self._permission_gate_payload()
         self.assertTrue(payload["timeoutRequestStarted"])
         self.assertTrue(payload["timeoutAcceptedAfterRequest"])
         self.assertFalse(payload["lateCallbackAcceptedAfterTimeout"])
@@ -588,56 +627,10 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
 
     def test_window_close_cancels_only_before_irreversible_request(self):
         app = _signed_app(self.root, self.compiled_host)
-        executable = app / f"Contents/MacOS/{EXECUTABLE_NAME}"
         output_path = self.root / "permission-close.json"
-        expected_command = (
-            f"{executable} --test-permission-window-close-output {output_path}"
+        result = _run_window_test(
+            app, "--test-permission-window-close-output", output_path
         )
-
-        def exact_test_processes():
-            rows = subprocess.run(
-                ["/bin/ps", "-axo", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            ).stdout.splitlines()
-            matches = []
-            for row in rows:
-                fields = row.strip().split(maxsplit=1)
-                if len(fields) == 2 and fields[1] == expected_command:
-                    matches.append(int(fields[0]))
-            return matches
-
-        try:
-            result = subprocess.run(
-                [
-                    "/usr/bin/open",
-                    "-W",
-                    "-n",
-                    str(app),
-                    "--args",
-                    "--test-permission-window-close-output",
-                    str(output_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-        finally:
-            # `open` is only the launcher. If an assertion or timeout interrupts
-            # it, reap only this test's exact executable-and-output invocation.
-            leaked = exact_test_processes()
-            for pid in leaked:
-                os.kill(pid, signal.SIGTERM)
-            deadline = time.monotonic() + 2
-            while leaked and time.monotonic() < deadline:
-                time.sleep(0.05)
-                leaked = exact_test_processes()
-            for pid in leaked:
-                os.kill(pid, signal.SIGKILL)
-            self.assertFalse(exact_test_processes(), expected_command)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads(output_path.read_text(encoding="utf-8")),
@@ -1032,6 +1025,42 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
                 process.communicate(timeout=10)
             if request_thread is not None:
                 request_thread.join(timeout=1)
+
+
+class WindowLauncherCleanupTests(unittest.TestCase):
+    def test_timeout_reaps_only_the_exact_window_invocation(self):
+        app = Path("/private/tmp/remctl-window-fixture") / APP_NAME
+        executable = app / f"Contents/MacOS/{EXECUTABLE_NAME}"
+        output = app.parent / "permission-window.json"
+        flag = "--test-permission-window-output"
+        timeout = subprocess.TimeoutExpired("open", 15)
+        running = True
+
+        def run(command, **_kwargs):
+            if command[0] == "/usr/bin/open":
+                raise timeout
+            self.assertEqual(command, ["/bin/ps", "-axo", "pid=,command="])
+            rows = [
+                f"222 {executable} {flag} {app.parent / 'other-output.json'}",
+                f"333 /Applications/{APP_NAME}/Contents/MacOS/{EXECUTABLE_NAME} --run-capability-host --socket /installed.sock",
+            ]
+            if running:
+                rows.append(f"111 {executable} {flag} {output}")
+            return subprocess.CompletedProcess(command, 0, stdout="\n".join(rows))
+
+        def terminate(_pid, _signal):
+            nonlocal running
+            running = False
+
+        with (
+            mock.patch.object(subprocess, "run", side_effect=run),
+            mock.patch.object(os, "kill", side_effect=terminate) as kill,
+            mock.patch.object(time, "sleep"),
+            self.assertRaises(subprocess.TimeoutExpired) as raised,
+        ):
+            _run_window_test(app, flag, output)
+        self.assertIs(raised.exception, timeout)
+        kill.assert_called_once_with(111, signal.SIGTERM)
 
 
 if __name__ == "__main__":

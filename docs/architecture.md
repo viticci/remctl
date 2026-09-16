@@ -64,6 +64,8 @@ This exposes fields EventKit does not expose cleanly for fast list views:
 
 RemCTL opens the database read-only. It never writes to SQLite.
 
+List reads batch-load subtask counts and tags through `remctl_serialization.py`. Each successful batch records an explicit zero count or empty tag list for reminders without extras, so serialization does not issue a second query for those reminders. If one batch query fails, its per-reminder fallback remains available independently of the other batch.
+
 ### Attachment Resolution and Rendering
 
 Attachment rows live in the store's attachment tables (`ZREMCDATTACHMENT` on parent reminders, saved-attachment rows for subtasks). Each row records a filename, UTI, pixel dimensions, and a `ZSHA512SUM` digest of the file's contents. The files themselves live outside the database:
