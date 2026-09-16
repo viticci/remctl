@@ -799,5 +799,356 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertFalse(codex["configured"])
 
 
+
+def http_call(port, method="POST", path="/mcp", body=None, headers=None):
+    import http.client
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    request_headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    request_headers.update(headers or {})
+    connection.request(method, path, body=json.dumps(body) if body is not None else None, headers=request_headers)
+    response = connection.getresponse()
+    data = response.read().decode("utf-8")
+    payload = json.loads(data) if data else None
+    return response.status, {k.lower(): v for k, v in response.getheaders()}, payload
+
+
+class HTTPTransportTests(unittest.TestCase):
+    AUTH = {"Authorization": "Bearer test-token"}
+    MODERN_HEADERS = {"Authorization": "Bearer test-token", "MCP-Protocol-Version": MODERN, "Mcp-Method": "tools/list"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server, cls.executor = make_server(FakeExecutor(stdout="[]"))
+        transport = remctl_mcp.HTTPTransportConfig(token="test-token", allowed_hosts=remctl_mcp.LOOPBACK_HOSTS | {"mac.example.ts.net"})
+        cls.httpd = remctl_mcp.make_http_server(cls.server, transport, "127.0.0.1", 0)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def test_health_needs_no_token_and_works_under_a_mount_path(self):
+        for path in ("/health", "/remctl/health"):
+            status, _, payload = http_call(self.port, "GET", path)
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["ok"])
+            self.assertIn(MODERN, payload["protocolVersions"])
+
+    def test_missing_or_wrong_token_is_401_and_bad_origin_is_403(self):
+        status, headers, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        self.assertEqual(status, 401)
+        self.assertIn("bearer", headers["www-authenticate"].lower())
+        status, _, _ = http_call(self.port, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={"Authorization": "Bearer nope"})
+        self.assertEqual(status, 401)
+        status, _, _ = http_call(self.port, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={**self.AUTH, "Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        status, _, _ = http_call(self.port, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={**self.AUTH, "Origin": "https://mac.example.ts.net"})
+        self.assertEqual(status, 200)
+        status, _, _ = http_call(self.port, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={**self.AUTH, "Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_modern_requests_validate_mirrored_headers(self):
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": modern_meta()}}
+        status, headers, payload = http_call(self.port, body=body, headers=self.MODERN_HEADERS)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["mcp-protocol-version"], MODERN)
+        self.assertEqual(payload["result"]["resultType"], "complete")
+        for broken, fragment in (
+            ({**self.MODERN_HEADERS, "MCP-Protocol-Version": None}, "MCP-Protocol-Version"),
+            ({**self.MODERN_HEADERS, "Mcp-Method": "ping"}, "Mcp-Method"),
+            ({**self.MODERN_HEADERS, "Mcp-Method": None}, "Mcp-Method"),
+        ):
+            with self.subTest(fragment=fragment):
+                clean = {k: v for k, v in broken.items() if v is not None}
+                status, _, payload = http_call(self.port, body=body, headers=clean)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_HEADER_MISMATCH)
+                self.assertIn(fragment, payload["error"]["message"])
+        call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"_meta": modern_meta(), "name": "lists", "arguments": {}}}
+        status, _, payload = http_call(self.port, body=call, headers={**self.MODERN_HEADERS, "Mcp-Method": "tools/call", "Mcp-Name": "lists"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["structuredContent"], {"items": [], "count": 0})
+        status, _, payload = http_call(self.port, body=call, headers={**self.MODERN_HEADERS, "Mcp-Method": "tools/call", "Mcp-Name": "today"})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_HEADER_MISMATCH)
+        encoded = "=?base64?" + __import__("base64").b64encode(b"lists").decode() + "?="
+        status, _, _ = http_call(self.port, body=call, headers={**self.MODERN_HEADERS, "Mcp-Method": "tools/call", "Mcp-Name": encoded})
+        self.assertEqual(status, 200)
+
+    def test_modern_error_mapping_and_notifications(self):
+        bad_version = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {PV: "2025-11-25", CC: {}}}}
+        status, _, payload = http_call(self.port, body=bad_version, headers={**self.MODERN_HEADERS, "MCP-Protocol-Version": "2025-11-25"})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_UNSUPPORTED_PROTOCOL_VERSION)
+        unknown = {"jsonrpc": "2.0", "id": 1, "method": "nope", "params": {"_meta": modern_meta()}}
+        status, _, payload = http_call(self.port, body=unknown, headers={**self.MODERN_HEADERS, "Mcp-Method": "nope"})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_METHOD_NOT_FOUND)
+        notification = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"_meta": modern_meta(), "requestId": 1}}
+        status, _, payload = http_call(self.port, body=notification, headers={**self.MODERN_HEADERS, "Mcp-Method": "notifications/cancelled"})
+        self.assertEqual(status, 202)
+        self.assertIsNone(payload)
+        discover = {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": modern_meta()}}
+        status, _, payload = http_call(self.port, body=discover, headers={**self.MODERN_HEADERS, "Mcp-Method": "server/discover"})
+        self.assertEqual(payload["result"]["supportedVersions"], [MODERN])
+
+    def test_legacy_sessions_are_minted_validated_and_deletable(self):
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": APPS_CAPS, "clientInfo": {"name": "t", "version": "1"}}}
+        status, headers, payload = http_call(self.port, body=init, headers=self.AUTH)
+        self.assertEqual(status, 200)
+        session = headers["mcp-session-id"]
+        self.assertTrue(session)
+        self.assertEqual(payload["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(headers["mcp-protocol-version"], "2025-06-18")
+        status, _, _ = http_call(self.port, body={"jsonrpc": "2.0", "method": "notifications/initialized"}, headers={**self.AUTH, "Mcp-Session-Id": session})
+        self.assertEqual(status, 202)
+        status, _, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers={**self.AUTH, "Mcp-Session-Id": session, "MCP-Protocol-Version": "2025-06-18"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("resultType", payload["result"])
+        self.assertIn("ui", payload["result"]["tools"][0]["_meta"], "the session remembers the negotiated Apps capability")
+        status, _, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers={**self.AUTH, "Mcp-Session-Id": "unknown"})
+        self.assertEqual(status, 404)
+        status, _, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers=self.AUTH)
+        self.assertEqual(status, 200, "a session-less legacy request is still served")
+        self.assertNotIn("ui", payload["result"]["tools"][0]["_meta"])
+        status, _, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 2, "method": "ping"}, headers={**self.AUTH, "MCP-Protocol-Version": "1999-01-01"})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_UNSUPPORTED_PROTOCOL_VERSION)
+        status, _, payload = http_call(self.port, body={"jsonrpc": "2.0", "id": 3, "method": "ping"}, headers={**self.AUTH, "MCP-Protocol-Version": MODERN})
+        self.assertEqual(status, 200, "a modern header on an envelope-less body is served as legacy")
+        status, _, _ = http_call(self.port, "GET", headers=self.AUTH)
+        self.assertEqual(status, 405)
+        status, _, _ = http_call(self.port, "DELETE", headers={**self.AUTH, "Mcp-Session-Id": session})
+        self.assertEqual(status, 200)
+        status, _, _ = http_call(self.port, "DELETE", headers={**self.AUTH, "Mcp-Session-Id": session})
+        self.assertEqual(status, 404)
+
+    def test_rejected_request_does_not_poison_a_keep_alive_connection(self):
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        connection.request("POST", "/mcp", body=body, headers={"Content-Type": "application/json"})
+        first = connection.getresponse()
+        first.read()
+        self.assertEqual(first.status, 401)
+        connection.request("POST", "/mcp", body=body, headers={**self.AUTH, "Content-Type": "application/json"})
+        second = connection.getresponse()
+        payload = json.loads(second.read().decode("utf-8"))
+        self.assertEqual(second.status, 200, "the unauthenticated body must be drained before the next request")
+        self.assertEqual(payload["result"], {})
+        connection.close()
+
+    def test_parse_errors_and_batches(self):
+        import http.client
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        connection.request("POST", "/mcp", body="{not json", headers={**self.AUTH, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_PARSE)
+        status, _, payload = http_call(self.port, body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"jsonrpc": "2.0", "id": 2, "method": "ping"}], headers=self.AUTH)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in payload], [1, 2])
+
+
+class HTTPConfigAndTailscaleTests(unittest.TestCase):
+    def test_config_is_created_private_and_token_rotates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp-http.json"
+            config = remctl_mcp.ensure_http_config(path=path)
+            self.assertEqual(config["port"], remctl_mcp.HTTP_DEFAULT_PORT)
+            self.assertGreaterEqual(len(config["token"]), 32)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            again = remctl_mcp.ensure_http_config(path=path)
+            self.assertEqual(again["token"], config["token"])
+            moved = remctl_mcp.ensure_http_config(port=9999, path=path)
+            self.assertEqual(moved["port"], 9999)
+            rotated = remctl_mcp.rotate_http_token(path=path)
+            self.assertNotEqual(rotated["token"], config["token"])
+            self.assertEqual(remctl_mcp.load_http_config(path)["token"], rotated["token"])
+            path.write_text("{}", encoding="utf-8")
+            self.assertIsNone(remctl_mcp.load_http_config(path))
+
+    def test_allowed_hosts_include_tailscale_identity(self):
+        config = {"tailscale": {"hostname": "Mac.Example.ts.net", "ips": ["100.1.2.3"]}, "allowedHosts": ["Other.Host"]}
+        hosts = remctl_mcp.allowed_hosts_for(config)
+        for host in ("127.0.0.1", "localhost", "mac.example.ts.net", "100.1.2.3", "other.host"):
+            self.assertIn(host, hosts)
+        self.assertEqual(remctl_mcp._host_of("https://Mac.Example.ts.net:443/x"), "mac.example.ts.net")
+        self.assertEqual(remctl_mcp._host_of("127.0.0.1:7362"), "127.0.0.1")
+        self.assertEqual(remctl_mcp._host_of("[::1]:7362"), "::1")
+
+    def test_tailscale_status_parses_the_cli_json(self):
+        payload = {"BackendState": "Running", "Self": {"DNSName": "mac.example.ts.net.", "TailscaleIPs": ["100.1.2.3"]}, "CertDomains": ["mac.example.ts.net"], "CurrentTailnet": {"MagicDNSEnabled": True}}
+
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        with mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/usr/local/bin/tailscale"):
+            status = remctl_mcp.tailscale_status(runner=runner)
+        self.assertTrue(status["running"])
+        self.assertEqual(status["hostname"], "mac.example.ts.net")
+        self.assertTrue(status["https"])
+        payload["CertDomains"] = []
+        with mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/usr/local/bin/tailscale"):
+            self.assertFalse(remctl_mcp.tailscale_status(runner=runner)["https"])
+        with mock.patch.object(remctl_mcp, "tailscale_binary", return_value=None):
+            self.assertFalse(remctl_mcp.tailscale_status()["installed"])
+
+    def test_tailscale_serve_commands_and_mount_parsing(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            if "status" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"Web": {"mac.example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:1"}, "/remctl": {"Proxy": "http://127.0.0.1:7362"}}}}}), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/opt/tailscale"):
+            enabled = remctl_mcp.tailscale_serve_enable(7362, runner=runner)
+            mount = remctl_mcp.tailscale_serve_mount(runner=runner)
+            disabled = remctl_mcp.tailscale_serve_disable(runner=runner)
+        self.assertTrue(enabled["ok"])
+        self.assertEqual(calls[0], ["/opt/tailscale", "serve", "--bg", "--https=443", "--set-path=/remctl", "http://127.0.0.1:7362"])
+        self.assertEqual(mount["proxy"], "http://127.0.0.1:7362")
+        self.assertTrue(disabled["ok"])
+        self.assertEqual(calls[-1], ["/opt/tailscale", "serve", "--https=443", "--set-path=/remctl", "off"])
+
+        def failing(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "error: HTTPS certs are not enabled for this tailnet")
+
+        with mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/opt/tailscale"):
+            failed = remctl_mcp.tailscale_serve_enable(7362, runner=failing)
+        self.assertFalse(failed["ok"])
+        self.assertIn("admin console", failed["error"])
+
+    def test_http_agent_plist_and_remote_snippets(self):
+        plist = remctl_mcp.http_agent_plist(Path("/Users/x/bin/remctl"))
+        command, args = remctl_mcp.server_command(Path("/Users/x/bin/remctl"))
+        self.assertEqual(plist["Label"], remctl_mcp.HTTP_AGENT_LABEL)
+        self.assertEqual(plist["ProgramArguments"], [command, *args, "serve", "--http"])
+        self.assertTrue(plist["KeepAlive"])
+        config = {"port": 7362, "token": "tok", "tailscale": {"hostname": "mac.example.ts.net", "path": "/remctl"}}
+        self.assertEqual(remctl_mcp.tailscale_url(config), "https://mac.example.ts.net/remctl")
+        snippets = remctl_mcp.remote_snippets(config)
+        self.assertIn("--transport http", snippets["claude-code"])
+        self.assertIn("Bearer tok", snippets["claude-code"])
+        self.assertIn("--bearer-token-env-var REMCTL_MCP_TOKEN", snippets["codex"])
+        desktop = json.loads(snippets["claude-desktop"])
+        self.assertEqual(desktop["mcpServers"]["remctl"]["args"][1], "mcp-remote")
+        self.assertEqual(json.loads(snippets["json"])["mcpServers"]["remctl"]["headers"]["Authorization"], "Bearer tok")
+        self.assertEqual(remctl_mcp.mask_token("abcdefghijklmnop"), "abcd…op")
+
+    def test_install_tailscale_fails_closed_without_prerequisites(self):
+        with mock.patch.object(remctl_mcp, "tailscale_status", return_value={"installed": False, "running": False, "hostname": None, "ips": [], "https": False}):
+            self.assertIn("not installed", remctl_mcp.install_tailscale(Path("/x"))["error"])
+        with mock.patch.object(remctl_mcp, "tailscale_status", return_value={"installed": True, "running": False, "hostname": None, "ips": [], "https": False}):
+            self.assertIn("not connected", remctl_mcp.install_tailscale(Path("/x"))["error"])
+        with mock.patch.object(remctl_mcp, "tailscale_status", return_value={"installed": True, "running": True, "hostname": "m.ts.net", "ips": [], "https": False}):
+            self.assertIn("HTTPS", remctl_mcp.install_tailscale(Path("/x"))["error"])
+
+
+class OnboardingFlowTests(unittest.TestCase):
+    """The guided `remctl onboard` flow, with the host, apps, and Tailscale mocked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.remctl = load_module("remctl_onboard_test", "remctl")
+
+    def _run(self, *, answers, tailscale, clients, interactive=True, extra_args=()):
+        remctl = self.remctl
+        checks = [
+            {"name": "open_reminders", "status": "ok", "detail": "Reminders is running", "fix": None},
+            {"name": "eventkit", "status": "ok", "detail": "authorized", "fix": None},
+            {"name": "automation", "status": "ok", "detail": "authorized", "fix": None},
+            {"name": "database", "status": "ok", "detail": "authorized", "fix": None},
+        ]
+        result = {"ok": True, "warnings": 0, "failures": 0, "checks": checks, "capabilityHost": {"available": True, "ready": True, "fullReady": True, "protocolVersion": 2}}
+        installs = []
+
+        def fake_install(client, cli_path, **kwargs):
+            installs.append(client)
+            if client == "tailscale":
+                return {"client": "tailscale", "ok": True, "url": "https://mac.example.ts.net/remctl", "port": 7362, "health": {"ok": True},
+                        "snippets": {"claude-code": "claude mcp add ... TOKEN", "codex": "export X\ncodex mcp add ..."}}
+            return {"client": client, "ok": True, "note": f"{client} note"}
+
+        overview = {"server": {"command": ["python", "remctl", "mcp"]}, "clients": clients, "tailscale": tailscale}
+        parser, subparsers = remctl.build_parser()
+        args = remctl.parse_cli_args(parser, subparsers, ["onboard", *extra_args])
+        out = io.StringIO()
+        answer_iter = iter(answers)
+        with mock.patch.object(remctl, "run_onboarding", return_value=result), \
+             mock.patch.object(remctl, "mcp_overview", return_value=overview), \
+             mock.patch.object(remctl, "remctl_tailscale_detect", return_value=tailscale), \
+             mock.patch.object(remctl, "mcp_install_client", side_effect=fake_install), \
+             mock.patch.object(remctl, "onboarding_today_count", return_value=3), \
+             mock.patch.object(remctl, "capability_host_status_snapshot", return_value=result["capabilityHost"]), \
+             mock.patch.object(remctl, "capability_host_is_effective", return_value=True), \
+             mock.patch.object(remctl, "capability_host_requested_mode", return_value="auto"), \
+             mock.patch.object(remctl, "needs_full_disk_access_guidance", return_value=False), \
+             mock.patch("builtins.input", side_effect=lambda prompt: (print(prompt, end=""), next(answer_iter))[1]), \
+             mock.patch.object(sys, "stdout", out), \
+             mock.patch.object(sys.stdin, "isatty", return_value=interactive), \
+             mock.patch.object(out, "isatty", return_value=interactive, create=True):
+            remctl.C.enabled = False
+            remctl.cmd_onboard(args)
+        return out.getvalue(), installs
+
+    def test_interactive_flow_asks_per_app_and_offers_tailscale(self):
+        clients = [
+            {"id": "claude-code", "name": "Claude Code", "installed": True, "configured": True, "current": True},
+            {"id": "codex", "name": "Codex", "installed": True, "configured": False, "current": None},
+            {"id": "claude-desktop", "name": "Claude Desktop and Cowork", "installed": False, "configured": False, "current": None},
+        ]
+        tailscale = {"installed": True, "running": True, "hostname": "mac.example.ts.net", "https": True, "configured": False}
+        output, installs = self._run(answers=["y", "y"], tailscale=tailscale, clients=clients)
+        self.assertIn("Step 1 of 4", output)
+        self.assertIn("Step 4 of 4", output)
+        self.assertIn("✓ Reminders access", output)
+        self.assertIn("✓ Capability Host ready (protocol 2)", output)
+        self.assertIn("3 reminders due today or overdue", output)
+        self.assertIn("✓ Claude Code: connected", output)
+        self.assertIn("Connect Codex? [Y/n]", output)
+        self.assertNotIn("Claude Desktop and Cowork:", output, "apps that are not installed are not listed")
+        self.assertIn("Set this up now? [y/N]", output)
+        self.assertIn("Serving at https://mac.example.ts.net/remctl", output)
+        self.assertIn("claude mcp add ... TOKEN", output)
+        self.assertEqual(installs, ["codex", "tailscale"])
+        self.assertIn("Done.", output)
+
+    def test_declining_everything_leaves_hints_and_skips_when_not_a_tty(self):
+        clients = [{"id": "codex", "name": "Codex", "installed": True, "configured": False, "current": None}]
+        tailscale = {"installed": True, "running": True, "hostname": "mac.example.ts.net", "https": True, "configured": False}
+        output, installs = self._run(answers=["n", "n"], tailscale=tailscale, clients=clients)
+        self.assertEqual(installs, [])
+        self.assertIn("Skipped Codex. Later: remctl mcp install --client codex", output)
+        self.assertIn("Skipped. Later: remctl mcp install --client tailscale", output)
+        output, installs = self._run(answers=[], tailscale=tailscale, clients=clients, interactive=False)
+        self.assertEqual(installs, [])
+        self.assertIn("○ Codex: not connected", output)
+        self.assertIn("○ Not set up", output)
+
+    def test_tailscale_step_is_hidden_without_tailscale_and_explains_missing_https(self):
+        clients = []
+        output, _ = self._run(answers=[], tailscale={"installed": False}, clients=clients)
+        self.assertIn("Step 3 of 3", output)
+        self.assertNotIn("other devices", output)
+        self.assertIn("No supported AI app found", output)
+        output, _ = self._run(answers=[], tailscale={"installed": True, "running": True, "hostname": "m.ts.net", "https": False, "configured": False}, clients=clients)
+        self.assertIn("no HTTPS certificate", output)
+        output, _ = self._run(answers=[], tailscale={"installed": True, "running": True, "hostname": "m.ts.net", "https": True, "configured": True, "active": True, "url": "https://m.ts.net/remctl"}, clients=clients)
+        self.assertIn("Already serving at https://m.ts.net/remctl", output)
+        output, _ = self._run(answers=[], tailscale={"installed": True, "running": True, "hostname": "m.ts.net", "https": True, "configured": False}, clients=clients, extra_args=["--no-tailscale"])
+        self.assertIn("Step 3 of 3", output)
+        output, _ = self._run(answers=[], tailscale={"installed": True, "running": True, "hostname": "m.ts.net", "https": True, "configured": False}, clients=clients, extra_args=["--no-mcp"])
+        self.assertIn("Step 2 of 2", output)
+
 if __name__ == "__main__":
     unittest.main()

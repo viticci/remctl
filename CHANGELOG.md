@@ -10,6 +10,21 @@
 - New onboarding step and commands so nobody edits configuration files by hand: `remctl onboard` now offers to connect detected AI apps; `remctl mcp install` uses `claude mcp add` for Claude Code, `codex mcp add` for Codex, and a backed-up merge into `claude_desktop_config.json` for Claude Desktop and Cowork; `remctl mcp bundle` builds a one-click `.mcpb` desktop extension; `remctl mcp status`, `config`, and `remove` complete the set. `doctor` gained an `mcp_clients` check. `mcp` joins the local command set (seven local, 49 hosted).
 - The installer publishes `remctl_mcp.py`, `remctl_mcp_widget.html`, and the MCP icons in the same ownership manifest; the uninstaller removes them.
 
+### Other devices over Tailscale
+
+- `remctl mcp serve --http` runs the same server as a Streamable HTTP endpoint on the loopback interface: bearer-token auth on every request, `Origin` and `Host` validation, the 2026-07-28 header mirroring rules (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` with `-32020` on mismatch), `Mcp-Session-Id` sessions for legacy clients, `GET /health`, and a keep-alive-safe reject path.
+- `remctl mcp install --client tailscale` creates a private token (`~/.config/remctl/mcp-http.json`, mode 0600), installs the `net.macstories.remctl.mcp-http` LaunchAgent, and mounts the endpoint at `https://<mac>.<tailnet>.ts.net/remctl` with `tailscale serve`, so Claude Code, Codex, and other clients on the user's other tailnet devices can connect. `remctl mcp config --format tailscale` prints the commands per client; `remctl mcp token --rotate` rotates the token; `remctl mcp remove --client tailscale` tears it down. `doctor` reports the endpoint (`mcp_tailscale`).
+- Verified with the official MCP Python SDK client over HTTPS in modern and legacy modes, and with `claude mcp add --transport http` and `codex mcp add --url`.
+
+### Guided onboarding
+
+- `remctl onboard` is now a step-by-step flow: macOS permissions, a health check that reads today's reminders, connecting each detected AI app with one question, and an optional Tailscale step that appears only when Tailscale is installed. It shows what is already done, asks before every change, and ends with the next steps. `--no-mcp` and `--no-tailscale` skip steps; `--json` reports without asking.
+- Onboarding no longer re-requests permissions that are already authorized. Re-requesting an authorized grant through the host could block for minutes on a healthy Mac.
+
+### Documentation
+
+- Rewrote the README, installation guide, command guide, MCP guide, architecture guide, and the agent SKILL in plain language, covering both the CLI and the MCP surface.
+
 ### Cleanup
 
 - Avoid repeated per-reminder tag and subtask-count queries when batch reads find no extras.

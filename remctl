@@ -6268,9 +6268,15 @@ def capability_host_onboarding_checks(status):
     request_errors = {}
     skipped_requests = {}
     terminal_error = None
+    # Only ask macOS for grants that are missing. Re-requesting an authorized
+    # permission shows no dialog but can block inside the host for minutes, so
+    # onboarding would appear to hang on a healthy Mac.
+    already = status.get("permissions") if isinstance(status.get("permissions"), dict) else {}
     for kind in ("reminders", "automation"):
         if terminal_error is not None:
             skipped_requests[kind] = terminal_error
+            continue
+        if already.get(kind) == "authorized":
             continue
         try:
             remctl_broker.request_permission(kind, timeout=305)
@@ -12060,13 +12066,17 @@ def gather_doctor_checks(capability_host=None):
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
     try:
-        mcp_clients = mcp_overview()["clients"]
+        overview = mcp_overview()
     except (OSError, ValueError) as exc:
         add("mcp_clients", "warn", f"Could not read MCP client configuration: {exc}", "Run `remctl mcp status`.")
     else:
+        mcp_clients = overview["clients"]
+        tailscale = overview.get("tailscale") or {}
         connected = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is not False]
         stale = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is False]
         installed = [client["name"] for client in mcp_clients if client["installed"]]
+        if tailscale.get("configured") and tailscale.get("active"):
+            connected.append(f"tailnet devices at {tailscale.get('url')}")
         if stale:
             add(
                 "mcp_clients",
@@ -12085,6 +12095,15 @@ def gather_doctor_checks(capability_host=None):
             )
         else:
             add("mcp_clients", "ok", "No supported AI app detected; `remctl mcp config` prints a generic snippet", None)
+        if tailscale.get("configured") and not tailscale.get("active"):
+            add(
+                "mcp_tailscale",
+                "warn",
+                "Tailnet endpoint is configured but not serving"
+                + ("" if tailscale.get("agentRunning") else " (service not running)")
+                + ("" if tailscale.get("served") else " (tailscale serve mount missing)"),
+                "Run `remctl mcp install --client tailscale` to repair, or `remctl mcp remove --client tailscale` to turn it off.",
+            )
 
     if mode == "invalid":
         add(
@@ -12237,43 +12256,117 @@ def cmd_doctor(a):
 
 def cmd_onboard(a):
     result = run_onboarding(auto=False)
+    skip_mcp = getattr(a, "no_mcp", False)
+    skip_tailscale = skip_mcp or getattr(a, "no_tailscale", False)
     if getattr(a, "json", False):
-        if not getattr(a, "no_mcp", False):
+        if not skip_mcp:
             result["mcp"] = mcp_overview()
         print(json.dumps(result, indent=2))
-    else:
-        print(C.bold("RemCTL onboard"))
-        if capability_host_requested_mode() == "direct":
-            print(C.dim("Direct mode is self-managed; approve prompts only for the deliberate direct caller."))
-        else:
-            print(C.dim("Approve Reminders and Automation prompts for the signed RemCTL Capability Host."))
-        print()
-        print_check_report(None, result["checks"])
-        database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
-        needs_host_access = needs_full_disk_access_guidance(database_check)
-        if needs_host_access:
-            host_status = result.get("capabilityHost") or capability_host_status_snapshot()
-            host_targets = capability_host_target_specs(host_status)
-            if capability_host_requested_mode() == "direct":
-                print()
-                for line in full_disk_access_fix_text(rerun_command="remctl doctor").splitlines():
-                    print(C.dim(f"  {line}"))
-            elif host_targets and launch_full_disk_access_helper(targets=host_targets):
-                print_permission_helper_opened()
-            elif host_targets:
-                print_capability_host_full_disk_access_guidance(
-                    host_status,
-                    settings_opened=open_full_disk_access_settings(),
-                )
-            else:
-                print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
-        if not getattr(a, "no_mcp", False) and sys.stdin.isatty() and sys.stdout.isatty():
-            offer_mcp_connections(mcp_cli_path())
-        elif not getattr(a, "no_mcp", False):
+        if result["failures"]:
+            sys.exit(1)
+        return
+
+    cli_path = mcp_cli_path()
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    mode = capability_host_requested_mode()
+    tailscale = None if skip_tailscale else remctl_tailscale_detect()
+    show_tailscale = bool(tailscale and tailscale.get("installed"))
+    total = 2 + (0 if skip_mcp else 1) + (1 if show_tailscale else 0)
+
+    print(C.bold("RemCTL onboarding") + C.dim(f"  v{VERSION}"))
+    print(C.dim("A few steps, one question at a time. Nothing is changed without asking."))
+
+    # Step 1: macOS permissions.
+    blurb = (
+        ["Direct mode: this caller uses its own macOS permissions."]
+        if mode == "direct"
+        else [
+            "RemCTL reads and writes Reminders through its signed Capability Host app.",
+            "macOS asks you to allow Reminders and Automation for that app once.",
+        ]
+    )
+    onboarding_step(1, total, "macOS permissions", blurb)
+    for check in result["checks"]:
+        label = ONBOARD_CHECK_LABELS.get(check["name"], check["name"].replace("_", " "))
+        status = check["status"] if check["status"] in ("ok", "warn", "fail") else "info"
+        detail = check.get("detail") or ""
+        text = label if status == "ok" else f"{label}: {detail}"
+        onboarding_line(status, text, fix=check.get("fix") if status != "ok" else None)
+    database_check = next((check for check in result["checks"] if check["name"] == "database"), None)
+    if needs_full_disk_access_guidance(database_check):
+        host_status = result.get("capabilityHost") or capability_host_status_snapshot()
+        host_targets = capability_host_target_specs(host_status)
+        if mode == "direct":
             print()
-            print(C.dim("Connect Claude Code, Codex, or Claude Desktop later with `remctl mcp install`."))
+            for line in full_disk_access_fix_text(rerun_command="remctl doctor").splitlines():
+                print(C.dim(f"  {line}"))
+        elif host_targets and launch_full_disk_access_helper(targets=host_targets):
+            print_permission_helper_opened()
+        elif host_targets:
+            print_capability_host_full_disk_access_guidance(host_status, settings_opened=open_full_disk_access_settings())
+        else:
+            print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
+
+    # Step 2: does it work?
+    onboarding_step(2, total, "Health check")
+    host_status = result.get("capabilityHost") or capability_host_status_snapshot()
+    if mode == "direct":
+        onboarding_line("info", "Direct mode; skipping the Capability Host check.")
+        host_ready = result["failures"] == 0
+    else:
+        host_ready = capability_host_is_effective(host_status) and bool(host_status.get("fullReady"))
+        if host_ready:
+            onboarding_line("ok", f"Capability Host ready (protocol {host_status.get('protocolVersion')})")
+        else:
+            onboarding_line("fail", "Capability Host is not ready", fix="Finish the permission steps above, then run: remctl doctor")
+    count = onboarding_today_count(cli_path) if host_ready else None
+    if count is not None:
+        onboarding_line("ok", f"{count} reminder{'s' if count != 1 else ''} due today or overdue")
+    elif host_ready:
+        onboarding_line("warn", "Could not read today's reminders yet", fix="Run `remctl today` after the checks above pass.")
+
+    # Step 3: AI apps on this Mac.
+    mcp_results = []
+    step = 3
+    if not skip_mcp:
+        onboarding_step(step, total, "Connect your AI apps", [
+            "Claude Code, Codex, and Claude Desktop get typed reminder tools through RemCTL's MCP server.",
+            "Each app is registered through its own settings; you never edit config files by hand.",
+        ])
+        mcp_results = offer_mcp_connections(cli_path, interactive=interactive)
+        step += 1
+
+    # Step 4: other devices over Tailscale (only when Tailscale is installed).
+    tailscale_result = None
+    if show_tailscale:
+        onboarding_step(step, total, "Your other devices (optional)", [
+            f"Tailscale is on this Mac ({tailscale.get('hostname') or 'not connected'}).",
+            "RemCTL can serve the same tools to Claude Code, Codex, and Claude Desktop on your other tailnet devices,",
+            "over HTTPS with a private token. Nothing is exposed to the public internet.",
+        ])
+        tailscale_result = offer_tailscale(cli_path, tailscale, interactive=interactive)
+
+    # Summary.
+    print()
+    print(C.bold("Done." if result["failures"] == 0 else "Almost done."))
+    if result["failures"]:
+        onboarding_line("info", "Fix the failed checks in step 1, then run: remctl doctor")
+    onboarding_line("info", "Try it: remctl today")
+    if any(item.get("client") == "claude-desktop" and item.get("ok") for item in mcp_results):
+        onboarding_line("info", "Quit and reopen Claude Desktop so it picks up RemCTL (Cowork too).")
+    if any(item.get("client") == "claude-code" and item.get("ok") for item in mcp_results):
+        onboarding_line("info", "New Claude Code sessions see RemCTL; in an open session run /mcp.")
+    if tailscale_result and tailscale_result.get("ok"):
+        onboarding_line("info", "On another device, paste the command above. Reprint it: remctl mcp config --format tailscale")
+    onboarding_line("info", "Check everything later with: remctl doctor")
     if result["failures"]:
         sys.exit(1)
+
+
+def remctl_tailscale_detect():
+    import remctl_mcp
+
+    return remctl_mcp.tailscale_overview()
 
 
 def cmd_permissions(a):
@@ -12386,6 +12479,7 @@ def cmd_setup(a):
         print("  2. After any FDA change, restart the signed host")
         print("  3. remctl doctor --for-agent   # verify after the restart")
         print("  4. remctl mcp install          # connect Claude Code, Codex, Claude Desktop/Cowork (onboard offers this)")
+        print("     remctl mcp install --client tailscale   # optional: serve to your other devices over Tailscale")
         print("Unchanged existing install:")
         print("  1. remctl doctor --for-agent")
         print("  2. Run remctl onboard only if doctor reports host permission trouble")
@@ -12403,6 +12497,7 @@ MCP_CLIENT_LABELS = {
     "claude-code": "Claude Code",
     "codex": "Codex",
     "claude-desktop": "Claude Desktop and Cowork",
+    "tailscale": "Your other devices (Tailscale)",
     "other": "Other MCP clients",
 }
 
@@ -12436,10 +12531,10 @@ def mcp_overview(cli_path=None):
             "configPath": entry.get("path"),
         })
     command, args = remctl_mcp.server_command(cli_path)
-    return {"server": {"command": [command, *args]}, "clients": clients}
+    return {"server": {"command": [command, *args]}, "clients": clients, "tailscale": remctl_mcp.tailscale_overview()}
 
 
-def mcp_install_client(client, cli_path, *, scope="user"):
+def mcp_install_client(client, cli_path, *, scope="user", port=None):
     import remctl_mcp
 
     if client == "claude-code":
@@ -12450,6 +12545,8 @@ def mcp_install_client(client, cli_path, *, scope="user"):
         return remctl_mcp.install_claude_desktop(cli_path)
     if client == "other":
         return {"client": "other", "ok": True, "snippets": remctl_mcp.config_snippets(cli_path)}
+    if client == "tailscale":
+        return remctl_mcp.install_tailscale(cli_path, port=port)
     raise ValueError(f"unknown MCP client {client!r}")
 
 
@@ -12462,11 +12559,31 @@ def mcp_remove_client(client, *, scope="user"):
         return remctl_mcp.remove_codex()
     if client == "claude-desktop":
         return remctl_mcp.remove_claude_desktop()
+    if client == "tailscale":
+        return remctl_mcp.remove_tailscale()
     return {"client": client, "ok": True, "note": "Nothing to remove for this client."}
+
+
+def print_tailscale_snippets(snippets, *, indent="      "):
+    print(f"{indent}On another device with Claude Code:")
+    print(f"{indent}  {snippets['claude-code']}")
+    print(f"{indent}Codex on another device:")
+    for line in snippets["codex"].splitlines():
+        print(f"{indent}  {line}")
+    print(C.dim(f"{indent}Claude Desktop on another Mac and other clients: remctl mcp config --format tailscale"))
 
 
 def print_mcp_result(result):
     label = MCP_CLIENT_LABELS.get(result.get("client"), result.get("client"))
+    if result.get("client") == "tailscale":
+        if not result.get("ok"):
+            print(f"[{C.red('FAIL')}] {label}: {result.get('error') or 'failed'}")
+            return
+        health = result.get("health") or {}
+        print(f"[{C.green('OK')}] {label}: serving at {result['url']}")
+        print(f"      {C.dim('Endpoint ' + ('healthy' if health.get('ok') else 'not answering yet') + ' on 127.0.0.1:' + str(result.get('port')) + '; token stored in ' + str(remctl_mcp.http_config_path()))}")
+        print_tailscale_snippets(result["snippets"])
+        return
     if result.get("client") == "other":
         snippets = result.get("snippets") or {}
         print(C.bold("Other MCP clients"))
@@ -12490,35 +12607,151 @@ def print_mcp_result(result):
         print(f"[{C.red('FAIL')}] {label}: {result.get('error') or 'failed'}")
 
 
-def offer_mcp_connections(cli_path):
-    """Interactive onboarding step: connect detected AI apps one by one."""
+def tailscale_state_text(ts):
+    if not ts.get("installed"):
+        return C.dim("Tailscale not installed")
+    if ts.get("configured"):
+        if ts.get("active"):
+            return C.green(f"serving at {ts.get('url')}")
+        return C.yellow("configured but not running; run `remctl mcp install --client tailscale` to repair")
+    if not ts.get("running"):
+        return C.yellow("Tailscale is not connected; open Tailscale and sign in")
+    return C.dim("available; run `remctl mcp install --client tailscale`")
+
+
+ONBOARD_CHECK_LABELS = {
+    "open_reminders": "Reminders app",
+    "eventkit": "Reminders access",
+    "reminders": "Reminders access",
+    "automation": "Automation access for the Reminders app",
+    "applescript": "Automation access for the Reminders app",
+    "database": "Full Disk Access for the Reminders database",
+    "capability_host": "Capability Host",
+    "platform": "macOS",
+    "python": "Python",
+    "store_dir": "Reminders database",
+    "bridge": "EventKit bridge",
+    "private_helper": "Private helper",
+}
+
+
+def onboarding_step(number, total, title, blurb=()):
+    print()
+    print(C.bold(f"Step {number} of {total} · {title}"))
+    for line in blurb:
+        print(C.dim(f"  {line}"))
+
+
+def onboarding_line(status, text, *, fix=None, indent=2):
+    glyph, paint = {
+        "ok": ("✓", C.green),
+        "warn": ("!", C.yellow),
+        "fail": ("✗", C.red),
+        "pending": ("○", C.dim),
+        "info": ("→", C.dim),
+    }[status]
+    print(" " * indent + paint(glyph) + " " + text)
+    if fix:
+        for line in str(fix).splitlines():
+            print(" " * (indent + 2) + C.dim(line))
+
+
+def onboarding_ask(question, *, default_yes):
+    """Ask a yes/no question; returns None when input is interrupted."""
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        answer = input(f"  {question} {suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not answer:
+        return default_yes
+    return answer in ("y", "yes")
+
+
+def onboarding_today_count(cli_path):
+    """How many reminders are due today or overdue, through the normal route; None on failure."""
+    env = dict(os.environ, REMCTL_SKIP_ONBOARD="1", NO_COLOR="1")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(cli_path), "today", "--json"],
+            capture_output=True, text=True, timeout=30, env=env, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout)
+        return len(rows) if isinstance(rows, list) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def offer_mcp_connections(cli_path, *, interactive=True):
+    """Onboarding step: connect the AI apps found on this Mac, one question each."""
     overview = mcp_overview(cli_path)
     detected = [client for client in overview["clients"] if client["installed"]]
-    print()
-    print(C.bold("Connect AI apps (MCP)"))
-    if not detected:
-        print(C.dim("  No supported AI app was detected (Claude Code, Codex, Claude Desktop)."))
-        print(C.dim("  Run `remctl mcp install --client other` for a generic configuration snippet."))
-        return []
     results = []
+    if not detected:
+        onboarding_line("info", "No supported AI app found on this Mac (Claude Code, Codex, Claude Desktop).")
+        onboarding_line("info", "Any other MCP client can connect with the snippet from `remctl mcp config`.")
+        return results
     for client in detected:
         label = client["name"]
         if client["configured"] and client.get("current") is not False:
-            print(f"[{C.green('OK')}] {label}: already connected")
+            onboarding_line("ok", f"{label}: connected")
             continue
         verb = "Update" if client["configured"] else "Connect"
-        try:
-            answer = input(f"{verb} RemCTL for {label}? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        if not interactive:
+            onboarding_line("pending", f"{label}: not connected", fix=f"remctl mcp install --client {client['id']}")
+            continue
+        answer = onboarding_ask(f"{verb} {label}?", default_yes=True)
+        if answer is None:
             break
-        if answer not in ("", "y", "yes"):
-            print(C.dim(f"  Skipped {label}. Run `remctl mcp install --client {client['id']}` later."))
+        if not answer:
+            onboarding_line("info", f"Skipped {label}. Later: remctl mcp install --client {client['id']}")
             continue
         result = mcp_install_client(client["id"], cli_path)
         results.append(result)
-        print_mcp_result(result)
+        if result.get("ok"):
+            onboarding_line("ok", f"{label}: connected", fix=result.get("note"))
+        else:
+            onboarding_line("fail", f"{label}: {result.get('error')}")
     return results
+
+
+def offer_tailscale(cli_path, ts, *, interactive=True):
+    """Onboarding step: optionally serve the MCP tools to other tailnet devices."""
+    if ts.get("configured"):
+        if ts.get("active"):
+            onboarding_line("ok", f"Already serving at {ts.get('url')}")
+            onboarding_line("info", "Commands for another device: remctl mcp config --format tailscale")
+        else:
+            onboarding_line("warn", "Set up earlier, but not serving right now", fix="remctl mcp install --client tailscale   # repair")
+        return None
+    if not ts.get("running"):
+        onboarding_line("warn", "Tailscale is installed but not connected.", fix="Open Tailscale and sign in, then run: remctl mcp install --client tailscale")
+        return None
+    if not ts.get("https"):
+        onboarding_line(
+            "warn",
+            "Your tailnet has no HTTPS certificate for this Mac.",
+            fix="In the Tailscale admin console, DNS page, enable MagicDNS and HTTPS certificates.\nThen run: remctl mcp install --client tailscale",
+        )
+        return None
+    if not interactive:
+        onboarding_line("pending", "Not set up", fix="remctl mcp install --client tailscale")
+        return None
+    answer = onboarding_ask("Set this up now?", default_yes=False)
+    if not answer:
+        onboarding_line("info", "Skipped. Later: remctl mcp install --client tailscale")
+        return None
+    print(C.dim("  Starting the endpoint and asking Tailscale to serve it…"))
+    result = mcp_install_client("tailscale", cli_path)
+    if result.get("ok"):
+        onboarding_line("ok", f"Serving at {result['url']}")
+        print_tailscale_snippets(result["snippets"], indent="    ")
+    else:
+        onboarding_line("fail", result.get("error") or "Setup failed")
+    return result
 
 
 def cmd_mcp(a):
@@ -12529,6 +12762,12 @@ def cmd_mcp(a):
     if action == "serve":
         widget = mcp_asset_path("remctl_mcp_widget.html")
         icons = remctl_mcp.icon_data_uri(mcp_asset_path("remctl-mcp-icon.png"))
+        if getattr(a, "http", False):
+            config = remctl_mcp.ensure_http_config(port=getattr(a, "port", None))
+            transport = remctl_mcp.HTTPTransportConfig(token=config["token"], allowed_hosts=remctl_mcp.allowed_hosts_for(config))
+            server = remctl_mcp.build_server(cli_path, VERSION, widget_path=widget, icons=icons)
+            host = getattr(a, "host", None) or config.get("host", "127.0.0.1")
+            sys.exit(remctl_mcp.serve_http(server, transport, host=host, port=int(config["port"])))
         sys.exit(remctl_mcp.serve(cli_path, VERSION, widget_path=widget, icons=icons))
 
     json_mode = getattr(a, "json", False)
@@ -12537,12 +12776,16 @@ def cmd_mcp(a):
         if not clients or "all" in clients:
             detected = [client["id"] for client in remctl_mcp.detect_clients() if client["installed"]]
             clients = [client for client in clients if client != "all"] + [client for client in detected if client not in clients]
+            if action == "remove" and "tailscale" not in clients:
+                config = remctl_mcp.load_http_config()
+                if config and config.get("tailscale"):
+                    clients.append("tailscale")
             if not clients and action == "install":
                 clients = ["other"]
         results = []
         for client in clients:
             if action == "install":
-                results.append(mcp_install_client(client, cli_path, scope=getattr(a, "scope", "user")))
+                results.append(mcp_install_client(client, cli_path, scope=getattr(a, "scope", "user"), port=getattr(a, "port", None)))
             else:
                 results.append(mcp_remove_client(client, scope=getattr(a, "scope", "user")))
         if json_mode:
@@ -12574,12 +12817,61 @@ def cmd_mcp(a):
             else:
                 state = C.yellow("not connected")
             print(f"  {client['name']}: {state}")
+        print(f"  Your other devices (Tailscale): {tailscale_state_text(overview['tailscale'])}")
         print(C.dim("Connect with `remctl mcp install`; get a generic snippet with `remctl mcp config`."))
+        return
+
+    if action == "token":
+        if getattr(a, "rotate", False):
+            config = remctl_mcp.rotate_http_token()
+            restarted = remctl_mcp.restart_http_agent() if remctl_mcp.http_agent_status()["loaded"] else False
+            if json_mode:
+                print(json.dumps({"ok": True, "token": config["token"], "rotated": True, "restarted": restarted}, indent=2))
+                return
+            print(C.bold("RemCTL MCP token rotated"))
+            print(f"  {config['token']}")
+            print(C.dim("  Devices that used the old token must be reconnected: remctl mcp config --format tailscale"))
+            return
+        config = remctl_mcp.load_http_config()
+        if config is None:
+            if json_mode:
+                print(json.dumps({"ok": False, "error": "no HTTP endpoint configured"}, indent=2))
+            else:
+                print("No token yet. Run `remctl mcp install --client tailscale` first.", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps({"ok": True, "token": config["token"]}, indent=2) if json_mode else config["token"])
         return
 
     if action == "config":
         snippets = remctl_mcp.config_snippets(cli_path)
         fmt = getattr(a, "format_kind", "all")
+        if fmt == "tailscale":
+            config = remctl_mcp.load_http_config()
+            if not config or not config.get("tailscale"):
+                message = "Tailscale access is not set up. Run `remctl mcp install --client tailscale` first."
+                if json_mode:
+                    print(json.dumps({"ok": False, "error": message}, indent=2))
+                else:
+                    print(message, file=sys.stderr)
+                sys.exit(1)
+            remote = remctl_mcp.remote_snippets(config)
+            if json_mode:
+                print(json.dumps(remote, indent=2))
+                return
+            print(C.bold("Connect a device on your tailnet"))
+            print(f"  Endpoint: {remote['url']}")
+            print(f"  Token:    {remote['token']}")
+            print(C.bold("Claude Code"))
+            print(f"  {remote['claude-code']}")
+            print(C.bold("Codex"))
+            for line in remote["codex"].splitlines():
+                print(f"  {line}")
+            print(C.bold("Claude Desktop on another Mac (needs Node; uses the mcp-remote bridge)"))
+            print(remote["claude-desktop"])
+            print(C.bold("Other clients (Streamable HTTP with a bearer header)"))
+            print(remote["json"])
+            print(C.dim("Rotate the token with `remctl mcp token --rotate` if it leaks."))
+            return
         if fmt == "all":
             if json_mode:
                 print(json.dumps(snippets, indent=2))
@@ -13459,7 +13751,8 @@ def build_parser():
         ),
         formatter_class=HelpFormatter,
     )
-    c.add_argument("--no-mcp", action="store_true", help="Skip the connect-AI-apps step")
+    c.add_argument("--no-mcp", action="store_true", help="Skip the AI apps and other-devices steps")
+    c.add_argument("--no-tailscale", action="store_true", help="Skip the other-devices (Tailscale) step")
     js(c)
 
     c = sub.add_parser(
@@ -13569,6 +13862,7 @@ def build_parser():
             "  remctl mcp install --client claude-code --client codex\n"
             "  remctl mcp install --client claude-desktop   # also reaches Cowork; restart Claude\n"
             "  remctl mcp bundle --open        # one-click .mcpb extension for Claude Desktop\n"
+            "  remctl mcp install --client tailscale   # serve to your other devices over Tailscale\n"
             "  remctl mcp status\n"
             "  remctl mcp config               # snippets for any other MCP client\n"
             "\n"
@@ -13578,11 +13872,15 @@ def build_parser():
         formatter_class=HelpFormatter,
     )
     msub = c.add_subparsers(dest="mcp_action", metavar="action")
-    msub.add_parser("serve", help="Run the MCP server over stdio (default)")
-    mcp_clients = ["claude-code", "codex", "claude-desktop", "other", "all"]
+    s = msub.add_parser("serve", help="Run the MCP server over stdio (default) or Streamable HTTP")
+    s.add_argument("--http", action="store_true", help="Serve Streamable HTTP on 127.0.0.1 with the bearer token from mcp-http.json")
+    s.add_argument("--port", type=int, help="HTTP port (default: the configured port, 7362 on first use)")
+    s.add_argument("--host", help=argparse.SUPPRESS)
+    mcp_clients = ["claude-code", "codex", "claude-desktop", "tailscale", "other", "all"]
     s = msub.add_parser("install", help="Connect RemCTL to AI apps without editing config files by hand")
-    s.add_argument("--client", action="append", choices=mcp_clients, help="Client to connect; repeatable; default: every detected app")
+    s.add_argument("--client", action="append", choices=mcp_clients, help="Client to connect; repeatable; default: every detected app on this Mac (tailscale only when named)")
     s.add_argument("--scope", choices=["user", "local", "project"], default="user", help="Claude Code scope (default: user)")
+    s.add_argument("--port", type=int, help="HTTP port for --client tailscale (default 7362)")
     js(s)
     s = msub.add_parser("remove", help="Disconnect RemCTL from AI apps")
     s.add_argument("--client", action="append", choices=mcp_clients, help="Client to disconnect; repeatable; default: every detected app")
@@ -13590,7 +13888,10 @@ def build_parser():
     js(s)
     s = msub.add_parser("status", help="Show which apps are connected"); js(s)
     s = msub.add_parser("config", help="Print connection snippets for any MCP client")
-    s.add_argument("--format", dest="format_kind", choices=["all", "command", "json", "toml", "claude-code", "codex"], default="all", help="Snippet to print")
+    s.add_argument("--format", dest="format_kind", choices=["all", "command", "json", "toml", "claude-code", "codex", "tailscale"], default="all", help="Snippet to print; tailscale prints the commands for other devices")
+    js(s)
+    s = msub.add_parser("token", help="Print or rotate the bearer token for tailnet access")
+    s.add_argument("--rotate", action="store_true", help="Generate a new token and restart the endpoint")
     js(s)
     s = msub.add_parser("bundle", help="Build a .mcpb desktop extension for Claude Desktop")
     s.add_argument("--output", help="Bundle path (default: ~/Downloads/RemCTL.mcpb)")

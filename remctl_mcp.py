@@ -18,20 +18,31 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import http.server
 import io
 import json
 import os
+import plistlib
+import secrets
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 import re
 import shutil
 import stat as stat_module
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+from remctl_runtime import resolve_config_dir, write_private_text_file
 
 # ── Protocol constants ───────────────────────────────────────────────────────
 
@@ -51,6 +62,7 @@ ERR_METHOD_NOT_FOUND = -32601
 ERR_INVALID_PARAMS = -32602
 ERR_INTERNAL = -32603
 ERR_LEGACY_RESOURCE_NOT_FOUND = -32002
+ERR_HEADER_MISMATCH = -32020
 ERR_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 SERVER_NAME = "remctl"
@@ -452,7 +464,7 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "update_reminder",
         "Update Reminder",
-        "Change one or more fields of a reminder. Pass 'clear' as due, recurrence, or alarm to remove them. A list move can return a new id plus oldId.",
+        "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. A list move can return a new id plus oldId.",
         (
             REMINDER_ID,
             Param("title", "string", "Replacement title.", max_length=1024),
@@ -461,7 +473,7 @@ TOOLS: tuple[Tool, ...] = (
             Param("notes", "string", "Replacement notes.", max_length=16 * 1024),
             Param("due", "string", DUE_HELP + " Use clear to remove the due date.", max_length=128),
             PRIORITY,
-            Param("recurrence", "string", RECURRENCE_HELP + " Use clear to remove recurrence.", max_length=128),
+            Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
             Param("url", "string", "URL appended to the notes.", max_length=2048),
         ),
@@ -941,6 +953,19 @@ class RequestContext:
 
 
 @dataclass
+class LegacySession:
+    """State a legacy `initialize` handshake establishes.
+
+    stdio has exactly one (the process); Streamable HTTP keeps one per
+    `Mcp-Session-Id`. Modern requests never touch it.
+    """
+
+    id: str | None = None
+    version: str | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ServerConfig:
     version: str
     executor: CommandExecutor
@@ -954,8 +979,7 @@ class MCPServer:
 
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
-        self._legacy_capabilities: dict[str, Any] = {}
-        self._legacy_version: str | None = None
+        self.default_session = LegacySession()
         self._widget_html: str | None = None
 
     # -- identity -------------------------------------------------------------
@@ -987,7 +1011,8 @@ class MCPServer:
 
     # -- era classification ---------------------------------------------------
 
-    def classify(self, method: str, params: Any) -> RequestContext:
+    def classify(self, method: str, params: Any, session: LegacySession | None = None) -> RequestContext:
+        session = session or self.default_session
         meta = params.get("_meta") if isinstance(params, dict) else None
         meta = meta if isinstance(meta, dict) else {}
         has_version = META_PROTOCOL_VERSION in meta
@@ -1013,23 +1038,24 @@ class MCPServer:
                 apps=client_supports_apps(capabilities),
                 legacy_aliases=False,
             )
-        apps = client_supports_apps(self._legacy_capabilities)
-        return RequestContext("legacy", self._legacy_version, apps=apps, legacy_aliases=not apps)
+        apps = client_supports_apps(session.capabilities)
+        return RequestContext("legacy", session.version, apps=apps, legacy_aliases=not apps)
 
     # -- message handling -----------------------------------------------------
 
-    def handle_message(self, message: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
+    def handle_message(self, message: Any, session: LegacySession | None = None) -> dict[str, Any] | list[dict[str, Any]] | None:
         """Handle one decoded JSON-RPC message (or legacy batch). Returns the response or None."""
 
+        session = session or self.default_session
         if isinstance(message, list):
             if not message:
                 return self._error_response(None, ERR_INVALID_REQUEST, "Invalid Request")
-            responses = [self._handle_single(item) for item in message]
+            responses = [self._handle_single(item, session) for item in message]
             responses = [response for response in responses if response is not None]
             return responses or None
-        return self._handle_single(message)
+        return self._handle_single(message, session)
 
-    def _handle_single(self, message: Any) -> dict[str, Any] | None:
+    def _handle_single(self, message: Any, session: LegacySession) -> dict[str, Any] | None:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return self._error_response(None, ERR_INVALID_REQUEST, "Invalid Request")
         has_id = "id" in message
@@ -1052,8 +1078,8 @@ class MCPServer:
             return self._error_response(None, ERR_INVALID_REQUEST, "Invalid Request")
         _debug(f"request {request_id} {method}")
         try:
-            context = self.classify(method, params or {})
-            result = self._dispatch(method, params or {}, context, request_id)
+            context = self.classify(method, params or {}, session)
+            result = self._dispatch(method, params or {}, context, request_id, session)
         except RPCError as exc:
             return self._error_response(request_id, exc.code, exc.message, exc.data)
         except Exception as exc:  # pragma: no cover - defensive
@@ -1069,7 +1095,8 @@ class MCPServer:
                 self.config.executor.cancel(request_id)
         # notifications/initialized and unknown notifications are ignored by contract.
 
-    def _dispatch(self, method: str, params: dict[str, Any], context: RequestContext, request_id: Any) -> dict[str, Any]:
+    def _dispatch(self, method: str, params: dict[str, Any], context: RequestContext, request_id: Any,
+                  session: LegacySession) -> dict[str, Any]:
         if method == "server/discover":
             return {
                 "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
@@ -1086,7 +1113,7 @@ class MCPServer:
                     "initialize is a legacy method; use per-request _meta with server/discover.",
                     {"supported": list(MODERN_PROTOCOL_VERSIONS)},
                 )
-            return self._initialize(params)
+            return self._initialize(params, session)
         if method == "ping":
             return {}
         if method == "tools/list":
@@ -1145,12 +1172,12 @@ class MCPServer:
 
     # -- legacy initialize ----------------------------------------------------
 
-    def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _initialize(self, params: dict[str, Any], session: LegacySession) -> dict[str, Any]:
         requested = params.get("protocolVersion")
         version = requested if requested in LEGACY_PROTOCOL_VERSIONS else LATEST_LEGACY_PROTOCOL_VERSION
         capabilities = params.get("capabilities")
-        self._legacy_capabilities = capabilities if isinstance(capabilities, dict) else {}
-        self._legacy_version = version
+        session.capabilities = capabilities if isinstance(capabilities, dict) else {}
+        session.version = version
         client = params.get("clientInfo")
         if isinstance(client, dict):
             _debug(f"legacy client {client.get('name')} {client.get('version')} negotiated {version}")
@@ -1286,11 +1313,19 @@ def build_executor_command(cli_path: Path) -> list[str]:
     return [sys.executable, str(cli_path)]
 
 
-def serve(cli_path: Path, version: str, *, widget_path: Path | None = None, icons: list[dict[str, Any]] | None = None) -> int:
+def build_server(cli_path: Path, version: str, *, widget_path: Path | None = None, icons: list[dict[str, Any]] | None = None) -> MCPServer:
     executor = CommandExecutor(build_executor_command(cli_path))
-    server = MCPServer(ServerConfig(version=version, executor=executor, widget_path=widget_path, icons=icons or []))
+    return MCPServer(ServerConfig(version=version, executor=executor, widget_path=widget_path, icons=icons or []))
+
+
+def serve(cli_path: Path, version: str, *, widget_path: Path | None = None, icons: list[dict[str, Any]] | None = None) -> int:
+    server = build_server(cli_path, version, widget_path=widget_path, icons=icons)
     _debug(f"serving {SERVER_NAME} {version} for {cli_path}")
     return serve_stdio(server)
+
+
+def restart_http_agent(*, runner: Callable[..., Any] | None = None) -> bool:
+    return _launchctl("kickstart", "-k", f"gui/{os.getuid()}/{HTTP_AGENT_LABEL}", runner=runner).returncode == 0
 
 
 def icon_data_uri(path: Path | None) -> list[dict[str, Any]]:
@@ -1477,6 +1512,22 @@ def _toml_has_server(text: str) -> bool:
     return re.search(r"^\s*\[mcp_servers\." + re.escape(SERVER_NAME) + r"\]", text, re.MULTILINE) is not None
 
 
+def _codex_server_entry(text: str) -> dict[str, Any] | None:
+    """The `[mcp_servers.remctl]` table as a dict, when the file parses (Python 3.11+); else None."""
+
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10 client
+        return None
+    try:
+        data = tomllib.loads(text)
+    except (ValueError, tomllib.TOMLDecodeError):
+        return None
+    servers = data.get("mcp_servers")
+    entry = servers.get(SERVER_NAME) if isinstance(servers, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
 def registration_status(cli_path: Path | None = None, *, claude_config: Path | None = None,
                         codex_config: Path | None = None, desktop_config: Path | None = None) -> list[dict[str, Any]]:
     """Read each client's configuration directly; no client process is spawned."""
@@ -1503,9 +1554,14 @@ def registration_status(cli_path: Path | None = None, *, claude_config: Path | N
     codex_entry: dict[str, Any] = {"client": "codex", "configured": False, "path": str(codex_path)}
     if codex_path.exists():
         try:
-            codex_entry["configured"] = _toml_has_server(codex_path.read_text(encoding="utf-8"))
+            text = codex_path.read_text(encoding="utf-8")
         except OSError as exc:
             codex_entry["error"] = str(exc)
+        else:
+            codex_entry["configured"] = _toml_has_server(text)
+            server = _codex_server_entry(text)
+            if server is not None:
+                codex_entry["server"] = server
     entries.append(codex_entry)
 
     desktop_path = desktop_config or CLAUDE_DESKTOP_CONFIG
@@ -1623,6 +1679,631 @@ def build_bundle(cli_path: Path, version: str, output: Path, *, icon_path: Path 
 
 def bundle_default_output() -> Path:
     return Path.home() / "Downloads" / "RemCTL.mcpb"
+
+
+
+# ── Streamable HTTP transport ────────────────────────────────────────────────
+
+HTTP_DEFAULT_PORT = 7362
+HTTP_MAX_BODY = 4 * 1024 * 1024
+HTTP_HEALTH_PATH = "/health"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _decode_header_value(value: str) -> str:
+    """Undo the Base64 sentinel encoding a client uses for non-ASCII header values."""
+
+    if value.startswith("=?base64?") and value.endswith("?="):
+        try:
+            return base64.b64decode(value[len("=?base64?"):-2], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return value
+    return value
+
+
+def _host_of(value: str | None) -> str:
+    """Lowercased host without port, for Origin and Host validation."""
+
+    if not value:
+        return ""
+    candidate = value.strip()
+    if "://" in candidate:
+        candidate = urllib.parse.urlsplit(candidate).netloc
+    if candidate.startswith("["):
+        return candidate.split("]")[0].lstrip("[").lower()
+    return candidate.rsplit(":", 1)[0].lower() if candidate.count(":") == 1 else candidate.lower()
+
+
+@dataclass
+class HTTPTransportConfig:
+    token: str
+    allowed_hosts: frozenset[str] = LOOPBACK_HOSTS
+
+
+def _http_status_for_error(code: int) -> int:
+    if code == ERR_METHOD_NOT_FOUND:
+        return 404
+    if code in (ERR_INVALID_PARAMS, ERR_HEADER_MISMATCH, ERR_UNSUPPORTED_PROTOCOL_VERSION, ERR_INVALID_REQUEST, ERR_PARSE, -32021):
+        return 400
+    return 500
+
+
+class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Streamable HTTP endpoint for `MCPServer`; dual-era like the stdio loop.
+
+    Modern requests (2026-07-28) carry the `_meta` envelope and the mirrored
+    `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers, which are
+    validated against the body. Legacy clients get an `Mcp-Session-Id` on
+    `initialize`; GET is 405 because no server-initiated stream is offered.
+    Every request needs the bearer token. Any path is accepted so a reverse
+    proxy may mount the endpoint wherever it likes.
+    """
+
+    server_version = "remctl-mcp"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+    timeout = 120  # socket read timeout; a client that under-delivers its body cannot pin a thread
+    mcp_server: MCPServer
+    transport: HTTPTransportConfig
+    sessions: dict[str, LegacySession]
+    sessions_lock: threading.Lock
+    anonymous_session: LegacySession
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - BaseHTTPRequestHandler API
+        _debug("http " + (format % args))
+
+    # -- helpers --------------------------------------------------------------
+
+    def _send_json(self, status: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
+        body = b"" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _rpc_error(self, status: int, code: int, message: str, request_id: Any = None, data: Any = None,
+                   extra_headers: dict[str, str] | None = None) -> None:
+        self._send_json(status, MCPServer._error_response(request_id, code, message, data), extra_headers)
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        scheme, _, credential = header.strip().partition(" ")
+        if scheme.lower() != "bearer" or not credential.strip():
+            return False
+        return secrets.compare_digest(credential.strip(), self.transport.token)
+
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin and origin.lower() != "null" and _host_of(origin) not in self.transport.allowed_hosts:
+            return False
+        host = _host_of(self.headers.get("Host"))
+        return not host or host in self.transport.allowed_hosts
+
+    def _gate(self) -> bool:
+        if not self._origin_allowed():
+            self._rpc_error(403, ERR_INVALID_REQUEST, "Origin or Host not allowed")
+            return False
+        if not self._authorized():
+            self._rpc_error(401, ERR_INVALID_REQUEST, "Authentication required", extra_headers={"WWW-Authenticate": 'Bearer realm="remctl"'})
+            return False
+        return True
+
+    def _read_raw_body(self) -> bytes:
+        """Read the whole body up front so a rejected request never leaves bytes on a keep-alive connection."""
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            raise RPCError(ERR_INVALID_REQUEST, "Invalid Content-Length") from None
+        if length > HTTP_MAX_BODY:
+            self.close_connection = True
+            raise RPCError(ERR_INVALID_REQUEST, "Request body too large")
+        return self.rfile.read(length) if length else b""
+
+    @staticmethod
+    def _parse_body(raw: bytes) -> Any:
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise RPCError(ERR_PARSE, "Parse error") from None
+
+    @staticmethod
+    def _is_modern(message: Any) -> bool:
+        if not isinstance(message, dict):
+            return False
+        if message.get("method") == "server/discover":
+            return True
+        params = message.get("params")
+        meta = params.get("_meta") if isinstance(params, dict) else None
+        return isinstance(meta, dict) and (META_PROTOCOL_VERSION in meta or META_CLIENT_CAPABILITIES in meta)
+
+    def _validate_modern_headers(self, message: dict[str, Any]) -> None:
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        header_version = self.headers.get("MCP-Protocol-Version")
+        body_version = meta.get(META_PROTOCOL_VERSION)
+        if header_version is None:
+            raise RPCError(ERR_HEADER_MISMATCH, "Header mismatch: MCP-Protocol-Version header is required")
+        if body_version is not None and header_version != body_version:
+            raise RPCError(ERR_HEADER_MISMATCH, f"Header mismatch: MCP-Protocol-Version header value {header_version!r} does not match body value {body_version!r}")
+        method = message.get("method")
+        header_method = self.headers.get("Mcp-Method")
+        if header_method is None:
+            raise RPCError(ERR_HEADER_MISMATCH, "Header mismatch: Mcp-Method header is required")
+        if header_method != method:
+            raise RPCError(ERR_HEADER_MISMATCH, f"Header mismatch: Mcp-Method header value {header_method!r} does not match body value {method!r}")
+        if method in ("tools/call", "prompts/get", "resources/read"):
+            body_name = params.get("uri" if method == "resources/read" else "name")
+            header_name = self.headers.get("Mcp-Name")
+            if header_name is None:
+                raise RPCError(ERR_HEADER_MISMATCH, "Header mismatch: Mcp-Name header is required")
+            if _decode_header_value(header_name) != body_name:
+                raise RPCError(ERR_HEADER_MISMATCH, f"Header mismatch: Mcp-Name header value {header_name!r} does not match body value {body_name!r}")
+
+    # -- verbs ----------------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path.rstrip("/").endswith(HTTP_HEALTH_PATH.rstrip("/")) or self.path.rstrip("/") == "":
+            server = self.mcp_server
+            self._send_json(200, {"ok": True, "name": SERVER_NAME, "version": server.config.version, "transport": "streamable-http",
+                                  "protocolVersions": list(SUPPORTED_PROTOCOL_VERSIONS)})
+            return
+        if not self._gate():
+            return
+        self._send_json(405, MCPServer._error_response(None, ERR_INVALID_REQUEST, "This endpoint offers no server-initiated stream; use POST"),
+                        {"Allow": "POST, DELETE"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        if not self._gate():
+            return
+        session_id = self.headers.get("Mcp-Session-Id")
+        if not session_id:
+            self._send_json(405, None, {"Allow": "POST"})
+            return
+        with self.sessions_lock:
+            removed = self.sessions.pop(session_id, None)
+        self._send_json(200 if removed else 404, None)
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            raw = self._read_raw_body()
+        except RPCError as exc:
+            self._rpc_error(413 if "large" in exc.message else 400, exc.code, exc.message)
+            return
+        if not self._gate():
+            return
+        try:
+            message = self._parse_body(raw)
+        except RPCError as exc:
+            self._rpc_error(400, exc.code, exc.message)
+            return
+        if self._is_modern(message):
+            self._handle_modern(message)
+        else:
+            self._handle_legacy(message)
+
+    def _handle_modern(self, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        try:
+            self._validate_modern_headers(message)
+        except RPCError as exc:
+            self._rpc_error(400, exc.code, exc.message, request_id)
+            return
+        headers = {"MCP-Protocol-Version": MODERN_PROTOCOL_VERSIONS[0]}
+        response = self.mcp_server.handle_message(message, LegacySession())
+        if response is None:
+            self._send_json(202, None, headers)
+            return
+        status = 200
+        if isinstance(response, dict) and "error" in response:
+            status = _http_status_for_error(response["error"].get("code", 0))
+        self._send_json(status, response, headers)
+
+    def _handle_legacy(self, message: Any) -> None:
+        header_version = self.headers.get("MCP-Protocol-Version")
+        if header_version and header_version not in SUPPORTED_PROTOCOL_VERSIONS:
+            self._rpc_error(400, ERR_UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
+                            data={"supported": list(LEGACY_PROTOCOL_VERSIONS), "requested": header_version})
+            return
+        session_id = self.headers.get("Mcp-Session-Id")
+        extra: dict[str, str] = {}
+        if isinstance(message, dict) and message.get("method") == "initialize":
+            session = LegacySession(id=uuid.uuid4().hex)
+            with self.sessions_lock:
+                self.sessions[session.id] = session
+            extra["Mcp-Session-Id"] = session.id
+        elif session_id:
+            with self.sessions_lock:
+                session = self.sessions.get(session_id)
+            if session is None:
+                self._rpc_error(404, ERR_INVALID_REQUEST, "Session not found; send initialize again")
+                return
+        else:
+            session = self.anonymous_session
+        response = self.mcp_server.handle_message(message, session)
+        extra["MCP-Protocol-Version"] = session.version or LATEST_LEGACY_PROTOCOL_VERSION
+        if response is None:
+            self._send_json(202, None, extra)
+            return
+        self._send_json(200, response, extra)
+
+
+def make_http_server(server: MCPServer, transport: HTTPTransportConfig, host: str = "127.0.0.1",
+                     port: int = HTTP_DEFAULT_PORT) -> http.server.ThreadingHTTPServer:
+    handler = type("BoundMCPHTTPHandler", (MCPHTTPHandler,), {
+        "mcp_server": server,
+        "transport": transport,
+        "sessions": {},
+        "sessions_lock": threading.Lock(),
+        "anonymous_session": LegacySession(),
+    })
+    httpd = http.server.ThreadingHTTPServer((host, port), handler)
+    httpd.daemon_threads = True
+    return httpd
+
+
+def serve_http(server: MCPServer, transport: HTTPTransportConfig, host: str = "127.0.0.1", port: int = HTTP_DEFAULT_PORT) -> int:
+    httpd = make_http_server(server, transport, host, port)
+    sys.stderr.write(f"remctl mcp: Streamable HTTP endpoint on http://{host}:{port}/ (bearer token required)\n")
+    sys.stderr.flush()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# ── HTTP endpoint configuration and token ────────────────────────────────────
+
+HTTP_CONFIG_FILENAME = "mcp-http.json"
+HTTP_AGENT_LABEL = "net.macstories.remctl.mcp-http"
+TAILSCALE_MOUNT_PATH = "/remctl"
+
+
+def http_config_path() -> Path:
+    return resolve_config_dir("remctl") / HTTP_CONFIG_FILENAME
+
+
+def load_http_config(path: Path | None = None) -> dict[str, Any] | None:
+    path = path or http_config_path()
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) and isinstance(value.get("token"), str) else None
+
+
+def save_http_config(config: dict[str, Any], path: Path | None = None) -> Path:
+    path = path or http_config_path()
+    write_private_text_file(path, json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    return path
+
+
+def ensure_http_config(*, port: int | None = None, path: Path | None = None) -> dict[str, Any]:
+    """Load the endpoint config, creating it with a fresh token when missing."""
+
+    config = load_http_config(path) or {
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": port or HTTP_DEFAULT_PORT,
+        "token": secrets.token_urlsafe(32),
+        "createdAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    if port is not None and config.get("port") != port:
+        config["port"] = port
+    config.setdefault("host", "127.0.0.1")
+    config.setdefault("port", HTTP_DEFAULT_PORT)
+    save_http_config(config, path)
+    return config
+
+
+def rotate_http_token(path: Path | None = None) -> dict[str, Any]:
+    config = ensure_http_config(path=path)
+    config["token"] = secrets.token_urlsafe(32)
+    config["rotatedAt"] = datetime.now().isoformat(timespec="seconds")
+    save_http_config(config, path)
+    return config
+
+
+def allowed_hosts_for(config: dict[str, Any]) -> frozenset[str]:
+    hosts = set(LOOPBACK_HOSTS)
+    tailscale = config.get("tailscale") if isinstance(config.get("tailscale"), dict) else {}
+    if tailscale.get("hostname"):
+        hosts.add(str(tailscale["hostname"]).lower())
+    for ip in tailscale.get("ips") or []:
+        hosts.add(str(ip).lower())
+    for extra in config.get("allowedHosts") or []:
+        hosts.add(str(extra).lower())
+    return frozenset(hosts)
+
+
+def mask_token(token: str) -> str:
+    return token[:4] + "…" + token[-2:] if len(token) > 8 else "…"
+
+
+# ── LaunchAgent for the HTTP endpoint ────────────────────────────────────────
+
+def http_agent_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{HTTP_AGENT_LABEL}.plist"
+
+
+def http_agent_log_path() -> Path:
+    return Path.home() / "Library" / "Logs" / "remctl-mcp-http.log"
+
+
+def http_agent_plist(cli_path: Path) -> dict[str, Any]:
+    command, args = server_command(cli_path)
+    return {
+        "Label": HTTP_AGENT_LABEL,
+        "ProgramArguments": [command, *args, "serve", "--http"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "LimitLoadToSessionType": "Aqua",
+        "ProcessType": "Background",
+        "EnvironmentVariables": {"NO_COLOR": "1", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        "StandardOutPath": str(http_agent_log_path()),
+        "StandardErrorPath": str(http_agent_log_path()),
+    }
+
+
+def _launchctl(*args: str, runner: Callable[..., Any] | None = None) -> subprocess.CompletedProcess[str]:
+    return _run(["/bin/launchctl", *args], timeout=30, runner=runner)
+
+
+def http_agent_status(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    plist = http_agent_plist_path()
+    status: dict[str, Any] = {"label": HTTP_AGENT_LABEL, "plist": str(plist), "installed": plist.exists(), "loaded": False, "running": False, "pid": None}
+    result = _launchctl("print", f"gui/{os.getuid()}/{HTTP_AGENT_LABEL}", runner=runner)
+    if result.returncode == 0:
+        status["loaded"] = True
+        match = re.search(r"^\s*pid = (\d+)", result.stdout, re.MULTILINE)
+        if match:
+            status["pid"] = int(match.group(1))
+            status["running"] = True
+    return status
+
+
+def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = None, plist_path: Path | None = None) -> dict[str, Any]:
+    plist = plist_path or http_agent_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    http_agent_log_path().parent.mkdir(parents=True, exist_ok=True)
+    plist.write_bytes(plistlib.dumps(http_agent_plist(cli_path)))
+    plist.chmod(0o644)
+    domain = f"gui/{os.getuid()}"
+    _launchctl("bootout", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    result = _launchctl("bootstrap", domain, str(plist), runner=runner)
+    if result.returncode != 0 and "already" not in (result.stderr + result.stdout).lower():
+        return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
+    _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    return {"ok": True, "plist": str(plist)}
+
+
+def remove_http_agent(*, runner: Callable[..., Any] | None = None, plist_path: Path | None = None) -> dict[str, Any]:
+    plist = plist_path or http_agent_plist_path()
+    _launchctl("bootout", f"gui/{os.getuid()}/{HTTP_AGENT_LABEL}", runner=runner)
+    existed = plist.exists()
+    if existed:
+        plist.unlink()
+    return {"ok": True, "plist": str(plist), "removed": existed}
+
+
+def http_health(config: dict[str, Any], *, timeout: float = 2.0) -> dict[str, Any]:
+    url = f"http://{config.get('host', '127.0.0.1')}:{config.get('port', HTTP_DEFAULT_PORT)}{HTTP_HEALTH_PATH}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - loopback only
+            payload = json.loads(response.read().decode("utf-8"))
+        return {"ok": bool(payload.get("ok")), "version": payload.get("version"), "url": url}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"ok": False, "url": url, "error": str(getattr(exc, "reason", exc))}
+
+
+# ── Tailscale ────────────────────────────────────────────────────────────────
+
+def tailscale_binary() -> str | None:
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    bundled = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    return str(bundled) if bundled.is_file() else None
+
+
+def tailscale_status(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Detect Tailscale: installed, running, MagicDNS name, IPs, HTTPS certificate domains."""
+
+    binary = tailscale_binary()
+    status: dict[str, Any] = {"installed": binary is not None, "binary": binary, "running": False, "hostname": None, "ips": [], "https": False}
+    if not binary:
+        return status
+    result = _run([binary, "status", "--json"], timeout=15, runner=runner)
+    if result.returncode != 0:
+        status["error"] = (result.stderr or result.stdout).strip()[:300]
+        return status
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        status["error"] = "tailscale status returned invalid JSON"
+        return status
+    self_node = payload.get("Self") if isinstance(payload.get("Self"), dict) else {}
+    status["running"] = payload.get("BackendState") == "Running"
+    hostname = str(self_node.get("DNSName") or "").rstrip(".")
+    status["hostname"] = hostname or None
+    status["ips"] = [str(ip) for ip in self_node.get("TailscaleIPs") or []]
+    cert_domains = payload.get("CertDomains") or []
+    tailnet = payload.get("CurrentTailnet") if isinstance(payload.get("CurrentTailnet"), dict) else {}
+    status["magicDNS"] = bool(tailnet.get("MagicDNSEnabled"))
+    status["https"] = bool(hostname and hostname in cert_domains)
+    return status
+
+
+def tailscale_serve_mount(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callable[..., Any] | None = None) -> dict[str, Any] | None:
+    """The proxy target currently mounted at `path` on port 443, or None."""
+
+    binary = tailscale_binary()
+    if not binary:
+        return None
+    result = _run([binary, "serve", "status", "--json"], timeout=15, runner=runner)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return None
+    for site, entry in (payload.get("Web") or {}).items():
+        if not str(site).endswith(":443"):
+            continue
+        handlers = entry.get("Handlers") if isinstance(entry, dict) else None
+        if isinstance(handlers, dict) and path in handlers:
+            handler = handlers[path]
+            return {"site": site, "path": path, "proxy": handler.get("Proxy") if isinstance(handler, dict) else None}
+    return None
+
+
+def tailscale_serve_enable(port: int, path: str = TAILSCALE_MOUNT_PATH, *, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    binary = tailscale_binary()
+    if not binary:
+        return {"ok": False, "error": "Tailscale is not installed."}
+    argv = [binary, "serve", "--bg", "--https=443", f"--set-path={path}", f"http://127.0.0.1:{port}"]
+    result = _run(argv, timeout=60, runner=runner)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        hint = ""
+        if "https" in message.lower() or "cert" in message.lower() or "magicdns" in message.lower():
+            hint = " Enable MagicDNS and HTTPS certificates for your tailnet in the Tailscale admin console (DNS page), then retry."
+        return {"ok": False, "error": (message or "tailscale serve failed") + hint, "command": argv}
+    return {"ok": True, "command": argv}
+
+
+def tailscale_serve_disable(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    binary = tailscale_binary()
+    if not binary:
+        return {"ok": False, "error": "Tailscale is not installed."}
+    result = _run([binary, "serve", "--https=443", f"--set-path={path}", "off"], timeout=60, runner=runner)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        if "not" in message.lower() and "found" in message.lower():
+            return {"ok": True, "note": "nothing was mounted"}
+        return {"ok": False, "error": message or "tailscale serve off failed"}
+    return {"ok": True}
+
+
+def tailscale_url(config: dict[str, Any]) -> str | None:
+    tailscale = config.get("tailscale") if isinstance(config.get("tailscale"), dict) else None
+    if not tailscale or not tailscale.get("hostname"):
+        return None
+    return f"https://{tailscale['hostname']}{tailscale.get('path') or TAILSCALE_MOUNT_PATH}"
+
+
+def install_tailscale(cli_path: Path, *, port: int | None = None, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Expose the MCP server to the tailnet: token, LaunchAgent, and `tailscale serve`."""
+
+    status = tailscale_status(runner=runner)
+    if not status["installed"]:
+        return {"client": "tailscale", "ok": False, "error": "Tailscale is not installed on this Mac. Install it from tailscale.com, sign in, then rerun."}
+    if not status["running"] or not status["hostname"]:
+        return {"client": "tailscale", "ok": False, "error": "Tailscale is installed but not connected. Open Tailscale, sign in, then rerun."}
+    if not status["https"]:
+        return {
+            "client": "tailscale",
+            "ok": False,
+            "error": "This tailnet has no HTTPS certificate for this Mac. Enable MagicDNS and HTTPS certificates in the Tailscale admin console (DNS page), then rerun.",
+        }
+    config = ensure_http_config(port=port)
+    config["tailscale"] = {"hostname": status["hostname"], "ips": status["ips"], "path": TAILSCALE_MOUNT_PATH}
+    save_http_config(config)
+    agent = install_http_agent(cli_path, runner=runner)
+    if not agent["ok"]:
+        return {"client": "tailscale", "ok": False, "error": f"Could not start the endpoint service: {agent['error']}"}
+    serve = tailscale_serve_enable(int(config["port"]), runner=runner)
+    if not serve["ok"]:
+        return {"client": "tailscale", "ok": False, "error": serve["error"], "agent": agent}
+    url = tailscale_url(config)
+    health = None
+    for _ in range(20):
+        health = http_health(config)
+        if health["ok"]:
+            break
+        time.sleep(0.25)
+    return {
+        "client": "tailscale",
+        "ok": True,
+        "url": url,
+        "port": config["port"],
+        "token": config["token"],
+        "health": health,
+        "agent": agent,
+        "snippets": remote_snippets(config),
+        "note": "Devices on your tailnet can now connect with the token. Reprint the commands with `remctl mcp config --format tailscale`.",
+    }
+
+
+def remove_tailscale(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    serve = tailscale_serve_disable(runner=runner) if tailscale_binary() else {"ok": True, "note": "Tailscale not installed"}
+    agent = remove_http_agent(runner=runner)
+    config = load_http_config()
+    if config and "tailscale" in config:
+        config.pop("tailscale", None)
+        save_http_config(config)
+    return {"client": "tailscale", "ok": serve["ok"] and agent["ok"], "serve": serve, "agent": agent,
+            "note": "The token stays in the config file so reconnecting later keeps existing devices working; delete mcp-http.json to discard it."}
+
+
+def tailscale_overview(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Detection plus current endpoint state, for status, doctor, and onboarding."""
+
+    status = tailscale_status(runner=runner)
+    config = load_http_config()
+    overview: dict[str, Any] = {
+        "installed": status["installed"],
+        "running": status["running"],
+        "hostname": status["hostname"],
+        "https": status["https"],
+        "configured": bool(config and config.get("tailscale")),
+        "url": tailscale_url(config) if config else None,
+        "port": config.get("port") if config else None,
+    }
+    if config and config.get("tailscale"):
+        agent = http_agent_status(runner=runner)
+        mount = tailscale_serve_mount(runner=runner) if status["installed"] else None
+        health = http_health(config)
+        overview.update(agentRunning=agent["running"], served=mount is not None, healthy=health["ok"],
+                        active=agent["running"] and mount is not None and health["ok"])
+    return overview
+
+
+def remote_snippets(config: dict[str, Any]) -> dict[str, str]:
+    """Ready-to-paste connection commands for devices on the tailnet."""
+
+    url = tailscale_url(config) or f"http://127.0.0.1:{config.get('port', HTTP_DEFAULT_PORT)}/"
+    token = config["token"]
+    desktop = {
+        "mcpServers": {
+            SERVER_NAME: {
+                "command": "npx",
+                "args": ["-y", "mcp-remote", url, "--header", "Authorization:${AUTH_HEADER}"],
+                "env": {"AUTH_HEADER": f"Bearer {token}"},
+            }
+        }
+    }
+    return {
+        "url": url,
+        "token": token,
+        "claude-code": f'claude mcp add --transport http --scope user {SERVER_NAME} {url} --header "Authorization: Bearer {token}"',
+        "codex": f"export REMCTL_MCP_TOKEN={token}   # add to ~/.zshrc\ncodex mcp add {SERVER_NAME} --url {url} --bearer-token-env-var REMCTL_MCP_TOKEN",
+        "claude-desktop": json.dumps(desktop, indent=2),
+        "json": json.dumps({"mcpServers": {SERVER_NAME: {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}}, indent=2),
+        "curl": f'curl -s {url}/health',
+    }
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
