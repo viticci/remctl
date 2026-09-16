@@ -93,7 +93,7 @@ done
 
 REQUIRED_SOURCES=(
     remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html
     remctl-bridge.swift remctl-permissions.swift remctl-private.m remctl-capability-host.swift
     remctl-capability-host-Info.plist remctl-capability-host-launchagent.plist
     scripts/build_capability_archive.py
@@ -361,7 +361,11 @@ def remove(path):
 for index,item in enumerate(reversed(items),1):
     source, destination, backup = item["source"], item["destination"], item["backup"]
     try:
-        if fail_at and index == fail_at: raise OSError("injected rollback failure")
+        # A negative index counts from the oldest journal entry (-1 = the app), so a
+        # test can target an entry that was actually published regardless of how
+        # many pairs a generation carries.
+        target = fail_at if fail_at >= 0 else len(items) + 1 + fail_at
+        if fail_at and index == target: raise OSError("injected rollback failure")
         if os.path.lexists(backup):
             if os.path.lexists(destination): remove(destination)
             os.replace(backup, destination)
@@ -471,9 +475,12 @@ plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 
 # Stage the public generation.
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html
 do cp "$SCRIPT_DIR/$item" "$BIN_STAGE/$item"; done
-chmod 755 "$BIN_STAGE/remctl"; chmod 644 "$BIN_STAGE"/*.py
+chmod 755 "$BIN_STAGE/remctl"; chmod 644 "$BIN_STAGE"/*.py "$BIN_STAGE/remctl_mcp_widget.html"
+for icon in remctl-mcp-icon.png remctl-mcp-icon-512.png; do
+    if [[ -f "$SCRIPT_DIR/assets/$icon" ]]; then cp "$SCRIPT_DIR/assets/$icon" "$BIN_STAGE/$icon"; chmod 644 "$BIN_STAGE/$icon"; fi
+done
 if [[ -f "$SCRIPT_DIR/assets/remctl-permissions-icon.png" ]]; then
     cp "$SCRIPT_DIR/assets/remctl-permissions-icon.png" "$BIN_STAGE/remctl-permissions-icon.png"; chmod 644 "$BIN_STAGE/remctl-permissions-icon.png"
 fi
@@ -564,7 +571,8 @@ import hashlib, json, os, stat, sys
 root, manifest, adopt, app_contract = sys.argv[1:]
 managed={
  "remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py",
- "remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl-bridge",
+ "remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py",
+ "remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-bridge",
  "remctl-private","remctl-permissions","remctl-permissions-icon.png",
  ".remctl-capability-host-app",".remctl-capability-host-signing-identity",
  "completions/_remctl","completions/_rctl","completions/_reminders","rctl","reminders"}
@@ -609,7 +617,7 @@ legacy={
  "completions/_remctl":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37",
  "completions/_rctl":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37",
  "completions/_reminders":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37"}
-allowed=set(legacy)|{"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png","rctl","reminders"}
+allowed=set(legacy)|{"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png","rctl","reminders","remctl_mcp.py","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png"}
 valid=present <= allowed and set(legacy) <= present
 for name,digest in legacy.items(): valid &= matches(os.path.join(root,name),{"type":"file","sha256":digest})
 for name in ("rctl","reminders"): valid &= matches(os.path.join(root,name),{"type":"symlink","target":"remctl"})
@@ -664,9 +672,10 @@ assert_no_backup() {
 }
 assert_no_backup "$APP_PATH"; assert_no_backup "$AGENT_PATH"
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl-bridge remctl-private \
-    remctl-permissions .remctl-capability-host-app rctl reminders
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html \
+    remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
 do assert_no_backup "$BIN_DIR/$item"; done
+for icon in remctl-mcp-icon.png remctl-mcp-icon-512.png; do if [[ -f "$BIN_STAGE/$icon" ]]; then assert_no_backup "$BIN_DIR/$icon"; fi; done
 assert_no_backup "$OWNERSHIP_MANIFEST"
 if [[ -f "$BIN_STAGE/remctl-permissions-icon.png" ]]; then assert_no_backup "$BIN_DIR/remctl-permissions-icon.png"; fi
 if [[ -f "$BIN_STAGE/.remctl-capability-host-signing-identity" ]]; then assert_no_backup "$IDENTITY_MARKER"; fi
@@ -694,9 +703,10 @@ PAIRS="$BUILD_STAGE/publish-pairs"; : > "$PAIRS"
 add_pair() { printf '%s\0%s\0' "$1" "$2" >> "$PAIRS"; }
 add_pair "$STAGED_APP" "$APP_PATH"; add_pair "$STAGED_AGENT" "$AGENT_PATH"
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl-bridge remctl-private \
-    remctl-permissions .remctl-capability-host-app rctl reminders
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html \
+    remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
 do add_pair "$BIN_STAGE/$item" "$BIN_DIR/$item"; done
+for icon in remctl-mcp-icon.png remctl-mcp-icon-512.png; do if [[ -f "$BIN_STAGE/$icon" ]]; then add_pair "$BIN_STAGE/$icon" "$BIN_DIR/$icon"; fi; done
 add_pair "$BIN_STAGE/.remctl-install-manifest.json" "$OWNERSHIP_MANIFEST"
 if [[ -f "$BIN_STAGE/remctl-permissions-icon.png" ]]; then add_pair "$BIN_STAGE/remctl-permissions-icon.png" "$BIN_DIR/remctl-permissions-icon.png"; fi
 if [[ -f "$BIN_STAGE/.remctl-capability-host-signing-identity" ]]; then add_pair "$BIN_STAGE/.remctl-capability-host-signing-identity" "$IDENTITY_MARKER"; fi
@@ -778,4 +788,5 @@ else
     echo -e "${DIM}Run '$BIN_DIR/remctl doctor' (agents: '$BIN_DIR/remctl doctor --for-agent --json'). Run '$BIN_DIR/remctl onboard' only if doctor reports host permission trouble.${RESET}"
 fi
 echo -e "${DIM}Use '$BIN_DIR/remctl permissions full-disk-access' only to reopen or repair the exact-host Full Disk Access guide.${RESET}"
+echo -e "${DIM}Connect AI apps: '$BIN_DIR/remctl onboard' offers it, or run '$BIN_DIR/remctl mcp install' (Claude Code, Codex, Claude Desktop/Cowork) any time.${RESET}"
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then echo -e "${YELLOW}Add $BIN_DIR to PATH, then open a new Terminal window.${RESET}"; fi

@@ -24,6 +24,7 @@ SOURCE_MANIFEST = {
     "remctl_broker": "remctl_broker.py",
     "remctl_capability_policy": "remctl_capability_policy.py",
     "remctl_capabilities": "remctl_capabilities.py",
+    "remctl_mcp": "remctl_mcp.py",
 }
 DISCOVERED_MODULE_PATTERN = "remctl_*.py"
 ARCHIVE_DESCRIPTOR = 198

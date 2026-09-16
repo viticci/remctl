@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 — Unreleased
+
+### MCP server
+
+- Added `remctl mcp`, a local MCP (Model Context Protocol) server over stdio with no third-party dependencies. It implements the stateless MCP 2026-07-28 revision (`server/discover`, per-request `_meta` protocol and capability fields, `resultType`, `serverInfo` and cache hints on every result, `-32022` version errors with the supported list) and stays a dual-era server for `initialize`-based clients on 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Verified against the official MCP Python SDK 2.2 client in modern and legacy modes.
+- Fifteen tools with input schemas, output schemas, annotations, and structured results: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `doctor`, and an exact-argv `run` escape hatch. Two prompts: `daily_review` and `plan_week`. Every tool runs the installed CLI with `--json`, so the signed Capability Host keeps owning macOS permissions and clients need no grants. RemCTL's structured stderr errors surface as tool errors the model can act on; `notifications/cancelled` terminates the tool's subprocess.
+- MCP Apps widget (`ui://remctl/reminders-v1.html`, extension `io.modelcontextprotocol/ui`, spec 2026-01-26), adapted from MacRemote's shared widget: reminder rows with Reminders-style check-off, reschedule, rename, and two-step delete, section headers, single-reminder cards, change confirmations with warnings, list and doctor views, host theming, and capability-scoped linkage with legacy aliases.
+- New onboarding step and commands so nobody edits configuration files by hand: `remctl onboard` now offers to connect detected AI apps; `remctl mcp install` uses `claude mcp add` for Claude Code, `codex mcp add` for Codex, and a backed-up merge into `claude_desktop_config.json` for Claude Desktop and Cowork; `remctl mcp bundle` builds a one-click `.mcpb` desktop extension; `remctl mcp status`, `config`, and `remove` complete the set. `doctor` gained an `mcp_clients` check. `mcp` joins the local command set (seven local, 49 hosted).
+- The installer publishes `remctl_mcp.py`, `remctl_mcp_widget.html`, and the MCP icons in the same ownership manifest; the uninstaller removes them.
+
+### Cleanup
 
 - Avoid repeated per-reminder tag and subtask-count queries when batch reads find no extras.
 - Reduce repeated work in ASCII table-width measurement, limited EventKit read sorting, and Capability Host request handling.

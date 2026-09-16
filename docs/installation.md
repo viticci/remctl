@@ -79,6 +79,7 @@ For an agent setup, use `remctl doctor --for-agent --json` instead of the human-
 3. Triggers the host's Automation prompt for Reminders AppleScript operations such as `flag` and `unflag`.
 4. Checks the host's effective Full Disk Access and helper readiness.
 5. Opens the guided Full Disk Access helper only when the exact host app still needs access.
+6. Offers to connect detected AI apps (Claude Code, Codex, Claude Desktop and Cowork) to the RemCTL MCP server. Pass `--no-mcp` to skip this step; `remctl mcp install` runs it later.
 
 If the helper does not open, do not restart the host or run a second permission command.
 
@@ -87,6 +88,19 @@ Private metadata writes do not require a separate first-run flow. They use the s
 See [private-metadata.md](private-metadata.md) for supported private fields and examples.
 
 `remctl permissions full-disk-access` reopens the same exact-host guide. Use it to inspect or repair Full Disk Access after onboarding, not as an unconditional first-run step.
+
+## Connect AI Apps
+
+RemCTL 2.0 includes a local MCP server so AI apps can use typed reminder tools. Onboarding offers the connection; you can also run it directly:
+
+```bash
+remctl mcp install                          # every detected app
+remctl mcp install --client claude-desktop  # Claude Desktop and Cowork; restart Claude afterwards
+remctl mcp bundle --open                    # or: one-click .mcpb extension for Claude Desktop
+remctl mcp status
+```
+
+The server needs no extra macOS grants because every tool runs the installed `remctl` through the signed host. See [mcp.md](mcp.md) for the tool list, protocol details, and troubleshooting.
 
 ## macOS Permission Scope
 

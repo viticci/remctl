@@ -455,7 +455,9 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.run_script(INSTALL, "--shell-completions", "none")
         injected = self.environment.copy()
         injected["REMCTL_TEST_PUBLISH_FAIL_AT"] = "5"
-        injected["REMCTL_TEST_ROLLBACK_FAIL_AT"] = "18"
+        # -4 = the fourth published pair (remctl_runtime.py) counted from the oldest
+        # journal entry, so the injected failure always hits a file that has a backup.
+        injected["REMCTL_TEST_ROLLBACK_FAIL_AT"] = "-4"
         result = self.run_script(
             INSTALL,
             "--shell-completions",

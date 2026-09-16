@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v1.8.0
+"""remctl — Power-user Reminders CLI v2.0.0
 
 Normal installed commands run through the signed RemCTL Capability Host, which
 owns database, Reminders, and Automation access. The client supports Python
@@ -59,7 +59,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "1.8.0"
+VERSION = "2.0.0"
 PRIVATE_PROTOCOL_VERSION = 2
 _private_protocol_probe = None
 
@@ -6417,6 +6417,7 @@ def maybe_run_first_launch_onboarding(args):
                 print_permission_helper_opened()
             else:
                 print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
+    print(C.dim("Connect Claude Code, Codex, or Claude Desktop to RemCTL with `remctl mcp install`."))
     print()
     return result
 
@@ -10799,6 +10800,7 @@ _remctl() {
         'setup:Install shell completions'
         'permissions:Reopen the signed host Full Disk Access guide for repair'
         'completion:Generate shell completions'
+        'mcp:Run or connect the RemCTL MCP server'
     )
     case "$words[2]" in
         show)
@@ -11225,7 +11227,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -11392,6 +11394,8 @@ complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose signed-host
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
 complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the signed host Full Disk Access guide for repair"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
+complete -c remctl -n "__fish_use_subcommand" -a mcp -d "Run or connect the RemCTL MCP server"
+complete -c remctl -n "__fish_seen_subcommand_from mcp" -a "serve install remove status config bundle" -d "MCP action"
 complete -c remctl -l images -d "Render image attachments inline"
 complete -c remctl -l image-mode -d "Image rendering protocol" -x -a "kitty iterm2 halfblock none"
 complete -c remctl -l image-width -d "Image render width in cells" -x
@@ -12055,6 +12059,33 @@ def gather_doctor_checks(capability_host=None):
     else:
         add("completion", "warn", f"Unsupported shell '{shell}'", "Run remctl setup --shell zsh|bash|fish.")
 
+    try:
+        mcp_clients = mcp_overview()["clients"]
+    except (OSError, ValueError) as exc:
+        add("mcp_clients", "warn", f"Could not read MCP client configuration: {exc}", "Run `remctl mcp status`.")
+    else:
+        connected = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is not False]
+        stale = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is False]
+        installed = [client["name"] for client in mcp_clients if client["installed"]]
+        if stale:
+            add(
+                "mcp_clients",
+                "warn",
+                "MCP connection points at a different RemCTL path: " + ", ".join(stale),
+                "Run `remctl mcp install` to update the connected apps.",
+            )
+        elif connected:
+            add("mcp_clients", "ok", "MCP server connected to " + ", ".join(connected), None)
+        elif installed:
+            add(
+                "mcp_clients",
+                "warn",
+                "MCP server not connected to " + ", ".join(installed),
+                "Run `remctl mcp install` (or `remctl onboard`) to connect AI apps.",
+            )
+        else:
+            add("mcp_clients", "ok", "No supported AI app detected; `remctl mcp config` prints a generic snippet", None)
+
     if mode == "invalid":
         add(
             "capability_host",
@@ -12207,6 +12238,8 @@ def cmd_doctor(a):
 def cmd_onboard(a):
     result = run_onboarding(auto=False)
     if getattr(a, "json", False):
+        if not getattr(a, "no_mcp", False):
+            result["mcp"] = mcp_overview()
         print(json.dumps(result, indent=2))
     else:
         print(C.bold("RemCTL onboard"))
@@ -12234,6 +12267,11 @@ def cmd_onboard(a):
                 )
             else:
                 print_capability_host_full_disk_access_guidance(host_status, settings_opened=False)
+        if not getattr(a, "no_mcp", False) and sys.stdin.isatty() and sys.stdout.isatty():
+            offer_mcp_connections(mcp_cli_path())
+        elif not getattr(a, "no_mcp", False):
+            print()
+            print(C.dim("Connect Claude Code, Codex, or Claude Desktop later with `remctl mcp install`."))
     if result["failures"]:
         sys.exit(1)
 
@@ -12347,6 +12385,7 @@ def cmd_setup(a):
         print("  1. remctl onboard   # request host access and open the FDA guide if needed")
         print("  2. After any FDA change, restart the signed host")
         print("  3. remctl doctor --for-agent   # verify after the restart")
+        print("  4. remctl mcp install          # connect Claude Code, Codex, Claude Desktop/Cowork (onboard offers this)")
         print("Unchanged existing install:")
         print("  1. remctl doctor --for-agent")
         print("  2. Run remctl onboard only if doctor reports host permission trouble")
@@ -12356,6 +12395,234 @@ def cmd_setup(a):
         if getattr(a, "doctor", False):
             print()
             cmd_doctor(SimpleNamespace(json=False))
+
+
+# ── MCP server and client connections ────────────────────────────────────────
+
+MCP_CLIENT_LABELS = {
+    "claude-code": "Claude Code",
+    "codex": "Codex",
+    "claude-desktop": "Claude Desktop and Cowork",
+    "other": "Other MCP clients",
+}
+
+
+def mcp_cli_path():
+    """The script every MCP client should launch: this file, symlinks resolved."""
+    return Path(__file__).resolve()
+
+
+def mcp_asset_path(name):
+    script_dir = Path(__file__).resolve().parent
+    for candidate in (script_dir / name, script_dir / "assets" / name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def mcp_overview(cli_path=None):
+    """Detected clients plus their current RemCTL registration, for JSON and doctor."""
+    import remctl_mcp
+
+    cli_path = cli_path or mcp_cli_path()
+    status = {entry["client"]: entry for entry in remctl_mcp.registration_status(cli_path)}
+    clients = []
+    for client in remctl_mcp.detect_clients():
+        entry = status.get(client["id"], {})
+        clients.append({
+            **client,
+            "configured": bool(entry.get("configured")),
+            "current": entry.get("current"),
+            "configPath": entry.get("path"),
+        })
+    command, args = remctl_mcp.server_command(cli_path)
+    return {"server": {"command": [command, *args]}, "clients": clients}
+
+
+def mcp_install_client(client, cli_path, *, scope="user"):
+    import remctl_mcp
+
+    if client == "claude-code":
+        return remctl_mcp.install_claude_code(cli_path, scope=scope)
+    if client == "codex":
+        return remctl_mcp.install_codex(cli_path)
+    if client == "claude-desktop":
+        return remctl_mcp.install_claude_desktop(cli_path)
+    if client == "other":
+        return {"client": "other", "ok": True, "snippets": remctl_mcp.config_snippets(cli_path)}
+    raise ValueError(f"unknown MCP client {client!r}")
+
+
+def mcp_remove_client(client, *, scope="user"):
+    import remctl_mcp
+
+    if client == "claude-code":
+        return remctl_mcp.remove_claude_code(scope=scope)
+    if client == "codex":
+        return remctl_mcp.remove_codex()
+    if client == "claude-desktop":
+        return remctl_mcp.remove_claude_desktop()
+    return {"client": client, "ok": True, "note": "Nothing to remove for this client."}
+
+
+def print_mcp_result(result):
+    label = MCP_CLIENT_LABELS.get(result.get("client"), result.get("client"))
+    if result.get("client") == "other":
+        snippets = result.get("snippets") or {}
+        print(C.bold("Other MCP clients"))
+        print("  Add a stdio server that runs:")
+        print(f"    {snippets.get('command')}")
+        print("  JSON (Claude Desktop, Cursor, VS Code, Windsurf, and similar):")
+        for line in str(snippets.get("json", "")).splitlines():
+            print(f"    {line}")
+        print("  TOML (Codex config.toml):")
+        for line in str(snippets.get("toml", "")).splitlines():
+            print(f"    {line}")
+        return
+    if result.get("ok"):
+        print(f"[{C.green('OK')}] {label}: connected")
+        for key in ("path", "note"):
+            if result.get(key):
+                print(f"      {C.dim(str(result[key]))}")
+        if result.get("backup"):
+            print(f"      {C.dim('Previous config saved as ' + str(result['backup']))}")
+    else:
+        print(f"[{C.red('FAIL')}] {label}: {result.get('error') or 'failed'}")
+
+
+def offer_mcp_connections(cli_path):
+    """Interactive onboarding step: connect detected AI apps one by one."""
+    overview = mcp_overview(cli_path)
+    detected = [client for client in overview["clients"] if client["installed"]]
+    print()
+    print(C.bold("Connect AI apps (MCP)"))
+    if not detected:
+        print(C.dim("  No supported AI app was detected (Claude Code, Codex, Claude Desktop)."))
+        print(C.dim("  Run `remctl mcp install --client other` for a generic configuration snippet."))
+        return []
+    results = []
+    for client in detected:
+        label = client["name"]
+        if client["configured"] and client.get("current") is not False:
+            print(f"[{C.green('OK')}] {label}: already connected")
+            continue
+        verb = "Update" if client["configured"] else "Connect"
+        try:
+            answer = input(f"{verb} RemCTL for {label}? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if answer not in ("", "y", "yes"):
+            print(C.dim(f"  Skipped {label}. Run `remctl mcp install --client {client['id']}` later."))
+            continue
+        result = mcp_install_client(client["id"], cli_path)
+        results.append(result)
+        print_mcp_result(result)
+    return results
+
+
+def cmd_mcp(a):
+    import remctl_mcp
+
+    action = getattr(a, "mcp_action", None) or "serve"
+    cli_path = mcp_cli_path()
+    if action == "serve":
+        widget = mcp_asset_path("remctl_mcp_widget.html")
+        icons = remctl_mcp.icon_data_uri(mcp_asset_path("remctl-mcp-icon.png"))
+        sys.exit(remctl_mcp.serve(cli_path, VERSION, widget_path=widget, icons=icons))
+
+    json_mode = getattr(a, "json", False)
+    if action in ("install", "remove"):
+        clients = list(dict.fromkeys(getattr(a, "client", None) or []))
+        if not clients or "all" in clients:
+            detected = [client["id"] for client in remctl_mcp.detect_clients() if client["installed"]]
+            clients = [client for client in clients if client != "all"] + [client for client in detected if client not in clients]
+            if not clients and action == "install":
+                clients = ["other"]
+        results = []
+        for client in clients:
+            if action == "install":
+                results.append(mcp_install_client(client, cli_path, scope=getattr(a, "scope", "user")))
+            else:
+                results.append(mcp_remove_client(client, scope=getattr(a, "scope", "user")))
+        if json_mode:
+            print(json.dumps({"ok": all(result.get("ok") for result in results), "results": results}, indent=2))
+        else:
+            print(C.bold("RemCTL MCP " + action))
+            for result in results:
+                print_mcp_result(result)
+            if action == "install" and any(result.get("client") == "claude-desktop" and result.get("ok") for result in results):
+                print(C.dim("Prefer a one-click install? `remctl mcp bundle --open` builds a desktop extension for Claude Desktop."))
+        if not all(result.get("ok") for result in results):
+            sys.exit(1)
+        return
+
+    if action == "status":
+        overview = mcp_overview(cli_path)
+        if json_mode:
+            print(json.dumps(overview, indent=2))
+            return
+        print(C.bold("RemCTL MCP status"))
+        print(f"Server command: {' '.join(overview['server']['command'])}")
+        for client in overview["clients"]:
+            if not client["installed"]:
+                state = C.dim("not installed")
+            elif client["configured"] and client.get("current") is not False:
+                state = C.green("connected")
+            elif client["configured"]:
+                state = C.yellow("connected to a different RemCTL path; rerun remctl mcp install")
+            else:
+                state = C.yellow("not connected")
+            print(f"  {client['name']}: {state}")
+        print(C.dim("Connect with `remctl mcp install`; get a generic snippet with `remctl mcp config`."))
+        return
+
+    if action == "config":
+        snippets = remctl_mcp.config_snippets(cli_path)
+        fmt = getattr(a, "format_kind", "all")
+        if fmt == "all":
+            if json_mode:
+                print(json.dumps(snippets, indent=2))
+                return
+            print(C.bold("Stdio command"))
+            print(f"  {snippets['command']}")
+            print(C.bold("Claude Code"))
+            print(f"  {snippets['claude-code']}")
+            print(C.bold("Codex"))
+            print(f"  {snippets['codex']}")
+            print(C.bold("JSON (Claude Desktop and most other clients)"))
+            print(snippets["json"])
+            print(C.bold("TOML (Codex config.toml)"))
+            print(snippets["toml"], end="")
+            return
+        print(snippets[fmt], end="" if fmt == "toml" else "\n")
+        return
+
+    if action == "bundle":
+        output = Path(a.output).expanduser() if getattr(a, "output", None) else remctl_mcp.bundle_default_output()
+        icon = mcp_asset_path("remctl-mcp-icon-512.png") or mcp_asset_path("remctl-mcp-icon.png")
+        path = remctl_mcp.build_bundle(cli_path, VERSION, output, icon_path=icon)
+        result = {"ok": True, "path": str(path), "opened": False}
+        if getattr(a, "open", False):
+            try:
+                subprocess.run(["open", str(path)], check=False, timeout=30)
+                result["opened"] = True
+            except (OSError, subprocess.SubprocessError):
+                result["opened"] = False
+        if json_mode:
+            print(json.dumps(result, indent=2))
+            return
+        print(C.bold("RemCTL MCP bundle"))
+        print(f"  {path}")
+        if result["opened"]:
+            print(C.dim("  Claude Desktop is showing the install dialog. Review it and click Install."))
+        else:
+            print(C.dim("  Double-click the file, or drag it onto Claude Desktop, to install it as an extension."))
+        print(C.dim("  The extension launches the RemCTL installed on this Mac; reinstalling RemCTL keeps it working."))
+        return
+
+    print(f"remctl: error: unknown mcp action {action!r}", file=sys.stderr)
+    sys.exit(2)
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -12445,6 +12712,7 @@ def build_parser():
             f"  2. {CLI_NAME} onboard             # request host access; opens the FDA guide if needed\n"
             "  3. After any Full Disk Access change, restart the signed host\n"
             f"  4. {CLI_NAME} doctor --for-agent  # verify access.effective and protocol v2 after restart\n"
+            f"  5. {CLI_NAME} mcp install         # connect Claude Code, Codex, Claude Desktop/Cowork (onboard offers this)\n"
             "Upgrade or reinstall:\n"
             "  1. ./install.sh\n"
             f"  2. {CLI_NAME} doctor --for-agent\n"
@@ -13185,10 +13453,14 @@ def build_parser():
             "repair. After an FDA change, restart the signed host, then run\n"
             "`remctl doctor --for-agent`. With `--json`, onboard still requests Reminders and\n"
             "Automation and returns the result, but it does not open the FDA helper. Do not add\n"
-            "Hermes, Python, Codex, or Terminal."
+            "Hermes, Python, Codex, or Terminal.\n"
+            "After the permission checks, onboard offers to connect detected AI apps (Claude\n"
+            "Code, Codex, Claude Desktop and Cowork) to the RemCTL MCP server; --no-mcp skips it."
         ),
         formatter_class=HelpFormatter,
-    ); js(c)
+    )
+    c.add_argument("--no-mcp", action="store_true", help="Skip the connect-AI-apps step")
+    js(c)
 
     c = sub.add_parser(
         "doctor",
@@ -13281,6 +13553,49 @@ def build_parser():
         formatter_class=HelpFormatter,
     )
     c.add_argument("shell", nargs="?", default="zsh", choices=["bash", "zsh", "fish"], help="Shell type")
+
+    c = sub.add_parser(
+        "mcp",
+        help="Run or connect the RemCTL MCP server",
+        description=(
+            "Run RemCTL as a local MCP (Model Context Protocol) server over stdio, or connect it to\n"
+            "Claude Code, Codex, Claude Desktop and Cowork, and other MCP clients. The server speaks\n"
+            "MCP 2026-07-28 and stays compatible with initialize-based clients back to 2024-11-05."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl mcp                      # serve over stdio (what clients launch)\n"
+            "  remctl mcp install              # connect every detected AI app\n"
+            "  remctl mcp install --client claude-code --client codex\n"
+            "  remctl mcp install --client claude-desktop   # also reaches Cowork; restart Claude\n"
+            "  remctl mcp bundle --open        # one-click .mcpb extension for Claude Desktop\n"
+            "  remctl mcp status\n"
+            "  remctl mcp config               # snippets for any other MCP client\n"
+            "\n"
+            "Every tool runs the installed remctl with --json, so the signed Capability Host keeps\n"
+            "owning Full Disk Access, Reminders, and Automation. Clients need no extra grants."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    msub = c.add_subparsers(dest="mcp_action", metavar="action")
+    msub.add_parser("serve", help="Run the MCP server over stdio (default)")
+    mcp_clients = ["claude-code", "codex", "claude-desktop", "other", "all"]
+    s = msub.add_parser("install", help="Connect RemCTL to AI apps without editing config files by hand")
+    s.add_argument("--client", action="append", choices=mcp_clients, help="Client to connect; repeatable; default: every detected app")
+    s.add_argument("--scope", choices=["user", "local", "project"], default="user", help="Claude Code scope (default: user)")
+    js(s)
+    s = msub.add_parser("remove", help="Disconnect RemCTL from AI apps")
+    s.add_argument("--client", action="append", choices=mcp_clients, help="Client to disconnect; repeatable; default: every detected app")
+    s.add_argument("--scope", choices=["user", "local", "project"], default="user", help="Claude Code scope (default: user)")
+    js(s)
+    s = msub.add_parser("status", help="Show which apps are connected"); js(s)
+    s = msub.add_parser("config", help="Print connection snippets for any MCP client")
+    s.add_argument("--format", dest="format_kind", choices=["all", "command", "json", "toml", "claude-code", "codex"], default="all", help="Snippet to print")
+    js(s)
+    s = msub.add_parser("bundle", help="Build a .mcpb desktop extension for Claude Desktop")
+    s.add_argument("--output", help="Bundle path (default: ~/Downloads/RemCTL.mcpb)")
+    s.add_argument("--open", action="store_true", help="Open the bundle in Claude Desktop after building it")
+    js(s)
 
     return p, sub
 
@@ -13411,6 +13726,7 @@ def main():
         "setup": cmd_setup,
         "permissions": cmd_permissions,
         "completion": cmd_completion,
+        "mcp": cmd_mcp,
     }
 
     handler = cmds.get(a.cmd)

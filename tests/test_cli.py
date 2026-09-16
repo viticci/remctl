@@ -1827,7 +1827,7 @@ class CliTests(unittest.TestCase):
             parser_commands,
             remctl_runtime.LOCAL_COMMANDS | remctl_runtime.HOSTED_COMMANDS,
         )
-        self.assertEqual(len(parser_commands), 55)
+        self.assertEqual(len(parser_commands), 56)
 
     def test_internal_host_tty_state_requires_active_marker(self):
         non_tty = SimpleNamespace(isatty=lambda: False)

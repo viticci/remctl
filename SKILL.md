@@ -5,9 +5,15 @@ description: Use when an agent needs to operate Apple Reminders through RemCTL o
 
 # RemCTL
 
-RemCTL is a power-user Apple Reminders CLI. In a normal installation, protected data commands run through the dedicated, signed `RemCTL Capability Host.app`, which a LaunchAgent keeps available. Terminal, Hermes, Codex, and other same-user callers connect through an owner-only Unix socket using protocol version 2. The host is the single macOS permission target for Full Disk Access, Reminders, and Automation. Public writes use EventKit, non-private flag operations use AppleScript, and explicit `--private` writes use unsupported ReminderKit APIs inside the host. Local administration commands such as `onboard`, `permissions`, `doctor`, `setup`, `completion`, and `list-symbols` stay in the caller.
+RemCTL is a power-user Apple Reminders CLI. In a normal installation, protected data commands run through the dedicated, signed `RemCTL Capability Host.app`, which a LaunchAgent keeps available. Terminal, Hermes, Codex, and other same-user callers connect through an owner-only Unix socket using protocol version 2. The host is the single macOS permission target for Full Disk Access, Reminders, and Automation. Public writes use EventKit, non-private flag operations use AppleScript, and explicit `--private` writes use unsupported ReminderKit APIs inside the host. Local administration commands such as `onboard`, `permissions`, `doctor`, `setup`, `completion`, `list-symbols`, and `mcp` stay in the caller.
 
 The installed command can be invoked as `remctl`, `rctl`, or `reminders`; all three names behave identically and produce the same output.
+
+## MCP Server
+
+RemCTL 2.0 also runs as a local MCP server (`remctl mcp`, stdio, MCP 2026-07-28 plus legacy `initialize` back to 2024-11-05). If your host already shows RemCTL tools (`today`, `upcoming`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `doctor`, `run`, ...), prefer them over shelling out: they validate arguments, return `structuredContent`, use the same numeric ids as the CLI, and `run` accepts exact CLI argv for anything else. Every tool runs the installed CLI with `--json` through the signed host, so nothing in the permission model changes.
+
+To connect a host, run `remctl mcp install --client claude-code|codex|claude-desktop` (or plain `remctl mcp install` for every detected app; `remctl onboard` offers the same step). `remctl mcp status` and `remctl doctor` (`mcp_clients` check) report the connections; `remctl mcp config` prints snippets for other clients; `remctl mcp bundle --open` builds a one-click Claude Desktop extension. After `--client claude-desktop`, the user must quit and reopen Claude Desktop. Full details: `docs/mcp.md`.
 
 ## Default Workflow
 
@@ -41,6 +47,8 @@ launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
 # Always after onboarding:
 remctl doctor --for-agent --json
 ```
+
+After onboarding succeeds, connect the AI apps the user works in: `remctl mcp install` detects Claude Code, Codex, and Claude Desktop and registers the MCP server through each app's own mechanism. Verify with `remctl mcp status`.
 
 For a reinstall or upgrade from an existing signed-host installation, use the normal installer. It preserves the existing signed host identity, so macOS can retain its grants:
 

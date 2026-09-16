@@ -11,9 +11,13 @@ RemCTL separates the caller-facing client from permission-bearing execution.
 ## Components
 
 ```text
+MCP client (Claude Code, Claude Desktop, Cowork, Codex, ...)
+  └─ remctl mcp (stdio JSON-RPC; MCP 2026-07-28 and legacy initialize)
+       └─ spawns remctl <command> --json per tool call
+
 Terminal / Hermes / Codex / other caller
   └─ remctl client (Python 3.10+)
-       ├─ runs 6 setup/display commands locally
+       ├─ runs 7 setup/display commands locally (including `mcp`)
        └─ sends 49 permission-bearing commands over protocol 2
           through an owner-only Unix socket
 

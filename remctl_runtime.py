@@ -23,6 +23,7 @@ LOCAL_COMMANDS = frozenset(
         "completion",
         "doctor",
         "list-symbols",
+        "mcp",
         "onboard",
         "permissions",
         "setup",

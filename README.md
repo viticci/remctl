@@ -13,9 +13,12 @@ This gives scripts and agents access to the modern Reminders data model without 
 ## How It Works
 
 ```text
+AI apps over MCP (Claude Code, Claude Desktop, Cowork, Codex, ...)
+  -> remctl mcp (stdio MCP server; 2026-07-28 + legacy initialize)
+     -> remctl <command> --json
 Terminal / Hermes / Codex / other callers
   -> remctl client (Python 3.10+)
-     -> 6 setup and display commands stay in the caller
+     -> 7 setup and display commands stay in the caller
      -> auto: owner-only Unix socket, broker protocol v2
         -> signed persistent RemCTL Capability Host.app (protected Python 3.13+)
            reads:   SQLite with Full Disk Access
@@ -28,7 +31,7 @@ Why this architecture exists:
 
 - **Direct SQLite reads** expose sections, subtasks, tags, attachments (with sha512-verified local file paths), deep links, list colors and badges, recurrence metadata, normal alarms, location alarms, and Early Reminder metadata in tens of milliseconds.
 - **One permission target** keeps Reminders, Automation, and Full Disk Access grants on the signed capability host. Terminal, Hermes, Codex, Python, and other callers do not need separate RemCTL grants in normal hosted use.
-- **Complete protected execution** routes 49 permission-bearing commands through the protocol-v2 broker. Six setup and display commands stay local: `completion`, `doctor`, `list-symbols`, `onboard`, `permissions`, and `setup`.
+- **Complete protected execution** routes 49 permission-bearing commands through the protocol-v2 broker. Seven setup and display commands stay local: `completion`, `doctor`, `list-symbols`, `mcp`, `onboard`, `permissions`, and `setup`.
 - **Explicit execution modes** use `REMCTL_CAPABILITY_HOST=auto|force|direct`. `auto` is the default and uses the host when installed. `force` requires it. `direct` bypasses it for diagnostics and degraded recovery, so the caller must have its own access. Setting `REMCTL_STORE_DIR` forces direct execution in `auto` or `direct` mode and is an error with `force`. `REMCTL_BRIDGE_PATH` and `REMCTL_PRIVATE_PATH` affect direct execution only; hosted commands use the sealed helpers fixed by the signed generation.
 - **Limited EventKit reads** are available only with `--via-eventkit` on `show`, `search`, `today`, and `upcoming`. The flag never changes the execution route: the signed host performs the EventKit read in normal `auto` mode, while the caller performs it in `direct` mode or with a custom store. It is never selected automatically and does not return RemCTL numeric IDs.
 - **EventKit writes** keep Reminders and iCloud in charge of mutations. RemCTL does not write directly to the database.
@@ -58,6 +61,8 @@ After any required restart, verify the installation and try a normal command:
 ~/bin/remctl today
 ```
 
+Onboarding ends by offering to connect Claude Code, Codex, and Claude Desktop or Cowork to RemCTL's MCP server; `remctl mcp install` does the same later. See [MCP Server](#mcp-server).
+
 `install.sh` builds, signs, and strictly verifies a complete capability-host generation before it transactionally replaces and starts the LaunchAgent service. The command-line client supports Python 3.10 or newer. The signed host uses a separate protected Python 3.13+ selected by the installer. Xcode Command Line Tools, an official python.org Framework installation of Python 3.13 or newer, and an Apple Development signing identity with a TeamIdentifier are the supported tester setup. The installer preserves an existing identity, accepts a valid explicit `REMCTL_CODESIGN_IDENTITY`, or auto-detects an Apple Development identity. A Mac without that identity is not currently eligible for a live Capability Host install; RemCTL does not fall back to ad-hoc signing. `--bootstrap` also creates RemCTL's config directory; shell completion is installed when supported. For zsh, `setup` prints the `fpath` lines to add to `~/.zshrc` when your config does not already load the completion directory.
 
 `remctl onboard` asks the signed host to present the native Reminders and Automation consent flows. macOS has no native Full Disk Access prompt, so onboarding opens the guided helper only when that grant is missing. If it does, add only the exact signed host shown by the helper, then restart it with `launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"` before running `doctor`. Run `remctl permissions full-disk-access` only when you need to reopen that guide or repair the grant.
@@ -82,6 +87,24 @@ For either an exact official 1.7.1 install with generated helpers or an expected
 
 Full setup details live in [docs/installation.md](docs/installation.md). Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
+## MCP Server
+
+RemCTL 2.0 is also a local [MCP](https://modelcontextprotocol.io) server, so Claude Code, Claude Desktop, Cowork, Codex, and any other MCP client can use typed reminder tools instead of learning the CLI. `remctl mcp` speaks the stateless MCP 2026-07-28 revision (`server/discover`, per-request `_meta`, `resultType`) and stays compatible with `initialize`-based clients back to 2024-11-05. It has no dependencies beyond Python's standard library, and every tool runs the installed `remctl` with `--json`, so the signed Capability Host keeps owning permissions and the AI app needs none.
+
+`remctl onboard` ends by offering to connect the AI apps it detects. The same step is available any time, with no configuration files to edit by hand:
+
+```bash
+remctl mcp install                          # every detected app
+remctl mcp install --client claude-code     # claude mcp add … (user scope)
+remctl mcp install --client codex           # codex mcp add …
+remctl mcp install --client claude-desktop  # merges claude_desktop_config.json; also reaches Cowork
+remctl mcp bundle --open                    # one-click .mcpb desktop extension for Claude Desktop
+remctl mcp status                           # who is connected
+remctl mcp config                           # snippets for any other client
+```
+
+Fifteen tools cover the everyday surface (`today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `doctor`) plus `run` for exact-argv access to everything else, all with schemas, annotations, and structured results. Hosts that support [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview), such as Claude Desktop, render results in an interactive reminders widget with check-off, reschedule, rename, and delete actions. Details, the protocol contract, and troubleshooting live in [docs/mcp.md](docs/mcp.md).
+
 ## Uninstalling
 
 To remove RemCTL files installed by `install.sh`, run:
@@ -102,6 +125,7 @@ The guarded, identity-checked uninstaller checks `~/bin` and `~/.local/bin` by d
 | Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `section-create`, `section-rename`, `section-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
+| Connect AI apps | `mcp install`, `mcp status`, `mcp config`, `mcp bundle`, `mcp remove` |
 
 Common examples:
 
@@ -419,6 +443,8 @@ If Full Disk Access cannot yet be granted to the signed host, `show`, `search`, 
 
 ## For Agents
 
+If the RemCTL MCP server is connected to your host (`remctl mcp status`), prefer its tools: they carry schemas, annotations, structured results, and the same numeric ids as the CLI. Everything below still applies when you call the CLI directly, and the `run` tool accepts the same argv.
+
 Use JSON when scripting:
 
 ```bash
@@ -479,6 +505,7 @@ remctl doctor --for-agent --json
 - [Smart-list private API notes](docs/private-metadata.md#smart-list-examples)
 - [Template private API notes](docs/private-metadata.md#template-examples)
 - [Architecture](docs/architecture.md)
+- [MCP server](docs/mcp.md)
 
 ## Project Layout
 
@@ -498,6 +525,8 @@ remctl doctor --for-agent --json
 | `remctl_images.py` | Attachment file resolution and inline terminal image rendering |
 | `remctl_serialization.py` | Shared reminder JSON serialization |
 | `remctl_smart_lists.py` | Smart-list filter decoding and safe v1 encoding |
+| `remctl_mcp.py` | Dual-era stdio MCP server, tool catalog, MCP Apps metadata, and client-connection helpers |
+| `remctl_mcp_widget.html` | Self-contained MCP Apps reminders widget |
 | `scripts/build_capability_archive.py` | Builds the sealed, sourceless Python runtime archive |
 | `scripts/live_edit_matrix.py` | Opt-in live edit-mode matrix for due/display/alarm regressions |
 | `scripts/live_private_matrix.py` | Opt-in live private command matrix using disposable Reminders data |

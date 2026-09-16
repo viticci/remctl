@@ -586,6 +586,10 @@ REMCTL_CAPABILITY_HOST=force remctl stats --json
 REMCTL_CAPABILITY_HOST=direct remctl stats --json
 remctl setup --shell auto
 remctl completion zsh
+
+# Connect AI apps to the MCP server (onboard offers this too):
+remctl mcp install
+remctl mcp status
 ```
 
 Use [installation.md](installation.md) for the first-run visual permission flow. `onboard` is the guided first-install command: it asks the signed host to request Reminders and Automation, verifies the permission state, and opens the exact-host Full Disk Access guide only when needed. If that guide opens, pause while the user adds only the app path it shows; the default is `~/Applications/RemCTL Capability Host.app`. Restart the host only after the Full Disk Access grant changes, then run `doctor`. If the guide does not open, skip both the manual Full Disk Access step and the restart.
@@ -599,6 +603,10 @@ On an unchanged existing installation, start with `doctor --for-agent --json`. F
 For hosted `auto` execution, `doctor --for-agent --json` reports private-helper readiness under `capabilityHost.privateProtocol.compatible`; use that field with `capabilityHost.fullReady`. The direct `private_helper` check and its path apply only to explicit direct diagnostics. After updating RemCTL, rerun `install.sh` when the hosted protocol is incompatible or a deliberate direct helper is outdated.
 
 `doctor` also checks whether an installed zsh completion file appears in exported `FPATH` or the usual zsh startup files. If it warns, add the printed `fpath=(... $fpath)` and `compinit` lines to `~/.zshrc`, then open a new terminal.
+
+### MCP Server
+
+`remctl mcp` runs the local MCP server over stdio; AI apps launch it, so you never run it by hand. `remctl mcp install` connects detected apps through their own tooling (`claude mcp add`, `codex mcp add`) or a backed-up merge into Claude Desktop's config, `remctl mcp status` reports the connections, `remctl mcp config` prints snippets for other clients, `remctl mcp bundle` builds a one-click Claude Desktop extension, and `remctl mcp remove` disconnects. See [mcp.md](mcp.md).
 
 ## Agent Fast Path
 

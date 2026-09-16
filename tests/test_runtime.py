@@ -69,6 +69,7 @@ class RuntimeTests(unittest.TestCase):
             "completion",
             "doctor",
             "list-symbols",
+            "mcp",
             "onboard",
             "permissions",
             "setup",

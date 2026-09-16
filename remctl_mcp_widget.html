@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RemCTL Reminders</title>
+<style>
+/* ════════════════════════════════════════════════════════════════════════
+   REMCTL REMINDERS WIDGET — MCP App (SEP-1865, spec 2026-01-26)
+   One card, one accent line for status, Reminders-style check circles.
+   Self-contained: no external scripts, styles, fetch, XHR, or sockets.
+   ════════════════════════════════════════════════════════════════════════ */
+html, body { box-sizing: border-box; width: 100%; margin: 0; background: transparent; }
+body {
+  padding: var(--rw-safe-top, 0px) var(--rw-safe-right, 0px) var(--rw-safe-bottom, 0px) var(--rw-safe-left, 0px);
+}
+:root[data-rw-theme="dark"] .rw, :root[data-rw-theme="dark"] .rw-waiting { color-scheme: dark; }
+:root[data-rw-theme="light"] .rw, :root[data-rw-theme="light"] .rw-waiting { color-scheme: light; }
+
+.rw-waiting {
+  font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif);
+  font-size: 12px; padding: 18px; text-align: center; color-scheme: light dark;
+  color: var(--color-text-secondary, light-dark(rgba(60,60,67,.62), rgba(235,235,245,.60)));
+}
+
+.rw, .rw * { box-sizing: border-box; margin: 0; padding: 0; }
+.rw {
+  color-scheme: light dark;
+  --bg:     var(--color-background-primary, light-dark(#ffffff, #1d1d20));
+  --panel:  var(--color-background-secondary, light-dark(#f6f6f8, #161619));
+  --text:   var(--color-text-primary, light-dark(#1d1d1f, #f5f5f7));
+  --text2:  var(--color-text-secondary, light-dark(rgba(60,60,67,.62), rgba(235,235,245,.60)));
+  --text3:  var(--color-text-tertiary, light-dark(rgba(60,60,67,.34), rgba(235,235,245,.30)));
+  --line:   var(--color-border-primary, light-dark(rgba(0,0,0,.10), rgba(255,255,255,.11)));
+  --line2:  var(--color-border-secondary, light-dark(rgba(0,0,0,.055), rgba(255,255,255,.065)));
+  --accent: light-dark(#7c3aed, #a78bfa);
+  --accent-tint: color-mix(in srgb, var(--accent) 12%, transparent);
+  --ok:     var(--color-text-success, light-dark(#1d7a35, #32d158));
+  --ok-line: var(--color-border-success, light-dark(#34c759, #30d158));
+  --ok-tint: light-dark(rgba(52,199,89,.13), rgba(48,209,88,.16));
+  --bad:    var(--color-text-danger, light-dark(#d70015, #ff6961));
+  --bad-line: var(--color-border-danger, light-dark(#ff3b30, #ff453a));
+  --bad-tint: light-dark(rgba(255,59,48,.09), rgba(255,69,58,.14));
+  --warn:   var(--color-text-warning, light-dark(#9a5200, #ffb340));
+  --warn-line: var(--color-border-warning, light-dark(#ff9500, #ff9f0a));
+  --warn-tint: light-dark(rgba(255,149,0,.13), rgba(255,159,10,.15));
+  --hover:  light-dark(rgba(0,0,0,.035), rgba(255,255,255,.05));
+  --code-bg: light-dark(rgba(0,0,0,.045), rgba(255,255,255,.07));
+  --mono: var(--font-mono, ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace);
+  font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", Roboto, sans-serif);
+  font-size: 13px; line-height: 1.45; color: var(--text);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+.rw-card { position: relative; background: transparent; }
+.rw-accent { position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--status-line); opacity: .95; }
+.rw-card[data-status="success"] { --status: var(--ok);   --status-line: var(--ok-line);   --status-tint: var(--ok-tint); }
+.rw-card[data-status="warning"] { --status: var(--warn); --status-line: var(--warn-line); --status-tint: var(--warn-tint); }
+.rw-card[data-status="failed"]  { --status: var(--bad);  --status-line: var(--bad-line);  --status-tint: var(--bad-tint); }
+
+/* header */
+.rw-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 12px 16px 10px; }
+.rw-title-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rw-tool { font-size: 13px; font-weight: 600; letter-spacing: -.08px; white-space: nowrap; }
+.rw-chip {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 590; letter-spacing: .01em;
+  padding: 2px 8px 2px 7px; border-radius: 100px; color: var(--status); background: var(--status-tint); white-space: nowrap;
+}
+.rw-chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--status-line); flex: none; }
+.rw-count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text3); font-variant-numeric: tabular-nums; }
+.rw-body { border-top: 1px solid var(--line2); }
+
+/* table */
+.rw-table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: auto; }
+.rw-table th {
+  background: var(--bg); font-size: 11px; font-weight: 590; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--text2); text-align: left; padding: 8px 12px; box-shadow: inset 0 -1px var(--line2);
+}
+.rw-table td { padding: 8px 12px; font-size: 12.5px; border-bottom: 1px solid var(--line2); vertical-align: middle; }
+.rw-table tr:last-child td { border-bottom: none; }
+.rw-table tbody tr:hover td { background: var(--hover); }
+.rw-td-check { width: 38px; padding-right: 0 !important; }
+.rw-td-when { white-space: nowrap; color: var(--text2); font-variant-numeric: tabular-nums; }
+.rw-td-when.rw-overdue { color: var(--bad); font-weight: 590; }
+.rw-td-repeat { white-space: nowrap; color: var(--text2); font-size: 11.5px; }
+.rw-td-actions { text-align: right; white-space: nowrap; }
+.rw-td-dim { color: var(--text3); }
+tr.rw-row-done .rw-title { text-decoration: line-through; color: var(--text3); }
+.rw-titlecell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rw-title { font-weight: 480; overflow-wrap: anywhere; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.rw-sub { font-size: 11px; color: var(--text2); overflow-wrap: anywhere; }
+.rw-mark { font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+.rw-mark-flag { color: var(--warn); }
+.rw-mark-priority { color: var(--accent); }
+.rw-mark-urgent { color: var(--bad); }
+.rw-check {
+  all: unset; display: grid; place-items: center; width: 19px; height: 19px; border-radius: 50%;
+  border: 1.5px solid var(--line); cursor: pointer; -webkit-tap-highlight-color: transparent;
+  transition: border-color .15s ease, background-color .15s ease, transform .15s ease;
+}
+.rw-check:hover { border-color: var(--accent); }
+.rw-check:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rw-check svg { opacity: 0; transition: opacity .12s ease; }
+.rw-check[data-state="pending"] { border-color: var(--line2); border-top-color: var(--accent); animation: rw-spin .65s linear infinite; }
+.rw-check[data-state="done"] { border-color: var(--accent); background: var(--accent); animation: rw-pop .2s ease; }
+.rw-check[data-state="done"] svg { opacity: 1; }
+.rw-check[data-state="failed"] { border-color: var(--bad-line); }
+.rw-section-head { display: flex; align-items: baseline; gap: 7px; padding: 11px 16px 4px; border-top: 1px solid var(--line2); }
+.rw-section-head:first-child { border-top: none; }
+.rw-section-title { font-size: 11px; font-weight: 590; letter-spacing: .05em; text-transform: uppercase; color: var(--text2); }
+.rw-section-count { font-family: var(--mono); font-size: 10.5px; color: var(--text3); font-variant-numeric: tabular-nums; }
+.rw-more { display: flex; justify-content: center; padding: 8px 16px 10px; }
+.rw-more[hidden] { display: none; }
+.rw-more-btn, .rw-rowbtn, .rw-footbtn {
+  all: unset; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font: inherit; font-size: 11.5px;
+  font-weight: 590; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); color: var(--text);
+  background: var(--bg); white-space: nowrap; -webkit-tap-highlight-color: transparent;
+  transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+}
+.rw-more-btn:hover, .rw-rowbtn:hover, .rw-footbtn:hover { background: var(--hover); border-color: var(--accent); }
+.rw-rowbtn:focus-visible, .rw-footbtn:focus-visible, .rw-more-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rw-rowbtn[data-state="pending"] { color: var(--text2); }
+.rw-rowbtn[data-state="done"] { color: var(--accent); border-color: var(--accent); }
+.rw-rowbtn[data-state="armed"] { color: var(--bad); border-color: var(--bad-line); }
+.rw-rowbtn[data-state="failed"] { color: var(--bad); border-color: var(--bad-line); }
+.rw-rowbtn.rw-destructive { color: var(--bad); }
+.rw-action-group { display: inline-flex; gap: 5px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+details.rw-overflow { position: relative; display: inline-block; }
+details.rw-overflow summary {
+  list-style: none; cursor: pointer; font-size: 11.5px; font-weight: 590; padding: 3px 9px; border-radius: 6px;
+  border: 1px solid var(--line); color: var(--text2); display: inline-flex; align-items: center; gap: 4px;
+}
+details.rw-overflow summary::-webkit-details-marker { display: none; }
+details.rw-overflow[open] summary { border-color: var(--accent); color: var(--text); }
+.rw-menu { display: flex; flex-direction: column; gap: 5px; padding: 6px 0 2px; align-items: flex-end; }
+tr.rw-inputrow td { background: var(--panel); padding: 0; }
+.rw-inputform { display: flex; gap: 8px; align-items: center; padding: 9px 12px; flex-wrap: wrap; }
+.rw-inputlabel { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--text2); font-weight: 590; }
+.rw-input {
+  font: inherit; font-size: 12px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text); min-width: min(210px, 100%);
+}
+.rw-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.rw-spin {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--line);
+  border-top-color: var(--accent); animation: rw-spin .65s linear infinite;
+}
+@keyframes rw-spin { to { transform: rotate(360deg); } }
+@keyframes rw-pop { 0% { transform: scale(.85); } 60% { transform: scale(1.08); } 100% { transform: scale(1); } }
+
+/* record card */
+.rw-record { padding: 14px 16px 12px; display: flex; flex-direction: column; gap: 9px; }
+.rw-record-title { font-size: 15px; font-weight: 650; letter-spacing: -.15px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; overflow-wrap: anywhere; }
+.rw-record-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text2); flex-wrap: wrap; }
+.rw-dot { color: var(--text3); }
+.rw-notes { font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; padding: 9px 10px; border-radius: 8px; background: var(--panel); }
+.rw-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+.rw-tag { font-size: 11px; padding: 2px 7px; border-radius: 100px; color: var(--accent); background: var(--accent-tint); }
+.rw-sublist { display: flex; flex-direction: column; gap: 4px; }
+.rw-subitem { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.rw-subdot { width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid var(--line); flex: none; }
+.rw-subdot.rw-done { background: var(--accent); border-color: var(--accent); }
+.rw-subitem.rw-done span { text-decoration: line-through; color: var(--text3); }
+.rw-link { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); text-decoration: none; font-size: 12px; font-weight: 590; }
+.rw-link:hover { text-decoration: underline; }
+.rw-record-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.rw-record-actions .rw-inputform { padding: 0; flex-basis: 100%; }
+.rw-label { font-size: 10.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--text2); }
+
+/* change confirmation */
+.rw-change { padding: 14px 16px 12px; display: flex; flex-direction: column; gap: 7px; }
+.rw-change-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.rw-change-icon { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; color: var(--accent); background: var(--accent-tint); }
+.rw-change-title { font-size: 13.5px; font-weight: 600; letter-spacing: -.09px; }
+.rw-change-sub { font-size: 12.5px; color: var(--text2); overflow-wrap: anywhere; }
+.rw-idchip { font-family: var(--mono); font-size: 11px; color: var(--text3); }
+.rw-warning { display: flex; gap: 9px; padding: 9px 10px; border-radius: 8px; background: var(--warn-tint); color: var(--warn); font-size: 12px; }
+.rw-warning ul { padding-left: 16px; }
+
+/* lists table */
+.rw-color { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+.rw-badge { margin-right: 6px; }
+
+/* doctor */
+.rw-doctor-summary { display: flex; gap: 8px; padding: 12px 16px 6px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--text2); }
+.rw-status-ok { color: var(--ok); } .rw-status-warn { color: var(--warn); } .rw-status-fail { color: var(--bad); }
+.rw-fix { font-size: 11px; color: var(--text3); white-space: pre-wrap; margin-top: 2px; }
+
+/* summary (generic) */
+.rw-summary { padding: 13px 16px 15px; display: flex; flex-direction: column; gap: 12px; }
+.rw-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 7px; }
+.rw-fact { min-width: 0; padding: 9px 10px; border-radius: 8px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line2); }
+.rw-fact-label { display: block; font-size: 10.5px; font-weight: 590; color: var(--text2); margin-bottom: 2px; }
+.rw-fact-value { display: block; font-size: 12px; color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
+
+/* empty + error */
+.rw-empty { padding: 22px 16px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.rw-empty-icon { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: var(--accent); background: var(--accent-tint); margin-bottom: 4px; }
+.rw-empty-title { font-size: 13px; font-weight: 600; }
+.rw-empty-sub { font-size: 12px; color: var(--text2); }
+.rw-error { padding: 14px 16px; display: flex; gap: 10px; }
+.rw-error-icon { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; color: var(--bad); background: var(--bad-tint); }
+.rw-error-title { font-size: 13px; font-weight: 600; }
+.rw-error-sub { font-size: 12px; color: var(--text2); white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+.rw-code { font-family: var(--mono); font-size: 10.5px; color: var(--text3); margin-top: 4px; }
+
+/* footer */
+.rw-footer { display: flex; gap: 6px; padding: 8px 12px 10px; border-top: 1px solid var(--line2); justify-content: flex-end; }
+@media (max-width: 480px) {
+  .rw-td-repeat, .rw-th-repeat { display: none; }
+  .rw-table td, .rw-table th { padding-left: 8px; padding-right: 8px; }
+}
+</style>
+</head>
+<body>
+<div id="rw-root"><div class="rw-waiting">Waiting for RemCTL…</div></div>
+
+<script id="remctl-widget">
+/* ════════════════════════════════════════════════════════════════════════
+   RENDERER — RemCTLWidget.mount(root, payload)
+   payload = { toolTitle, toolName, status, profile, accent, value, error,
+               actions, canAct, onAction, onRunAgain, onOpenLink }
+   ════════════════════════════════════════════════════════════════════════ */
+const RemCTLWidget = (() => {
+  'use strict';
+
+  const el = (tag, cls, ...kids) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    for (const kid of kids) if (kid != null) node.append(kid.nodeType ? kid : document.createTextNode(kid));
+    return node;
+  };
+  const svg = (markup) => { const t = document.createElement('template'); t.innerHTML = markup.trim(); return t.content.firstChild; };
+  const I = {
+    check: () => svg('<svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 6.3 5 8.8l4.5-5.5" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+    checkTint: () => svg('<svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 6.3 5 8.8l4.5-5.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+    alert: () => svg('<svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M7 4.4v3.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="7" cy="10.3" r=".95" fill="currentColor"/></svg>'),
+    emptyCheck: () => svg('<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.2 8.6 6.4 11.8 12.8 4.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+    linkArrow: () => svg('<svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M4 2.5h5.5V8M9.5 2.5 2.5 9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+    spinner: () => el('span', 'rw-spin')
+  };
+
+  const isObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const stripControl = (v) => String(v == null ? '' : v)
+    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+  const safeText = (v, max = 4000) => {
+    if (v == null) return '';
+    if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+    if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '';
+    if (typeof v !== 'string') return '';
+    const text = stripControl(v).trim();
+    return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  };
+  const isHttpUrl = (v) => typeof v === 'string' && /^https?:\/\/[^\s]+$/i.test(v.trim());
+
+  /* ---------- dates ---------- */
+  function parseISO(value) {
+    if (typeof value !== 'string' || !value) return null;
+    const m = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?)?/);
+    if (!m) return null;
+    const date = new Date(+m[1], +m[2] - 1, +m[3], m[4] ? +m[4] : 0, m[5] ? +m[5] : 0);
+    return Number.isNaN(date.getTime()) ? null : { date, hasTime: !!m[4] };
+  }
+  const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  function whenLabel(row) {
+    const parsed = parseISO(row.dueDate);
+    if (!parsed) return { text: '—', overdue: false };
+    const allDay = row.allDay === true || !parsed.hasTime;
+    const now = new Date();
+    const today = startOfDay(now);
+    const day = startOfDay(parsed.date);
+    const diff = Math.round((day - today) / 86400000);
+    let dayText;
+    if (diff === 0) dayText = 'Today';
+    else if (diff === 1) dayText = 'Tomorrow';
+    else if (diff === -1) dayText = 'Yesterday';
+    else if (diff > 1 && diff < 7) dayText = parsed.date.toLocaleDateString(undefined, { weekday: 'short' });
+    else dayText = parsed.date.toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', year: parsed.date.getFullYear() === now.getFullYear() ? undefined : 'numeric'
+    });
+    const time = allDay ? '' : ' ' + parsed.date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    const overdue = row.completed !== true && (allDay ? day < today : parsed.date < now);
+    return { text: dayText + time, overdue };
+  }
+  const WEEKDAYS = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun',
+    monday: 'Mon', tuesday: 'Tue', wednesday: 'Wed', thursday: 'Thu', friday: 'Fri', saturday: 'Sat', sunday: 'Sun' };
+  function repeatLabel(row) {
+    const rec = row.recurrence;
+    if (!isObject(rec)) return '';
+    const freq = safeText(rec.frequency).toLowerCase();
+    if (!freq) return '';
+    const interval = Number.isFinite(rec.interval) && rec.interval > 1 ? rec.interval : 1;
+    const unit = { daily: 'day', weekly: 'week', monthly: 'month', yearly: 'year' }[freq] || freq;
+    let text = interval > 1 ? 'every ' + interval + ' ' + unit + 's' : { daily: 'daily', weekly: 'weekly', monthly: 'monthly', yearly: 'yearly' }[freq] || freq;
+    const days = Array.isArray(rec.daysOfWeek) ? rec.daysOfWeek.map(d => WEEKDAYS[String(d).toLowerCase()] || safeText(d)).filter(Boolean) : [];
+    if (days.length) text += ' ' + days.join(', ');
+    if (Array.isArray(rec.daysOfMonth) && rec.daysOfMonth.length) text += ' on ' + rec.daysOfMonth.map(safeText).join(', ');
+    if (Number.isFinite(rec.occurrenceCount)) text += ', ' + rec.occurrenceCount + ' times';
+    if (typeof rec.endDate === 'string') text += ' until ' + rec.endDate.slice(0, 10);
+    return text;
+  }
+  const PRIORITY_MARK = { high: '!!!', medium: '!!', low: '!' };
+
+  /* ---------- shared action affordances ---------- */
+  function substitute(value, row, inputs) {
+    const primitive = (v) => v !== undefined && v !== null && typeof v !== 'object';
+    if (typeof value === 'string') {
+      return value.replace(/\{([A-Za-z0-9_.]+)\}/g, (m, field) => {
+        if (field.startsWith('input.')) { const v = (inputs || {})[field.slice(6)]; return primitive(v) ? String(v) : m; }
+        return primitive(row[field]) ? String(row[field]) : m;
+      });
+    }
+    if (Array.isArray(value)) return value.map(v => substitute(v, row, inputs));
+    if (value && typeof value === 'object') {
+      const out = {}; for (const k of Object.keys(value)) out[k] = substitute(value[k], row, inputs); return out;
+    }
+    return value;
+  }
+  function actionApplies(action, row) {
+    const fields = Array.isArray(action.requiredRowFields) ? action.requiredRowFields : [];
+    return fields.every(f => row[f] !== undefined && row[f] !== null);
+  }
+  function actionButton(action, opts) {
+    const b = el('button', 'rw-rowbtn' + (action.style === 'destructive' ? ' rw-destructive' : ''));
+    b.type = 'button'; b.dataset.state = '';
+    const label = () => {
+      b.textContent = '';
+      if (b.dataset.state === 'pending') b.append(I.spinner(), action.title);
+      else if (b.dataset.state === 'done') b.append(I.checkTint(), 'Done');
+      else if (b.dataset.state === 'armed') b.append('Confirm?');
+      else if (b.dataset.state === 'failed') b.append('Failed');
+      else b.append(action.title);
+    };
+    label();
+    const fire = (inputs) => {
+      b.dataset.state = 'pending'; label();
+      Promise.resolve(opts.run(inputs || {})).then(() => {
+        b.dataset.state = 'done'; label();
+        if (opts.onDone) opts.onDone();
+      }).catch((err) => {
+        // Never reset silently: a silent reset reads as "the button does nothing".
+        b.dataset.state = 'failed'; label();
+        b.title = (err && err.message) ? String(err.message) : action.title + ' failed';
+        setTimeout(() => { if (b.dataset.state === 'failed') { b.dataset.state = ''; label(); } }, 3500);
+      });
+    };
+    b.addEventListener('click', () => {
+      if (b.dataset.state === 'pending' || b.dataset.state === 'done') return;
+      if (action.inputs && action.inputs.length && opts.requestInputs) { opts.requestInputs(fire); return; }
+      if (action.style === 'destructive') {
+        if (b.dataset.state !== 'armed') {
+          b.dataset.state = 'armed'; label();
+          setTimeout(() => { if (b.dataset.state === 'armed') { b.dataset.state = ''; label(); } }, 3500);
+          return;
+        }
+        b.dataset.state = '';
+      }
+      fire();
+    });
+    return b;
+  }
+  function actionGroup(actions, optionsFor, limit) {
+    const group = el('div', 'rw-action-group');
+    for (const action of actions.slice(0, limit)) group.append(actionButton(action, optionsFor(action)));
+    const overflow = actions.slice(limit);
+    if (!overflow.length) return group;
+    const details = el('details', 'rw-overflow');
+    const summary = el('summary'); summary.append('More');
+    summary.setAttribute('aria-label', 'More actions, ' + overflow.length + ' available');
+    const menu = el('div', 'rw-menu');
+    for (const action of overflow) {
+      const options = optionsFor(action);
+      const requestInputs = options.requestInputs;
+      if (requestInputs) options.requestInputs = (fire) => { details.open = false; requestInputs(fire); };
+      menu.append(actionButton(action, options));
+    }
+    details.append(summary, menu);
+    group.append(details);
+    return group;
+  }
+  function buildInputForm(action, row, fire, close) {
+    const form = el('div', 'rw-inputform');
+    const fields = {};
+    const go = el('button', 'rw-rowbtn');
+    for (const input of (action.inputs || [])) {
+      const wrap = el('label', 'rw-inputlabel', input.title);
+      const box = document.createElement('input');
+      box.className = 'rw-input'; box.type = 'text'; box.placeholder = input.placeholder || '';
+      if (input.prefillField && row[input.prefillField] != null) box.value = String(row[input.prefillField]);
+      box.addEventListener('keydown', (e) => { if (e.key === 'Enter') go.click(); if (e.key === 'Escape') close(); });
+      fields[input.name] = box;
+      wrap.append(box); form.append(wrap);
+    }
+    go.type = 'button'; go.textContent = action.title;
+    const cancel = el('button', 'rw-rowbtn'); cancel.type = 'button'; cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => close());
+    go.addEventListener('click', () => {
+      const values = {};
+      for (const key of Object.keys(fields)) values[key] = fields[key].value;
+      if (Object.values(values).some(v => !String(v).trim())) { Object.values(fields)[0].focus(); return; }
+      close(); fire(values);
+    });
+    form.append(go, cancel);
+    return { form, focus: () => { const first = Object.values(fields)[0]; if (first) first.focus(); } };
+  }
+
+  /* ---------- reminders table ---------- */
+  function titleCell(row, showList) {
+    const cell = el('div', 'rw-titlecell');
+    const title = el('div', 'rw-title', safeText(row.title, 400) || '(untitled)');
+    if (row.flagged === true) title.append(el('span', 'rw-mark rw-mark-flag', '⚑'));
+    const mark = PRIORITY_MARK[String(row.priority || '').toLowerCase()];
+    if (mark) title.append(el('span', 'rw-mark rw-mark-priority', mark));
+    if (row.urgent === true) title.append(el('span', 'rw-mark rw-mark-urgent', 'URGENT'));
+    cell.append(title);
+    const subs = [];
+    if (showList && row.list) subs.push(safeText(row.list, 120));
+    if (row.subtaskCount > 0) subs.push(row.subtaskCount + (row.subtaskCount === 1 ? ' subtask' : ' subtasks'));
+    if (subs.length) cell.append(el('div', 'rw-sub', subs.join(' · ')));
+    return cell;
+  }
+
+  function renderReminderRows(p, rows) {
+    const body = el('div', 'rw-body');
+    const lists = new Set(rows.map(r => r.list).filter(Boolean));
+    const showList = lists.size > 1;
+    const showRepeat = rows.some(r => repeatLabel(r));
+    const hasSections = rows.some(r => typeof r.section === 'string' && r.section);
+    const groups = [];
+    if (hasSections) {
+      const byKey = new Map();
+      for (const row of rows) {
+        const key = typeof row.section === 'string' && row.section ? row.section : '';
+        if (!byKey.has(key)) byKey.set(key, []);
+        byKey.get(key).push(row);
+      }
+      for (const [key, items] of byKey) groups.push({ title: key, rows: items });
+    } else {
+      groups.push({ title: null, rows });
+    }
+    for (const group of groups) {
+      if (group.title !== null) {
+        const head = el('div', 'rw-section-head', el('span', 'rw-section-title', group.title || 'Other'),
+          el('span', 'rw-section-count', String(group.rows.length)));
+        body.append(head);
+      }
+      body.append(reminderTable(p, group.rows, { showList, showRepeat }));
+    }
+    return body;
+  }
+
+  function reminderTable(p, rows, opts) {
+    const table = el('table', 'rw-table');
+    const checkAction = p.canAct ? (p.actions || []).find(a => a.kind === 'checkOff') : null;
+    const buttonActions = p.canAct ? (p.actions || []).filter(a => a.kind === 'rowButton') : [];
+    const thead = el('thead'); const headRow = el('tr');
+    if (checkAction) headRow.append(el('th', 'rw-td-check'));
+    headRow.append(el('th', null, 'Reminder'), el('th', null, 'When'));
+    if (opts.showRepeat) headRow.append(el('th', 'rw-th-repeat', 'Repeats'));
+    if (buttonActions.length) headRow.append(el('th', 'rw-td-actions'));
+    thead.append(headRow);
+    const tbody = el('tbody');
+    const pageSize = window.matchMedia('(max-width: 480px)').matches ? 6 : 10;
+    let visible = Math.min(pageSize, rows.length);
+    const more = el('div', 'rw-more'); const moreBtn = el('button', 'rw-more-btn'); moreBtn.type = 'button';
+    moreBtn.addEventListener('click', () => { visible = Math.min(rows.length, visible + pageSize); paint(); });
+    more.append(moreBtn);
+
+    function invoke(action, row, inputs) {
+      return Promise.resolve(p.onAction(action, { ...row }, inputs || {}));
+    }
+    function paint() {
+      tbody.textContent = '';
+      rows.slice(0, visible).forEach((row, index) => {
+        const tr = el('tr');
+        if (row.completed === true) tr.classList.add('rw-row-done');
+        if (checkAction) {
+          if (!actionApplies(checkAction, row)) tr.append(el('td', 'rw-td-check'));
+          else {
+            const btn = el('button', 'rw-check'); btn.type = 'button';
+            btn.title = checkAction.title;
+            btn.setAttribute('aria-label', checkAction.title + ': ' + (safeText(row.title, 80) || 'row ' + (index + 1)));
+            btn.append(I.check());
+            btn.dataset.state = row.completed === true ? 'done' : '';
+            btn.addEventListener('click', () => {
+              if (btn.dataset.state) return;
+              btn.dataset.state = 'pending';
+              invoke(checkAction, row).then(() => {
+                btn.dataset.state = 'done'; tr.classList.add('rw-row-done');
+              }).catch((err) => {
+                btn.dataset.state = 'failed';
+                btn.title = (err && err.message) ? String(err.message) : checkAction.title + ' failed';
+                setTimeout(() => { if (btn.dataset.state === 'failed') btn.dataset.state = ''; }, 3000);
+              });
+            });
+            tr.append(el('td', 'rw-td-check', btn));
+          }
+        }
+        tr.append(el('td', null, titleCell(row, opts.showList)));
+        const when = whenLabel(row);
+        tr.append(el('td', 'rw-td-when' + (when.overdue ? ' rw-overdue' : '') + (when.text === '—' ? ' rw-td-dim' : ''), when.text));
+        if (opts.showRepeat) tr.append(el('td', 'rw-td-repeat', repeatLabel(row) || ''));
+        if (buttonActions.length) {
+          const td = el('td', 'rw-td-actions');
+          const applicable = buttonActions.filter(a => actionApplies(a, row));
+          td.append(actionGroup(applicable, (action) => ({
+            run: (values) => invoke(action, row, values),
+            requestInputs: (fire) => toggleInputRow(tr, action, row, fire)
+          }), checkAction ? 1 : 2));
+          tr.append(td);
+        }
+        tbody.append(tr);
+      });
+      const remaining = Math.max(0, rows.length - visible);
+      more.hidden = remaining === 0;
+      if (remaining) moreBtn.textContent = 'Show ' + Math.min(pageSize, remaining) + ' more';
+    }
+    function toggleInputRow(tr, action, row, fire) {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains('rw-inputrow')) { next.remove(); return; }
+      tbody.querySelectorAll('tr.rw-inputrow').forEach(n => n.remove());
+      const formTr = el('tr', 'rw-inputrow'); const td = el('td'); td.colSpan = 99;
+      const built = buildInputForm(action, row, fire, () => formTr.remove());
+      td.append(built.form); formTr.append(td); tr.after(formTr); built.focus();
+    }
+    table.append(thead, tbody); paint();
+    const wrap = el('div', null, table, more);
+    return wrap;
+  }
+
+  /* ---------- single reminder card ---------- */
+  function renderRecord(p, row) {
+    const card = el('div', 'rw-record');
+    const title = el('div', 'rw-record-title', safeText(row.title, 400) || '(untitled)');
+    if (row.flagged === true) title.append(el('span', 'rw-mark rw-mark-flag', '⚑'));
+    const mark = PRIORITY_MARK[String(row.priority || '').toLowerCase()];
+    if (mark) title.append(el('span', 'rw-mark rw-mark-priority', mark));
+    if (row.urgent === true) title.append(el('span', 'rw-mark rw-mark-urgent', 'URGENT'));
+    if (row.completed === true) title.style.textDecoration = 'line-through';
+    card.append(title);
+    const meta = el('div', 'rw-record-meta');
+    const parts = [];
+    if (row.list) parts.push(safeText(row.list, 120));
+    if (row.section) parts.push(safeText(row.section, 120));
+    const when = whenLabel(row);
+    if (when.text !== '—') { const node = el('span', when.overdue ? 'rw-overdue' : null, when.text); if (when.overdue) node.style.color = 'var(--bad)'; parts.push(node); }
+    const repeat = repeatLabel(row); if (repeat) parts.push(repeat);
+    if (row.completed === true) parts.push('Completed' + (row.completionDate ? ' ' + safeText(row.completionDate).slice(0, 10) : ''));
+    if (Array.isArray(row.alarms) && row.alarms.length) parts.push(row.alarms.length + (row.alarms.length === 1 ? ' alarm' : ' alarms'));
+    if (Array.isArray(row.attachments) && row.attachments.length) parts.push(row.attachments.length + (row.attachments.length === 1 ? ' attachment' : ' attachments'));
+    parts.forEach((part, index) => { if (index) meta.append(el('span', 'rw-dot', '·')); meta.append(part.nodeType ? part : document.createTextNode(part)); });
+    if (parts.length) card.append(meta);
+    if (typeof row.notes === 'string' && row.notes.trim()) card.append(el('div', 'rw-notes', safeText(row.notes, 6000)));
+    const tags = Array.isArray(row.tags) ? row.tags.map(t => safeText(isObject(t) ? t.name : t, 60)).filter(Boolean) : [];
+    if (tags.length) { const box = el('div', 'rw-tags'); for (const tag of tags) box.append(el('span', 'rw-tag', '#' + tag.replace(/^#/, ''))); card.append(box); }
+    const url = isHttpUrl(row.url) ? row.url.trim() : (isObject(row.richLink) && isHttpUrl(row.richLink.url) ? row.richLink.url.trim() : null);
+    if (url) card.append(linkNode(p, url));
+    const subtasks = Array.isArray(row.subtasks) ? row.subtasks.filter(isObject) : [];
+    if (subtasks.length) {
+      const list = el('div', 'rw-sublist');
+      list.append(el('div', 'rw-label', 'Subtasks'));
+      for (const sub of subtasks) {
+        const done = sub.completed === true;
+        list.append(el('div', 'rw-subitem' + (done ? ' rw-done' : ''), el('span', 'rw-subdot' + (done ? ' rw-done' : '')), el('span', null, safeText(sub.title, 300) || '(untitled)')));
+      }
+      card.append(list);
+    }
+    if (p.canAct && (p.actions || []).length && row.id != null) {
+      const box = el('div', 'rw-record-actions');
+      const applicable = p.actions.filter(a => actionApplies(a, row));
+      const labelled = applicable.map(a => a.kind === 'checkOff' ? { ...a, title: row.completed === true ? 'Mark Not Done' : a.title } : a);
+      box.append(actionGroup(labelled, (action) => ({
+        run: (values) => {
+          if (action.kind === 'checkOff' && row.completed === true) {
+            return Promise.resolve(p.onAction({ ...action, arguments: { ...action.arguments, completed: false } }, { ...row }, {}));
+          }
+          return Promise.resolve(p.onAction(action, { ...row }, values || {}));
+        },
+        requestInputs: (fire) => {
+          const existing = box.querySelector('.rw-inputform');
+          if (existing) { existing.remove(); return; }
+          const built = buildInputForm(action, row, fire, () => built.form.remove());
+          box.append(built.form); built.focus();
+        }
+      }), 3));
+      card.append(box);
+    }
+    return el('div', 'rw-body', card);
+  }
+
+  function linkNode(p, url) {
+    if (p.onOpenLink) {
+      const btn = el('button', 'rw-link'); btn.type = 'button'; btn.append(url.replace(/^https?:\/\//, '').slice(0, 80), I.linkArrow());
+      btn.addEventListener('click', () => { p.onOpenLink(url); });
+      return btn;
+    }
+    const a = el('a', 'rw-link', url.replace(/^https?:\/\//, '').slice(0, 80), I.linkArrow());
+    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    return a;
+  }
+
+  /* ---------- change confirmation ---------- */
+  const CHANGE_TITLES = {
+    created: 'Reminder created', updated: 'Reminder updated', completed: 'Marked done', uncompleted: 'Marked not done',
+    deleted: 'Reminder deleted', flagged: 'Reminder flagged', unflagged: 'Flag removed', unchanged: 'No changes',
+    partial: 'Created, but one step failed', moved: 'Reminder moved'
+  };
+  function renderChange(p, value) {
+    const status = safeText(value.status, 40).toLowerCase();
+    const box = el('div', 'rw-change');
+    const icon = el('div', 'rw-change-icon'); icon.append(status === 'partial' ? I.alert() : I.checkTint());
+    if (status === 'partial') { icon.style.color = 'var(--warn)'; icon.style.background = 'var(--warn-tint)'; }
+    const head = el('div', 'rw-change-head', icon, el('div', 'rw-change-title', CHANGE_TITLES[status] || 'Done'));
+    const id = value.numericId != null ? value.numericId : value.id;
+    if (id != null && (typeof id === 'number' || /^\d+$/.test(String(id)))) head.append(el('span', 'rw-idchip', '#' + id));
+    box.append(head);
+    const title = safeText(value.title, 300);
+    if (title) box.append(el('div', 'rw-change-sub', title));
+    if (isObject(value.resolvedList) && value.resolvedList.title) {
+      box.append(el('div', 'rw-change-sub', 'List: ' + safeText(value.resolvedList.title, 120) + ' (resolved from ' + safeText(value.resolvedList.requested, 120) + ')'));
+    }
+    if (value.oldId != null && value.id != null) box.append(el('div', 'rw-change-sub', 'The move created a new id; the old id ' + safeText(value.oldId) + ' is gone.'));
+    if (value.completionDate) box.append(el('div', 'rw-change-sub', 'Completed ' + safeText(value.completionDate, 40)));
+    const warnings = [];
+    if (Array.isArray(value.warnings)) for (const w of value.warnings) { const t = safeText(w, 500); if (t) warnings.push(t); }
+    if (status === 'partial') {
+      const failed = safeText(isObject(value.error) ? value.error.message : value.error, 500);
+      warnings.push((value.failed ? safeText(value.failed, 80) + ': ' : '') + (failed || 'a private metadata step failed; use update to finish'));
+    }
+    if (warnings.length) {
+      const warn = el('div', 'rw-warning'); const wi = el('div'); wi.append(I.alert());
+      const list = el('ul'); for (const w of warnings) list.append(el('li', null, w));
+      warn.append(wi, el('div', null, el('div', null, warnings.length === 1 ? 'Completed with a warning' : 'Completed with warnings'), list));
+      box.append(warn);
+    }
+    return { node: el('div', 'rw-body', box), warning: warnings.length > 0 };
+  }
+
+  /* ---------- lists ---------- */
+  function renderLists(p, rows) {
+    const table = el('table', 'rw-table');
+    const thead = el('thead'); const tr = el('tr'); tr.append(el('th', null, 'List'), el('th', null, 'Type'), el('th', 'rw-td-actions', 'ID')); thead.append(tr);
+    const tbody = el('tbody');
+    for (const row of rows) {
+      const r = el('tr');
+      const name = el('div', 'rw-title');
+      const hex = isObject(row.color) && typeof row.color.hex === 'string' && /^#[0-9a-f]{6}$/i.test(row.color.hex) ? row.color.hex : null;
+      if (hex) { const dot = el('span', 'rw-color'); dot.style.background = hex; name.append(dot); }
+      const emoji = isObject(row.badge) && typeof row.badge.emoji === 'string' ? row.badge.emoji.slice(0, 4) : '';
+      if (emoji) name.append(el('span', 'rw-badge', emoji));
+      name.append(safeText(row.title || row.name, 200) || '(untitled)');
+      if (row.pinned === true) name.append(el('span', 'rw-mark rw-mark-priority', 'PINNED'));
+      r.append(el('td', null, name));
+      const kind = row.isGroup === true ? 'Group' : row.isGroceries === true ? 'Groceries' : safeText(row.listType, 40) === 'standard' ? 'List' : (safeText(row.listType, 40) || 'List');
+      r.append(el('td', 'rw-td-when', kind));
+      r.append(el('td', 'rw-td-actions rw-td-dim', row.id != null ? String(row.id) : '—'));
+      tbody.append(r);
+    }
+    table.append(thead, tbody);
+    return el('div', 'rw-body', table);
+  }
+
+  /* ---------- doctor ---------- */
+  function renderDoctor(p, value) {
+    const body = el('div', 'rw-body');
+    const summary = el('div', 'rw-doctor-summary');
+    const access = isObject(value.access) && isObject(value.access.effective) ? value.access.effective : null;
+    if (access) summary.append(el('span', access.ready ? 'rw-status-ok' : 'rw-status-fail', (access.ready ? 'Ready' : 'Not ready') + ' · ' + safeText(access.route, 40)));
+    if (Number.isFinite(value.failures)) summary.append(el('span', value.failures ? 'rw-status-fail' : null, value.failures + (value.failures === 1 ? ' failure' : ' failures')));
+    if (Number.isFinite(value.warnings)) summary.append(el('span', value.warnings ? 'rw-status-warn' : null, value.warnings + (value.warnings === 1 ? ' warning' : ' warnings')));
+    body.append(summary);
+    const checks = Array.isArray(value.checks) ? value.checks.filter(isObject) : [];
+    if (checks.length) {
+      const table = el('table', 'rw-table');
+      const tbody = el('tbody');
+      for (const check of checks) {
+        const status = safeText(check.status, 10).toLowerCase();
+        const tr = el('tr');
+        tr.append(el('td', 'rw-td-when rw-status-' + (status === 'ok' ? 'ok' : status === 'warn' ? 'warn' : 'fail'), status.toUpperCase()));
+        const cell = el('div', 'rw-titlecell', el('div', 'rw-title', safeText(check.name, 60)), el('div', 'rw-sub', safeText(check.detail, 400)));
+        if (check.fix) cell.append(el('div', 'rw-fix', safeText(check.fix, 600)));
+        tr.append(el('td', null, cell));
+        tbody.append(tr);
+      }
+      table.append(tbody); body.append(table);
+    }
+    return body;
+  }
+
+  /* ---------- generic summary ---------- */
+  const HIDDEN_KEYS = /(?:argv|stderr|stdout|executable|command|path|token|secret|password|credential|deeplink)/i;
+  function safeLabel(key) {
+    if (typeof key !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) || HIDDEN_KEYS.test(key)) return null;
+    return key.replace(/[_-]+/g, ' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/^./, c => c.toUpperCase());
+  }
+  function renderSummary(p, value) {
+    const wrap = el('div', 'rw-summary');
+    const facts = el('div', 'rw-facts');
+    let count = 0;
+    const visit = (object) => {
+      for (const [key, raw] of Object.entries(object)) {
+        const label = safeLabel(key); if (!label) continue;
+        let text = '';
+        if (raw === null || typeof raw !== 'object') text = safeText(raw, 600);
+        else if (Array.isArray(raw)) text = raw.every(v => v === null || typeof v !== 'object') ? raw.map(v => safeText(v, 80)).filter(Boolean).join(', ') : raw.length + (raw.length === 1 ? ' item' : ' items');
+        else { const scalars = Object.entries(raw).filter(([k, v]) => safeLabel(k) && (v === null || typeof v !== 'object')).map(([k, v]) => safeLabel(k) + ': ' + safeText(v, 80)); text = scalars.slice(0, 6).join('\n'); }
+        if (!text) continue;
+        facts.append(el('div', 'rw-fact', el('span', 'rw-fact-label', label), el('span', 'rw-fact-value', text)));
+        if (++count >= 24) break;
+      }
+    };
+    if (isObject(value)) visit(value);
+    if (!count) return renderEmpty(p, 'Completed', 'Nothing to show.');
+    wrap.append(facts);
+    return el('div', 'rw-body', wrap);
+  }
+
+  /* ---------- empty + error ---------- */
+  function renderEmpty(p, title, sub) {
+    const box = el('div', 'rw-empty');
+    const icon = el('div', 'rw-empty-icon'); icon.append(I.emptyCheck());
+    box.append(icon, el('div', 'rw-empty-title', title), el('div', 'rw-empty-sub', sub));
+    return el('div', 'rw-body', box);
+  }
+  function renderError(p) {
+    const error = isObject(p.error) ? p.error : {};
+    const box = el('div', 'rw-error');
+    const icon = el('div', 'rw-error-icon'); icon.append(I.alert());
+    const main = el('div', null, el('div', 'rw-error-title', p.toolTitle + ' couldn’t complete'));
+    const message = safeText(error.message, 800);
+    if (message) main.append(el('div', 'rw-error-sub', message));
+    const code = safeText(error.code, 60);
+    if (code) main.append(el('div', 'rw-code', code));
+    box.append(icon, main);
+    return el('div', 'rw-body', box);
+  }
+
+  const REMINDER_KEYS = ['id', 'title', 'list'];
+  const looksLikeReminders = (rows) => Array.isArray(rows) && rows.length > 0 && rows.every(r => isObject(r) && REMINDER_KEYS.every(k => k in r));
+
+  function mount(root, p) {
+    root.textContent = '';
+    const card = el('div', 'rw');
+    const shell = el('div', 'rw-card');
+    if (typeof p.accent === 'string' && /^#[0-9a-f]{6}$/i.test(p.accent)) shell.style.setProperty('--accent', p.accent);
+    shell.append(el('div', 'rw-accent'));
+    let status = p.status === 'failed' ? 'failed' : 'success';
+    let body; let count = null;
+    const value = p.value;
+    const items = isObject(value) && Array.isArray(value.items) ? value.items.filter(isObject) : null;
+    let profile = p.profile;
+    if (profile === 'generic' || !profile) {
+      if (items && looksLikeReminders(items)) profile = 'reminders';
+      else if (isObject(value) && CHANGE_TITLES[safeText(value.status, 40).toLowerCase()]) profile = 'change';
+      else if (isObject(value) && Array.isArray(value.checks) && 'ok' in value) profile = 'doctor';
+      else if (isObject(value) && REMINDER_KEYS.every(k => k in value) && !items) profile = 'reminder';
+      else profile = 'generic';
+    }
+    if (p.status === 'failed') body = renderError(p);
+    else if (profile === 'reminders') {
+      count = items ? items.length : 0;
+      body = items && items.length ? renderReminderRows(p, items) : renderEmpty(p, 'Nothing here', p.toolTitle + ' found no reminders.');
+    } else if (profile === 'reminder') body = isObject(value) ? renderRecord(p, value) : renderEmpty(p, 'Nothing here', 'No reminder returned.');
+    else if (profile === 'change') {
+      const change = isObject(value) ? renderChange(p, value) : { node: renderEmpty(p, 'Done', ''), warning: false };
+      body = change.node; if (change.warning || safeText(value && value.status).toLowerCase() === 'partial') status = 'warning';
+    } else if (profile === 'lists') {
+      count = items ? items.length : 0;
+      body = items && items.length ? renderLists(p, items) : renderEmpty(p, 'No lists', 'Reminders has no lists to show.');
+    } else if (profile === 'doctor') {
+      body = isObject(value) ? renderDoctor(p, value) : renderSummary(p, value);
+      if (isObject(value) && value.ok === false) status = 'failed'; else if (isObject(value) && value.warnings > 0) status = 'warning';
+    } else body = renderSummary(p, value);
+
+    shell.dataset.status = status;
+    const header = el('div', 'rw-header', el('div', 'rw-title-group', el('span', 'rw-tool', p.toolTitle),
+      el('span', 'rw-chip', status === 'failed' ? 'Failed' : status === 'warning' ? 'Completed with warnings' : 'Success')));
+    if (count != null) header.append(el('span', 'rw-count', count + (count === 1 ? ' item' : ' items')));
+    shell.append(header, body);
+    if (p.onRunAgain) {
+      const footer = el('div', 'rw-footer');
+      const again = el('button', 'rw-footbtn', 'Run again'); again.type = 'button';
+      again.addEventListener('click', () => { again.disabled = true; Promise.resolve(p.onRunAgain()).finally(() => { again.disabled = false; }); });
+      footer.append(again);
+      shell.append(footer);
+    }
+    card.append(shell);
+    root.append(card);
+  }
+
+  return { mount };
+})();
+</script>
+
+<script id="remctl-transport">/* ════════════════════════════════════════════════════════════════════════
+   TRANSPORT — MCP Apps host bridge, raw JSON-RPC 2.0 over postMessage.
+   The view initiates ui/initialize; the host streams tool-input and
+   tool-result; widget actions ride host-proxied tools/call.
+   ════════════════════════════════════════════════════════════════════════ */
+(() => {
+"use strict";
+const PROTOCOL_VERSION = "2026-01-26";
+const UI_META_KEY = "net.macstories.remctl/ui";
+const rootEl = document.getElementById("rw-root");
+const documentRoot = document.documentElement;
+const hostFontStyle = document.createElement("style");
+hostFontStyle.id = "rw-host-fonts";
+document.head.append(hostFontStyle);
+
+let nextID = 1;
+const pending = new Map();
+const appliedStyleVariables = new Set();
+const state = { result: null, toolInput: {}, hostCapabilities: {}, hostContext: {}, initialized: false, tornDown: false };
+let resizeObserver = null;
+let lastReportedSize = null;
+
+// Standardized MCP Apps style variables only; arbitrary custom properties from
+// an untrusted host message are ignored.
+const HOST_STYLE_VARIABLES = new Set([
+  "--color-background-primary", "--color-background-secondary", "--color-background-tertiary", "--color-background-inverse",
+  "--color-background-ghost", "--color-background-info", "--color-background-danger", "--color-background-success",
+  "--color-background-warning", "--color-background-disabled",
+  "--color-text-primary", "--color-text-secondary", "--color-text-tertiary", "--color-text-inverse", "--color-text-ghost",
+  "--color-text-info", "--color-text-danger", "--color-text-success", "--color-text-warning", "--color-text-disabled",
+  "--color-border-primary", "--color-border-secondary", "--color-border-tertiary", "--color-border-inverse",
+  "--color-border-ghost", "--color-border-info", "--color-border-danger", "--color-border-success", "--color-border-warning",
+  "--color-border-disabled", "--color-ring-primary", "--color-ring-secondary", "--color-ring-inverse", "--color-ring-info",
+  "--color-ring-danger", "--color-ring-success", "--color-ring-warning",
+  "--font-sans", "--font-mono", "--font-weight-normal", "--font-weight-medium", "--font-weight-semibold", "--font-weight-bold",
+  "--font-text-xs-size", "--font-text-sm-size", "--font-text-md-size", "--font-text-lg-size", "--font-text-xs-line-height",
+  "--font-text-sm-line-height", "--font-text-md-line-height", "--font-text-lg-line-height",
+  "--border-radius-xs", "--border-radius-sm", "--border-radius-md", "--border-radius-lg", "--border-radius-xl",
+  "--border-radius-full", "--border-width-regular", "--shadow-hairline", "--shadow-sm", "--shadow-md", "--shadow-lg"
+]);
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+function isValidRPCID(value) { return typeof value === "string" || (typeof value === "number" && Number.isSafeInteger(value)); }
+function isJSONValue(value, ancestors = new Set()) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (!Array.isArray(value) && !isPlainObject(value)) return false;
+  if (ancestors.has(value)) return false;
+  ancestors.add(value);
+  try { return (Array.isArray(value) ? value : Object.values(value)).every(item => isJSONValue(item, ancestors)); }
+  catch (_) { return false; } finally { ancestors.delete(value); }
+}
+
+const post = (message) => { if (state.tornDown) return false; window.parent.postMessage(message, "*"); return true; };
+function request(method, params, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    if (state.tornDown) { reject(new Error("view torn down")); return; }
+    const id = nextID++;
+    const timer = setTimeout(() => { if (pending.delete(id)) reject(new Error("timeout")); }, timeoutMs);
+    pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v); }, reject: (e) => { clearTimeout(timer); reject(e); } });
+    if (!post({ jsonrpc: "2.0", id, method, params })) { pending.delete(id); clearTimeout(timer); reject(new Error("view torn down")); }
+  });
+}
+const notify = (method, params) => post({ jsonrpc: "2.0", method, params: params || {} });
+function rejectPending(reason) { for (const [id, waiter] of pending) { pending.delete(id); waiter.reject(reason); } }
+function jsonRPCError(id, code, message) { post({ jsonrpc: "2.0", id, error: { code, message } }); }
+
+function validToolResult(result) {
+  if (!isPlainObject(result)) return false;
+  const has = (key) => Object.prototype.hasOwnProperty.call(result, key);
+  if (!has("content") || !Array.isArray(result.content) || !isJSONValue(result.content)) return false;
+  if (has("structuredContent") && !isJSONValue(result.structuredContent)) return false;
+  if (has("_meta") && (!isPlainObject(result._meta) || !isJSONValue(result._meta))) return false;
+  if (has("isError") && typeof result.isError !== "boolean") return false;
+  return true;
+}
+
+function handleHostMessage(event) {
+  if (event.source !== window.parent) return;
+  const msg = event.data;
+  if (!isPlainObject(msg) || msg.jsonrpc !== "2.0") return;
+  const hasResult = Object.prototype.hasOwnProperty.call(msg, "result");
+  const hasError = Object.prototype.hasOwnProperty.call(msg, "error");
+  if (isValidRPCID(msg.id) && hasResult !== hasError) {
+    const waiter = pending.get(msg.id);
+    if (waiter) {
+      pending.delete(msg.id);
+      if (hasError) waiter.reject(new Error(isPlainObject(msg.error) && typeof msg.error.message === "string" ? msg.error.message : "Host request failed"));
+      else waiter.resolve(msg.result);
+    }
+    return;
+  }
+  if (typeof msg.method !== "string") return;
+  switch (msg.method) {
+    case "ui/notifications/tool-input":
+      if (!isPlainObject(msg.params) || !isPlainObject(msg.params.arguments)) return;
+      state.toolInput = msg.params.arguments;
+      break;
+    case "ui/notifications/tool-input-partial":
+      break;
+    case "ui/notifications/tool-result":
+      if (!validToolResult(msg.params)) return;
+      state.result = msg.params;
+      renderResult();
+      break;
+    case "ui/notifications/tool-cancelled": {
+      if (msg.params !== undefined && !isPlainObject(msg.params)) return;
+      const waiting = document.createElement("div");
+      waiting.className = "rw-waiting"; waiting.textContent = "Cancelled";
+      rootEl.replaceChildren(waiting);
+      break;
+    }
+    case "ui/notifications/host-context-changed":
+      if (!isPlainObject(msg.params)) return;
+      applyHostContext(isPlainObject(msg.params.hostContext) ? msg.params.hostContext : msg.params);
+      break;
+    case "ui/resource-teardown":
+      if (!isValidRPCID(msg.id)) return;
+      post({ jsonrpc: "2.0", id: msg.id, result: {} });
+      state.tornDown = true;
+      rejectPending(new Error("view torn down"));
+      if (resizeObserver) resizeObserver.disconnect();
+      window.removeEventListener("message", handleHostMessage);
+      break;
+    case "ping":
+      if (isValidRPCID(msg.id)) post({ jsonrpc: "2.0", id: msg.id, result: {} });
+      break;
+    default:
+      if (isValidRPCID(msg.id)) jsonRPCError(msg.id, -32601, "Method not found.");
+  }
+}
+window.addEventListener("message", handleHostMessage);
+
+function mergeContext(base, patch) {
+  const merged = isPlainObject(base) ? { ...base } : {};
+  for (const [key, value] of Object.entries(patch || {})) merged[key] = isPlainObject(value) && isPlainObject(merged[key]) ? mergeContext(merged[key], value) : value;
+  return merged;
+}
+function finitePixels(value) { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(value, 100000) + "px" : ""; }
+function applyHostContext(patch) {
+  if (!isPlainObject(patch)) return;
+  state.hostContext = mergeContext(state.hostContext, patch);
+  const ctx = state.hostContext;
+  if (ctx.theme === "dark" || ctx.theme === "light") documentRoot.dataset.rwTheme = ctx.theme;
+  const variables = isPlainObject(ctx.styles) && isPlainObject(ctx.styles.variables) ? ctx.styles.variables : {};
+  for (const key of appliedStyleVariables) documentRoot.style.removeProperty(key);
+  appliedStyleVariables.clear();
+  for (const [key, value] of Object.entries(variables)) {
+    if (!HOST_STYLE_VARIABLES.has(key) || typeof value !== "string" || value.length > 4096) continue;
+    documentRoot.style.setProperty(key, value); appliedStyleVariables.add(key);
+  }
+  const css = isPlainObject(ctx.styles) && isPlainObject(ctx.styles.css) ? ctx.styles.css : {};
+  hostFontStyle.textContent = typeof css.fonts === "string" && css.fonts.length <= 20000 ? css.fonts : "";
+  const dimensions = isPlainObject(ctx.containerDimensions) ? ctx.containerDimensions : {};
+  documentRoot.style.maxWidth = finitePixels(dimensions.maxWidth);
+  documentRoot.style.maxHeight = finitePixels(dimensions.maxHeight);
+  const safeArea = isPlainObject(ctx.safeAreaInsets) ? ctx.safeAreaInsets : {};
+  for (const edge of ["top", "right", "bottom", "left"]) documentRoot.style.setProperty("--rw-safe-" + edge, finitePixels(safeArea[edge]) || "0px");
+  if (typeof ctx.displayMode === "string") documentRoot.dataset.rwDisplayMode = ctx.displayMode;
+}
+const canCallServerTools = () => isPlainObject(state.hostCapabilities.serverTools);
+const canOpenLinks = () => isPlainObject(state.hostCapabilities.openLinks);
+
+(function boot() {
+  pending.set(0, {
+    resolve: (result) => {
+      if (!isPlainObject(result)) return;
+      state.hostCapabilities = isPlainObject(result.hostCapabilities) ? result.hostCapabilities : {};
+      applyHostContext(result.hostContext);
+      state.initialized = true;
+      notify("ui/notifications/initialized");
+      if (state.result) renderResult();
+    },
+    reject: () => { /* standalone preview: no host */ }
+  });
+  post({ jsonrpc: "2.0", id: 0, method: "ui/initialize",
+    params: { appInfo: { name: "RemCTL Reminders", version: "2.0.0" }, appCapabilities: {}, protocolVersion: PROTOCOL_VERSION } });
+})();
+
+function reportSize() {
+  if (!state.initialized || state.tornDown) return;
+  const rect = documentRoot.getBoundingClientRect();
+  const width = Math.ceil(rect.width), height = Math.ceil(rect.height);
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return;
+  const size = width + "x" + height;
+  if (size === lastReportedSize) return;
+  lastReportedSize = size;
+  notify("ui/notifications/size-changed", { width, height });
+}
+resizeObserver = new ResizeObserver(reportSize);
+resizeObserver.observe(document.body);
+
+function firstText(result) {
+  const block = Array.isArray(result.content) ? result.content.find(item => isPlainObject(item) && item.type === "text" && typeof item.text === "string") : null;
+  return block ? block.text : "";
+}
+function resultValue(result) {
+  if (Object.prototype.hasOwnProperty.call(result, "structuredContent")) return result.structuredContent;
+  try { return JSON.parse(firstText(result)); } catch (_) { return { output: firstText(result) }; }
+}
+function substituteArguments(value, row, inputs) {
+  const primitive = (v) => v !== undefined && v !== null && typeof v !== "object";
+  if (typeof value === "string") {
+    return value.replace(/\{([A-Za-z0-9_.]+)\}/g, (m, field) => {
+      if (field.startsWith("input.")) { const v = (inputs || {})[field.slice(6)]; return primitive(v) ? String(v) : m; }
+      return primitive(row[field]) ? String(row[field]) : m;
+    });
+  }
+  if (Array.isArray(value)) return value.map(v => substituteArguments(v, row, inputs));
+  if (value && typeof value === "object") { const out = {}; for (const k of Object.keys(value)) out[k] = substituteArguments(value[k], row, inputs); return out; }
+  return value;
+}
+
+function renderResult() {
+  const result = state.result || {};
+  const meta = isPlainObject(result._meta) && isPlainObject(result._meta[UI_META_KEY]) ? result._meta[UI_META_KEY] : {};
+  const value = resultValue(result);
+  const failed = result.isError === true;
+  const error = failed && isPlainObject(value) && isPlainObject(value.error) ? value.error : (failed ? { message: firstText(result) } : null);
+  const actions = canCallServerTools() && Array.isArray(meta.actions) ? meta.actions.filter(isPlainObject) : [];
+  RemCTLWidget.mount(rootEl, {
+    toolTitle: typeof meta.toolTitle === "string" ? meta.toolTitle : "RemCTL",
+    toolName: typeof meta.toolName === "string" ? meta.toolName : null,
+    status: failed ? "failed" : "success",
+    profile: typeof meta.profile === "string" ? meta.profile : "generic",
+    accent: typeof meta.accent === "string" ? meta.accent : null,
+    value, error, actions,
+    canAct: actions.length > 0,
+    onAction: (action, row, inputs) => request("tools/call", { name: action.toolName, arguments: substituteArguments(action.arguments, row, inputs) })
+      .then((r) => {
+        if (r && r.isError === true) {
+          let message = "The action could not be completed.";
+          try { const parsed = JSON.parse(firstText(r)); if (parsed && parsed.error && typeof parsed.error.message === "string") message = parsed.error.message; } catch (_) {}
+          throw new Error(message);
+        }
+      }),
+    onRunAgain: canCallServerTools() && typeof meta.toolName === "string"
+      ? () => request("tools/call", { name: meta.toolName, arguments: state.toolInput || {} }).then(r => { if (validToolResult(r)) { state.result = r; renderResult(); } })
+      : null,
+    onOpenLink: canOpenLinks() ? (url) => request("ui/open-link", { url }) : null
+  });
+  reportSize();
+}
+})();
+</script>
+</body>
+</html>
