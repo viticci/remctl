@@ -101,6 +101,7 @@ The guarded, identity-checked uninstaller checks `~/bin` and `~/.local/bin` by d
 | Create and edit | `add`, `edit`, `reminder-move`, `done`, `undone`, `delete`, `flag`, `unflag` |
 | Organize | `list-symbols`, `list-create`, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, `section-create`, `section-rename`, `section-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete`, `sections`, `tags` |
 | Share data | `export`, `import`, `link`, `open`, `--json`, `--format table` on tabular read commands |
+| Work across accounts | `accounts`, `config`, `--all-accounts` and `--account NAME` on read and write commands |
 | Set up the Mac | `onboard`, `permissions`, `doctor`, `setup`, `completion` |
 
 Common examples:
@@ -155,7 +156,12 @@ remctl list-edit Projects --private --color orange --symbol education3
 remctl list-pin "Project X" --private
 remctl list-rename --list-id 123 --new-name "Project X Archive"
 remctl info 23880 --json
+remctl accounts
+remctl today --all-accounts
+remctl add "Send invoice" -l Projects --account Exchange
 ```
+
+RemCTL works across every Reminders account on the Mac — iCloud, Exchange, Google, other CalDAV, and on-device local. See [Multiple Accounts](#multiple-accounts) below.
 
 The full command guide is in [docs/commands.md](docs/commands.md). For smart lists specifically, start with [Smart Lists in the command guide](docs/commands.md#smart-lists), then read [Private Metadata Writes: Smart List Examples](docs/private-metadata.md#smart-list-examples) for the ReminderKit write path, guardrails, and implementation notes. Template commands are covered in [docs/commands.md#templates](docs/commands.md#templates) and [docs/private-metadata.md#template-examples](docs/private-metadata.md#template-examples).
 
@@ -166,6 +172,72 @@ The full command guide is in [docs/commands.md](docs/commands.md). For smart lis
 Due dates are atomic. If `-d/--due` is present and RemCTL cannot parse it, the command fails before creating or editing anything. Supported deterministic forms include `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `today at 3pm`, `tomorrow 09:30`, `tonight at 11`, `Friday at 15:00`, `next friday at 3pm`, `+3d`, `eod`, and `eow`. In create mode, date-only forms such as `today`, `tomorrow`, `YYYY-MM-DD`, `+3d`, and `next friday` create all-day reminders; forms with explicit times create timed reminders.
 
 Recurrence, normal alarm, and priority inputs are also validated before writes. Supported recurrence forms are `daily`, `weekly`, `monthly`, `yearly`, `weekly mon,wed,fri`, and `monthly 1,15`. An optional `xN` interval token (1–999) follows the frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. Monthly rules can also pin a weekday to a week of the month: `monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri` (alias of `-1-fri`), down to `-5-fri`. Ordinal suffixes are checked, so `4st-fri` is rejected; week-pinned days cannot be mixed with plain day-of-month numbers, and they are monthly-only. Use `last-fri` rather than `5th-fri` for "the last Friday": EventKit skips months that have no fifth Friday. `upcoming DAYS` requires a positive range from 1 to 3650 days.
+
+## Multiple Accounts
+
+Reminders keeps a **separate database per connected account**, and RemCTL's core reads the single live one — so an Exchange, Google, or other CalDAV account is invisible to it, and writes go to iCloud. The optional `remctl_accounts.py` extension makes every account Reminders knows about a first-class target.
+
+```bash
+remctl accounts                          # what's connected, and which is default
+remctl lists --all-accounts              # every account, grouped by account
+remctl today --account Exchange          # scope one command to one account
+remctl --account Exchange lists          # the flag works before the command too
+remctl add "Send invoice" -l Projects --account "work@example.com"
+remctl done 42 --account Exchange
+```
+
+**Nothing changes until you ask for it.** With no `--account`, no `--all-accounts`, no `REMCTL_ACCOUNT_SCOPE`, and no stored `accountScope`, every command behaves exactly as it does without the extension installed — same output, same code path. Delete `remctl_accounts.py` and RemCTL is stock.
+
+Set a persistent default when you'd rather not pass a flag each time:
+
+```bash
+remctl config accountScope all            # default to every account
+remctl config accountScope Exchange       # default to one account
+remctl config accountScope ""             # back to the single default account
+export REMCTL_ACCOUNT_SCOPE=all           # or just for this shell
+```
+
+`remctl config` also exposes `storeDir` (point RemCTL at a different Reminders Stores directory) and `dbPath` (pin one specific store file).
+
+### What you get across accounts
+
+Read commands — `lists`, `groups`, `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, `sections`, `sharees`, `tags`, `smart-lists`, `templates`, `stats` — run against each account in scope and merge the results. Human output groups items under bold per-account headers; JSON adds `account` and `accountType` to every item so agents can tell sources apart; `stats` reports per-account figures plus a combined total.
+
+Because these are reads, a list name that exists in more than one account is not an error — you get each match in turn:
+
+```text
+$ remctl show Projects --all-accounts
+  work@example.com
+Projects:
+[ ] #44 Draft the Q3 summary
+
+  personal@example.com
+Projects:
+[ ] #12 Renew passport
+```
+
+Accounts that don't have the list are skipped silently rather than reporting "not found"; if *no* account has it, the command errors and exits non-zero as usual.
+
+Commands that **act** on a single thing — `add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`, `info`, `subtasks`, `open`, `link`, `list-edit`, `list-delete`, `section-create` — resolve the account themselves, so `remctl done 42` works wherever reminder 42 lives. Here an ambiguous target *is* refused, because acting on the wrong account's copy is not recoverable:
+
+```text
+$ remctl done 42 --all-accounts
+Error: reminder id 42 exists in multiple accounts (work@example.com, personal@example.com). Use --account to specify which one.
+```
+
+On these commands `--all-accounts` means "search every account to resolve this target".
+
+`export` and `import` stay single-account by design, since IDs collide across accounts.
+
+### Account types
+
+`remctl accounts` reports each account's type. Types come from EventKit where it names a concrete kind (Exchange and friends), falling back to a local heuristic otherwise — EventKit reports both iCloud and Google as plain `CalDAV`, so the more specific label wins. Account *discovery* is type-agnostic: it enumerates every account store, so any account type Reminders supports is found.
+
+### Reminders outside iCloud
+
+Only iCloud reminders carry a CloudKit identifier, and core refuses to modify a reminder without one rather than risk matching by title — which would otherwise make every Exchange and Google reminder read-only. When you target an account explicitly, RemCTL resolves the reminder's real EventKit identifier so ordinary writes work. One caveat: that lookup matches on list plus title, so a list holding two identically-titled reminders resolves to the first.
+
+Multi-account writes need the current bridge, so recompile with `./install.sh` after updating. Details and the maintainer-facing integration contract are in [docs/multi-account.md](docs/multi-account.md); command syntax is in [Multi-Account in the command guide](docs/commands.md#multi-account).
 
 ## Assignees
 
@@ -473,6 +545,7 @@ remctl doctor --for-agent --json
 
 - [Installation and onboarding](docs/installation.md)
 - [Command guide](docs/commands.md)
+- [Multiple accounts](docs/multi-account.md)
 - [Smart-list command syntax](docs/commands.md#smart-lists)
 - [Template command syntax](docs/commands.md#templates)
 - [Private metadata writes](docs/private-metadata.md)

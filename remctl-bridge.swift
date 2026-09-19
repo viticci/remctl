@@ -10,6 +10,8 @@ struct Command: Decodable {
     let title: String?
     let newTitle: String?
     let list: String?
+    let calendarIdentifier: String?  // stable EKCalendar.calendarIdentifier; preferred over list name
+    let account: String?              // EKSource.title hint for disambiguating same-name lists
     let listId: String?
     let due: String?
     let priority: Int?
@@ -237,6 +239,19 @@ func findReminder(_ store: EKEventStore, id: String) -> EKReminder {
     return item
 }
 
+func sourceTypeName(_ type: EKSourceType?) -> String? {
+    guard let type = type else { return nil }
+    switch type {
+    case .local:       return "Local"
+    case .exchange:    return "Exchange"
+    case .calDAV:      return "CalDAV"
+    case .mobileMe:    return "MobileMe"
+    case .subscribed:  return "Subscribed"
+    case .birthdays:   return "Birthdays"
+    default:           return nil
+    }
+}
+
 func normalizedReminderKitListIdentifier(_ raw: String) -> String {
     raw
         .replacingOccurrences(of: "x-apple-reminderkit://REMCDList/", with: "", options: [.caseInsensitive])
@@ -290,6 +305,67 @@ func findList(_ store: EKEventStore, name: String? = nil, listId: String? = nil)
     fail("iCloud Reminders list not found: \(name)")
 }
 
+// Multi-account resolver. Delegates to findList() above -- byte-for-byte
+// upstream -- whenever no account is being targeted, so the default
+// single-account path and its iCloud-only restriction are unchanged.
+func findListScoped(_ store: EKEventStore,
+                    calendarIdentifier: String? = nil,
+                    name: String? = nil,
+                    listId: String? = nil,
+                    account: String? = nil) -> EKCalendar {
+    let wantsScope = !(calendarIdentifier ?? "").isEmpty || !(account ?? "").isEmpty
+    guard wantsScope else {
+        return findList(store, name: name, listId: listId)
+    }
+
+    let calendars = store.calendars(for: .reminder)
+
+    // Prefer the stable EKCalendar identifier when the caller resolved one.
+    if let cid = calendarIdentifier, !cid.isEmpty {
+        if let cal = store.calendar(withIdentifier: cid) {
+            return cal
+        }
+        if (name ?? "").isEmpty && (listId ?? "").isEmpty {
+            fail("Reminders list not found for calendarIdentifier: \(cid)")
+        }
+    }
+
+    // ReminderKit list id, unrestricted by source when a scope was requested.
+    if let rawListId = listId, !rawListId.isEmpty {
+        let wanted = normalizedReminderKitListIdentifier(rawListId)
+        let matches = calendars.filter {
+            normalizedReminderKitListIdentifier($0.calendarIdentifier).caseInsensitiveCompare(wanted) == .orderedSame
+        }
+        if matches.count == 1 { return matches[0] }
+        if matches.count > 1 {
+            fail("Multiple EventKit reminder lists match id \(wanted)")
+        }
+        if (name ?? "").isEmpty {
+            fail("Reminders list not found for id: \(wanted)")
+        }
+    }
+
+    guard let name = name, !name.isEmpty else {
+        fail("List name or listId is required")
+    }
+
+    // Account-scoped lookup spans every connected account, not just iCloud.
+    if let account = account, !account.isEmpty {
+        let accountMatches = calendars.filter { $0.title == name && $0.source?.title == account }
+        if accountMatches.count == 1 { return accountMatches[0] }
+        if accountMatches.count > 1 {
+            fail("Ambiguous list '\(name)' in account '\(account)': \(accountMatches.count) matches")
+        }
+        let titleMatches = calendars.filter { $0.title == name }
+        if titleMatches.isEmpty { fail("List not found: \(name)") }
+        let sourceNames = titleMatches.compactMap { $0.source?.title }.joined(separator: ", ")
+        fail("List '\(name)' not found in account '\(account)' (found in: \(sourceNames))")
+    }
+
+    // calendarIdentifier was supplied but did not resolve; fall back to core.
+    return findList(store, name: name, listId: listId)
+}
+
 func defaultICloudReminderList(_ store: EKEventStore) -> EKCalendar {
     if let cal = store.defaultCalendarForNewReminders(), isICloudReminderSource(cal.source) {
         return cal
@@ -300,7 +376,10 @@ func defaultICloudReminderList(_ store: EKEventStore) -> EKCalendar {
 func applyFields(_ reminder: EKReminder, _ cmd: Command, store: EKEventStore) {
     if let t = cmd.title { reminder.title = t }
 
-    if let list = cmd.list {
+    if cmd.calendarIdentifier != nil || cmd.account != nil {
+        reminder.calendar = findListScoped(store, calendarIdentifier: cmd.calendarIdentifier,
+                                           name: cmd.list, listId: cmd.listId, account: cmd.account)
+    } else if let list = cmd.list {
         reminder.calendar = findList(store, name: list, listId: cmd.listId)
     } else if let listId = cmd.listId {
         reminder.calendar = findList(store, listId: listId)
@@ -690,7 +769,10 @@ case "create":
     guard let title = cmd.title, !title.isEmpty else { fail("title is required for create") }
     let reminder = EKReminder(eventStore: store)
     reminder.title = title
-    if let list = cmd.list {
+    if cmd.calendarIdentifier != nil || cmd.account != nil {
+        reminder.calendar = findListScoped(store, calendarIdentifier: cmd.calendarIdentifier,
+                                           name: cmd.list, listId: cmd.listId, account: cmd.account)
+    } else if let list = cmd.list {
         reminder.calendar = findList(store, name: list, listId: cmd.listId)
     } else if let listId = cmd.listId {
         reminder.calendar = findList(store, listId: listId)
@@ -767,15 +849,62 @@ case "flag", "unflag":
     // callers use AppleScript or remctl-private set_flagged.
     fail("EventKit cannot set the real flagged state; use the AppleScript path or remctl-private set_flagged")
 
+case "find_reminder":
+    // Find a reminder by title within a specific calendar and return its calendarItemIdentifier.
+    // Used to obtain a stable EventKit identifier for reminders (e.g. Exchange) that have no
+    // ZCKIDENTIFIER in the CoreData store.
+    guard let calId = cmd.calendarIdentifier else { fail("find_reminder: calendarIdentifier required") }
+    guard let searchTitle = cmd.title else { fail("find_reminder: title required") }
+    guard let cal = store.calendar(withIdentifier: calId) else { fail("Calendar not found: \(calId)") }
+    let predicate = store.predicateForReminders(in: [cal])
+    let sem = DispatchSemaphore(value: 0)
+    var found: EKReminder? = nil
+    store.fetchReminders(matching: predicate) { items in
+        found = items?.first(where: { $0.title == searchTitle && !$0.isCompleted })
+               ?? items?.first(where: { $0.title == searchTitle })
+        sem.signal()
+    }
+    sem.wait()
+    guard let reminder = found else { fail("Reminder not found: \(searchTitle)") }
+    let result: [String: Any] = ["calendarItemIdentifier": reminder.calendarItemIdentifier]
+    if let data = try? JSONSerialization.data(withJSONObject: result),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+    exit(0)
+
+case "list_calendars":
+    let cals = store.calendars(for: .reminder).map { cal -> [String: Any] in
+        var entry: [String: Any] = [
+            "title":              cal.title,
+            "calendarIdentifier": cal.calendarIdentifier,
+        ]
+        if let sourceTitle = cal.source?.title { entry["sourceTitle"] = sourceTitle }
+        if let typeName = sourceTypeName(cal.source?.sourceType) { entry["sourceType"] = typeName }
+        return entry
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: cals),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+    exit(0)
+
 case "create_list":
     guard let title = cmd.title, !title.isEmpty else { fail("title is required for create_list") }
     let cal = EKCalendar(for: .reminder, eventStore: store)
     cal.title = title
-    // Use the local/iCloud source for reminders
-    guard let source = store.sources.first(where: { isICloudReminderSource($0) }) else {
-        fail("No iCloud Reminders source found")
+    if let account = cmd.account {
+        guard let source = store.sources.first(where: { $0.title == account }) else {
+            fail("Account not found: \(account)")
+        }
+        cal.source = source
+    } else {
+        // Default (single-account) path stays iCloud-only.
+        guard let source = store.sources.first(where: { isICloudReminderSource($0) }) else {
+            fail("No iCloud Reminders source found")
+        }
+        cal.source = source
     }
-    cal.source = source
     if let colorName = cmd.color, let cg = colorForName(colorName) {
         cal.cgColor = cg
     }
@@ -789,7 +918,10 @@ case "create_list":
 case "rename_list":
     guard let title = cmd.title else { fail("title is required for rename_list") }
     guard let newTitle = cmd.newTitle else { fail("newTitle is required for rename_list") }
-    let cal = findList(store, name: title, listId: cmd.listId)
+    let cal = (cmd.calendarIdentifier != nil || cmd.account != nil)
+        ? findListScoped(store, calendarIdentifier: cmd.calendarIdentifier,
+                         name: title, listId: cmd.listId, account: cmd.account)
+        : findList(store, name: title, listId: cmd.listId)
     cal.title = newTitle
     do {
         try store.saveCalendar(cal, commit: true)
@@ -800,7 +932,10 @@ case "rename_list":
 
 case "delete_list":
     guard let title = cmd.title else { fail("title is required for delete_list") }
-    let cal = findList(store, name: title, listId: cmd.listId)
+    let cal = (cmd.calendarIdentifier != nil || cmd.account != nil)
+        ? findListScoped(store, calendarIdentifier: cmd.calendarIdentifier,
+                         name: title, listId: cmd.listId, account: cmd.account)
+        : findList(store, name: title, listId: cmd.listId)
     do {
         try store.removeCalendar(cal, commit: true)
         output(["status": "deleted", "title": title])

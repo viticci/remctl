@@ -34,6 +34,15 @@ from remctl_runtime import (
     start_of_day,
     upcoming_window,
 )
+# Optional multi-account extension. RemCTL is fully functional without it;
+# when present it adds --account/--all-accounts and the accounts/config
+# commands on top of the single-account core, without altering core paths.
+try:
+    import remctl_accounts
+    remctl_accounts.bind(globals())
+except ImportError:
+    remctl_accounts = None
+
 from remctl_serialization import (
     DUE_DATE_DELTA_UNITS,
     due_date_delta_alerts_from_row,
@@ -374,7 +383,15 @@ def reminders_db_score(path):
         db_size,
     )
 
+# Extension hook: when set, open_db() delegates to this callable so an
+# extension can point core commands at a different account store. Left as
+# None the behavior below is unchanged.
+_db_opener = None
+
+
 def open_db():
+    if _db_opener is not None:
+        return _db_opener()
     conn = sqlite3.connect(f"file:{find_main_db()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     if not table_exists(conn, "ZREMCDREMINDER"):
@@ -13589,6 +13606,9 @@ def build_parser():
     )
     c.add_argument("shell", nargs="?", default="zsh", choices=["bash", "zsh", "fish"], help="Shell type")
 
+    if remctl_accounts:
+        remctl_accounts.register_cli(p, sub)
+
     return p, sub
 
 
@@ -13725,6 +13745,9 @@ def main():
         "permissions": cmd_permissions,
         "completion": cmd_completion,
     }
+
+    if remctl_accounts:
+        cmds = remctl_accounts.install(cmds, a, sub)
 
     handler = cmds.get(a.cmd)
     if handler:

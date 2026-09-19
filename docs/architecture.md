@@ -44,11 +44,15 @@ The LaunchAgent keeps the signed native host available. The socket parent is own
 
 ## Reads
 
-Direct reads use the iCloud Reminders CoreData store:
+Direct reads use the Reminders CoreData stores. Each account (iCloud, Exchange,
+CalDAV, on-device local) has its own database file in the Stores directory:
 
 ```text
 ~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/Data-*.sqlite
 ```
+
+See [Multi-Account Support](#multi-account-support) for how RemCTL selects among
+and reads across these stores.
 
 This exposes fields EventKit does not expose cleanly for fast list views:
 
@@ -223,6 +227,92 @@ remctl doctor --for-agent
 ```
 
 For an unchanged existing installation, start with `doctor --for-agent --json`. For an upgrade, run `./install.sh` first to publish the updated signed host generation, then run `doctor --for-agent --json`. Rerun `onboard` only when doctor reports host permission trouble. `doctor --for-agent --json` reports the requested mode, direct result, effective route, host permissions, and `fullReady` state.
+
+## Multi-Account Support
+
+macOS Reminders stores each account — iCloud, Exchange, CalDAV, and on-device
+local — in a separate `Data-<uuid>.sqlite` file under the Stores directory.
+RemCTL reads the account name and type directly from each store's CoreData
+metadata so that accounts are identified by the display name Reminders.app
+shows, not by a UUID or file path.
+
+**Account discovery**
+
+`discover_accounts()` (remctl:~280) scans the Stores directory and returns all
+real accounts in descending order by reminder count. Each `Account` namedtuple
+carries `store_path`, `name`, and `type`. The account type is derived from
+`ZREMCDREPLICAMANAGER.ZIDENTIFIER` suffixes:
+
+| Identifier suffix | Type |
+| --- | --- |
+| `com.apple.exchangesync.exchangesyncd` | Exchange |
+| `com.apple.reminders` | iCloud |
+| (none or other) | Local |
+
+Accounts named `LocalInternal` and stores that contain no reminders are
+excluded automatically. The first element of the returned list is always the
+same store that the existing `find_main_db_path()` would have selected, so
+the default single-account behavior is unchanged.
+
+**Default database selection**
+
+`find_main_db_path()` (remctl:~226) picks the store with the most reminder
+rows, using the most-recent file-group modification time (`.sqlite`, `-wal`,
+and `-shm` files) as a tiebreak. This correctly identifies the active iCloud
+store even when a larger but less active Exchange store is present.
+
+**Account scope in commands**
+
+Read commands (`lists`, `show`, `today`, `flagged`, `urgent`, `upcoming`,
+`overdue`, `search`) accept `--all-accounts` and `--account NAME`. Write
+commands (`add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`) accept
+`--account NAME` to target a reminder or list in a specific account when the
+same integer ID (`Z_PK`) exists in more than one store.
+
+Account flags are accepted both before and after the subcommand (the launcher
+skips them when identifying the command), so `remctl --account X today` and
+`remctl today --account X` are equivalent.
+
+`resolve_account_scope()` resolves the active scope from, in priority order:
+`--account`/`--all-accounts` flags, the `REMCTL_ACCOUNT_SCOPE` environment
+variable, the `accountScope` key in `~/.config/remctl/config.json`, and the
+single-account default. When the scope resolves to exactly one account, all
+output is byte-identical to the pre-multi-account behavior — no account labels,
+no extra columns.
+
+**Z_PK collision safety**
+
+`Z_PK` row identifiers are local to each store and are not unique across
+accounts. RemCTL never mixes rows from different stores into a single query
+or join. The `iter_account_dbs()` context manager opens one connection per
+account and keeps them separate through serialization; account metadata is
+stamped onto already-serialized dicts, not injected into SQL queries.
+
+For single-item commands, `_resolve_reminder_for_write()` honors the active
+scope: with one account it reads that store directly; across multiple accounts
+it scans each store for the requested ID, acts on a unique match, and reports an
+ambiguity error when the ID exists in more than one. `resolve_list_ref_across()`
+and `resolve_reminder_across()` provide the same scan-and-disambiguate logic for
+list and reminder references. All three stamp the resolved account back onto the
+request so the write path targets the correct store.
+
+**Writes to non-CloudKit accounts**
+
+The EventKit bridge enumerates calendars from every account, so writes are not
+limited to iCloud. iCloud reminders carry a CloudKit identifier
+(`ZCKIDENTIFIER`) that RemCTL passes straight to the bridge. Exchange and other
+CalDAV reminders do not store that identifier, so `_ek_identifier()` resolves a
+stable EventKit `calendarItemIdentifier` on demand: it asks the bridge
+(`list_calendars`) for the target calendar, then (`find_reminder`) for the
+reminder by title within that calendar. New reminders are likewise created
+against a resolved `calendarIdentifier` rather than a list name, which keeps
+same-named lists in different accounts unambiguous. Because non-iCloud
+reminders have no CloudKit identifier, the numeric ID of a freshly created
+Exchange reminder is recovered by title immediately after creation.
+
+The config file additionally accepts `storeDir` and `dbPath` keys, the
+persistent equivalents of `REMCTL_STORE_DIR` and `REMCTL_DB`; environment
+variables take precedence over the config file.
 
 ## Environment Overrides
 
