@@ -254,6 +254,31 @@ class CapabilityPlannerTests(unittest.TestCase):
                 self.assertEqual(remctl_broker.socket_path(), socket_path)
                 self.assertEqual(remctl_broker.launch_agent_path(), agent_path)
 
+    def test_launch_agent_fallback_ignores_custom_app_prefix(self):
+        # launchd loads per-user agents at login only from ~/Library/LaunchAgents.
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value).resolve()
+            client = root / "bin"
+            app = root / "Applications" / "RemCTL Capability Host.app"
+            client.mkdir()
+            (client / ".remctl-capability-host-app").write_text(str(app) + "\n")
+            with (
+                mock.patch.object(remctl_broker, "CLIENT_ROOT", client),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "REMCTL_CAPABILITY_HOST_APP": "",
+                        "REMCTL_CAPABILITY_HOST_LAUNCH_AGENT": "",
+                    },
+                ),
+            ):
+                self.assertEqual(
+                    remctl_broker.launch_agent_path(),
+                    Path.home()
+                    / "Library/LaunchAgents"
+                    / "net.macstories.remctl.capability-host.plist",
+                )
+
     def test_real_parser_planner_and_server_binding_cover_all_file_surfaces(self):
         parser = remctl_broker._load_real_parser()
         with tempfile.TemporaryDirectory() as temp_value:

@@ -256,16 +256,8 @@ def launch_agent_path() -> Path:
     )
     if installed_agent is not None:
         return installed_agent
-    installed_app = _installed_path_marker(
-        CLIENT_ROOT / ".remctl-capability-host-app",
-        expected_name=APP_NAME,
-    )
-    if installed_app is not None and installed_app.parent.name == "Applications":
-        return (
-            installed_app.parent.parent
-            / "Library/LaunchAgents"
-            / f"{LAUNCH_AGENT_LABEL}.plist"
-        )
+    # launchd loads per-user agents at login only from ~/Library/LaunchAgents,
+    # whatever prefix the app was installed under.
     return Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 
 

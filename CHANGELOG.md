@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The Capability Host LaunchAgent now defaults to `~/Library/LaunchAgents` whatever the `PREFIX`. With a custom prefix such as the documented `PREFIX="$HOME/.local"`, the installer used to write it to `PREFIX/Library/LaunchAgents`, which launchd never loads at login, so the host stopped at the first reboot and every hosted command failed until the job was bootstrapped by hand. Reinstalling with the same `PREFIX` migrates an exact installer-owned plist from the old location, including while the old job is loaded; `uninstall.sh` still finds an unmigrated one. `REMCTL_LAUNCH_AGENT_DIR` still overrides the location.
+
 ## 1.8.0 — 2026-09-04
 
 ### Signed Capability Host

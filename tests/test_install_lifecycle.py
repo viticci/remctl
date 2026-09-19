@@ -323,6 +323,77 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertFalse((self.bin / "reminders").exists())
         self.assertTrue(self.config.is_dir())
 
+    def default_agent_dir_environment(self) -> tuple[dict[str, str], Path]:
+        # Without REMCTL_LAUNCH_AGENT_DIR the LaunchAgent follows HOME, not
+        # PREFIX. Keep HOME inside the temp prefix so tests stay isolated.
+        home = self.prefix / "home"
+        home.mkdir(exist_ok=True)
+        environment = self.environment.copy()
+        del environment["REMCTL_LAUNCH_AGENT_DIR"]
+        environment["HOME"] = str(home)
+        return environment, home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+
+    def test_custom_prefix_launch_agent_defaults_to_home_and_migrates(self) -> None:
+        # launchd loads per-user agents at login only from ~/Library/LaunchAgents.
+        # Earlier installers put the plist below a custom PREFIX instead.
+        self.run_script(INSTALL, "--bootstrap", "--shell-completions", "none")
+        self.assertTrue(self.agent.is_file())
+
+        environment, home_agent = self.default_agent_dir_environment()
+        reinstall = self.run_script(
+            INSTALL, "--bootstrap", "--shell-completions", "none", environment=environment
+        )
+        self.assertIn("Migrated the LaunchAgent", reinstall.stdout)
+        self.assertTrue(home_agent.is_file())
+        self.assertFalse(self.agent.exists())
+        self.assertEqual(
+            (self.app / "Contents" / "Resources" / "remctl-capability-host-launch-agent-path")
+            .read_text()
+            .strip(),
+            str(home_agent),
+        )
+        self.assert_no_backups()
+
+        again = self.run_script(
+            INSTALL, "--bootstrap", "--shell-completions", "none", environment=environment
+        )
+        self.assertNotIn("Migrated the LaunchAgent", again.stdout)
+        self.assertTrue(home_agent.is_file())
+
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(home_agent.exists())
+        self.assertFalse(self.app.exists())
+
+    def test_uninstall_removes_unmigrated_prefix_launch_agent(self) -> None:
+        self.run_script(INSTALL, "--bootstrap", "--shell-completions", "none")
+        environment, home_agent = self.default_agent_dir_environment()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(self.agent.exists())
+        self.assertFalse(home_agent.exists())
+        self.assertFalse(self.app.exists())
+
+    def test_installer_refuses_foreign_prefix_launch_agent_before_publishing(self) -> None:
+        self.agents.mkdir(parents=True)
+        self.agent.write_text("foreign\n")
+        environment, home_agent = self.default_agent_dir_environment()
+        result = self.run_script(
+            INSTALL, "--bootstrap", "--shell-completions", "none", environment=environment, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing to migrate a LaunchAgent", result.stdout)
+        self.assertEqual(self.agent.read_text(), "foreign\n")
+        self.assertFalse(home_agent.exists())
+        self.assertFalse(self.app.exists())
+
+    def test_simulation_refuses_launch_agent_outside_prefix(self) -> None:
+        environment = self.environment.copy()
+        del environment["REMCTL_LAUNCH_AGENT_DIR"]
+        result = self.run_script(
+            INSTALL, "--dry-run", "--shell-completions", "none", environment=environment, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Simulation requires the LaunchAgent directory below PREFIX", result.stdout)
+
     def test_first_install_transport_health_does_not_run_slow_permission_status(self) -> None:
         source = INSTALL.read_text()
         function = source.split("transport_available() {", 1)[1].split("\n}", 1)[0]

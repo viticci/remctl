@@ -36,11 +36,18 @@ PREFIX_WAS_SET=0
 if [[ -n "${PREFIX+x}" ]]; then PREFIX_WAS_SET=1; fi
 PREFIX="${PREFIX:-$HOME}"
 APP_DIR="${REMCTL_APP_DIR:-$PREFIX/Applications}"
-LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$PREFIX/Library/LaunchAgents}"
+LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 APP_PATH="$APP_DIR/RemCTL Capability Host.app"
 HOST_EXECUTABLE="$APP_PATH/Contents/MacOS/RemCTL Capability Host"
 AGENT_LABEL="net.macstories.remctl.capability-host"
 AGENT_PATH="$LAUNCH_AGENT_DIR/$AGENT_LABEL.plist"
+# Earlier installers defaulted the LaunchAgent to PREFIX/Library/LaunchAgents.
+# Remove an install that was never migrated from there.
+LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
+if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$LEGACY_AGENT_PATH" != "$AGENT_PATH" && ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] && \
+    [[ -e "$LEGACY_AGENT_PATH" || -L "$LEGACY_AGENT_PATH" ]]; then
+    AGENT_PATH="$LEGACY_AGENT_PATH"
+fi
 SOCKET_PATH="$PREFIX/Library/Application Support/RemCTL/capability-host.sock"
 SUPPORT_DIR="$(dirname "$SOCKET_PATH")"
 CONFIG_BASE="${XDG_CONFIG_HOME:-$HOME/.config}"

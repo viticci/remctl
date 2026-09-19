@@ -25,7 +25,8 @@ Environment:
   PREFIX                      Install root (default: $HOME)
   REMCTL_BIN_DIR              CLI directory (default: PREFIX/bin)
   REMCTL_APP_DIR              App directory (default: PREFIX/Applications)
-  REMCTL_LAUNCH_AGENT_DIR     LaunchAgent directory (default: PREFIX/Library/LaunchAgents)
+  REMCTL_LAUNCH_AGENT_DIR     LaunchAgent directory (default: $HOME/Library/LaunchAgents,
+                              the only per-user directory launchd loads at login)
   REMCTL_CAPABILITY_PYTHON    Protected Python 3.13+ used by the signed host
   REMCTL_CODESIGN_IDENTITY    Stable signing identity (explicit selection wins)
 
@@ -64,7 +65,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-$HOME}"
 BIN_DIR="${REMCTL_BIN_DIR:-$PREFIX/bin}"
 APP_DIR="${REMCTL_APP_DIR:-$PREFIX/Applications}"
-LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$PREFIX/Library/LaunchAgents}"
+LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 CONFIG_BASE="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_DIR="${REMCTL_CONFIG_DIR:-$CONFIG_BASE/remctl}"
 APP_NAME="RemCTL Capability Host.app"
@@ -72,6 +73,14 @@ APP_PATH="$APP_DIR/$APP_NAME"
 HOST_EXECUTABLE="$APP_PATH/Contents/MacOS/RemCTL Capability Host"
 AGENT_LABEL="net.macstories.remctl.capability-host"
 AGENT_PATH="$LAUNCH_AGENT_DIR/$AGENT_LABEL.plist"
+# Earlier installers defaulted the LaunchAgent to PREFIX/Library/LaunchAgents,
+# which launchd never loads at login, so a custom-PREFIX host stopped at the
+# first reboot. An exact installer-owned plist left there is migrated.
+LEGACY_AGENT_PATH=""
+if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist" != "$AGENT_PATH" ]]; then
+    LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
+fi
+OLD_AGENT_PATH="$AGENT_PATH"
 SOCKET_PATH="$PREFIX/Library/Application Support/RemCTL/capability-host.sock"
 IDENTITY_MARKER="$BIN_DIR/.remctl-capability-host-signing-identity"
 APP_MARKER="$BIN_DIR/.remctl-capability-host-app"
@@ -108,6 +117,9 @@ if [[ "$SKIP_LAUNCHSERVICES" == "1" && "$PREFIX" != "$HOME" ]]; then
     CAPABILITY_SIMULATION=1
 elif [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
     fail "REMCTL_SKIP_LAUNCHSERVICES is allowed only with a non-home PREFIX."
+fi
+if [[ "$CAPABILITY_SIMULATION" == "1" && "$LAUNCH_AGENT_DIR/" != "$PREFIX/"* ]]; then
+    fail "Simulation requires the LaunchAgent directory below PREFIX; set REMCTL_LAUNCH_AGENT_DIR or HOME inside it."
 fi
 if [[ "${REMCTL_TEST_PUBLISH_FAIL_AT:-0}" != "0" && "$CAPABILITY_SIMULATION" != "1" ]]; then
     fail "REMCTL_TEST_PUBLISH_FAIL_AT is restricted to temp-prefix simulation."
@@ -395,14 +407,14 @@ cleanup() {
         rollback_publish || rollback_ok=0
     fi
     if [[ "$result" -ne 0 && "$SERVICE_QUIESCED" == "1" && "$OLD_SERVICE_LOADED" == "1" && "$CAPABILITY_SIMULATION" != "1" ]]; then
-        if [[ "$rollback_ok" == "1" && -f "$AGENT_PATH" ]]; then
+        if [[ "$rollback_ok" == "1" && -f "$OLD_AGENT_PATH" ]]; then
             [[ -x "$LSREGISTER" && -d "$APP_PATH" ]] && "$LSREGISTER" -f "$APP_PATH" >/dev/null 2>&1 || true
             recovery_ready=0
-            if job_loaded || bootstrap_job "$AGENT_PATH"; then
+            if job_loaded || bootstrap_job "$OLD_AGENT_PATH"; then
                 if wait_for_transport; then recovery_ready=1; fi
             fi
             if [[ "$recovery_ready" != "1" ]]; then
-                echo -e "${RED}RECOVERY ERROR:${RESET} The previous files were restored, but its capability-host service did not recover. Re-run the installer after checking $AGENT_PATH." >&2
+                echo -e "${RED}RECOVERY ERROR:${RESET} The previous files were restored, but its capability-host service did not recover. Re-run the installer after checking $OLD_AGENT_PATH." >&2
                 RECOVERY_FAILED=1
             fi
         else
@@ -536,8 +548,9 @@ chmod 644 "$STAGED_AGENT"
 plutil -lint "$STAGED_AGENT" >/dev/null
 
 installed_agent_owned() {
-    [[ -f "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || return 1
-    "$CAPABILITY_PYTHON" -I -S - "$AGENT_PATH" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PY'
+    local path="${1:-$AGENT_PATH}"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    "$CAPABILITY_PYTHON" -I -S - "$path" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PY'
 import plistlib, sys
 path,label,host,socket=sys.argv[1:]
 try:
@@ -634,6 +647,11 @@ APP_CONTRACT=0
 if [[ -e "$AGENT_PATH" || -L "$AGENT_PATH" ]]; then
     installed_agent_owned || fail "Refusing to replace a LaunchAgent that does not match the RemCTL contract: $AGENT_PATH"
 fi
+MIGRATE_LEGACY_AGENT=0
+if [[ -n "$LEGACY_AGENT_PATH" ]] && [[ -e "$LEGACY_AGENT_PATH" || -L "$LEGACY_AGENT_PATH" ]]; then
+    installed_agent_owned "$LEGACY_AGENT_PATH" || fail "Refusing to migrate a LaunchAgent that does not match the RemCTL contract: $LEGACY_AGENT_PATH"
+    MIGRATE_LEGACY_AGENT=1
+fi
 if [[ -e "$APP_PATH" || -L "$APP_PATH" ]]; then
     installed_app_owned || fail "Refusing to replace an app that does not match the signed RemCTL contract: $APP_PATH"
     APP_CONTRACT=1
@@ -680,7 +698,10 @@ fi
 if [[ "$CAPABILITY_SIMULATION" != "1" ]]; then
     echo -e "${BLUE}→${RESET} Quiescing previous capability host..."
     if job_loaded; then
-        installed_agent_owned || fail "The loaded $AGENT_LABEL job has no exact installer-owned plist; refusing to stop it."
+        if ! installed_agent_owned; then
+            [[ "$MIGRATE_LEGACY_AGENT" == "1" ]] || fail "The loaded $AGENT_LABEL job has no exact installer-owned plist; refusing to stop it."
+            OLD_AGENT_PATH="$LEGACY_AGENT_PATH"
+        fi
         OLD_SERVICE_LOADED=1
     fi
     socket_owned || fail "A capability-host socket exists but is not an exact current-user 0600 socket in its canonical 0700 directory; refusing to stop or overwrite anything."
@@ -749,6 +770,13 @@ for line in open(sys.argv[1],encoding="utf-8"):
 PY
 then
     echo -e "${YELLOW}The new generation is active, but old transaction backups could not be removed. Resolve the reported *.remctl-transaction-backup files before reinstalling.${RESET}" >&2
+fi
+if [[ "$MIGRATE_LEGACY_AGENT" == "1" ]]; then
+    if installed_agent_owned "$LEGACY_AGENT_PATH" && rm -f -- "$LEGACY_AGENT_PATH"; then
+        echo -e "${DIM}Migrated the LaunchAgent from $LEGACY_AGENT_PATH to $AGENT_PATH.${RESET}"
+    else
+        echo -e "${YELLOW}The new generation is active, but the old LaunchAgent could not be removed: $LEGACY_AGENT_PATH${RESET}" >&2
+    fi
 fi
 SERVICE_QUIESCED=0
 
