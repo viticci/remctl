@@ -4,6 +4,7 @@ import html.parser
 import io
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -603,7 +604,77 @@ class RegistrationTests(unittest.TestCase):
     def test_server_command_uses_the_absolute_interpreter(self):
         command, args = remctl_mcp.server_command(Path("/Users/x/bin/remctl"))
         self.assertTrue(os.path.isabs(command))
+        self.assertEqual(command, remctl_mcp.stable_interpreter())
+        self.assertIsNone(remctl_mcp.interpreter_problem(command))
         self.assertEqual(args, ["/Users/x/bin/remctl", "mcp"])
+
+    @staticmethod
+    def _homebrew_python(root):
+        """A fake Homebrew prefix: the interpreter lives in a versioned keg, reached through opt/ and bin/ links."""
+        keg = root / "Cellar" / "python@3.14" / "3.14.7"
+        (keg / "bin").mkdir(parents=True)
+        real = keg / "bin" / "python3.14"
+        real.write_text("#!/bin/sh\n", encoding="utf-8")
+        real.chmod(0o755)
+        (root / "opt").mkdir()
+        (root / "opt" / "python@3.14").symlink_to(keg)
+        (root / "bin").mkdir()
+        (root / "bin" / "python3").symlink_to(real)
+        return real
+
+    def test_stable_interpreter_prefers_the_homebrew_opt_link_over_the_versioned_keg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            opt = str(root / "opt" / "python@3.14" / "bin" / "python3.14")
+            self.assertEqual(remctl_mcp.stable_interpreter(str(root / "bin" / "python3")), opt)
+            self.assertEqual(remctl_mcp.stable_interpreter(str(real)), opt)
+            # Without an opt link that reaches the same file, keep the resolved path.
+            (root / "opt" / "python@3.14").unlink()
+            self.assertEqual(remctl_mcp.stable_interpreter(str(real)), str(real))
+            plain = root / "python3"
+            plain.symlink_to(real)
+            self.assertEqual(remctl_mcp.stable_interpreter(str(plain)), str(real))
+
+    def test_interpreter_problem_names_interpreters_that_will_stop_working(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            not_executable = root / "python-data"
+            not_executable.write_text("", encoding="utf-8")
+            self.assertIsNone(remctl_mcp.interpreter_problem(str(root / "opt" / "python@3.14" / "bin" / "python3.14")))
+            self.assertIsNone(remctl_mcp.interpreter_problem(str(root / "bin" / "python3")))
+            self.assertEqual(remctl_mcp.interpreter_problem(str(real)), "interpreter_versioned")
+            for command in (None, "", 3, str(root / "missing" / "python3"), str(not_executable)):
+                with self.subTest(command=command):
+                    self.assertEqual(remctl_mcp.interpreter_problem(command), "interpreter_missing")
+            with mock.patch.object(remctl_mcp.shutil, "which", side_effect=lambda name: str(root / "bin" / "python3") if name == "python3" else None):
+                self.assertIsNone(remctl_mcp.interpreter_problem("python3"))
+                self.assertEqual(remctl_mcp.interpreter_problem("python9"), "interpreter_missing")
+
+    def test_registration_status_accepts_any_working_interpreter_and_names_stale_reasons(self):
+        # An app registered from another Python is still current; one whose Python
+        # is gone, or sits in a keg that `brew upgrade` deletes, is not.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            cli = Path("/Users/x/bin/remctl")
+            _, args = remctl_mcp.server_command(cli)
+            claude = root / ".claude.json"
+            codex = root / "config.toml"
+            desktop = root / "desktop.json"
+            claude.write_text(json.dumps({"mcpServers": {"remctl": {"command": str(root / "bin" / "python3"), "args": args}}}), encoding="utf-8")
+            codex.write_text(f"[mcp_servers.remctl]\ncommand = {json.dumps(str(real))}\nargs = {json.dumps(args)}\n", encoding="utf-8")
+            desktop.write_text(json.dumps({"mcpServers": {"remctl": {"command": str(root / "gone" / "python3"), "args": args}}}), encoding="utf-8")
+            status = {entry["client"]: entry for entry in remctl_mcp.registration_status(cli, claude_config=claude, codex_config=codex, desktop_config=desktop)}
+            self.assertTrue(status["claude-code"]["current"])
+            self.assertNotIn("staleReason", status["claude-code"])
+            self.assertFalse(status["codex"]["current"])
+            self.assertEqual(status["codex"]["staleReason"], "interpreter_versioned")
+            self.assertFalse(status["claude-desktop"]["current"])
+            self.assertEqual(status["claude-desktop"]["staleReason"], "interpreter_missing")
+            moved = {entry["client"]: entry for entry in remctl_mcp.registration_status(Path("/Users/y/bin/remctl"), claude_config=claude, codex_config=codex, desktop_config=desktop)}
+            self.assertEqual({entry["staleReason"] for entry in moved.values()}, {"different_cli"})
 
     def test_claude_code_install_builds_the_documented_command_and_replaces_existing(self):
         calls = []
@@ -794,6 +865,27 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(args.format_kind, "toml")
         args = self.remctl.parse_cli_args(parser, subparsers, ["onboard", "--no-mcp"])
         self.assertTrue(args.no_mcp)
+
+    def test_stale_connections_are_grouped_by_reason(self):
+        stale = [
+            {"name": "Codex", "staleReason": "interpreter_versioned"},
+            {"name": "Claude Desktop", "staleReason": "different_cli"},
+            {"name": "Claude Code", "staleReason": "interpreter_versioned"},
+            {"name": "Older client"},
+        ]
+        self.assertEqual(
+            self.remctl.mcp_stale_clients_text(stale),
+            "MCP connection starts a versioned Homebrew Python that `brew upgrade` deletes: Codex, Claude Code; "
+            "MCP connection points at a different RemCTL path: Claude Desktop, Older client",
+        )
+        serving = {"installed": True, "configured": True, "active": True, "url": "https://mac.example.ts.net/remctl"}
+        with mock.patch.object(self.remctl.C, "enabled", False):
+            self.assertEqual(self.remctl.tailscale_state_text(serving), "serving at https://mac.example.ts.net/remctl")
+            self.assertEqual(
+                self.remctl.tailscale_state_text({**serving, "agentInterpreterProblem": "interpreter_versioned"}),
+                "serving at https://mac.example.ts.net/remctl, but the service starts a versioned Homebrew Python "
+                "that `brew upgrade` deletes; rerun `remctl mcp install --client tailscale`",
+            )
 
     def test_completion_scripts_mention_mcp(self):
         for shell in ("zsh", "bash", "fish"):
@@ -1073,6 +1165,48 @@ class HTTPConfigAndTailscaleTests(unittest.TestCase):
             failed = remctl_mcp.tailscale_serve_enable(7362, runner=failing)
         self.assertFalse(failed["ok"])
         self.assertIn("admin console", failed["error"])
+
+    def test_tailscale_commands_run_as_the_cli_without_a_terminal(self):
+        # The binary inside Tailscale.app acts as the CLI only when TERM or
+        # TAILSCALE_BE_CLI is set; the tailnet service and GUI apps have no TERM.
+        environments = []
+
+        def runner(argv, **kwargs):
+            environments.append(kwargs.get("env"))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with mock.patch.dict(os.environ, {"REMCTL_TEST_MARKER": "kept"}), \
+             mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+            os.environ.pop("TERM", None)
+            os.environ.pop("TAILSCALE_BE_CLI", None)
+            remctl_mcp.tailscale_status(runner=runner)
+            remctl_mcp.tailscale_serve_mount(runner=runner)
+            remctl_mcp.tailscale_serve_enable(7362, runner=runner)
+            remctl_mcp.tailscale_serve_disable(runner=runner)
+        self.assertEqual(len(environments), 4)
+        for env in environments:
+            self.assertEqual(env["TAILSCALE_BE_CLI"], "1")
+            self.assertEqual(env["REMCTL_TEST_MARKER"], "kept")
+
+    def test_http_agent_status_reports_an_interpreter_that_will_stop_working(self):
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            keg = RegistrationTests._homebrew_python(root)
+            plist = root / "agent.plist"
+            with mock.patch.object(remctl_mcp, "http_agent_plist_path", return_value=plist):
+                self.assertNotIn("interpreterProblem", remctl_mcp.http_agent_status(runner=runner))
+                cases = (
+                    (str(root / "opt" / "python@3.14" / "bin" / "python3.14"), None),
+                    (str(keg), "interpreter_versioned"),
+                    (str(root / "gone" / "python3"), "interpreter_missing"),
+                )
+                for command, expected in cases:
+                    with self.subTest(command=command):
+                        plist.write_bytes(plistlib.dumps({"Label": remctl_mcp.HTTP_AGENT_LABEL, "ProgramArguments": [command, "/Users/x/bin/remctl", "mcp", "serve", "--http"]}))
+                        self.assertEqual(remctl_mcp.http_agent_status(runner=runner)["interpreterProblem"], expected)
 
     def test_http_agent_plist_and_remote_snippets(self):
         plist = remctl_mcp.http_agent_plist(Path("/Users/x/bin/remctl"))

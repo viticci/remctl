@@ -1430,6 +1430,40 @@ CLAUDE_CODE_CONFIG = Path.home() / ".claude.json"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
 
+# A Homebrew keg path, such as /opt/homebrew/Cellar/python@3.14/3.14.7/bin/python3.14.
+HOMEBREW_KEG_PATH = re.compile(r"^(?P<prefix>/.+)/Cellar/(?P<formula>[^/]+)/[^/]+/(?P<rest>.+)$")
+
+
+def stable_interpreter(executable: str | None = None) -> str:
+    """An absolute interpreter path that survives Python patch upgrades.
+
+    Symlinks are resolved so no client depends on PATH, but a Homebrew Python
+    resolves into a versioned keg that `brew upgrade` deletes. The formula's
+    `opt` link reaches the same file and follows upgrades, so prefer it.
+    """
+
+    real = os.path.realpath(executable or sys.executable)
+    match = HOMEBREW_KEG_PATH.match(real)
+    if match:
+        linked = os.path.join(match["prefix"], "opt", match["formula"], match["rest"])
+        if os.path.realpath(linked) == real:
+            return linked
+    return real
+
+
+def interpreter_problem(command: Any) -> str | None:
+    """Why a registered interpreter will stop starting the server, or None."""
+
+    if not isinstance(command, str) or not command:
+        return "interpreter_missing"
+    path = command if os.path.isabs(command) else shutil.which(command)
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return "interpreter_missing"
+    if HOMEBREW_KEG_PATH.match(command):
+        return "interpreter_versioned"
+    return None
+
+
 def server_command(cli_path: Path) -> tuple[str, list[str]]:
     """The interpreter and arguments every client should launch.
 
@@ -1437,12 +1471,13 @@ def server_command(cli_path: Path) -> tuple[str, list[str]]:
     start servers with a minimal PATH that may not contain python3.
     """
 
-    return os.path.realpath(sys.executable), [str(cli_path), "mcp"]
+    return stable_interpreter(), [str(cli_path), "mcp"]
 
 
-def _run(argv: list[str], *, timeout: float = 60.0, runner: Callable[..., Any] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(argv: list[str], *, timeout: float = 60.0, runner: Callable[..., Any] | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     run = runner or subprocess.run
-    return run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    return run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
 
 
 def detect_clients() -> list[dict[str, Any]]:
@@ -1658,12 +1693,20 @@ def registration_status(cli_path: Path | None = None, *, claude_config: Path | N
     entries.append(desktop_entry)
 
     if cli_path is not None:
-        command, args = server_command(cli_path)
-        expected = {"command": command, "args": args}
+        _, expected_args = server_command(cli_path)
         for entry in entries:
             server = entry.get("server")
-            if isinstance(server, dict):
-                entry["current"] = server.get("command") == expected["command"] and list(server.get("args") or []) == expected["args"]
+            if not isinstance(server, dict):
+                continue
+            # Any working interpreter will do. Comparing it with the Python that runs
+            # this check flags every app that was registered from a different one.
+            if list(server.get("args") or []) != expected_args:
+                problem = "different_cli"
+            else:
+                problem = interpreter_problem(server.get("command"))
+            entry["current"] = problem is None
+            if problem:
+                entry["staleReason"] = problem
     return entries
 
 
@@ -2146,6 +2189,13 @@ def _launchctl(*args: str, runner: Callable[..., Any] | None = None) -> subproce
 def http_agent_status(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
     plist = http_agent_plist_path()
     status: dict[str, Any] = {"label": HTTP_AGENT_LABEL, "plist": str(plist), "installed": plist.exists(), "loaded": False, "running": False, "pid": None}
+    if status["installed"]:
+        try:
+            data = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError):
+            data = None
+        program = data.get("ProgramArguments") if isinstance(data, dict) else None
+        status["interpreterProblem"] = interpreter_problem(program[0] if isinstance(program, list) and program else None)
     result = _launchctl("print", f"gui/{os.getuid()}/{HTTP_AGENT_LABEL}", runner=runner)
     if result.returncode == 0:
         status["loaded"] = True
@@ -2192,6 +2242,18 @@ def http_health(config: dict[str, Any], *, timeout: float = 2.0) -> dict[str, An
 
 # ── Tailscale ────────────────────────────────────────────────────────────────
 
+def tailscale_env() -> dict[str, str]:
+    """The environment for Tailscale commands.
+
+    The binary inside Tailscale.app acts as the CLI only when TERM or
+    TAILSCALE_BE_CLI is set. Callers started without a terminal, such as the
+    tailnet LaunchAgent or Claude Desktop, have no TERM, and the app then
+    prints a GUI start-up error instead of JSON.
+    """
+
+    return {**os.environ, "TAILSCALE_BE_CLI": "1"}
+
+
 def tailscale_binary() -> str | None:
     found = shutil.which("tailscale")
     if found:
@@ -2207,7 +2269,7 @@ def tailscale_status(*, runner: Callable[..., Any] | None = None) -> dict[str, A
     status: dict[str, Any] = {"installed": binary is not None, "binary": binary, "running": False, "hostname": None, "ips": [], "https": False}
     if not binary:
         return status
-    result = _run([binary, "status", "--json"], timeout=15, runner=runner)
+    result = _run([binary, "status", "--json"], timeout=15, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         status["error"] = (result.stderr or result.stdout).strip()[:300]
         return status
@@ -2234,7 +2296,7 @@ def tailscale_serve_mount(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callable[
     binary = tailscale_binary()
     if not binary:
         return None
-    result = _run([binary, "serve", "status", "--json"], timeout=15, runner=runner)
+    result = _run([binary, "serve", "status", "--json"], timeout=15, runner=runner, env=tailscale_env())
     if result.returncode != 0 or not result.stdout.strip():
         return None
     try:
@@ -2256,7 +2318,7 @@ def tailscale_serve_enable(port: int, path: str = TAILSCALE_MOUNT_PATH, *, runne
     if not binary:
         return {"ok": False, "error": "Tailscale is not installed."}
     argv = [binary, "serve", "--bg", "--https=443", f"--set-path={path}", f"http://127.0.0.1:{port}"]
-    result = _run(argv, timeout=60, runner=runner)
+    result = _run(argv, timeout=60, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         message = (result.stderr or result.stdout).strip()
         hint = ""
@@ -2270,7 +2332,7 @@ def tailscale_serve_disable(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callabl
     binary = tailscale_binary()
     if not binary:
         return {"ok": False, "error": "Tailscale is not installed."}
-    result = _run([binary, "serve", "--https=443", f"--set-path={path}", "off"], timeout=60, runner=runner)
+    result = _run([binary, "serve", "--https=443", f"--set-path={path}", "off"], timeout=60, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         message = (result.stderr or result.stdout).strip()
         if "not" in message.lower() and "found" in message.lower():
@@ -2359,7 +2421,8 @@ def tailscale_overview(*, runner: Callable[..., Any] | None = None) -> dict[str,
         mount = tailscale_serve_mount(runner=runner) if status["installed"] else None
         health = http_health(config)
         overview.update(agentRunning=agent["running"], served=mount is not None, healthy=health["ok"],
-                        active=agent["running"] and mount is not None and health["ok"])
+                        active=agent["running"] and mount is not None and health["ok"],
+                        agentInterpreterProblem=agent.get("interpreterProblem"))
     return overview
 
 

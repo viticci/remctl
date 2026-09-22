@@ -5761,6 +5761,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(by_name["capability_host"]["status"], "warn")
         self.assertEqual(by_name["effective_access"]["detail"], "route=capabilityHost; ready=yes")
 
+    def test_gather_doctor_checks_names_why_an_mcp_connection_is_stale(self):
+        def doctor(clients, tailscale):
+            with (
+                mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+                mock.patch.object(self.remctl, "mcp_overview", return_value={"clients": clients, "tailscale": tailscale}),
+            ):
+                checks = self.remctl.gather_doctor_checks(self._warming_host_status())
+            return {check["name"]: check for check in checks}
+
+        serving = {"configured": True, "active": True, "url": "https://mac.example.ts.net/remctl"}
+        current = {"name": "Codex", "installed": True, "configured": True, "current": True}
+        by_name = doctor([current], serving)
+        self.assertEqual(by_name["mcp_clients"]["status"], "ok")
+        self.assertNotIn("mcp_tailscale", by_name)
+
+        stale = {**current, "current": False, "staleReason": "interpreter_versioned"}
+        by_name = doctor([stale], {**serving, "agentInterpreterProblem": "interpreter_versioned"})
+        self.assertEqual(by_name["mcp_clients"]["status"], "warn")
+        self.assertEqual(
+            by_name["mcp_clients"]["detail"],
+            "MCP connection starts a versioned Homebrew Python that `brew upgrade` deletes: Codex",
+        )
+        self.assertEqual(by_name["mcp_tailscale"]["status"], "warn")
+        self.assertEqual(
+            by_name["mcp_tailscale"]["detail"],
+            "Tailnet endpoint service starts a versioned Homebrew Python that `brew upgrade` deletes",
+        )
+        self.assertIn("remctl mcp install --client tailscale", by_name["mcp_tailscale"]["fix"])
+
     def test_gather_doctor_checks_still_fails_when_a_permission_is_refused(self):
         status = self._warming_host_status(reminders="denied", automation="denied")
         with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):

@@ -33,7 +33,7 @@ remctl mcp remove --client codex
 | Claude Desktop and Cowork | Adds `mcpServers.remctl` to `~/Library/Application Support/Claude/claude_desktop_config.json`. Every other key stays as it was, the file keeps its permissions, and a timestamped backup is saved next to it. | Quit and reopen Claude Desktop. The server appears in Claude chats and in Cowork on this Mac. |
 | Other clients | `remctl mcp config` prints JSON, TOML, and shell snippets. | Paste into the client's MCP settings. |
 
-The launch command uses an absolute Python path so GUI apps with a minimal `PATH` can start the server. `remctl mcp config --format command` shows it.
+The launch command uses an absolute Python path so GUI apps with a minimal `PATH` can start the server. `remctl mcp config --format command` shows it. For a Homebrew Python, RemCTL registers the formula's stable `opt` path, such as `/opt/homebrew/opt/python@3.14/bin/python3.14`, not the versioned `Cellar` folder that `brew upgrade` deletes.
 
 ### One-click Claude Desktop extension
 
@@ -93,7 +93,7 @@ remctl mcp token --rotate             # new token; reconnect devices afterwards
 remctl mcp remove --client tailscale  # stop serving; the token file stays for later
 ```
 
-`remctl doctor` reports the endpoint under `mcp_clients` and warns (`mcp_tailscale`) when it is configured but not serving.
+`remctl doctor` reports the endpoint under `mcp_clients` and warns (`mcp_tailscale`) when it is configured but not serving, or when its service starts a Python that `brew upgrade` deletes.
 
 Security notes:
 
@@ -203,6 +203,7 @@ Set `REMCTL_MCP_DEBUG=1` in the client's environment for a per-request trace on 
 - **`claude mcp list` says Failed to connect.** Run `remctl mcp config --format command` and execute that command in a terminal. It should wait silently; press Control-D to exit. A traceback means the CLI itself is broken: run `remctl doctor`.
 - **Tools work in Claude Code but Claude Desktop shows nothing.** Quit and reopen Claude Desktop after `remctl mcp install --client claude-desktop`, or install the `.mcpb` bundle.
 - **`doctor` says the connection points at a different path.** RemCTL moved, for example to a new `PREFIX`. Run `remctl mcp install` again.
+- **`doctor` says a connection starts a Python that no longer exists, or a versioned Homebrew Python.** The app was registered with a Python path that `brew upgrade` removes. Run `remctl mcp install` again; it registers the stable `opt` path. For the tailnet service, run `remctl mcp install --client tailscale`.
 - **A tool reports that the Capability Host is unavailable.** Call the `doctor` tool or run `remctl doctor` and follow its fix text. The MCP server never bypasses the host.
 - **The tailnet endpoint is configured but not serving.** `remctl mcp status` shows which part is down. `remctl mcp install --client tailscale` repairs the service and the serve mount. `tailscale serve status` lists the mounts.
 - **Another device gets 401.** The token differs. Run `remctl mcp config --format tailscale` on the Mac and reconnect the device.

@@ -12131,7 +12131,7 @@ def gather_doctor_checks(capability_host=None):
         mcp_clients = overview["clients"]
         tailscale = overview.get("tailscale") or {}
         connected = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is not False]
-        stale = [client["name"] for client in mcp_clients if client["configured"] and client.get("current") is False]
+        stale = [client for client in mcp_clients if client["configured"] and client.get("current") is False]
         installed = [client["name"] for client in mcp_clients if client["installed"]]
         if tailscale.get("configured") and tailscale.get("active"):
             connected.append(f"tailnet devices at {tailscale.get('url')}")
@@ -12139,7 +12139,7 @@ def gather_doctor_checks(capability_host=None):
             add(
                 "mcp_clients",
                 "warn",
-                "MCP connection points at a different RemCTL path: " + ", ".join(stale),
+                mcp_stale_clients_text(stale),
                 "Run `remctl mcp install` to update the connected apps.",
             )
         elif connected:
@@ -12161,6 +12161,14 @@ def gather_doctor_checks(capability_host=None):
                 + ("" if tailscale.get("agentRunning") else " (service not running)")
                 + ("" if tailscale.get("served") else " (tailscale serve mount missing)"),
                 "Run `remctl mcp install --client tailscale` to repair, or `remctl mcp remove --client tailscale` to turn it off.",
+            )
+        elif tailscale.get("configured") and tailscale.get("agentInterpreterProblem"):
+            add(
+                "mcp_tailscale",
+                "warn",
+                "Tailnet endpoint service "
+                + MCP_STALE_REASONS.get(tailscale["agentInterpreterProblem"], MCP_STALE_REASONS["interpreter_missing"]),
+                "Run `remctl mcp install --client tailscale` to rewrite the service with a stable Python path.",
             )
 
     if mode == "invalid":
@@ -12587,6 +12595,26 @@ def mcp_asset_path(name):
     return None
 
 
+# Why a registered MCP connection is not current, as remctl_mcp.registration_status reports it.
+MCP_STALE_REASONS = {
+    "different_cli": "points at a different RemCTL path",
+    "interpreter_missing": "starts a Python that no longer exists",
+    "interpreter_versioned": "starts a versioned Homebrew Python that `brew upgrade` deletes",
+}
+
+
+def mcp_stale_reason(client):
+    return MCP_STALE_REASONS.get(client.get("staleReason"), MCP_STALE_REASONS["different_cli"])
+
+
+def mcp_stale_clients_text(stale):
+    """One doctor sentence per reason, naming the apps that reason applies to."""
+    groups = {}
+    for client in stale:
+        groups.setdefault(mcp_stale_reason(client), []).append(client["name"])
+    return "; ".join(f"MCP connection {reason}: {', '.join(names)}" for reason, names in groups.items())
+
+
 def mcp_overview(cli_path=None):
     """Detected clients plus their current RemCTL registration, for JSON and doctor."""
     import remctl_mcp
@@ -12600,6 +12628,7 @@ def mcp_overview(cli_path=None):
             **client,
             "configured": bool(entry.get("configured")),
             "current": entry.get("current"),
+            "staleReason": entry.get("staleReason"),
             "configPath": entry.get("path"),
         })
     command, args = remctl_mcp.server_command(cli_path)
@@ -12683,6 +12712,9 @@ def tailscale_state_text(ts):
     if not ts.get("installed"):
         return C.dim("Tailscale not installed")
     if ts.get("configured"):
+        if ts.get("active") and ts.get("agentInterpreterProblem"):
+            reason = MCP_STALE_REASONS.get(ts["agentInterpreterProblem"], MCP_STALE_REASONS["interpreter_missing"])
+            return C.yellow(f"serving at {ts.get('url')}, but the service {reason}; rerun `remctl mcp install --client tailscale`")
         if ts.get("active"):
             return C.green(f"serving at {ts.get('url')}")
         return C.yellow("configured but not running; run `remctl mcp install --client tailscale` to repair")
@@ -12885,7 +12917,7 @@ def cmd_mcp(a):
             elif client["configured"] and client.get("current") is not False:
                 state = C.green("connected")
             elif client["configured"]:
-                state = C.yellow("connected to a different RemCTL path; rerun remctl mcp install")
+                state = C.yellow(f"connected, but it {mcp_stale_reason(client)}; rerun remctl mcp install")
             else:
                 state = C.yellow("not connected")
             print(f"  {client['name']}: {state}")
