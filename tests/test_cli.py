@@ -5709,6 +5709,106 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["access"]["effective"]["ready"])
         self.assertTrue(payload["capabilityHost"]["fullReady"])
 
+    def _warming_host_status(self, **permissions):
+        return {
+            **self._absent_host_status,
+            "status": "ok",
+            "installed": True,
+            "available": True,
+            "ready": True,
+            "fullReady": False,
+            "protocolVersion": 2,
+            "permissions": {
+                "fullDiskAccess": "authorized",
+                "reminders": "unknown",
+                "automation": "unknown",
+                **permissions,
+            },
+            "error": None,
+        }
+
+    def test_host_permission_state_classifies_every_reported_value(self):
+        self.assertEqual(self.remctl.host_permission_state("authorized"), "authorized")
+        for value in ("denied", "restricted", "writeOnly", "notDetermined"):
+            with self.subTest(value=value):
+                self.assertEqual(self.remctl.host_permission_state(value), "blocked")
+        for value in ("unknown", "targetNotRunning", None, ""):
+            with self.subTest(value=value):
+                self.assertEqual(self.remctl.host_permission_state(value), "unverified")
+
+    def test_gather_doctor_checks_warns_while_host_permissions_are_unverified(self):
+        # A host that has just started answers "unknown" until its first
+        # permission refresh lands, and reads and writes work the whole time.
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):
+            checks = self.remctl.gather_doctor_checks(self._warming_host_status())
+        by_name = {check["name"]: check for check in checks}
+        self.assertEqual(by_name["eventkit"]["status"], "warn")
+        self.assertEqual(by_name["automation"]["status"], "warn")
+        self.assertEqual(by_name["capability_host"]["status"], "warn")
+        self.assertEqual(by_name["effective_access"]["status"], "ok")
+        self.assertEqual([check["name"] for check in checks if check["status"] == "fail"], [])
+
+    def test_gather_doctor_checks_warns_when_reminders_is_not_running(self):
+        # macOS answers targetNotRunning when it cannot reach Reminders, which
+        # says nothing about whether Automation was granted.
+        status = self._warming_host_status(reminders="authorized", automation="targetNotRunning")
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):
+            checks = self.remctl.gather_doctor_checks(status)
+        by_name = {check["name"]: check for check in checks}
+        self.assertEqual(by_name["eventkit"]["status"], "ok")
+        self.assertEqual(by_name["automation"]["status"], "warn")
+        self.assertIn("flag", by_name["automation"]["fix"])
+        self.assertEqual(by_name["capability_host"]["status"], "warn")
+        self.assertEqual(by_name["effective_access"]["detail"], "route=capabilityHost; ready=yes")
+
+    def test_gather_doctor_checks_still_fails_when_a_permission_is_refused(self):
+        status = self._warming_host_status(reminders="denied", automation="denied")
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):
+            checks = self.remctl.gather_doctor_checks(status)
+        by_name = {check["name"]: check for check in checks}
+        self.assertEqual(by_name["eventkit"]["status"], "fail")
+        self.assertEqual(by_name["automation"]["status"], "fail")
+        self.assertEqual(by_name["capability_host"]["status"], "fail")
+        self.assertEqual(by_name["effective_access"]["status"], "fail")
+        self.assertIn("onboard", by_name["automation"]["fix"])
+
+    def test_gather_doctor_checks_fails_when_the_host_reports_an_error(self):
+        status = self._warming_host_status()
+        status["error"] = {"code": "protocol_mismatch", "message": "Capability Host protocol mismatch"}
+        with mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"):
+            checks = self.remctl.gather_doctor_checks(status)
+        by_name = {check["name"]: check for check in checks}
+        self.assertEqual(by_name["capability_host"]["status"], "fail")
+        self.assertIn("protocol mismatch", by_name["capability_host"]["detail"])
+        self.assertEqual(by_name["effective_access"]["status"], "fail")
+
+    def test_capability_host_status_settled_waits_for_a_verified_snapshot(self):
+        warming = self._warming_host_status()
+        verified = self._warming_host_status(reminders="authorized", automation="authorized")
+        verified["fullReady"] = True
+        with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(
+                self.remctl,
+                "capability_host_status_snapshot",
+                side_effect=[warming, warming, verified],
+            ),
+            mock.patch.object(self.remctl.time, "sleep"),
+        ):
+            settled = self.remctl.capability_host_status_settled()
+        self.assertTrue(settled["fullReady"])
+        self.assertEqual(settled["permissions"]["automation"], "authorized")
+
+    def test_capability_host_status_settled_gives_up_within_its_timeout(self):
+        warming = self._warming_host_status()
+        with (
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=warming),
+            mock.patch.object(self.remctl.time, "sleep"),
+        ):
+            settled = self.remctl.capability_host_status_settled(timeout=0)
+        self.assertEqual(settled["permissions"]["reminders"], "unknown")
+
     def test_print_full_disk_access_guidance_copies_only_signed_host_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             app_path = Path(tmpdir).resolve() / "RemCTL Capability Host.app"

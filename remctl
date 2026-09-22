@@ -6228,6 +6228,56 @@ def database_access_check_for_onboarding():
     )
 
 
+HOST_PERMISSION_BLOCKED_STATES = frozenset({"denied", "restricted", "writeOnly", "notDetermined"})
+# The Capability Host answers "unknown" until its first permission refresh
+# lands, and "targetNotRunning" when Reminders is not running, so macOS cannot
+# report an Automation grant. Neither answer means a permission was refused.
+HOST_PERMISSION_UNVERIFIED_STATES = frozenset({"unknown", "targetNotRunning"})
+DOCTOR_PERMISSION_SETTLE_SECONDS = 3.0
+DOCTOR_PERMISSION_SETTLE_INTERVAL = 0.25
+
+
+def host_permission_state(value):
+    """Classify one host permission as authorized, blocked, or unverified."""
+
+    if value == "authorized":
+        return "authorized"
+    if value in HOST_PERMISSION_BLOCKED_STATES:
+        return "blocked"
+    return "unverified"
+
+
+def host_permissions_unverified(status):
+    """Return the host permissions that are not verified either way yet."""
+
+    permissions = status.get("permissions") if isinstance(status, dict) else None
+    if not isinstance(permissions, dict):
+        return ["reminders", "automation"]
+    return [
+        key
+        for key in ("reminders", "automation")
+        if host_permission_state(permissions.get(key)) == "unverified"
+    ]
+
+
+def capability_host_status_settled(timeout=DOCTOR_PERMISSION_SETTLE_SECONDS):
+    """Snapshot the host, letting a warming permission cache settle first.
+
+    A host that has just started reports "unknown" until its first refresh
+    finishes. Diagnostics poll briefly so a restart does not read as a broken
+    install; a host that stays unverified still answers within the timeout.
+    """
+
+    status = capability_host_status_snapshot()
+    if not capability_host_is_effective(status):
+        return status
+    deadline = time.monotonic() + max(0.0, timeout)
+    while host_permissions_unverified(status) and time.monotonic() < deadline:
+        time.sleep(DOCTOR_PERMISSION_SETTLE_INTERVAL)
+        status = capability_host_status_snapshot()
+    return status
+
+
 def _host_permission_check(name, key, permissions, *, denied_fix):
     value = permissions.get(key) if isinstance(permissions, dict) else None
     if value == "authorized":
@@ -11841,6 +11891,9 @@ def cmd_completion(a):
         sys.exit(1)
 
 
+DOCTOR_PERMISSION_STATUS = {"authorized": "ok", "unverified": "warn", "blocked": "fail"}
+
+
 def gather_doctor_checks(capability_host=None):
     checks = []
     host_status = capability_host or capability_host_status_snapshot()
@@ -11949,26 +12002,31 @@ def gather_doctor_checks(capability_host=None):
     if host_effective:
         permissions = host_status.get("permissions")
         reminders_access = permissions.get("reminders") if isinstance(permissions, dict) else None
+        reminders_state = host_permission_state(reminders_access)
         add(
             "eventkit",
-            "ok" if reminders_access == "authorized" else "fail",
+            DOCTOR_PERMISSION_STATUS[reminders_state],
             f"Capability Host Reminders access: {reminders_access or 'unknown'}",
-            (
-                None
-                if reminders_access == "authorized"
-                else "Run `remctl onboard` to request Reminders access for the signed host."
-            ),
+            {
+                "authorized": None,
+                "unverified": "The host has not verified Reminders access yet. Rerun `remctl doctor`.",
+                "blocked": "Run `remctl onboard` to request Reminders access for the signed host.",
+            }[reminders_state],
         )
         automation_access = permissions.get("automation") if isinstance(permissions, dict) else None
+        automation_state = host_permission_state(automation_access)
         add(
             "automation",
-            "ok" if automation_access == "authorized" else "fail",
+            DOCTOR_PERMISSION_STATUS[automation_state],
             f"Capability Host Automation access: {automation_access or 'unknown'}",
-            (
-                None
-                if automation_access == "authorized"
-                else "Run `remctl onboard` to request Automation access for the signed host."
-            ),
+            {
+                "authorized": None,
+                "unverified": (
+                    "macOS cannot report Automation access until Reminders has run once. "
+                    "Only flag and unflag need it; reads and writes are unaffected."
+                ),
+                "blocked": "Run `remctl onboard` to request Automation access for the signed host.",
+            }[automation_state],
         )
     elif mode == "direct" and bridge_ok:
         checks.append(bridge_access_check_for_onboarding())
@@ -12126,18 +12184,32 @@ def gather_doctor_checks(capability_host=None):
         full_ready = bool(host_status.get("fullReady"))
         error = host_status.get("error")
         error_detail = error.get("message") if isinstance(error, dict) else error
-        add(
-            "capability_host",
-            "ok" if full_ready else "fail",
-            (
-                "Signed Capability Host is ready for full RemCTL execution."
-                if full_ready
-                else str(error_detail or "Capability Host is installed but is not fully ready.")
-            ),
-            None if full_ready else "Run `remctl onboard`, then rerun `remctl doctor --for-agent`.",
-        )
+        # fullReady also covers a refused grant, an incompatible private helper
+        # and a missing bridge. An unverified permission is the one cause that
+        # clears itself, so it must not read as a broken install.
+        unverified = host_permissions_unverified(host_status)
+        settling = bool(unverified) and not error_detail
+        if full_ready:
+            add("capability_host", "ok", "Signed Capability Host is ready for full RemCTL execution.")
+        elif settling:
+            add(
+                "capability_host",
+                "warn",
+                "Capability Host is running; it has not verified "
+                f"{' and '.join(unverified)} access yet.",
+                "Rerun `remctl doctor` in a moment; the host verifies access on its own.",
+            )
+        else:
+            add(
+                "capability_host",
+                "fail",
+                str(error_detail or "Capability Host is installed but is not fully ready."),
+                "Run `remctl onboard`, then rerun `remctl doctor --for-agent`.",
+            )
         effective_route = "capabilityHost"
-        effective_ready = full_ready
+        # Reads and writes run through the host's EventKit and database access,
+        # which stays usable while a permission is merely unverified.
+        effective_ready = full_ready or (settling and bool(host_status.get("ready")))
     else:
         add(
             "capability_host",
@@ -12159,7 +12231,7 @@ def gather_doctor_checks(capability_host=None):
 
 
 def cmd_doctor(a):
-    capability_host = capability_host_status_snapshot()
+    capability_host = capability_host_status_settled()
     checks = gather_doctor_checks(capability_host)
     context = doctor_execution_context()
     fail_count = sum(1 for check in checks if check["status"] == "fail")

@@ -21,6 +21,12 @@
 - `remctl onboard` is now a step-by-step flow: macOS permissions, a health check that reads today's reminders, connecting each detected AI app with one question, and an optional Tailscale step that appears only when Tailscale is installed. It shows what is already done, asks before every change, and ends with the next steps. `--no-mcp` and `--no-tailscale` skip steps; `--json` reports without asking.
 - Onboarding no longer re-requests permissions that are already authorized. Re-requesting an authorized grant through the host could block for minutes on a healthy Mac.
 
+### Fixes
+
+- `create_reminder` now reports the new reminder's numeric `id`, the id every other tool accepts. `remctl add --json` reports the CloudKit identifier as `id` and the number as `numericId`, so a model that passed the created `id` back to `get_reminder` was told `reminder_id must be an integer`. The CloudKit identifier is still reported, as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning rather than an id that cannot be used. The CLI's own `add --json` output is unchanged.
+- `create_reminder` and `update_reminder` accept Apple's numeric priorities (`0`, `1`-`4`, `5`, `6`-`9`) as well as the names, and `tags` accepts a list of strings as well as a comma-separated string. Out-of-range numbers and unknown names are still refused. The `tags` description now says plainly that it appends `#hashtags` to the title and does not create Reminders tags.
+- `doctor` no longer reports a starting Capability Host as a broken install. The host answers `unknown` until its first permission refresh lands, and `targetNotRunning` while macOS cannot reach Reminders. `doctor` graded both as failures, so `eventkit`, `automation`, `capability_host`, and `effective_access` failed and the command exited 1 while reads and writes worked normally. `doctor` now waits up to three seconds for the host to finish verifying, reports a permission it still cannot read as a warning, and keeps `effective_access` accurate. A refused or restricted grant is still a failure. Because the `doctor` MCP tool runs the CLI, a restarted host no longer makes that tool return an error.
+
 ### Documentation
 
 - Rewrote the README, installation guide, command guide, MCP guide, architecture guide, and the agent SKILL in plain language, covering both the CLI and the MCP surface.

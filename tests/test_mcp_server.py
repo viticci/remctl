@@ -380,8 +380,54 @@ class ToolCallTests(unittest.TestCase):
     def test_object_output_passes_through_and_stderr_is_attached(self):
         server, _ = make_server(FakeExecutor(stdout='{"status":"created","id":"abc","numericId":5}', stderr="Warning: something\n"))
         result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "x"}})["result"]
-        self.assertEqual(result["structuredContent"]["numericId"], 5)
+        self.assertEqual(result["structuredContent"]["id"], 5)
         self.assertEqual(result["structuredContent"]["stderr"], "Warning: something")
+
+    def test_create_reminder_reports_the_numeric_id_as_id(self):
+        created = '{"status":"created","id":"3AE94447-1111-2222-3333-444444444444","title":"Milk","numericId":4774}'
+        server, _ = make_server(FakeExecutor(stdout=created))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "Milk"}})["result"]
+        structured = result["structuredContent"]
+        self.assertEqual(structured["id"], 4774)
+        self.assertEqual(structured["cloudKitId"], "3AE94447-1111-2222-3333-444444444444")
+        self.assertNotIn("numericId", structured)
+        self.assertEqual(list(structured), ["status", "id", "cloudKitId", "title"])
+        # The id it hands back is the id every other tool accepts.
+        follow_up = remctl_mcp.validate_arguments(
+            remctl_mcp.TOOLS_BY_NAME["get_reminder"], {"reminder_id": structured["id"]}
+        )
+        self.assertEqual(follow_up["reminder_id"], 4774)
+
+    def test_create_reminder_warns_when_the_numeric_id_is_missing(self):
+        server, _ = make_server(FakeExecutor(stdout='{"status":"created","id":"3AE94447-1111","title":"Milk"}'))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "Milk"}})["result"]
+        structured = result["structuredContent"]
+        self.assertNotIn("id", structured)
+        self.assertEqual(structured["cloudKitId"], "3AE94447-1111")
+        self.assertIn("numeric_id_unavailable", structured["warnings"][0])
+
+    def test_tools_that_already_report_a_numeric_id_are_untouched(self):
+        server, _ = make_server(FakeExecutor(stdout='{"status":"updated","id":4774,"title":"Milk"}'))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "update_reminder", "arguments": {"reminder_id": 4774, "title": "Milk"}})["result"]
+        self.assertEqual(result["structuredContent"], {"status": "updated", "id": 4774, "title": "Milk"})
+
+    def test_priority_accepts_apple_numbers_and_still_rejects_nonsense(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["create_reminder"]
+        for value, expected in ((0, "none"), (1, "high"), (4, "high"), (5, "medium"), (9, "low"), ("5", "medium"), ("high", "high")):
+            with self.subTest(value=value):
+                arguments = remctl_mcp.validate_arguments(tool, {"title": "x", "priority": value})
+                self.assertEqual(arguments["priority"], expected)
+        for value in (42, -1, 1.5, True, "urgent"):
+            with self.subTest(value=value):
+                with self.assertRaises(remctl_mcp.ToolArgumentError):
+                    remctl_mcp.validate_arguments(tool, {"title": "x", "priority": value})
+
+    def test_tags_accept_a_list_as_well_as_a_comma_separated_string(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["create_reminder"]
+        self.assertEqual(remctl_mcp.validate_arguments(tool, {"title": "x", "tags": ["work", " home "]})["tags"], "work,home")
+        self.assertEqual(remctl_mcp.validate_arguments(tool, {"title": "x", "tags": "work,home"})["tags"], "work,home")
+        with self.assertRaises(remctl_mcp.ToolArgumentError):
+            remctl_mcp.validate_arguments(tool, {"title": "x", "tags": [1, 2]})
 
     def test_apps_client_receives_result_hints_and_actions(self):
         server, _ = make_server(FakeExecutor(stdout="[]"))

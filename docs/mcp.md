@@ -131,6 +131,9 @@ Notes:
 - `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands. Include `--json`. Destructive commands need `--force`.
 - `delete_reminder` is annotated as destructive so hosts ask for confirmation.
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.
+- `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.
+- `priority` accepts the names `high`, `medium`, `low`, and `none`, and Apple's numbers (`0`, `1`-`4`, `5`, `6`-`9`).
+- `tags` accepts a list of strings as well as a comma-separated string. Both spellings append `#hashtags` to the title; neither creates Reminders tags.
 
 Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint: false`).
 

@@ -169,6 +169,7 @@ class Param:
     max_length: int | None = None
     default: Any = None
     items_type: str | None = None
+    coerce: Callable[[Any], Any] | None = None
 
     def schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": self.type, "description": self.description}
@@ -203,6 +204,7 @@ class Tool:
     mutually_exclusive: tuple[tuple[str, ...], ...] = ()
     output_schema: dict[str, Any] | None = None
     accepts_stdin: bool = False
+    normalize_result: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
     def input_schema(self) -> dict[str, Any]:
         properties = {param.name: param.schema() for param in self.params}
@@ -240,7 +242,75 @@ DUE_HELP = (
     "Due date: YYYY-MM-DD for all-day, 'YYYY-MM-DD HH:MM' for timed, relative forms such as "
     "tomorrow, 'tomorrow 09:30', +3d, or 'next friday'."
 )
-PRIORITY = Param("priority", "string", "Reminder priority.", enum=("high", "medium", "low", "none"))
+
+
+def _coerce_priority(value: Any) -> Any:
+    """Accept Apple's numeric priorities alongside the names.
+
+    Reminders stores priority as 0, 1-4, 5 and 6-9, and that is what a model
+    reaches for first, so map those onto the names instead of refusing them.
+    """
+
+    number = _coerce_integer(value)
+    if number is None:
+        return value
+    if number == 0:
+        return "none"
+    if 1 <= number <= 4:
+        return "high"
+    if number == 5:
+        return "medium"
+    if 6 <= number <= 9:
+        return "low"
+    return value
+
+
+def _coerce_tag_list(value: Any) -> Any:
+    """Accept a list of tags as well as the comma-separated spelling."""
+
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return ",".join(item.strip() for item in value if item.strip())
+    return value
+
+
+def _normalize_created_reminder(payload: dict[str, Any]) -> dict[str, Any]:
+    """Report the new reminder's numeric id as `id`.
+
+    `remctl add --json` reports the CloudKit identifier as `id` and the numeric
+    id as `numericId`, while edit, done and delete all report the number as
+    `id`. Every tool that takes a reminder wants the number, so a caller that
+    passes the created `id` straight back would be told it must be an integer.
+    """
+
+    numeric = payload.get("numericId")
+    if isinstance(numeric, bool) or not isinstance(numeric, int):
+        numeric = None
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "id":
+            if numeric is not None:
+                normalized["id"] = numeric
+            if isinstance(value, str) and value:
+                normalized["cloudKitId"] = value
+        elif key != "numericId":
+            normalized[key] = value
+    if numeric is None:
+        warnings = list(normalized.get("warnings") or [])
+        warnings.append(
+            "numeric_id_unavailable: the reminder was created, but RemCTL could not read its "
+            "numeric id back. Find it with search before calling another tool."
+        )
+        normalized["warnings"] = warnings
+    return normalized
+
+
+PRIORITY = Param(
+    "priority",
+    "string",
+    "Reminder priority. Apple's numbers (0, 1-4, 5, 6-9) are accepted too.",
+    enum=("high", "medium", "low", "none"),
+    coerce=_coerce_priority,
+)
 RECURRENCE_HELP = (
     "Recurrence rule: daily, weekly, monthly, yearly; optional xN interval after the frequency "
     "(daily x2); weekday lists (weekly mon,wed,fri); month days (monthly 1,15); ordinal weekdays "
@@ -455,11 +525,19 @@ TOOLS: tuple[Tool, ...] = (
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP, max_length=64),
             Param("url", "string", "URL appended to the notes.", max_length=2048),
-            Param("tags", "string", "Comma-separated tags added as inline #hashtags in the title.", max_length=512),
+            Param(
+                "tags",
+                "string",
+                "Tags appended to the title as #hashtags. This edits the title text; it does not "
+                "create Reminders tags. A list of strings is accepted as well.",
+                max_length=512,
+                coerce=_coerce_tag_list,
+            ),
             Param("flagged", "boolean", "Flag the reminder after creating it.", default=False),
         ),
         _argv_create_reminder, "change", read_only=False, timeout=150,
         mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+        normalize_result=_normalize_created_reminder,
     ),
     Tool(
         "update_reminder",
@@ -594,6 +672,8 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
             if param.required:
                 raise ToolArgumentError(f"Missing required argument: {param.name}.")
             continue
+        if param.coerce is not None:
+            raw = param.coerce(raw)
         if param.type == "integer":
             value = _coerce_integer(raw)
             if value is None:
@@ -910,6 +990,8 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
             structured = {"value": value}
     else:
         structured = {"output": _tail(result.stdout, 100_000)}
+    if tool.normalize_result is not None and isinstance(structured, dict):
+        structured = tool.normalize_result(structured)
     if result.stderr.strip():
         warnings = [line for line in result.stderr.strip().splitlines() if line.strip()]
         if isinstance(structured, dict) and "stderr" not in structured:
