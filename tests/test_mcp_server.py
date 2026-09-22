@@ -1273,6 +1273,30 @@ class HTTPConfigAndTailscaleTests(unittest.TestCase):
                         plist.write_bytes(plistlib.dumps({"Label": remctl_mcp.HTTP_AGENT_LABEL, "ProgramArguments": [command, "/Users/x/bin/remctl", "mcp", "serve", "--http"]}))
                         self.assertEqual(remctl_mcp.http_agent_status(runner=runner)["interpreterProblem"], expected)
 
+    def test_reinstalling_a_running_http_agent_waits_for_the_old_job_to_exit(self):
+        # bootout returns while launchd is still stopping the job, and a bootstrap
+        # in that window fails with "Bootstrap failed: 5: Input/output error".
+        calls = []
+        stopping = {"checks": 2}
+
+        def launchd(argv, **kwargs):
+            action = argv[1]
+            calls.append(action)
+            if action == "print":
+                if stopping["checks"]:
+                    stopping["checks"] -= 1
+                    return subprocess.CompletedProcess(argv, 0, "state = running", "")
+                return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+            if action == "bootstrap" and stopping["checks"]:
+                return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5: Input/output error")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(remctl_mcp, "http_agent_log_path", return_value=Path(tmp) / "Logs" / "remctl-mcp-http.log"):
+            result = remctl_mcp.install_http_agent(Path("/Users/x/bin/remctl"), runner=launchd, plist_path=Path(tmp) / "agent.plist")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap", "kickstart"])
+
     def test_http_agent_plist_and_remote_snippets(self):
         plist = remctl_mcp.http_agent_plist(Path("/Users/x/bin/remctl"))
         command, args = remctl_mcp.server_command(Path("/Users/x/bin/remctl"))

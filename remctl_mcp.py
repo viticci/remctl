@@ -2240,6 +2240,21 @@ def http_agent_status(*, runner: Callable[..., Any] | None = None) -> dict[str, 
     return status
 
 
+def _wait_for_http_agent_exit(domain: str, *, runner: Callable[..., Any] | None = None, timeout: float = 10.0) -> None:
+    """Wait until launchd has removed the agent after a bootout.
+
+    `launchctl bootout` returns while launchd is still stopping the job. A
+    bootstrap in that window fails with "Bootstrap failed: 5: Input/output
+    error" and leaves the endpoint down, so reinstalling a running agent failed.
+    """
+
+    deadline = time.monotonic() + timeout
+    while _launchctl("print", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner).returncode == 0:
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.2)
+
+
 def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = None, plist_path: Path | None = None) -> dict[str, Any]:
     plist = plist_path or http_agent_plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -2248,6 +2263,7 @@ def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = No
     plist.chmod(0o644)
     domain = f"gui/{os.getuid()}"
     _launchctl("bootout", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    _wait_for_http_agent_exit(domain, runner=runner)
     result = _launchctl("bootstrap", domain, str(plist), runner=runner)
     if result.returncode != 0 and "already" not in (result.stderr + result.stdout).lower():
         return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
