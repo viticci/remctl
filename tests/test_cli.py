@@ -2850,6 +2850,53 @@ class CliTests(unittest.TestCase):
         bridge_call.assert_not_called()
         self.assertIn("early_reminder_requires_due_date", stderr.getvalue())
 
+    def test_add_relative_alarm_requires_due_date_before_bridge(self):
+        # A relative alarm counts back from the due date; saved without one, it never fires.
+        args = SimpleNamespace(
+            title="Stretch",
+            list=None,
+            list_id=None,
+            notes=None,
+            due=None,
+            priority=None,
+            flag=False,
+            tags=None,
+            url=None,
+            recurrence=None,
+            alarm="15m",
+            private=False,
+            private_metadata=False,
+            grocery=False,
+            section=None,
+            section_id=None,
+            new_section=None,
+            subtask=None,
+            image=None,
+            urgent=None,
+            early_reminder=None,
+            location_title=None,
+            latitude=None,
+            longitude=None,
+            radius=100,
+            proximity="arriving",
+            address=None,
+            json=True,
+        )
+        with (
+            mock.patch.object(self.remctl, "bridge_call") as bridge_call,
+            mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.cmd_add(args)
+
+        bridge_call.assert_not_called()
+        bridge_call_result.assert_not_called()
+        self.assertEqual(json.loads(stderr.getvalue())["code"], "relative_alarm_requires_due_date")
+        self.assertTrue(self.remctl.alarm_is_relative(self.remctl.parse_alarm("1h")))
+        self.assertFalse(self.remctl.alarm_is_relative(self.remctl.parse_alarm("2026-09-30 09:00")))
+        self.assertFalse(self.remctl.alarm_is_relative(None))
+
     def test_add_grocery_rejects_without_private_before_bridge(self):
         args = SimpleNamespace(
             title="Milk",
@@ -6483,7 +6530,7 @@ class CliTests(unittest.TestCase):
         ):
             getattr(self.remctl, cmd_name)(args)
         osa_try.assert_called_once()
-        action = osa_try.call_args.args[2]
+        action = osa_try.call_args.args[1]
         self.assertIn(script_contains, action)
         bridge_call.assert_not_called()
 
@@ -6538,7 +6585,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIsNone(result.exit_code)
         result.bridge_call.assert_not_called()
-        script = result.osa_try.call_args.args[2]
+        script = result.osa_try.call_args.args[1]
         self.assertIn("set completed of r to true", script)
         self.assertIn("set completion date of r to _rdt", script)
         self.assertEqual(json.loads(result.stdout)["completionDate"], "2026-05-27T00:00:00")
@@ -6742,6 +6789,16 @@ class CliTests(unittest.TestCase):
         script = run.call_args.args[0][2]
         self.assertIn('reminder id "x-apple-reminder://ABC-123"', script)
         self.assertIn("to true", script)
+        self.assertNotIn("tell list", script)
+
+    def test_osa_by_id_try_addresses_reminder_at_app_level(self):
+        # The AppleScript fallback for done, undone, delete, and edit must also
+        # reach reminders in lists nested inside groups.
+        with mock.patch.object(self.remctl.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            self.assertTrue(self.remctl.osa_by_id_try("x-apple-reminder://ABC-123", "delete r"))
+        script = run.call_args.args[0][2]
+        self.assertIn('set r to reminder id "x-apple-reminder://ABC-123"\ndelete r', script)
         self.assertNotIn("tell list", script)
 
     def test_osa_set_flagged_result_surfaces_osascript_stderr(self):
@@ -7943,7 +8000,8 @@ class CliTests(unittest.TestCase):
 
     def test_cmd_edit_alarm_routes_through_bridge(self):
         """alarm is a bridge-only field; ensure it's routed correctly."""
-        reminder = self._FAKE_REMINDER
+        # A relative alarm counts back from the due date, so the reminder has one.
+        reminder = {**self._FAKE_REMINDER, "ZDUEDATE": 798800400.0}
         args = SimpleNamespace(
             id=1, json=True, title=None, notes=None, priority=None,
             due=None, url=None, recurrence=None, alarm="15m",
@@ -7980,7 +8038,140 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_edit(args)
         bridge_call.assert_not_called()
         osa_try.assert_called_once()
-        self.assertIn("set due date of r to _rdt", osa_try.call_args.args[2])
+        self.assertIn("set due date of r to _rdt", osa_try.call_args.args[1])
+
+    def test_cmd_edit_applescript_fallback_changes_the_date_before_other_fields(self):
+        # AppleScript has no transaction. The date is the change Reminders can
+        # refuse, so it runs first: a refusal then leaves nothing half-applied.
+        for due, date_statement in (
+            ("2026-04-20 09:00", "set due date of r to _rdt"),
+            ("clear", "set due date of r to missing value"),
+        ):
+            with self.subTest(due=due):
+                args = SimpleNamespace(
+                    id=1, json=True, title="Renamed", notes="Notes", priority="high",
+                    due=due, url=None, recurrence=None, alarm=None,
+                )
+                with (
+                    mock.patch.object(self.remctl, "open_db", return_value=None),
+                    mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+                    mock.patch.object(self.remctl, "bridge_available", return_value=False),
+                    mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.remctl.cmd_edit(args)
+                script = osa_try.call_args.args[1]
+                for statement in ('set name of r to "Renamed"', 'set body of r to "Notes"', "set priority of r to 1"):
+                    self.assertLess(script.index(date_statement), script.index(statement), statement)
+
+    def test_cmd_edit_refuses_to_clear_the_due_date_of_a_repeating_reminder(self):
+        # Reminders will not save a repeating reminder without a due date. The
+        # refusal comes before any write, so the title change is not applied alone.
+        reminder = {**self._FAKE_REMINDER, "ZDUEDATE": 798800400.0, "recurrence_frequency": 1}
+        args = SimpleNamespace(
+            id=1, json=True, title="Renamed", notes=None, priority=None,
+            due="clear", url=None, recurrence=None, alarm=None,
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+            mock.patch.object(self.remctl, "osa_by_id_try") as osa_try,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.remctl.cmd_edit(args)
+        self.assertEqual(raised.exception.code, 1)
+        bridge_call_result.assert_not_called()
+        osa_try.assert_not_called()
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["code"], "repeating_reminder_requires_due_date")
+        self.assertEqual(payload["id"], 1)
+
+        one_off = {**reminder, "recurrence_frequency": None}
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=one_off),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        self.assertIsNone(bridge_call_result.call_args.args[0]["due"])
+
+    def test_cmd_edit_failure_names_the_bridge_error(self):
+        args = SimpleNamespace(
+            id=1, json=True, title="Renamed", notes=None, priority=None,
+            due=None, url=None, recurrence=None, alarm=None,
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "error", "message": "The reminder could not be saved."}, returncode=1),
+            ),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit):
+                self.remctl.cmd_edit(args)
+        self.assertIn(
+            "Identifier-based writes failed (remctl-bridge: The reminder could not be saved). Refusing unsafe",
+            stderr.getvalue(),
+        )
+
+    def test_cmd_edit_relative_alarm_requires_a_due_date(self):
+        # A relative alarm counts back from the due date; saved without one, it never fires.
+        for label, reminder, due in (
+            ("no due date", self._FAKE_REMINDER, None),
+            ("due date cleared", {**self._FAKE_REMINDER, "ZDUEDATE": 798800400.0}, "clear"),
+        ):
+            with self.subTest(label):
+                args = SimpleNamespace(
+                    id=1, json=True, title=None, notes=None, priority=None,
+                    due=due, url=None, recurrence=None, alarm="15m",
+                )
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(self.remctl, "open_db", return_value=None),
+                    mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+                    mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                    mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    with self.assertRaises(SystemExit):
+                        self.remctl.cmd_edit(args)
+                bridge_call_result.assert_not_called()
+                self.assertEqual(json.loads(stderr.getvalue())["code"], "relative_alarm_requires_due_date")
+
+        args = SimpleNamespace(
+            id=1, json=True, title=None, notes=None, priority=None,
+            due="2026-04-20 09:00", url=None, recurrence=None, alarm="15m",
+        )
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": self._FAKE_REMINDER["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(args)
+        payload = bridge_call_result.call_args.args[0]
+        self.assertEqual((payload["due"], payload["alarm"]), ("2026-04-20T09:00:00", "-15m"))
 
     def _assert_refuses_unsafe_fallback(self, cmd_name, args):
         reminder = dict(self._FAKE_REMINDER)

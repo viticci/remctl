@@ -176,6 +176,12 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "array of strings"):
             remctl_mcp.validate_arguments(tool, {"args": [1]})
 
+    def test_set_completion_rejects_a_completion_date_when_reopening(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["set_completion"]
+        arguments = remctl_mcp.validate_arguments(tool, {"reminder_id": 7, "completed": False, "completion_date": "2026-09-01"})
+        with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "completion_date applies only when completed is true"):
+            tool.build_argv(arguments)
+
 
 class MediaTypeTests(unittest.TestCase):
     def test_apps_media_type_is_compared_after_normalization(self):

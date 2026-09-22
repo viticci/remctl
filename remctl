@@ -4586,6 +4586,45 @@ def fail_early_reminder_without_due(json_mode=False):
     sys.exit(1)
 
 
+def alarm_is_relative(parsed_alarm):
+    """parse_alarm writes relative alarms as -15m, -1h, or -1d."""
+    return bool(parsed_alarm) and parsed_alarm.startswith("-")
+
+
+def fail_relative_alarm_without_due(json_mode=False):
+    # A relative alarm fires before the due date; saved without one, it never fires.
+    message = (
+        "A relative alarm (15m, 1h, 1d) needs a due date to count back from. "
+        "Add a due date, or use an absolute alarm such as '2026-09-30 09:00'. "
+        "No reminder was created or changed."
+    )
+    if json_mode:
+        print(json.dumps({"status": "error", "code": "relative_alarm_requires_due_date", "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def fail_repeating_reminder_needs_due(reminder_id, json_mode=False):
+    # Reminders refuses to save a repeating reminder without a due date. Refuse
+    # before writing: the AppleScript fallback has no transaction, so it would
+    # change the other fields and then fail on the date.
+    message = (
+        "A repeating reminder needs a due date, so RemCTL cannot clear it. "
+        "Turn off the repeat in Reminders first, or pass a new due date. No reminder was changed."
+    )
+    if json_mode:
+        print(json.dumps({
+            "status": "error",
+            "code": "repeating_reminder_requires_due_date",
+            "message": message,
+            "id": reminder_id,
+        }), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def early_reminder_identifiers_for_reminder(db, reminder_ckid):
     if db is None or not reminder_ckid:
         return []
@@ -4725,7 +4764,7 @@ def delete_reminder_by_identifier_or_die(reminder):
         if result and result.get("status") == "deleted":
             return result
     rid = _rem_id(reminder)
-    if rid and osa_by_id_try(reminder["list_name"], rid, "delete r"):
+    if rid and osa_by_id_try(rid, "delete r"):
         return {"status": "deleted", "fallback": "applescript"}
     title = safe_display(_row_get(reminder, "ZTITLE") or "(untitled)")
     print(
@@ -6501,19 +6540,21 @@ def create_list_with_applescript(name):
     return {"status": "created", "id": rid, "fallback": "applescript"}
 
 
-def osa_by_id_try(list_name, rem_id, action, timeout=120):
+def osa_by_id_try(rem_id, action, timeout=120):
     """Non-fatal variant: returns True on success, False on failure.
     Used for AppleScript-first write paths that want to fall back to bridge.
+
+    The reminder is addressed at application level (`reminder id ...`), as in
+    osa_set_flagged_result: a `tell list "<name>"` scope throws -1728 for
+    lists inside groups, which Reminders' scripting dictionary does not expose.
 
     Reminders.app AppleScript dispatch can be slow (30–90s) on busy stores,
     especially after a remindd restart. Use a generous timeout — slow sync
     beats silent data loss."""
     script = (
         f'tell application "Reminders"\n'
-        f'tell list "{esc(list_name)}"\n'
-        f'set r to (first reminder whose id is "{esc(rem_id)}")\n'
+        f'set r to reminder id "{esc(rem_id)}"\n'
         f'{action}\n'
-        f'end tell\n'
         f'end tell'
     )
     try:
@@ -8729,6 +8770,8 @@ def cmd_add(a):
             sys.exit(1)
     if early_reminder_requires_due_date(a) and dt is None:
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
+    if alarm_is_relative(parsed_alarm) and dt is None:
+        fail_relative_alarm_without_due(json_mode=getattr(a, "json", False))
     if wants_private and not bridge_available():
         print("Error: private metadata creation requires remctl-bridge so the reminder has a stable ID.", file=sys.stderr)
         sys.exit(1)
@@ -9008,7 +9051,7 @@ def cmd_done(a):
     action = "set completed of r to true"
     if completion_dt:
         action += "\n" + as_date_assign(completion_dt, "completion date of r")
-    if rid and osa_by_id_try(r["list_name"], rid, action):
+    if rid and osa_by_id_try(rid, action):
         if a.json:
             payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
             if completion_iso:
@@ -9045,7 +9088,7 @@ def cmd_undone(a):
             return
 
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "set completed of r to false"):
+    if rid and osa_by_id_try(rid, "set completed of r to false"):
         if a.json:
             print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
         else:
@@ -9084,7 +9127,7 @@ def cmd_delete(a):
             return
 
     rid = _rem_id(r)
-    if rid and osa_by_id_try(r["list_name"], rid, "delete r"):
+    if rid and osa_by_id_try(rid, "delete r"):
         if a.json:
             print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
         else:
@@ -9158,6 +9201,8 @@ def cmd_edit(a):
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
     if early_reminder_requires_due_date(a) and dt is None and not r["ZDUEDATE"]:
         fail_early_reminder_without_due(json_mode=getattr(a, "json", False))
+    if a.due == "clear" and _row_get(r, "recurrence_frequency") is not None:
+        fail_repeating_reminder_needs_due(a.id, json_mode=getattr(a, "json", False))
     parsed_alarm = None
     clear_alarm = False
     if getattr(a, "alarm", None):
@@ -9167,6 +9212,8 @@ def cmd_edit(a):
             if parsed_alarm is None:
                 print(f"Error: could not parse alarm {a.alarm!r}. Use 15m, 1h, 1d, an absolute date, or clear.", file=sys.stderr)
                 sys.exit(1)
+    if alarm_is_relative(parsed_alarm) and (a.due == "clear" or (dt is None and not r["ZDUEDATE"])):
+        fail_relative_alarm_without_due(json_mode=getattr(a, "json", False))
 
     # Auto double-tap: if Reminders' displayed due date already equals the
     # requested target, AppleScript treats it as a no-op and pushes only
@@ -9375,6 +9422,16 @@ def cmd_edit(a):
 
     if r["ZCKIDENTIFIER"] and has_applescript_fields and not has_bridge_only:
         parts = []
+        # The date goes first: it is the change Reminders can refuse, and
+        # AppleScript has no transaction, so a refusal after the other
+        # statements would leave them applied.
+        if a.due == "clear":
+            parts.append("set due date of r to missing value")
+        elif dt is not None:
+            # Same double-tap defense as the bridge path.
+            if dt_nudge is not None:
+                parts.append(as_date_assign(dt_nudge))
+            parts.append(as_date_assign(dt))
         if a.title:
             parts.append(f'set name of r to "{esc(a.title)}"')
         notes_body = a.notes
@@ -9384,14 +9441,7 @@ def cmd_edit(a):
             parts.append(f'set body of r to "{esc(notes_body)}"')
         if priority_value is not None:
             parts.append(f"set priority of r to {priority_value}")
-        if a.due == "clear":
-            parts.append("set due date of r to missing value")
-        elif dt is not None:
-            # Same double-tap defense as the bridge path.
-            if dt_nudge is not None:
-                parts.append(as_date_assign(dt_nudge))
-            parts.append(as_date_assign(dt))
-        if parts and osa_by_id_try(r["list_name"], _rem_id(r), chr(10).join(parts)):
+        if parts and osa_by_id_try(_rem_id(r), chr(10).join(parts)):
             if a.json:
                 print(json.dumps({"status": "updated", "id": a.id, "title": resulting_title}))
             else:
@@ -9416,11 +9466,10 @@ def cmd_edit(a):
     if not r["ZCKIDENTIFIER"]:
         _refuse_unsafe_title_fallback(r, "edit it", "The reminder has no stable identifier")
     warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
-    _refuse_unsafe_title_fallback(
-        r,
-        "edit it",
-        "Identifier-based writes failed",
-    )
+    reason = "Identifier-based writes failed"
+    if bridge_write_attempted and bridge_write_result and bridge_write_result.get("returncode") != 0:
+        reason += f" (remctl-bridge: {bridge_failure_message(bridge_write_result).rstrip('.')})"
+    _refuse_unsafe_title_fallback(r, "edit it", reason)
 
 
 def reminder_move_relation(a):

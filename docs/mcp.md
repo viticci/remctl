@@ -126,8 +126,10 @@ Every tool returns `structuredContent` plus the same JSON as a text block, so cl
 
 Notes:
 
-- `due` accepts `YYYY-MM-DD` (all day), `YYYY-MM-DD HH:MM` (timed), relative forms such as `tomorrow 09:30` or `+3d`, and `clear` in `update_reminder`.
-- `recurrence` accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
+- `due` accepts `YYYY-MM-DD` (all day), `YYYY-MM-DD HH:MM` (timed), relative forms such as `tomorrow 09:30` or `+3d`, and `clear` in `update_reminder`. A repeating reminder must keep a due date, so `clear` on one is refused with `repeating_reminder_requires_due_date`.
+- A relative `alarm` (`15m`, `1h`, `1d`) counts back from the due date. Without one, the call is refused with `relative_alarm_requires_due_date`; an ISO date works without a due date.
+- `completion_date` applies only with `completed: true`.
+- `recurrence` needs a due date. It accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
 - `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands. Include `--json`. Destructive commands need `--force`.
 - `delete_reminder` is annotated as destructive so hosts ask for confirmation.
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.

@@ -312,11 +312,11 @@ PRIORITY = Param(
     coerce=_coerce_priority,
 )
 RECURRENCE_HELP = (
-    "Recurrence rule: daily, weekly, monthly, yearly; optional xN interval after the frequency "
+    "Recurrence rule (needs a due date): daily, weekly, monthly, yearly; optional xN interval after the frequency "
     "(daily x2); weekday lists (weekly mon,wed,fri); month days (monthly 1,15); ordinal weekdays "
     "(monthly 4th-fri, monthly last-fri)."
 )
-ALARM_HELP = "Alarm relative to the due date (15m, 1h, 1d) or an ISO datetime."
+ALARM_HELP = "Alarm relative to the due date (15m, 1h, 1d; needs a due date) or an ISO datetime."
 
 ROWS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -413,6 +413,8 @@ def _argv_update_reminder(args):
 def _argv_set_completion(args):
     if args["completed"]:
         return ["done", str(args["reminder_id"]), *_option(args, "completion_date", "--date"), "--json"]
+    if args.get("completion_date") is not None:
+        raise ToolArgumentError("completion_date applies only when completed is true.")
     return ["undone", str(args["reminder_id"]), "--json"]
 
 
@@ -549,7 +551,7 @@ TOOLS: tuple[Tool, ...] = (
             LIST_NAME,
             LIST_ID,
             Param("notes", "string", "Replacement notes.", max_length=16 * 1024),
-            Param("due", "string", DUE_HELP + " Use clear to remove the due date.", max_length=128),
+            Param("due", "string", DUE_HELP + " Use clear to remove the due date; a repeating reminder must keep one.", max_length=128),
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
