@@ -337,7 +337,11 @@ def _option(args: dict[str, Any], key: str, option: str) -> list[str]:
     value = args.get(key)
     if value is None or value == "":
         return []
-    return [option, str(value)]
+    text = str(value)
+    if text.startswith("-"):
+        # argparse reads a separate "-foo" as another option; the joined form keeps it a value.
+        return [f"{option}={text}"]
+    return [option, text]
 
 
 def _argv_today(args):
@@ -357,7 +361,7 @@ def _argv_flagged(args):
 
 
 def _argv_search(args):
-    return ["search", str(args["query"]), *_flag(args, "include_completed", "--completed"), "--json"]
+    return ["search", *_flag(args, "include_completed", "--completed"), "--json", "--", str(args["query"])]
 
 
 def _argv_show_list(args):
@@ -431,13 +435,41 @@ def _argv_doctor(args):
 
 
 RUN_FORBIDDEN_COMMANDS = frozenset({"mcp", "completion", "setup", "onboard", "permissions", "open"})
+# RemCTL's top-level options, and whether each one takes the next argument as its value.
+RUN_GLOBAL_OPTIONS = {
+    "--help": False,
+    "--version": False,
+    "--no-color": False,
+    "--format": True,
+    "--images": False,
+    "--image-mode": True,
+    "--image-width": True,
+}
+
+
+def _run_command_name(argv: list[str]) -> str | None:
+    """The subcommand argparse will run, skipping top-level options and their values."""
+
+    items = iter(argv)
+    for item in items:
+        if item == "--":
+            return next(items, None)
+        if not item.startswith("-"):
+            return item
+        name = item.split("=", 1)[0]
+        # argparse also accepts an unambiguous prefix, such as --form for --format.
+        matches = [option for option in RUN_GLOBAL_OPTIONS if option.startswith(name)] if name.startswith("--") else []
+        option = name if name in RUN_GLOBAL_OPTIONS else (matches[0] if len(matches) == 1 else None)
+        if option and RUN_GLOBAL_OPTIONS[option] and "=" not in item:
+            next(items, None)
+    return None
 
 
 def _argv_run(args):
     argv = [str(item) for item in args.get("args") or []]
     if not argv:
         raise ToolArgumentError("args must contain at least one RemCTL argument, for example [\"lists\", \"--json\"].")
-    command = next((item for item in argv if not item.startswith("-")), None)
+    command = _run_command_name(argv)
     if command in RUN_FORBIDDEN_COMMANDS:
         raise ToolArgumentError(
             f"run does not execute `remctl {command}`; it is an interactive or setup command with no MCP equivalent."

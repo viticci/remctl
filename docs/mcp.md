@@ -130,7 +130,8 @@ Notes:
 - A relative `alarm` (`15m`, `1h`, `1d`) counts back from the due date. Without one, the call is refused with `relative_alarm_requires_due_date`; an ISO date works without a due date.
 - `completion_date` applies only with `completed: true`.
 - `recurrence` needs a due date. It accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
-- `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands. Include `--json`. Destructive commands need `--force`.
+- `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands, including when top-level options such as `--format json` come first. Include `--json`. Destructive commands need `--force`.
+- Values that start with `-`, such as a search for `-urgent`, are passed as values, never as options.
 - `delete_reminder` is annotated as destructive so hosts ask for confirmation.
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.
 - `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.

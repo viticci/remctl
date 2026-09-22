@@ -33,6 +33,8 @@
 - `add` and `edit` refuse a relative alarm (`15m`, `1h`, `1d`) on a reminder without a due date, with the code `relative_alarm_requires_due_date`. A relative alarm counts back from the due date, so Reminders saved it but it never fired. An alarm at a fixed date and time still works without a due date.
 - `set_completion` refuses `completion_date` when `completed` is false. Before, it reopened the reminder and ignored the date without saying so.
 - The AppleScript fallback for `done`, `undone`, `delete`, and `edit` finds reminders in lists that are inside a list group. It addressed the reminder through its list, which Reminders' AppleScript cannot see inside a group (error -1728). It now addresses the reminder by its id, as `flag` already did.
+- MCP tools pass values that start with `-` as values. A search for `-urgent`, a new title such as `-Renamed`, or notes that begin with `--` made the command line read the value as an option and fail. The tools now use `--option=value` and `--`.
+- The `run` tool finds the command behind top-level options. `run` with `["--format", "json", "mcp"]` started a second MCP server, because the guard took `json` for the command. It now skips top-level options and their values, including abbreviations such as `--form`.
 - The command guide's recurrence examples now include a due date. Reminders refuses to save a repeating reminder without one, so the examples failed as written.
 
 ### Documentation

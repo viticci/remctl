@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import html.parser
 import io
 import json
@@ -100,13 +101,16 @@ class CatalogTests(unittest.TestCase):
             (("upcoming", ()), ["upcoming", "7", "--json"]),
             (("overdue", ()), ["overdue", "--json"]),
             (("flagged", ()), ["flagged", "--json"]),
-            (("search", (("query", "milk"), ("include_completed", True))), ["search", "milk", "--completed", "--json"]),
+            (("search", (("query", "milk"), ("include_completed", True))), ["search", "--completed", "--json", "--", "milk"]),
+            (("search", (("query", "-urgent"),)), ["search", "--json", "--", "-urgent"]),
             (("show_list", (("list", "Work"),)), ["show", "--json", "--", "Work"]),
             (("show_list", (("list_id", 153), ("include_completed", True))), ["show", "--list-id", "153", "--completed", "--json"]),
             (("lists", ()), ["lists", "--json"]),
             (("get_reminder", (("reminder_id", 42),)), ["info", "42", "--json"]),
             (("create_reminder", (("title", "-Leading dash"), ("list", "Work"), ("due", "tomorrow 09:30"), ("priority", "high"), ("flagged", True))), ["add", "--list", "Work", "--due", "tomorrow 09:30", "--priority", "high", "--flag", "--json", "--", "-Leading dash"]),
+            (("create_reminder", (("title", "Call Bo"), ("notes", "-> ask about Friday"))), ["add", "--notes=-> ask about Friday", "--json", "--", "Call Bo"]),
             (("update_reminder", (("reminder_id", 7), ("due", "clear"), ("list_id", 9))), ["edit", "7", "--list-id", "9", "--due", "clear", "--json"]),
+            (("update_reminder", (("reminder_id", 7), ("title", "-Renamed"), ("alarm", "-15m"))), ["edit", "7", "--title=-Renamed", "--alarm=-15m", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", True), ("completion_date", "2026-09-01"))), ["done", "7", "--date", "2026-09-01", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", False))), ["undone", "7", "--json"]),
             (("set_flagged", (("reminder_id", 7), ("flagged", False))), ["unflag", "7", "--json"]),
@@ -175,6 +179,30 @@ class CatalogTests(unittest.TestCase):
             tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": []}))
         with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "array of strings"):
             remctl_mcp.validate_arguments(tool, {"args": [1]})
+
+    def test_run_finds_the_command_behind_top_level_options(self):
+        # `--format json mcp` runs `mcp`: the value of a top-level option is not the command.
+        tool = remctl_mcp.TOOLS_BY_NAME["run"]
+        refused = (
+            ["--format", "json", "mcp"],
+            ["--form", "json", "setup"],
+            ["--format=json", "onboard"],
+            ["--image-width", "40", "--no-color", "permissions"],
+            ["--image-mode", "kitty", "completion", "zsh"],
+            ["--", "mcp"],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "does not execute"):
+                    tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": argv}))
+        allowed = (
+            ["--format", "json", "lists"],
+            ["--no-color", "show", "--json", "--", "mcp"],
+            ["search", "--json", "--", "setup"],
+        )
+        for argv in allowed:
+            with self.subTest(argv=argv):
+                self.assertEqual(tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": argv})), argv)
 
     def test_set_completion_rejects_a_completion_date_when_reopening(self):
         tool = remctl_mcp.TOOLS_BY_NAME["set_completion"]
@@ -871,6 +899,37 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(args.format_kind, "toml")
         args = self.remctl.parse_cli_args(parser, subparsers, ["onboard", "--no-mcp"])
         self.assertTrue(args.no_mcp)
+
+    def test_dash_leading_values_reach_the_real_parser_as_values(self):
+        # A title, note, query, or alarm that starts with "-" must not be read as an option.
+        parser, subparsers = self.remctl.build_parser()
+        cases = (
+            ("search", {"query": "-urgent"}, "query", "-urgent"),
+            ("create_reminder", {"title": "-Leading dash"}, "title", "-Leading dash"),
+            ("create_reminder", {"title": "Call Bo", "notes": "--draft"}, "notes", "--draft"),
+            ("update_reminder", {"reminder_id": 7, "title": "-Renamed"}, "title", "-Renamed"),
+            ("update_reminder", {"reminder_id": 7, "notes": "-n"}, "notes", "-n"),
+            ("update_reminder", {"reminder_id": 7, "alarm": "-15m"}, "alarm", "-15m"),
+        )
+        for name, arguments, dest, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                tool = remctl_mcp.TOOLS_BY_NAME[name]
+                argv = tool.build_argv(remctl_mcp.validate_arguments(tool, arguments))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parsed = self.remctl.parse_cli_args(parser, subparsers, argv)
+                self.assertEqual(getattr(parsed, dest), expected)
+
+    def test_run_guard_knows_every_top_level_option(self):
+        parser, subparsers = self.remctl.build_parser()
+        options = {
+            option: action.nargs != 0
+            for action in parser._actions
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        self.assertEqual(remctl_mcp.RUN_GLOBAL_OPTIONS, options)
+        # The value of a top-level option is not the command: this argv runs `mcp`.
+        self.assertEqual(self.remctl.parse_cli_args(parser, subparsers, ["--format", "json", "mcp"]).cmd, "mcp")
 
     def test_stale_connections_are_grouped_by_reason(self):
         stale = [
