@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 
 RECURRENCE_FREQUENCIES = {
@@ -11,6 +12,10 @@ RECURRENCE_FREQUENCIES = {
     2: "monthly",
     3: "yearly",
 }
+
+# Reminders timestamps count seconds from 2001-01-01T00:00:00Z, itself a UTC midnight.
+APPLE_EPOCH_UNIX = 978307200
+SECONDS_PER_DAY = 86400
 
 DUE_DATE_DELTA_UNITS = {
     0: ("minute", "minutes"),
@@ -283,6 +288,21 @@ def preload_indicators(db, pks):
     }
 
 
+def all_day_due_iso(raw, *, ts):
+    """The day of an all-day due date, as local midnight in ISO form.
+
+    Reminders stores an all-day due date as midnight UTC of that day. Read as
+    local time, that instant is 02:00 in Rome and the evening before in New
+    York, so the day comes from UTC. A value that is not a UTC midnight keeps
+    its local day.
+    """
+    if float(raw) % SECONDS_PER_DAY == 0:
+        day = datetime.fromtimestamp(float(raw) + APPLE_EPOCH_UNIX, tz=timezone.utc).date()
+    else:
+        day = ts(raw).date()
+    return datetime(day.year, day.month, day.day).isoformat()
+
+
 def serialize_reminder(
     row,
     *,
@@ -339,11 +359,18 @@ def serialize_reminder(
     if url:
         reminder["url"] = url
 
+    due_date = None
     if row["ZDUEDATE"]:
-        reminder["dueDate"] = ts(row["ZDUEDATE"]).isoformat()
+        if _row_get(row, "ZALLDAY"):
+            due_date = all_day_due_iso(row["ZDUEDATE"], ts=ts)
+        else:
+            due_date = ts(row["ZDUEDATE"]).isoformat()
+        reminder["dueDate"] = due_date
     display_date = _row_get(row, "ZDISPLAYDATEDATE")
     if display_date and display_date != row["ZDUEDATE"]:
-        reminder["displayDate"] = ts(display_date).isoformat()
+        display_iso = ts(display_date).isoformat()
+        if display_iso != due_date:
+            reminder["displayDate"] = display_iso
     if _row_get(row, "ZALLDAY") is not None:
         reminder["allDay"] = bool(_row_get(row, "ZALLDAY"))
     if row["ZCREATIONDATE"]:

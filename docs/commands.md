@@ -73,7 +73,7 @@ JSON keeps the raw values and adds fields human output cannot show:
 ```
 
 - `id` is RemCTL's numeric id. Pass it to `info`, `edit`, `done`, `undone`, `delete`, `link`, `open`, and `subtasks`.
-- `dueDate` is the real due date. `displayDate` appears when Reminders stores a separate display or alert date, for example an alarm 15 minutes before. Do not treat `displayDate` as the due date.
+- `dueDate` is the real due date. For an all-day reminder (`allDay: true`) it is midnight of that day, such as `2026-09-30T00:00:00`, in every time zone. `displayDate` appears when Reminders stores a separate display or alert date, for example an alarm 15 minutes before. Do not treat `displayDate` as the due date.
 - `alarms` lists EventKit alarms (`relative`, `absolute`) and location alarms (`type: "location"` with a `location` object).
 - `earlyReminder` is Reminders' Early Reminder, a private field separate from alarms.
 - `recurrence` decodes the stored rule. Weekdays pinned to a week of the month appear as `daysOfWeekDetailed` entries with `weekNumber`.

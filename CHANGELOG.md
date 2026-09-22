@@ -35,6 +35,8 @@
 - The AppleScript fallback for `done`, `undone`, `delete`, and `edit` finds reminders in lists that are inside a list group. It addressed the reminder through its list, which Reminders' AppleScript cannot see inside a group (error -1728). It now addresses the reminder by its id, as `flag` already did.
 - MCP tools pass values that start with `-` as values. A search for `-urgent`, a new title such as `-Renamed`, or notes that begin with `--` made the command line read the value as an option and fail. The tools now use `--option=value` and `--`.
 - The `run` tool finds the command behind top-level options. `run` with `["--format", "json", "mcp"]` started a second MCP server, because the guard took `json` for the command. It now skips top-level options and their values, including abbreviations such as `--form`.
+- The reminders widget shows weekday names and the occurrence count for repeating reminders. RemCTL reports weekdays as EventKit numbers, where 1 is Sunday, and the count as `count`. The widget expected names and `occurrenceCount`, so it showed `weekly 2, 4` and left out the count.
+- An all-day reminder's `dueDate` is midnight of its day, such as `2026-09-30T00:00:00`, in every time zone. Reminders stores the day as midnight UTC, and RemCTL printed that moment in local time: `2026-09-30T02:00:00` in Rome and `2026-09-29T20:00:00` in New York, the day before. `displayDate` is left out when it names the same moment.
 - The command guide's recurrence examples now include a due date. Reminders refuses to save a repeating reminder without one, so the examples failed as written.
 
 ### Documentation
