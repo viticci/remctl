@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import html.parser
 import io
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -99,13 +101,16 @@ class CatalogTests(unittest.TestCase):
             (("upcoming", ()), ["upcoming", "7", "--json"]),
             (("overdue", ()), ["overdue", "--json"]),
             (("flagged", ()), ["flagged", "--json"]),
-            (("search", (("query", "milk"), ("include_completed", True))), ["search", "milk", "--completed", "--json"]),
+            (("search", (("query", "milk"), ("include_completed", True))), ["search", "--completed", "--json", "--", "milk"]),
+            (("search", (("query", "-urgent"),)), ["search", "--json", "--", "-urgent"]),
             (("show_list", (("list", "Work"),)), ["show", "--json", "--", "Work"]),
             (("show_list", (("list_id", 153), ("include_completed", True))), ["show", "--list-id", "153", "--completed", "--json"]),
             (("lists", ()), ["lists", "--json"]),
             (("get_reminder", (("reminder_id", 42),)), ["info", "42", "--json"]),
             (("create_reminder", (("title", "-Leading dash"), ("list", "Work"), ("due", "tomorrow 09:30"), ("priority", "high"), ("flagged", True))), ["add", "--list", "Work", "--due", "tomorrow 09:30", "--priority", "high", "--flag", "--json", "--", "-Leading dash"]),
+            (("create_reminder", (("title", "Call Bo"), ("notes", "-> ask about Friday"))), ["add", "--notes=-> ask about Friday", "--json", "--", "Call Bo"]),
             (("update_reminder", (("reminder_id", 7), ("due", "clear"), ("list_id", 9))), ["edit", "7", "--list-id", "9", "--due", "clear", "--json"]),
+            (("update_reminder", (("reminder_id", 7), ("title", "-Renamed"), ("alarm", "-15m"))), ["edit", "7", "--title=-Renamed", "--alarm=-15m", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", True), ("completion_date", "2026-09-01"))), ["done", "7", "--date", "2026-09-01", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", False))), ["undone", "7", "--json"]),
             (("set_flagged", (("reminder_id", 7), ("flagged", False))), ["unflag", "7", "--json"]),
@@ -174,6 +179,36 @@ class CatalogTests(unittest.TestCase):
             tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": []}))
         with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "array of strings"):
             remctl_mcp.validate_arguments(tool, {"args": [1]})
+
+    def test_run_finds_the_command_behind_top_level_options(self):
+        # `--format json mcp` runs `mcp`: the value of a top-level option is not the command.
+        tool = remctl_mcp.TOOLS_BY_NAME["run"]
+        refused = (
+            ["--format", "json", "mcp"],
+            ["--form", "json", "setup"],
+            ["--format=json", "onboard"],
+            ["--image-width", "40", "--no-color", "permissions"],
+            ["--image-mode", "kitty", "completion", "zsh"],
+            ["--", "mcp"],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "does not execute"):
+                    tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": argv}))
+        allowed = (
+            ["--format", "json", "lists"],
+            ["--no-color", "show", "--json", "--", "mcp"],
+            ["search", "--json", "--", "setup"],
+        )
+        for argv in allowed:
+            with self.subTest(argv=argv):
+                self.assertEqual(tool.build_argv(remctl_mcp.validate_arguments(tool, {"args": argv})), argv)
+
+    def test_set_completion_rejects_a_completion_date_when_reopening(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["set_completion"]
+        arguments = remctl_mcp.validate_arguments(tool, {"reminder_id": 7, "completed": False, "completion_date": "2026-09-01"})
+        with self.assertRaisesRegex(remctl_mcp.ToolArgumentError, "completion_date applies only when completed is true"):
+            tool.build_argv(arguments)
 
 
 class MediaTypeTests(unittest.TestCase):
@@ -380,8 +415,54 @@ class ToolCallTests(unittest.TestCase):
     def test_object_output_passes_through_and_stderr_is_attached(self):
         server, _ = make_server(FakeExecutor(stdout='{"status":"created","id":"abc","numericId":5}', stderr="Warning: something\n"))
         result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "x"}})["result"]
-        self.assertEqual(result["structuredContent"]["numericId"], 5)
+        self.assertEqual(result["structuredContent"]["id"], 5)
         self.assertEqual(result["structuredContent"]["stderr"], "Warning: something")
+
+    def test_create_reminder_reports_the_numeric_id_as_id(self):
+        created = '{"status":"created","id":"3AE94447-1111-2222-3333-444444444444","title":"Milk","numericId":4774}'
+        server, _ = make_server(FakeExecutor(stdout=created))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "Milk"}})["result"]
+        structured = result["structuredContent"]
+        self.assertEqual(structured["id"], 4774)
+        self.assertEqual(structured["cloudKitId"], "3AE94447-1111-2222-3333-444444444444")
+        self.assertNotIn("numericId", structured)
+        self.assertEqual(list(structured), ["status", "id", "cloudKitId", "title"])
+        # The id it hands back is the id every other tool accepts.
+        follow_up = remctl_mcp.validate_arguments(
+            remctl_mcp.TOOLS_BY_NAME["get_reminder"], {"reminder_id": structured["id"]}
+        )
+        self.assertEqual(follow_up["reminder_id"], 4774)
+
+    def test_create_reminder_warns_when_the_numeric_id_is_missing(self):
+        server, _ = make_server(FakeExecutor(stdout='{"status":"created","id":"3AE94447-1111","title":"Milk"}'))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "create_reminder", "arguments": {"title": "Milk"}})["result"]
+        structured = result["structuredContent"]
+        self.assertNotIn("id", structured)
+        self.assertEqual(structured["cloudKitId"], "3AE94447-1111")
+        self.assertIn("numeric_id_unavailable", structured["warnings"][0])
+
+    def test_tools_that_already_report_a_numeric_id_are_untouched(self):
+        server, _ = make_server(FakeExecutor(stdout='{"status":"updated","id":4774,"title":"Milk"}'))
+        result = request(server, "tools/call", {"_meta": modern_meta(), "name": "update_reminder", "arguments": {"reminder_id": 4774, "title": "Milk"}})["result"]
+        self.assertEqual(result["structuredContent"], {"status": "updated", "id": 4774, "title": "Milk"})
+
+    def test_priority_accepts_apple_numbers_and_still_rejects_nonsense(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["create_reminder"]
+        for value, expected in ((0, "none"), (1, "high"), (4, "high"), (5, "medium"), (9, "low"), ("5", "medium"), ("high", "high")):
+            with self.subTest(value=value):
+                arguments = remctl_mcp.validate_arguments(tool, {"title": "x", "priority": value})
+                self.assertEqual(arguments["priority"], expected)
+        for value in (42, -1, 1.5, True, "urgent"):
+            with self.subTest(value=value):
+                with self.assertRaises(remctl_mcp.ToolArgumentError):
+                    remctl_mcp.validate_arguments(tool, {"title": "x", "priority": value})
+
+    def test_tags_accept_a_list_as_well_as_a_comma_separated_string(self):
+        tool = remctl_mcp.TOOLS_BY_NAME["create_reminder"]
+        self.assertEqual(remctl_mcp.validate_arguments(tool, {"title": "x", "tags": ["work", " home "]})["tags"], "work,home")
+        self.assertEqual(remctl_mcp.validate_arguments(tool, {"title": "x", "tags": "work,home"})["tags"], "work,home")
+        with self.assertRaises(remctl_mcp.ToolArgumentError):
+            remctl_mcp.validate_arguments(tool, {"title": "x", "tags": [1, 2]})
 
     def test_apps_client_receives_result_hints_and_actions(self):
         server, _ = make_server(FakeExecutor(stdout="[]"))
@@ -557,7 +638,77 @@ class RegistrationTests(unittest.TestCase):
     def test_server_command_uses_the_absolute_interpreter(self):
         command, args = remctl_mcp.server_command(Path("/Users/x/bin/remctl"))
         self.assertTrue(os.path.isabs(command))
+        self.assertEqual(command, remctl_mcp.stable_interpreter())
+        self.assertIsNone(remctl_mcp.interpreter_problem(command))
         self.assertEqual(args, ["/Users/x/bin/remctl", "mcp"])
+
+    @staticmethod
+    def _homebrew_python(root):
+        """A fake Homebrew prefix: the interpreter lives in a versioned keg, reached through opt/ and bin/ links."""
+        keg = root / "Cellar" / "python@3.14" / "3.14.7"
+        (keg / "bin").mkdir(parents=True)
+        real = keg / "bin" / "python3.14"
+        real.write_text("#!/bin/sh\n", encoding="utf-8")
+        real.chmod(0o755)
+        (root / "opt").mkdir()
+        (root / "opt" / "python@3.14").symlink_to(keg)
+        (root / "bin").mkdir()
+        (root / "bin" / "python3").symlink_to(real)
+        return real
+
+    def test_stable_interpreter_prefers_the_homebrew_opt_link_over_the_versioned_keg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            opt = str(root / "opt" / "python@3.14" / "bin" / "python3.14")
+            self.assertEqual(remctl_mcp.stable_interpreter(str(root / "bin" / "python3")), opt)
+            self.assertEqual(remctl_mcp.stable_interpreter(str(real)), opt)
+            # Without an opt link that reaches the same file, keep the resolved path.
+            (root / "opt" / "python@3.14").unlink()
+            self.assertEqual(remctl_mcp.stable_interpreter(str(real)), str(real))
+            plain = root / "python3"
+            plain.symlink_to(real)
+            self.assertEqual(remctl_mcp.stable_interpreter(str(plain)), str(real))
+
+    def test_interpreter_problem_names_interpreters_that_will_stop_working(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            not_executable = root / "python-data"
+            not_executable.write_text("", encoding="utf-8")
+            self.assertIsNone(remctl_mcp.interpreter_problem(str(root / "opt" / "python@3.14" / "bin" / "python3.14")))
+            self.assertIsNone(remctl_mcp.interpreter_problem(str(root / "bin" / "python3")))
+            self.assertEqual(remctl_mcp.interpreter_problem(str(real)), "interpreter_versioned")
+            for command in (None, "", 3, str(root / "missing" / "python3"), str(not_executable)):
+                with self.subTest(command=command):
+                    self.assertEqual(remctl_mcp.interpreter_problem(command), "interpreter_missing")
+            with mock.patch.object(remctl_mcp.shutil, "which", side_effect=lambda name: str(root / "bin" / "python3") if name == "python3" else None):
+                self.assertIsNone(remctl_mcp.interpreter_problem("python3"))
+                self.assertEqual(remctl_mcp.interpreter_problem("python9"), "interpreter_missing")
+
+    def test_registration_status_accepts_any_working_interpreter_and_names_stale_reasons(self):
+        # An app registered from another Python is still current; one whose Python
+        # is gone, or sits in a keg that `brew upgrade` deletes, is not.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            real = self._homebrew_python(root)
+            cli = Path("/Users/x/bin/remctl")
+            _, args = remctl_mcp.server_command(cli)
+            claude = root / ".claude.json"
+            codex = root / "config.toml"
+            desktop = root / "desktop.json"
+            claude.write_text(json.dumps({"mcpServers": {"remctl": {"command": str(root / "bin" / "python3"), "args": args}}}), encoding="utf-8")
+            codex.write_text(f"[mcp_servers.remctl]\ncommand = {json.dumps(str(real))}\nargs = {json.dumps(args)}\n", encoding="utf-8")
+            desktop.write_text(json.dumps({"mcpServers": {"remctl": {"command": str(root / "gone" / "python3"), "args": args}}}), encoding="utf-8")
+            status = {entry["client"]: entry for entry in remctl_mcp.registration_status(cli, claude_config=claude, codex_config=codex, desktop_config=desktop)}
+            self.assertTrue(status["claude-code"]["current"])
+            self.assertNotIn("staleReason", status["claude-code"])
+            self.assertFalse(status["codex"]["current"])
+            self.assertEqual(status["codex"]["staleReason"], "interpreter_versioned")
+            self.assertFalse(status["claude-desktop"]["current"])
+            self.assertEqual(status["claude-desktop"]["staleReason"], "interpreter_missing")
+            moved = {entry["client"]: entry for entry in remctl_mcp.registration_status(Path("/Users/y/bin/remctl"), claude_config=claude, codex_config=codex, desktop_config=desktop)}
+            self.assertEqual({entry["staleReason"] for entry in moved.values()}, {"different_cli"})
 
     def test_claude_code_install_builds_the_documented_command_and_replaces_existing(self):
         calls = []
@@ -748,6 +899,80 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(args.format_kind, "toml")
         args = self.remctl.parse_cli_args(parser, subparsers, ["onboard", "--no-mcp"])
         self.assertTrue(args.no_mcp)
+
+    def test_dash_leading_values_reach_the_real_parser_as_values(self):
+        # A title, note, query, or alarm that starts with "-" must not be read as an option.
+        parser, subparsers = self.remctl.build_parser()
+        cases = (
+            ("search", {"query": "-urgent"}, "query", "-urgent"),
+            ("create_reminder", {"title": "-Leading dash"}, "title", "-Leading dash"),
+            ("create_reminder", {"title": "Call Bo", "notes": "--draft"}, "notes", "--draft"),
+            ("update_reminder", {"reminder_id": 7, "title": "-Renamed"}, "title", "-Renamed"),
+            ("update_reminder", {"reminder_id": 7, "notes": "-n"}, "notes", "-n"),
+            ("update_reminder", {"reminder_id": 7, "alarm": "-15m"}, "alarm", "-15m"),
+        )
+        for name, arguments, dest, expected in cases:
+            with self.subTest(tool=name, arguments=arguments):
+                tool = remctl_mcp.TOOLS_BY_NAME[name]
+                argv = tool.build_argv(remctl_mcp.validate_arguments(tool, arguments))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parsed = self.remctl.parse_cli_args(parser, subparsers, argv)
+                self.assertEqual(getattr(parsed, dest), expected)
+
+    def test_run_guard_knows_every_top_level_option(self):
+        parser, subparsers = self.remctl.build_parser()
+        options = {
+            option: action.nargs != 0
+            for action in parser._actions
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        self.assertEqual(remctl_mcp.RUN_GLOBAL_OPTIONS, options)
+        # The value of a top-level option is not the command: this argv runs `mcp`.
+        self.assertEqual(self.remctl.parse_cli_args(parser, subparsers, ["--format", "json", "mcp"]).cmd, "mcp")
+
+    def test_stale_connections_are_grouped_by_reason(self):
+        stale = [
+            {"name": "Codex", "staleReason": "interpreter_versioned"},
+            {"name": "Claude Desktop", "staleReason": "different_cli"},
+            {"name": "Claude Code", "staleReason": "interpreter_versioned"},
+            {"name": "Older client"},
+        ]
+        self.assertEqual(
+            self.remctl.mcp_stale_clients_text(stale),
+            "MCP connection starts a versioned Homebrew Python that `brew upgrade` deletes: Codex, Claude Code; "
+            "MCP connection points at a different RemCTL path: Claude Desktop, Older client",
+        )
+        serving = {"installed": True, "configured": True, "active": True, "url": "https://mac.example.ts.net/remctl"}
+        with mock.patch.object(self.remctl.C, "enabled", False):
+            self.assertEqual(self.remctl.tailscale_state_text(serving), "serving at https://mac.example.ts.net/remctl")
+            self.assertEqual(
+                self.remctl.tailscale_state_text({**serving, "agentInterpreterProblem": "interpreter_versioned"}),
+                "serving at https://mac.example.ts.net/remctl, but the service starts a versioned Homebrew Python "
+                "that `brew upgrade` deletes; rerun `remctl mcp install --client tailscale`",
+            )
+
+    def test_status_reports_a_connected_app_whose_cli_is_not_on_path(self):
+        # Claude Code and Codex install into ~/.local/bin, which GUI apps,
+        # LaunchAgents, and remote runners such as MacRemote often lack on PATH.
+        overview = {
+            "server": {"command": ["/usr/bin/python3", "/Users/x/bin/remctl", "mcp"]},
+            "clients": [
+                {"id": "claude-code", "name": "Claude Code", "installed": False, "configured": True, "current": True},
+                {"id": "codex", "name": "Codex", "installed": False, "configured": True, "current": False, "staleReason": "different_cli"},
+                {"id": "claude-desktop", "name": "Claude Desktop and Cowork", "installed": False, "configured": False, "current": None},
+            ],
+            "tailscale": {"installed": False},
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.remctl, "mcp_overview", return_value=overview), \
+             mock.patch.object(self.remctl.C, "enabled", False), \
+             mock.patch.object(sys, "stdout", out):
+            self.remctl.cmd_mcp(SimpleNamespace(mcp_action="status", json=False))
+        output = out.getvalue()
+        self.assertIn("Claude Code: connected\n", output)
+        self.assertIn("Codex: connected, but it points at a different RemCTL path", output)
+        self.assertIn("Claude Desktop and Cowork: not installed", output)
 
     def test_completion_scripts_mention_mcp(self):
         for shell in ("zsh", "bash", "fish"):
@@ -1027,6 +1252,96 @@ class HTTPConfigAndTailscaleTests(unittest.TestCase):
             failed = remctl_mcp.tailscale_serve_enable(7362, runner=failing)
         self.assertFalse(failed["ok"])
         self.assertIn("admin console", failed["error"])
+
+    def test_tailscale_commands_run_as_the_cli_without_a_terminal(self):
+        # The binary inside Tailscale.app acts as the CLI only when TERM or
+        # TAILSCALE_BE_CLI is set; the tailnet service and GUI apps have no TERM.
+        environments = []
+
+        def runner(argv, **kwargs):
+            environments.append(kwargs.get("env"))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with mock.patch.dict(os.environ, {"REMCTL_TEST_MARKER": "kept"}), \
+             mock.patch.object(remctl_mcp, "tailscale_binary", return_value="/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+            os.environ.pop("TERM", None)
+            os.environ.pop("TAILSCALE_BE_CLI", None)
+            remctl_mcp.tailscale_status(runner=runner)
+            remctl_mcp.tailscale_serve_mount(runner=runner)
+            remctl_mcp.tailscale_serve_enable(7362, runner=runner)
+            remctl_mcp.tailscale_serve_disable(runner=runner)
+        self.assertEqual(len(environments), 4)
+        for env in environments:
+            self.assertEqual(env["TAILSCALE_BE_CLI"], "1")
+            self.assertEqual(env["REMCTL_TEST_MARKER"], "kept")
+
+    def test_http_agent_status_reports_an_interpreter_that_will_stop_working(self):
+        def runner(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(os.path.realpath(tmp))
+            keg = RegistrationTests._homebrew_python(root)
+            plist = root / "agent.plist"
+            with mock.patch.object(remctl_mcp, "http_agent_plist_path", return_value=plist):
+                self.assertNotIn("interpreterProblem", remctl_mcp.http_agent_status(runner=runner))
+                cases = (
+                    (str(root / "opt" / "python@3.14" / "bin" / "python3.14"), None),
+                    (str(keg), "interpreter_versioned"),
+                    (str(root / "gone" / "python3"), "interpreter_missing"),
+                )
+                for command, expected in cases:
+                    with self.subTest(command=command):
+                        plist.write_bytes(plistlib.dumps({"Label": remctl_mcp.HTTP_AGENT_LABEL, "ProgramArguments": [command, "/Users/x/bin/remctl", "mcp", "serve", "--http"]}))
+                        self.assertEqual(remctl_mcp.http_agent_status(runner=runner)["interpreterProblem"], expected)
+
+    def test_reinstalling_a_running_http_agent_waits_for_the_old_job_to_exit(self):
+        # bootout returns while launchd is still stopping the job, and a bootstrap
+        # in that window fails with "Bootstrap failed: 5: Input/output error".
+        calls = []
+        stopping = {"checks": 2}
+
+        def launchd(argv, **kwargs):
+            action = argv[1]
+            calls.append(action)
+            if action == "print":
+                if stopping["checks"]:
+                    stopping["checks"] -= 1
+                    return subprocess.CompletedProcess(argv, 0, "state = running", "")
+                return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+            if action == "bootstrap" and stopping["checks"]:
+                return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5: Input/output error")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(remctl_mcp, "http_agent_log_path", return_value=Path(tmp) / "Logs" / "remctl-mcp-http.log"):
+            result = remctl_mcp.install_http_agent(Path("/Users/x/bin/remctl"), runner=launchd, plist_path=Path(tmp) / "agent.plist")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap"])
+
+    def test_installing_the_http_agent_restarts_it_only_when_it_was_still_loaded(self):
+        # A clean bootstrap starts the job (RunAtLoad). kickstart -k then killed
+        # it, and launchd held the restart for its 10-second throttle.
+        cases = (
+            (0, "", ["bootout", "print", "bootstrap"]),
+            (37, "Bootstrap failed: 37: Operation already in progress", ["bootout", "print", "bootstrap", "kickstart"]),
+        )
+        for code, message, expected in cases:
+            calls = []
+
+            def launchd(argv, **kwargs):
+                calls.append(argv[1])
+                if argv[1] == "print":
+                    return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+                if argv[1] == "bootstrap":
+                    return subprocess.CompletedProcess(argv, code, "", message)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with self.subTest(bootstrap=code), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch.object(remctl_mcp, "http_agent_log_path", return_value=Path(tmp) / "Logs" / "remctl-mcp-http.log"):
+                result = remctl_mcp.install_http_agent(Path("/Users/x/bin/remctl"), runner=launchd, plist_path=Path(tmp) / "agent.plist")
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(calls, expected)
 
     def test_http_agent_plist_and_remote_snippets(self):
         plist = remctl_mcp.http_agent_plist(Path("/Users/x/bin/remctl"))

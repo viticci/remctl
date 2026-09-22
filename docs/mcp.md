@@ -33,7 +33,7 @@ remctl mcp remove --client codex
 | Claude Desktop and Cowork | Adds `mcpServers.remctl` to `~/Library/Application Support/Claude/claude_desktop_config.json`. Every other key stays as it was, the file keeps its permissions, and a timestamped backup is saved next to it. | Quit and reopen Claude Desktop. The server appears in Claude chats and in Cowork on this Mac. |
 | Other clients | `remctl mcp config` prints JSON, TOML, and shell snippets. | Paste into the client's MCP settings. |
 
-The launch command uses an absolute Python path so GUI apps with a minimal `PATH` can start the server. `remctl mcp config --format command` shows it.
+The launch command uses an absolute Python path so GUI apps with a minimal `PATH` can start the server. `remctl mcp config --format command` shows it. For a Homebrew Python, RemCTL registers the formula's stable `opt` path, such as `/opt/homebrew/opt/python@3.14/bin/python3.14`, not the versioned `Cellar` folder that `brew upgrade` deletes.
 
 ### One-click Claude Desktop extension
 
@@ -93,7 +93,7 @@ remctl mcp token --rotate             # new token; reconnect devices afterwards
 remctl mcp remove --client tailscale  # stop serving; the token file stays for later
 ```
 
-`remctl doctor` reports the endpoint under `mcp_clients` and warns (`mcp_tailscale`) when it is configured but not serving.
+`remctl doctor` reports the endpoint under `mcp_clients` and warns (`mcp_tailscale`) when it is configured but not serving, or when its service starts a Python that `brew upgrade` deletes.
 
 Security notes:
 
@@ -126,11 +126,17 @@ Every tool returns `structuredContent` plus the same JSON as a text block, so cl
 
 Notes:
 
-- `due` accepts `YYYY-MM-DD` (all day), `YYYY-MM-DD HH:MM` (timed), relative forms such as `tomorrow 09:30` or `+3d`, and `clear` in `update_reminder`.
-- `recurrence` accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
-- `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands. Include `--json`. Destructive commands need `--force`.
+- `due` accepts `YYYY-MM-DD` (all day), `YYYY-MM-DD HH:MM` (timed), relative forms such as `tomorrow 09:30` or `+3d`, and `clear` in `update_reminder`. A repeating reminder must keep a due date, so `clear` on one is refused with `repeating_reminder_requires_due_date`.
+- A relative `alarm` (`15m`, `1h`, `1d`) counts back from the due date. Without one, the call is refused with `relative_alarm_requires_due_date`; an ISO date works without a due date.
+- `completion_date` applies only with `completed: true`.
+- `recurrence` needs a due date. It accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
+- `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands, including when top-level options such as `--format json` come first. Include `--json`. Destructive commands need `--force`.
+- Values that start with `-`, such as a search for `-urgent`, are passed as values, never as options.
 - `delete_reminder` is annotated as destructive so hosts ask for confirmation.
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.
+- `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.
+- `priority` accepts the names `high`, `medium`, `low`, and `none`, and Apple's numbers (`0`, `1`-`4`, `5`, `6`-`9`).
+- `tags` accepts a list of strings as well as a comma-separated string. Both spellings append `#hashtags` to the title; neither creates Reminders tags.
 
 Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint: false`).
 
@@ -200,6 +206,7 @@ Set `REMCTL_MCP_DEBUG=1` in the client's environment for a per-request trace on 
 - **`claude mcp list` says Failed to connect.** Run `remctl mcp config --format command` and execute that command in a terminal. It should wait silently; press Control-D to exit. A traceback means the CLI itself is broken: run `remctl doctor`.
 - **Tools work in Claude Code but Claude Desktop shows nothing.** Quit and reopen Claude Desktop after `remctl mcp install --client claude-desktop`, or install the `.mcpb` bundle.
 - **`doctor` says the connection points at a different path.** RemCTL moved, for example to a new `PREFIX`. Run `remctl mcp install` again.
+- **`doctor` says a connection starts a Python that no longer exists, or a versioned Homebrew Python.** The app was registered with a Python path that `brew upgrade` removes. Run `remctl mcp install` again; it registers the stable `opt` path. For the tailnet service, run `remctl mcp install --client tailscale`.
 - **A tool reports that the Capability Host is unavailable.** Call the `doctor` tool or run `remctl doctor` and follow its fix text. The MCP server never bypasses the host.
 - **The tailnet endpoint is configured but not serving.** `remctl mcp status` shows which part is down. `remctl mcp install --client tailscale` repairs the service and the serve mount. `tailscale serve status` lists the mounts.
 - **Another device gets 401.** The token differs. Run `remctl mcp config --format tailscale` on the Mac and reconnect the device.

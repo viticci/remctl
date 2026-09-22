@@ -284,6 +284,11 @@ const RemCTLWidget = (() => {
   }
   const WEEKDAYS = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun',
     monday: 'Mon', tuesday: 'Tue', wednesday: 'Wed', thursday: 'Thu', friday: 'Fri', saturday: 'Sat', sunday: 'Sun' };
+  // RemCTL reports EventKit weekday numbers: 1 is Sunday and 7 is Saturday.
+  const WEEKDAY_NUMBERS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const weekdayLabel = (d) => Number.isInteger(d) && d >= 1 && d <= 7
+    ? WEEKDAY_NUMBERS[d - 1]
+    : WEEKDAYS[String(d).toLowerCase()] || safeText(d);
   function repeatLabel(row) {
     const rec = row.recurrence;
     if (!isObject(rec)) return '';
@@ -292,10 +297,11 @@ const RemCTLWidget = (() => {
     const interval = Number.isFinite(rec.interval) && rec.interval > 1 ? rec.interval : 1;
     const unit = { daily: 'day', weekly: 'week', monthly: 'month', yearly: 'year' }[freq] || freq;
     let text = interval > 1 ? 'every ' + interval + ' ' + unit + 's' : { daily: 'daily', weekly: 'weekly', monthly: 'monthly', yearly: 'yearly' }[freq] || freq;
-    const days = Array.isArray(rec.daysOfWeek) ? rec.daysOfWeek.map(d => WEEKDAYS[String(d).toLowerCase()] || safeText(d)).filter(Boolean) : [];
+    const days = Array.isArray(rec.daysOfWeek) ? rec.daysOfWeek.map(weekdayLabel).filter(Boolean) : [];
     if (days.length) text += ' ' + days.join(', ');
     if (Array.isArray(rec.daysOfMonth) && rec.daysOfMonth.length) text += ' on ' + rec.daysOfMonth.map(safeText).join(', ');
-    if (Number.isFinite(rec.occurrenceCount)) text += ', ' + rec.occurrenceCount + ' times';
+    const count = Number.isFinite(rec.count) ? rec.count : rec.occurrenceCount;
+    if (Number.isFinite(count)) text += ', ' + count + ' times';
     if (typeof rec.endDate === 'string') text += ' until ' + rec.endDate.slice(0, 10);
     return text;
   }

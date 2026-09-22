@@ -73,7 +73,7 @@ JSON keeps the raw values and adds fields human output cannot show:
 ```
 
 - `id` is RemCTL's numeric id. Pass it to `info`, `edit`, `done`, `undone`, `delete`, `link`, `open`, and `subtasks`.
-- `dueDate` is the real due date. `displayDate` appears when Reminders stores a separate display or alert date, for example an alarm 15 minutes before. Do not treat `displayDate` as the due date.
+- `dueDate` is the real due date. For an all-day reminder (`allDay: true`) it is midnight of that day, such as `2026-09-30T00:00:00`, in every time zone. `displayDate` appears when Reminders stores a separate display or alert date, for example an alarm 15 minutes before. Do not treat `displayDate` as the due date.
 - `alarms` lists EventKit alarms (`relative`, `absolute`) and location alarms (`type: "location"` with a `location` object).
 - `earlyReminder` is Reminders' Early Reminder, a private field separate from alarms.
 - `recurrence` decodes the stored rule. Weekdays pinned to a week of the month appear as `daysOfWeekDetailed` entries with `weekNumber`.
@@ -102,7 +102,7 @@ remctl add "Team meeting" -d "next monday at 3pm"
 remctl add "Deploy" -d +3d -p high
 remctl add "Pay rent" -d 2026-06-01 -f          # flagged
 remctl add "Check app" --url https://example.com
-remctl add "Standup" --recurrence "weekly mon,wed,fri" --alarm 15m
+remctl add "Standup" -d "tomorrow 09:30" --recurrence "weekly mon,wed,fri" --alarm 15m
 remctl add -- "-Title that starts with a dash"
 ```
 
@@ -122,32 +122,32 @@ With `--json`, `add` prints `{"status": "created", "id": "<uuid>", "numericId": 
 | `2026-04-15 14:00` | Timed |
 | `today`, `tomorrow`, `+3d`, `+1w`, `next friday`, `eow` | All-day |
 | `+2h`, `eod`, `tonight at 11`, `Friday at 15:00`, `next monday at 3pm`, `tomorrow 09:30` | Timed |
-| `clear` (edit only) | Remove the due date; `--alarm clear` removes alarms |
+| `clear` (edit only) | Remove the due date; `--alarm clear` removes alarms. A repeating reminder must keep its due date, so `edit` refuses with `repeating_reminder_requires_due_date` and changes nothing. |
 
 Date-only input creates an all-day reminder; input with a time creates a timed reminder. If `-d` cannot be parsed, `add` and `edit` stop before writing. With `--json`, the error is `{"status": "error", "code": "invalid_due_date", …}` on stderr with accepted examples. Natural-language phrases beyond this table need the optional `parsedatetime` package; prefer `YYYY-MM-DD HH:MM` in scripts.
 
 ### Recurrence
 
 ```bash
-remctl add "Daily journal" --recurrence daily
-remctl add "Weekly report" --recurrence weekly
-remctl add "Pay rent" --recurrence monthly
-remctl add "Annual review" --recurrence yearly
-remctl add "Standup" --recurrence "weekly mon,wed,fri"
-remctl add "Invoices" --recurrence "monthly 1,15"
-remctl add "Sprint review" --recurrence "monthly 4th-fri"
-remctl add "Payday check" --recurrence "monthly last-fri"
-remctl add "Deep clean" --recurrence "daily x2"
+remctl add "Daily journal" -d tomorrow --recurrence daily
+remctl add "Weekly report" -d tomorrow --recurrence weekly
+remctl add "Pay rent" -d tomorrow --recurrence monthly
+remctl add "Annual review" -d tomorrow --recurrence yearly
+remctl add "Standup" -d "tomorrow 09:30" --recurrence "weekly mon,wed,fri"
+remctl add "Invoices" -d tomorrow --recurrence "monthly 1,15"
+remctl add "Sprint review" -d tomorrow --recurrence "monthly 4th-fri"
+remctl add "Payday check" -d tomorrow --recurrence "monthly last-fri"
+remctl add "Deep clean" -d tomorrow --recurrence "daily x2"
 remctl edit 23880 --recurrence "monthly x2 last-fri"
 ```
 
-Rules: a frequency (`daily`, `weekly`, `monthly`, `yearly`); an optional interval `xN` (1 to 999) right after it; for weekly, a weekday list; for monthly, day numbers or ordinal weekdays (`1st-mon`, `3rd-mon`, `4th-fri`, `last-fri`, `-1-fri` down to `-5-fri`). Ordinal weekdays cannot be mixed with day numbers. The suffix must match the number (`4st-fri` is rejected). Prefer `last-fri` to `5th-fri`: EventKit skips months without a fifth Friday. Recurrence and normal alarms are EventKit features and never need `--private`.
+A repeating reminder needs a due date: Reminders will not save one without it. Rules: a frequency (`daily`, `weekly`, `monthly`, `yearly`); an optional interval `xN` (1 to 999) right after it; for weekly, a weekday list; for monthly, day numbers or ordinal weekdays (`1st-mon`, `3rd-mon`, `4th-fri`, `last-fri`, `-1-fri` down to `-5-fri`). Ordinal weekdays cannot be mixed with day numbers. The suffix must match the number (`4st-fri` is rejected). Prefer `last-fri` to `5th-fri`: EventKit skips months without a fifth Friday. Recurrence and normal alarms are EventKit features and never need `--private`.
 
 Read-back: JSON has a `recurrence` object; human output shows `↻ monthly 4th Fri` or `↻ every 2 months 4th Tue`. A series limited to N occurrences shows `, 5 times`.
 
 ### Alarms
 
-`--alarm 15m`, `1h`, `1d`, or an ISO date creates an EventKit alarm relative to or at a time. `edit ID --alarm clear` removes normal alarms. Alarms appear in `info --json` under `alarms`.
+`--alarm 15m`, `1h`, `1d`, or an ISO date creates an EventKit alarm relative to or at a time. A relative alarm counts back from the due date, so it needs one: without a due date, `add` and `edit` stop with `relative_alarm_requires_due_date`. An ISO date works without a due date. `edit ID --alarm clear` removes normal alarms. Alarms appear in `info --json` under `alarms`.
 
 Early Reminders are different: they are Reminders' private "early reminder" setting and require `--private --early-reminder 15m|1h|2d|1w|1mo|clear`. Setting one needs a due date.
 

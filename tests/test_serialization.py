@@ -2,9 +2,13 @@
 
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from remctl_serialization import preload_extras, serialize_reminder, serialize_reminders
+
+APPLE_EPOCH = 978307200
 
 
 def fixture_db():
@@ -98,3 +102,58 @@ class BatchExtrasTests(unittest.TestCase):
                                      [mock.call(db, 1), mock.call(db, 2)])
                     self.assertEqual([item["tags"] for item in payloads],
                                      [["Fallback"], ["Fallback"]])
+
+
+def apple_seconds(moment):
+    return moment.timestamp() - APPLE_EPOCH
+
+
+def local_ts(zone):
+    """The CLI's ts() as it behaves on a Mac set to this time zone."""
+    def ts(value):
+        if not value:
+            return None
+        return datetime.fromtimestamp(value + APPLE_EPOCH, ZoneInfo(zone)).replace(tzinfo=None)
+    return ts
+
+
+class DueDateTests(unittest.TestCase):
+    def serialize(self, zone, **fields):
+        row = dict(reminder_rows(1)[0], **fields)
+        return serialize_reminder(row, ts=local_ts(zone), priority_names={})
+
+    def test_all_day_due_date_keeps_its_day_in_every_time_zone(self):
+        # Reminders stores an all-day due date as midnight UTC and the display date
+        # as local midnight. Read as local time, midnight UTC is the evening before
+        # in New York.
+        for zone in ("America/New_York", "Europe/Rome", "Asia/Tokyo"):
+            with self.subTest(zone=zone):
+                payload = self.serialize(
+                    zone,
+                    ZALLDAY=1,
+                    ZDUEDATE=apple_seconds(datetime(2026, 9, 30, tzinfo=timezone.utc)),
+                    ZDISPLAYDATEDATE=apple_seconds(datetime(2026, 9, 30, tzinfo=ZoneInfo(zone))),
+                )
+                self.assertEqual(payload["dueDate"], "2026-09-30T00:00:00")
+                self.assertNotIn("displayDate", payload)
+                self.assertTrue(payload["allDay"])
+
+    def test_all_day_due_date_that_is_not_utc_midnight_keeps_its_local_day(self):
+        payload = self.serialize(
+            "America/New_York",
+            ZALLDAY=1,
+            ZDUEDATE=apple_seconds(datetime(2026, 9, 30, 8, 0, tzinfo=ZoneInfo("America/New_York"))),
+        )
+        self.assertEqual(payload["dueDate"], "2026-09-30T00:00:00")
+
+    def test_timed_due_date_is_local_time_and_keeps_a_separate_display_date(self):
+        due = datetime(2026, 9, 30, 13, 30, tzinfo=timezone.utc)
+        payload = self.serialize(
+            "America/New_York",
+            ZALLDAY=0,
+            ZDUEDATE=apple_seconds(due),
+            ZDISPLAYDATEDATE=apple_seconds(due) - 15 * 60,
+        )
+        self.assertEqual(payload["dueDate"], "2026-09-30T09:30:00")
+        self.assertEqual(payload["displayDate"], "2026-09-30T09:15:00")
+        self.assertFalse(payload["allDay"])

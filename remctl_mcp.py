@@ -169,6 +169,7 @@ class Param:
     max_length: int | None = None
     default: Any = None
     items_type: str | None = None
+    coerce: Callable[[Any], Any] | None = None
 
     def schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": self.type, "description": self.description}
@@ -203,6 +204,7 @@ class Tool:
     mutually_exclusive: tuple[tuple[str, ...], ...] = ()
     output_schema: dict[str, Any] | None = None
     accepts_stdin: bool = False
+    normalize_result: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
     def input_schema(self) -> dict[str, Any]:
         properties = {param.name: param.schema() for param in self.params}
@@ -240,13 +242,81 @@ DUE_HELP = (
     "Due date: YYYY-MM-DD for all-day, 'YYYY-MM-DD HH:MM' for timed, relative forms such as "
     "tomorrow, 'tomorrow 09:30', +3d, or 'next friday'."
 )
-PRIORITY = Param("priority", "string", "Reminder priority.", enum=("high", "medium", "low", "none"))
+
+
+def _coerce_priority(value: Any) -> Any:
+    """Accept Apple's numeric priorities alongside the names.
+
+    Reminders stores priority as 0, 1-4, 5 and 6-9, and that is what a model
+    reaches for first, so map those onto the names instead of refusing them.
+    """
+
+    number = _coerce_integer(value)
+    if number is None:
+        return value
+    if number == 0:
+        return "none"
+    if 1 <= number <= 4:
+        return "high"
+    if number == 5:
+        return "medium"
+    if 6 <= number <= 9:
+        return "low"
+    return value
+
+
+def _coerce_tag_list(value: Any) -> Any:
+    """Accept a list of tags as well as the comma-separated spelling."""
+
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return ",".join(item.strip() for item in value if item.strip())
+    return value
+
+
+def _normalize_created_reminder(payload: dict[str, Any]) -> dict[str, Any]:
+    """Report the new reminder's numeric id as `id`.
+
+    `remctl add --json` reports the CloudKit identifier as `id` and the numeric
+    id as `numericId`, while edit, done and delete all report the number as
+    `id`. Every tool that takes a reminder wants the number, so a caller that
+    passes the created `id` straight back would be told it must be an integer.
+    """
+
+    numeric = payload.get("numericId")
+    if isinstance(numeric, bool) or not isinstance(numeric, int):
+        numeric = None
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "id":
+            if numeric is not None:
+                normalized["id"] = numeric
+            if isinstance(value, str) and value:
+                normalized["cloudKitId"] = value
+        elif key != "numericId":
+            normalized[key] = value
+    if numeric is None:
+        warnings = list(normalized.get("warnings") or [])
+        warnings.append(
+            "numeric_id_unavailable: the reminder was created, but RemCTL could not read its "
+            "numeric id back. Find it with search before calling another tool."
+        )
+        normalized["warnings"] = warnings
+    return normalized
+
+
+PRIORITY = Param(
+    "priority",
+    "string",
+    "Reminder priority. Apple's numbers (0, 1-4, 5, 6-9) are accepted too.",
+    enum=("high", "medium", "low", "none"),
+    coerce=_coerce_priority,
+)
 RECURRENCE_HELP = (
-    "Recurrence rule: daily, weekly, monthly, yearly; optional xN interval after the frequency "
+    "Recurrence rule (needs a due date): daily, weekly, monthly, yearly; optional xN interval after the frequency "
     "(daily x2); weekday lists (weekly mon,wed,fri); month days (monthly 1,15); ordinal weekdays "
     "(monthly 4th-fri, monthly last-fri)."
 )
-ALARM_HELP = "Alarm relative to the due date (15m, 1h, 1d) or an ISO datetime."
+ALARM_HELP = "Alarm relative to the due date (15m, 1h, 1d; needs a due date) or an ISO datetime."
 
 ROWS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -267,7 +337,11 @@ def _option(args: dict[str, Any], key: str, option: str) -> list[str]:
     value = args.get(key)
     if value is None or value == "":
         return []
-    return [option, str(value)]
+    text = str(value)
+    if text.startswith("-"):
+        # argparse reads a separate "-foo" as another option; the joined form keeps it a value.
+        return [f"{option}={text}"]
+    return [option, text]
 
 
 def _argv_today(args):
@@ -287,7 +361,7 @@ def _argv_flagged(args):
 
 
 def _argv_search(args):
-    return ["search", str(args["query"]), *_flag(args, "include_completed", "--completed"), "--json"]
+    return ["search", *_flag(args, "include_completed", "--completed"), "--json", "--", str(args["query"])]
 
 
 def _argv_show_list(args):
@@ -343,6 +417,8 @@ def _argv_update_reminder(args):
 def _argv_set_completion(args):
     if args["completed"]:
         return ["done", str(args["reminder_id"]), *_option(args, "completion_date", "--date"), "--json"]
+    if args.get("completion_date") is not None:
+        raise ToolArgumentError("completion_date applies only when completed is true.")
     return ["undone", str(args["reminder_id"]), "--json"]
 
 
@@ -359,13 +435,41 @@ def _argv_doctor(args):
 
 
 RUN_FORBIDDEN_COMMANDS = frozenset({"mcp", "completion", "setup", "onboard", "permissions", "open"})
+# RemCTL's top-level options, and whether each one takes the next argument as its value.
+RUN_GLOBAL_OPTIONS = {
+    "--help": False,
+    "--version": False,
+    "--no-color": False,
+    "--format": True,
+    "--images": False,
+    "--image-mode": True,
+    "--image-width": True,
+}
+
+
+def _run_command_name(argv: list[str]) -> str | None:
+    """The subcommand argparse will run, skipping top-level options and their values."""
+
+    items = iter(argv)
+    for item in items:
+        if item == "--":
+            return next(items, None)
+        if not item.startswith("-"):
+            return item
+        name = item.split("=", 1)[0]
+        # argparse also accepts an unambiguous prefix, such as --form for --format.
+        matches = [option for option in RUN_GLOBAL_OPTIONS if option.startswith(name)] if name.startswith("--") else []
+        option = name if name in RUN_GLOBAL_OPTIONS else (matches[0] if len(matches) == 1 else None)
+        if option and RUN_GLOBAL_OPTIONS[option] and "=" not in item:
+            next(items, None)
+    return None
 
 
 def _argv_run(args):
     argv = [str(item) for item in args.get("args") or []]
     if not argv:
         raise ToolArgumentError("args must contain at least one RemCTL argument, for example [\"lists\", \"--json\"].")
-    command = next((item for item in argv if not item.startswith("-")), None)
+    command = _run_command_name(argv)
     if command in RUN_FORBIDDEN_COMMANDS:
         raise ToolArgumentError(
             f"run does not execute `remctl {command}`; it is an interactive or setup command with no MCP equivalent."
@@ -455,11 +559,19 @@ TOOLS: tuple[Tool, ...] = (
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP, max_length=64),
             Param("url", "string", "URL appended to the notes.", max_length=2048),
-            Param("tags", "string", "Comma-separated tags added as inline #hashtags in the title.", max_length=512),
+            Param(
+                "tags",
+                "string",
+                "Tags appended to the title as #hashtags. This edits the title text; it does not "
+                "create Reminders tags. A list of strings is accepted as well.",
+                max_length=512,
+                coerce=_coerce_tag_list,
+            ),
             Param("flagged", "boolean", "Flag the reminder after creating it.", default=False),
         ),
         _argv_create_reminder, "change", read_only=False, timeout=150,
         mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+        normalize_result=_normalize_created_reminder,
     ),
     Tool(
         "update_reminder",
@@ -471,7 +583,7 @@ TOOLS: tuple[Tool, ...] = (
             LIST_NAME,
             LIST_ID,
             Param("notes", "string", "Replacement notes.", max_length=16 * 1024),
-            Param("due", "string", DUE_HELP + " Use clear to remove the due date.", max_length=128),
+            Param("due", "string", DUE_HELP + " Use clear to remove the due date; a repeating reminder must keep one.", max_length=128),
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
@@ -594,6 +706,8 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
             if param.required:
                 raise ToolArgumentError(f"Missing required argument: {param.name}.")
             continue
+        if param.coerce is not None:
+            raw = param.coerce(raw)
         if param.type == "integer":
             value = _coerce_integer(raw)
             if value is None:
@@ -910,6 +1024,8 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
             structured = {"value": value}
     else:
         structured = {"output": _tail(result.stdout, 100_000)}
+    if tool.normalize_result is not None and isinstance(structured, dict):
+        structured = tool.normalize_result(structured)
     if result.stderr.strip():
         warnings = [line for line in result.stderr.strip().splitlines() if line.strip()]
         if isinstance(structured, dict) and "stderr" not in structured:
@@ -1348,6 +1464,40 @@ CLAUDE_CODE_CONFIG = Path.home() / ".claude.json"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 
 
+# A Homebrew keg path, such as /opt/homebrew/Cellar/python@3.14/3.14.7/bin/python3.14.
+HOMEBREW_KEG_PATH = re.compile(r"^(?P<prefix>/.+)/Cellar/(?P<formula>[^/]+)/[^/]+/(?P<rest>.+)$")
+
+
+def stable_interpreter(executable: str | None = None) -> str:
+    """An absolute interpreter path that survives Python patch upgrades.
+
+    Symlinks are resolved so no client depends on PATH, but a Homebrew Python
+    resolves into a versioned keg that `brew upgrade` deletes. The formula's
+    `opt` link reaches the same file and follows upgrades, so prefer it.
+    """
+
+    real = os.path.realpath(executable or sys.executable)
+    match = HOMEBREW_KEG_PATH.match(real)
+    if match:
+        linked = os.path.join(match["prefix"], "opt", match["formula"], match["rest"])
+        if os.path.realpath(linked) == real:
+            return linked
+    return real
+
+
+def interpreter_problem(command: Any) -> str | None:
+    """Why a registered interpreter will stop starting the server, or None."""
+
+    if not isinstance(command, str) or not command:
+        return "interpreter_missing"
+    path = command if os.path.isabs(command) else shutil.which(command)
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return "interpreter_missing"
+    if HOMEBREW_KEG_PATH.match(command):
+        return "interpreter_versioned"
+    return None
+
+
 def server_command(cli_path: Path) -> tuple[str, list[str]]:
     """The interpreter and arguments every client should launch.
 
@@ -1355,12 +1505,13 @@ def server_command(cli_path: Path) -> tuple[str, list[str]]:
     start servers with a minimal PATH that may not contain python3.
     """
 
-    return os.path.realpath(sys.executable), [str(cli_path), "mcp"]
+    return stable_interpreter(), [str(cli_path), "mcp"]
 
 
-def _run(argv: list[str], *, timeout: float = 60.0, runner: Callable[..., Any] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(argv: list[str], *, timeout: float = 60.0, runner: Callable[..., Any] | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     run = runner or subprocess.run
-    return run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    return run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
 
 
 def detect_clients() -> list[dict[str, Any]]:
@@ -1576,12 +1727,20 @@ def registration_status(cli_path: Path | None = None, *, claude_config: Path | N
     entries.append(desktop_entry)
 
     if cli_path is not None:
-        command, args = server_command(cli_path)
-        expected = {"command": command, "args": args}
+        _, expected_args = server_command(cli_path)
         for entry in entries:
             server = entry.get("server")
-            if isinstance(server, dict):
-                entry["current"] = server.get("command") == expected["command"] and list(server.get("args") or []) == expected["args"]
+            if not isinstance(server, dict):
+                continue
+            # Any working interpreter will do. Comparing it with the Python that runs
+            # this check flags every app that was registered from a different one.
+            if list(server.get("args") or []) != expected_args:
+                problem = "different_cli"
+            else:
+                problem = interpreter_problem(server.get("command"))
+            entry["current"] = problem is None
+            if problem:
+                entry["staleReason"] = problem
     return entries
 
 
@@ -2064,6 +2223,13 @@ def _launchctl(*args: str, runner: Callable[..., Any] | None = None) -> subproce
 def http_agent_status(*, runner: Callable[..., Any] | None = None) -> dict[str, Any]:
     plist = http_agent_plist_path()
     status: dict[str, Any] = {"label": HTTP_AGENT_LABEL, "plist": str(plist), "installed": plist.exists(), "loaded": False, "running": False, "pid": None}
+    if status["installed"]:
+        try:
+            data = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError):
+            data = None
+        program = data.get("ProgramArguments") if isinstance(data, dict) else None
+        status["interpreterProblem"] = interpreter_problem(program[0] if isinstance(program, list) and program else None)
     result = _launchctl("print", f"gui/{os.getuid()}/{HTTP_AGENT_LABEL}", runner=runner)
     if result.returncode == 0:
         status["loaded"] = True
@@ -2074,6 +2240,21 @@ def http_agent_status(*, runner: Callable[..., Any] | None = None) -> dict[str, 
     return status
 
 
+def _wait_for_http_agent_exit(domain: str, *, runner: Callable[..., Any] | None = None, timeout: float = 10.0) -> None:
+    """Wait until launchd has removed the agent after a bootout.
+
+    `launchctl bootout` returns while launchd is still stopping the job. A
+    bootstrap in that window fails with "Bootstrap failed: 5: Input/output
+    error" and leaves the endpoint down, so reinstalling a running agent failed.
+    """
+
+    deadline = time.monotonic() + timeout
+    while _launchctl("print", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner).returncode == 0:
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.2)
+
+
 def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = None, plist_path: Path | None = None) -> dict[str, Any]:
     plist = plist_path or http_agent_plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -2082,10 +2263,15 @@ def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = No
     plist.chmod(0o644)
     domain = f"gui/{os.getuid()}"
     _launchctl("bootout", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    _wait_for_http_agent_exit(domain, runner=runner)
     result = _launchctl("bootstrap", domain, str(plist), runner=runner)
-    if result.returncode != 0 and "already" not in (result.stderr + result.stdout).lower():
-        return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
-    _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    if result.returncode != 0:
+        if "already" not in (result.stderr + result.stdout).lower():
+            return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
+        # The old job is still loaded, so restart it in place. After a clean
+        # bootstrap, RunAtLoad has already started the job: kickstart -k would
+        # kill it, and launchd holds that restart for its 10-second throttle.
+        _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
     return {"ok": True, "plist": str(plist)}
 
 
@@ -2110,6 +2296,18 @@ def http_health(config: dict[str, Any], *, timeout: float = 2.0) -> dict[str, An
 
 # ── Tailscale ────────────────────────────────────────────────────────────────
 
+def tailscale_env() -> dict[str, str]:
+    """The environment for Tailscale commands.
+
+    The binary inside Tailscale.app acts as the CLI only when TERM or
+    TAILSCALE_BE_CLI is set. Callers started without a terminal, such as the
+    tailnet LaunchAgent or Claude Desktop, have no TERM, and the app then
+    prints a GUI start-up error instead of JSON.
+    """
+
+    return {**os.environ, "TAILSCALE_BE_CLI": "1"}
+
+
 def tailscale_binary() -> str | None:
     found = shutil.which("tailscale")
     if found:
@@ -2125,7 +2323,7 @@ def tailscale_status(*, runner: Callable[..., Any] | None = None) -> dict[str, A
     status: dict[str, Any] = {"installed": binary is not None, "binary": binary, "running": False, "hostname": None, "ips": [], "https": False}
     if not binary:
         return status
-    result = _run([binary, "status", "--json"], timeout=15, runner=runner)
+    result = _run([binary, "status", "--json"], timeout=15, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         status["error"] = (result.stderr or result.stdout).strip()[:300]
         return status
@@ -2152,7 +2350,7 @@ def tailscale_serve_mount(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callable[
     binary = tailscale_binary()
     if not binary:
         return None
-    result = _run([binary, "serve", "status", "--json"], timeout=15, runner=runner)
+    result = _run([binary, "serve", "status", "--json"], timeout=15, runner=runner, env=tailscale_env())
     if result.returncode != 0 or not result.stdout.strip():
         return None
     try:
@@ -2174,7 +2372,7 @@ def tailscale_serve_enable(port: int, path: str = TAILSCALE_MOUNT_PATH, *, runne
     if not binary:
         return {"ok": False, "error": "Tailscale is not installed."}
     argv = [binary, "serve", "--bg", "--https=443", f"--set-path={path}", f"http://127.0.0.1:{port}"]
-    result = _run(argv, timeout=60, runner=runner)
+    result = _run(argv, timeout=60, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         message = (result.stderr or result.stdout).strip()
         hint = ""
@@ -2188,7 +2386,7 @@ def tailscale_serve_disable(path: str = TAILSCALE_MOUNT_PATH, *, runner: Callabl
     binary = tailscale_binary()
     if not binary:
         return {"ok": False, "error": "Tailscale is not installed."}
-    result = _run([binary, "serve", "--https=443", f"--set-path={path}", "off"], timeout=60, runner=runner)
+    result = _run([binary, "serve", "--https=443", f"--set-path={path}", "off"], timeout=60, runner=runner, env=tailscale_env())
     if result.returncode != 0:
         message = (result.stderr or result.stdout).strip()
         if "not" in message.lower() and "found" in message.lower():
@@ -2277,7 +2475,8 @@ def tailscale_overview(*, runner: Callable[..., Any] | None = None) -> dict[str,
         mount = tailscale_serve_mount(runner=runner) if status["installed"] else None
         health = http_health(config)
         overview.update(agentRunning=agent["running"], served=mount is not None, healthy=health["ok"],
-                        active=agent["running"] and mount is not None and health["ok"])
+                        active=agent["running"] and mount is not None and health["ok"],
+                        agentInterpreterProblem=agent.get("interpreterProblem"))
     return overview
 
 

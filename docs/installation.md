@@ -99,7 +99,7 @@ Restart the host only after changing Full Disk Access. Reminders and Automation 
 
 ### Automation state
 
-The host caches the Automation result after it has seen a definitive answer (`authorized`, `denied`, or `notDetermined`). A freshly started host that cannot reach the Reminders app may report `targetNotRunning` or `unknown` until it verifies the state; `fullReady` stays false until then. Reminders does not need to stay open between commands.
+The host caches the Automation result after it has seen a definitive answer (`authorized`, `denied`, or `notDetermined`). A freshly started host that cannot reach the Reminders app may report `targetNotRunning` or `unknown` until it verifies the state; `fullReady` stays false until then. Reminders does not need to stay open between commands. `doctor` waits up to three seconds for a starting host to finish verifying, then reports a permission it still cannot read as a warning rather than a failure, because the host clears that state on its own and reads and writes work meanwhile. A refused or restricted grant is still a failure.
 
 ### Limited reads without Full Disk Access
 
