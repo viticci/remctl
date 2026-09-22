@@ -1295,7 +1295,31 @@ class HTTPConfigAndTailscaleTests(unittest.TestCase):
              mock.patch.object(remctl_mcp, "http_agent_log_path", return_value=Path(tmp) / "Logs" / "remctl-mcp-http.log"):
             result = remctl_mcp.install_http_agent(Path("/Users/x/bin/remctl"), runner=launchd, plist_path=Path(tmp) / "agent.plist")
         self.assertTrue(result["ok"], result)
-        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap", "kickstart"])
+        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap"])
+
+    def test_installing_the_http_agent_restarts_it_only_when_it_was_still_loaded(self):
+        # A clean bootstrap starts the job (RunAtLoad). kickstart -k then killed
+        # it, and launchd held the restart for its 10-second throttle.
+        cases = (
+            (0, "", ["bootout", "print", "bootstrap"]),
+            (37, "Bootstrap failed: 37: Operation already in progress", ["bootout", "print", "bootstrap", "kickstart"]),
+        )
+        for code, message, expected in cases:
+            calls = []
+
+            def launchd(argv, **kwargs):
+                calls.append(argv[1])
+                if argv[1] == "print":
+                    return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+                if argv[1] == "bootstrap":
+                    return subprocess.CompletedProcess(argv, code, "", message)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with self.subTest(bootstrap=code), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch.object(remctl_mcp, "http_agent_log_path", return_value=Path(tmp) / "Logs" / "remctl-mcp-http.log"):
+                result = remctl_mcp.install_http_agent(Path("/Users/x/bin/remctl"), runner=launchd, plist_path=Path(tmp) / "agent.plist")
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(calls, expected)
 
     def test_http_agent_plist_and_remote_snippets(self):
         plist = remctl_mcp.http_agent_plist(Path("/Users/x/bin/remctl"))

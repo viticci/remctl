@@ -2265,9 +2265,13 @@ def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = No
     _launchctl("bootout", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
     _wait_for_http_agent_exit(domain, runner=runner)
     result = _launchctl("bootstrap", domain, str(plist), runner=runner)
-    if result.returncode != 0 and "already" not in (result.stderr + result.stdout).lower():
-        return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
-    _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+    if result.returncode != 0:
+        if "already" not in (result.stderr + result.stdout).lower():
+            return {"ok": False, "error": (result.stderr or result.stdout).strip() or "launchctl bootstrap failed", "plist": str(plist)}
+        # The old job is still loaded, so restart it in place. After a clean
+        # bootstrap, RunAtLoad has already started the job: kickstart -k would
+        # kill it, and launchd holds that restart for its 10-second throttle.
+        _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
     return {"ok": True, "plist": str(plist)}
 
 
