@@ -12961,12 +12961,15 @@ def cmd_mcp(a):
         print(C.bold("RemCTL MCP status"))
         print(f"Server command: {' '.join(overview['server']['command'])}")
         for client in overview["clients"]:
-            if not client["installed"]:
-                state = C.dim("not installed")
-            elif client["configured"] and client.get("current") is not False:
+            # The app's own config says whether it is connected. "installed" only
+            # means its CLI is on this caller's PATH, and GUI apps, LaunchAgents,
+            # and remote runners often lack ~/.local/bin.
+            if client["configured"] and client.get("current") is not False:
                 state = C.green("connected")
             elif client["configured"]:
                 state = C.yellow(f"connected, but it {mcp_stale_reason(client)}; rerun remctl mcp install")
+            elif not client["installed"]:
+                state = C.dim("not installed")
             else:
                 state = C.yellow("not connected")
             print(f"  {client['name']}: {state}")

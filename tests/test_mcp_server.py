@@ -952,6 +952,28 @@ class CliIntegrationTests(unittest.TestCase):
                 "that `brew upgrade` deletes; rerun `remctl mcp install --client tailscale`",
             )
 
+    def test_status_reports_a_connected_app_whose_cli_is_not_on_path(self):
+        # Claude Code and Codex install into ~/.local/bin, which GUI apps,
+        # LaunchAgents, and remote runners such as MacRemote often lack on PATH.
+        overview = {
+            "server": {"command": ["/usr/bin/python3", "/Users/x/bin/remctl", "mcp"]},
+            "clients": [
+                {"id": "claude-code", "name": "Claude Code", "installed": False, "configured": True, "current": True},
+                {"id": "codex", "name": "Codex", "installed": False, "configured": True, "current": False, "staleReason": "different_cli"},
+                {"id": "claude-desktop", "name": "Claude Desktop and Cowork", "installed": False, "configured": False, "current": None},
+            ],
+            "tailscale": {"installed": False},
+        }
+        out = io.StringIO()
+        with mock.patch.object(self.remctl, "mcp_overview", return_value=overview), \
+             mock.patch.object(self.remctl.C, "enabled", False), \
+             mock.patch.object(sys, "stdout", out):
+            self.remctl.cmd_mcp(SimpleNamespace(mcp_action="status", json=False))
+        output = out.getvalue()
+        self.assertIn("Claude Code: connected\n", output)
+        self.assertIn("Codex: connected, but it points at a different RemCTL path", output)
+        self.assertIn("Claude Desktop and Cowork: not installed", output)
+
     def test_completion_scripts_mention_mcp(self):
         for shell in ("zsh", "bash", "fish"):
             with self.subTest(shell=shell):
