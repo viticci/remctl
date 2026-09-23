@@ -7156,6 +7156,106 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(payload["due"])
         self.assertTrue(payload["clearAlarms"])
 
+    def _absolute_alarm_row(self, alarm_id, when):
+        return {
+            "alarm_id": alarm_id,
+            "time_interval": None,
+            "latitude": None,
+            "longitude": None,
+            "date_components": json.dumps({
+                "year": when.year,
+                "month": when.month,
+                "day": when.day,
+                "hour": when.hour,
+                "minute": when.minute,
+                "second": when.second,
+                "timeZone": {"identifier": "Europe/Rome"},
+            }),
+        }
+
+    def _bridge_payloads_for_due_edit(self, reminder, alarm_rows, due):
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=object()),
+            mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_alarms", return_value=alarm_rows),
+            mock.patch.object(self.remctl, "bridge_available", return_value=True),
+            mock.patch.object(
+                self.remctl,
+                "bridge_call_result",
+                return_value=self._bridge_result({"status": "updated", "id": reminder["ZCKIDENTIFIER"]}),
+            ) as bridge_call_result,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(SimpleNamespace(
+                id=1,
+                json=True,
+                title=None,
+                notes=None,
+                priority=None,
+                due=due,
+                url=None,
+                recurrence=None,
+                alarm=None,
+            ))
+        return [call.args[0] for call in bridge_call_result.call_args_list]
+
+    def test_cmd_edit_due_date_carries_every_copy_of_the_due_alarm(self):
+        from datetime import datetime
+
+        # Each device that handles the notification stores its own
+        # acknowledged copy of the alarm. Moving only the due date left both
+        # copies behind, and Reminders kept showing the old time in Today.
+        old_due = datetime(2026, 9, 22, 15, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder.update({
+            "Z_PK": 1,
+            "ZDUEDATE": self.remctl.to_ts(old_due),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+        })
+        alarm_rows = [self._absolute_alarm_row(7640, old_due), self._absolute_alarm_row(7655, old_due)]
+
+        payload = self._bridge_payloads_for_due_edit(reminder, alarm_rows, "2026-09-24 15:00")[-1]
+
+        self.assertEqual(payload["due"], "2026-09-24T15:00:00")
+        self.assertEqual(payload.get("alarm"), "2026-09-24T15:00:00")
+
+    def test_cmd_edit_due_date_keeps_alarms_when_one_is_custom(self):
+        from datetime import datetime
+
+        old_due = datetime(2026, 9, 22, 15, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder.update({
+            "Z_PK": 1,
+            "ZDUEDATE": self.remctl.to_ts(old_due),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(datetime(2026, 9, 22, 9, 0, 0)),
+        })
+        alarm_rows = [
+            self._absolute_alarm_row(7640, old_due),
+            self._absolute_alarm_row(7641, datetime(2026, 9, 22, 9, 0, 0)),
+        ]
+
+        payload = self._bridge_payloads_for_due_edit(reminder, alarm_rows, "2026-09-24 15:00")[-1]
+
+        self.assertEqual(payload["due"], "2026-09-24T15:00:00")
+        self.assertNotIn("alarm", payload)
+
+    def test_cmd_edit_due_clear_clears_every_copy_of_the_due_alarm(self):
+        from datetime import datetime
+
+        old_due = datetime(2026, 9, 22, 15, 0, 0)
+        reminder = dict(self._FAKE_REMINDER)
+        reminder.update({
+            "Z_PK": 1,
+            "ZDUEDATE": self.remctl.to_ts(old_due),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(old_due),
+        })
+        alarm_rows = [self._absolute_alarm_row(7640, old_due), self._absolute_alarm_row(7655, old_due)]
+
+        payload = self._bridge_payloads_for_due_edit(reminder, alarm_rows, "clear")[-1]
+
+        self.assertIsNone(payload["due"])
+        self.assertIs(payload.get("clearAlarms"), True)
+
     def test_cmd_edit_alarm_clear_routes_through_bridge(self):
         reminder = self._FAKE_REMINDER
         args = SimpleNamespace(

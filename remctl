@@ -2679,48 +2679,56 @@ def _parse_alarm_iso_datetime(value):
     except (TypeError, ValueError):
         return None
 
+def _absolute_alarm_datetimes(db, reminder):
+    """Dates of the reminder's alarms, or None unless every alarm is absolute.
+
+    Reminders can store the same alarm more than once: each device that
+    handles the notification writes its own acknowledged copy, and both
+    sync. Callers treat such copies as one alarm.
+    """
+    if db is None:
+        return None
+    reminder_pk = _row_get(reminder, "Z_PK")
+    if not reminder_pk:
+        return None
+    try:
+        alarms = alarm_rows_to_json(q_alarms(db, reminder_pk))
+    except Exception:
+        return None
+    if not alarms or any(alarm.get("type") != "absolute" for alarm in alarms):
+        return None
+    dates = [_parse_alarm_iso_datetime(alarm.get("date")) for alarm in alarms]
+    if any(date is None for date in dates):
+        return None
+    return dates
+
 def should_carry_absolute_alarm_to_new_due(db, reminder, new_due, explicit_alarm=False):
     """Keep Reminders.app's visible time aligned when moving due-at-time items.
 
-    Reminders may store an absolute alarm/display date that is the UI-facing
-    time. EventKit does not move that alarm when only dueDateComponents change,
-    so a plain `edit -d` can leave the app showing the old time. Only carry a
-    single absolute alarm when it matches the old due/display time; otherwise
-    preserve the user's custom alarm setup.
+    Reminders shows a reminder at its absolute alarm (ZDISPLAYDATEDATE follows
+    it). EventKit does not move that alarm when only dueDateComponents change,
+    so a plain `edit -d` can leave the app showing the old time. Carry the
+    alarm when every alarm is absolute and at the old due time, however many
+    copies there are; otherwise preserve the user's custom alarm setup.
     """
-    if explicit_alarm or db is None or new_due is None:
+    if explicit_alarm or new_due is None:
         return False
-    reminder_pk = _row_get(reminder, "Z_PK")
-    if not reminder_pk:
+    alarm_dates = _absolute_alarm_datetimes(db, reminder)
+    if not alarm_dates:
         return False
-    try:
-        alarms = alarm_rows_to_json(q_alarms(db, reminder_pk))
-    except Exception:
-        return False
-    absolute_alarms = [alarm for alarm in alarms if alarm.get("type") == "absolute"]
-    if len(alarms) != 1 or len(absolute_alarms) != 1:
-        return False
-    alarm_dt = _parse_alarm_iso_datetime(absolute_alarms[0].get("date"))
     old_due = ts(_row_get(reminder, "ZDUEDATE"))
-    return _same_datetime_second(alarm_dt, old_due)
+    return all(_same_datetime_second(alarm_dt, old_due) for alarm_dt in alarm_dates)
 
 def should_clear_matching_absolute_alarm(db, reminder):
-    if db is None:
+    alarm_dates = _absolute_alarm_datetimes(db, reminder)
+    if not alarm_dates:
         return False
-    reminder_pk = _row_get(reminder, "Z_PK")
-    if not reminder_pk:
-        return False
-    try:
-        alarms = alarm_rows_to_json(q_alarms(db, reminder_pk))
-    except Exception:
-        return False
-    absolute_alarms = [alarm for alarm in alarms if alarm.get("type") == "absolute"]
-    if len(alarms) != 1 or len(absolute_alarms) != 1:
-        return False
-    alarm_dt = _parse_alarm_iso_datetime(absolute_alarms[0].get("date"))
     old_due = ts(_row_get(reminder, "ZDUEDATE"))
     old_display = ts(_row_get(reminder, "ZDISPLAYDATEDATE"))
-    return any(_same_datetime_second(alarm_dt, candidate) for candidate in (old_due, old_display))
+    return all(
+        any(_same_datetime_second(alarm_dt, candidate) for candidate in (old_due, old_display))
+        for alarm_dt in alarm_dates
+    )
 
 def hydrate_reminder_detail(db, payload, reminder_id):
     if "attachments" not in payload:
