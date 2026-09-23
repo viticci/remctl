@@ -76,7 +76,7 @@ Upgrades: `git pull && ./install.sh`, then `doctor`. Run `onboard` again only wh
 | One reminder in full | `remctl info 23880 --json` | `get_reminder` |
 | Groups, sections, tags, subtasks, sharees, stats, smart lists, templates | `remctl groups --json`, `sections --json`, `tags --json`, `subtasks ID --json`, `sharees LIST --json`, `stats --json`, `smart-lists --json`, `templates --json`, `template-info NAME --json` | `run` |
 
-Row fields: `id`, `title`, `list`, `completed`, `flagged`, `urgent`, `priority`, `subtaskCount`, `dueDate`, `allDay`, `deepLink`, plus `notes`, `section`, `recurrence`, and `attachments` when present. `info` adds `alarms`, `earlyReminder`, `tags`, `subtasks`, `assignment`, and the rich-link `url`. `dueDate` is the real due date; `displayDate`, when present, is Reminders' separate display or alert time. `attachments[].path` is the host-verified file location, or `null` with `resolved: false` for files not downloaded to this Mac; it does not mean your process can open the file.
+Row fields: `id`, `title`, `list`, `completed`, `flagged`, `urgent`, `priority`, `subtaskCount`, `dueDate`, `allDay`, `deepLink`, plus `notes`, `section`, `recurrence`, and `attachments` when present. `info` adds `alarms`, `earlyReminder`, `tags`, `subtasks`, `assignment`, and the rich-link `url`. `dueDate` is the real due date. `displayDate` appears when Reminders shows the reminder at another time, for example because an absolute alarm still points at an old time. Reminders.app lists and labels the reminder at `displayDate`, and `today`, `overdue`, and `upcoming` place it there too. `attachments[].path` is the host-verified file location, or `null` with `resolved: false` for files not downloaded to this Mac; it does not mean your process can open the file.
 
 ## Writing
 
@@ -88,18 +88,18 @@ Row fields: `id`, `title`, `list`, `completed`, `flagged`, `urgent`, `priority`,
 | Complete, uncomplete | `remctl done 23880 [--date 2026-05-27] --json`, `remctl undone 23880 --json` | `set_completion` |
 | Flag, unflag | `remctl flag 23880 --json`, `remctl unflag 23880 --json` | `set_flagged` |
 | Delete | `remctl delete 23880 --force --json` | `delete_reminder` |
-| Recurrence, alarm | `remctl add … --recurrence "weekly mon,wed,fri" --alarm 15m --json` | `create_reminder` / `update_reminder` |
+| Recurrence, alarm | `remctl add "Standup" -d "tomorrow 09:30" --recurrence "weekly mon,wed,fri" --alarm 15m --json` | `create_reminder` with `due` / `update_reminder` |
 | Reorder | `remctl reminder-move 23880 --before 23881 --private --json` | `run` |
 
-- `add --json` returns `status: "created"`, `id` (a UUID), and `numericId`. Use `numericId` for the next call. If `numericId` is missing, find the reminder with `show <list> --json` by title.
+- `create_reminder` returns `status: "created"`, the numeric `id` for the next call, and the CloudKit `cloudKitId`. The CLI's `add --json` names them differently: `id` is the UUID and `numericId` is the number. If the number could not be read back, `create_reminder` has no `id` and warns `numeric_id_unavailable`; find the reminder with `search` or `show_list` by title.
 - `add -f/--flag` creates the reminder first and flags it through automation. If the flag step fails, the result is still `created` with `warnings: ["flag_not_set: …"]`. Do not run `add` again; flag the returned id instead.
 - `edit -l` and `edit --list-id` normally keep the id. When EventKit refuses a pure move (parents with subtasks, shared-list boundaries), RemCTL clones and deletes through ReminderKit and returns `method: "clone-delete"`, `oldId`, and a new `id`. Continue with the new `id`. Move first, then apply other edits.
-- `edit -d` moves a single absolute alarm that matched the old due time, so the time shown in Reminders follows the due date.
+- `edit -d` moves the absolute alarms that matched the old due time, so the time shown in Reminders follows the due date. Reminders can keep one copy of an alarm for each device that handled it, and every copy moves. When the reminder has any other alarm, its alarms stay as they are. `edit -d clear` removes those alarms, but a repeating reminder must keep its due date: `edit` refuses with `code: "repeating_reminder_requires_due_date"` and changes nothing.
 - `done --date` takes only `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` and is rejected for recurring reminders; plain `done` advances the series.
 - `flag`/`unflag` succeed with `status: "flagged"` or `"unflagged"`, or fail with exit 1 and `code: "applescript_flag_failed"` on stderr, flag unchanged. Common causes: the host lacks Automation access, or Reminders did not answer within 120 seconds. `edit ID --private --flagged` or `--no-flagged` writes the flag through ReminderKit instead.
 - `reminder-move` needs `--private`. Within one list, the anchor must be in the same list. `--smart-list NAME` or `--smart-list-id ID` reorders an unsectioned custom smart list; sectioned smart lists are refused. Success returns `verified: true`.
 
-Recurrence grammar: `daily`, `weekly`, `monthly`, `yearly`; an interval right after the frequency (`daily x2`, N 1 to 999); weekdays for weekly (`weekly mon,wed,fri`); day numbers (`monthly 1,15`) or ordinal weekdays (`monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri`) for monthly, never mixed. Prefer `last-fri` to `5th-fri`. Invalid recurrence, alarm, and priority values fail before writing.
+Recurrence grammar: `daily`, `weekly`, `monthly`, `yearly`; an interval right after the frequency (`daily x2`, N 1 to 999); weekdays for weekly (`weekly mon,wed,fri`); day numbers (`monthly 1,15`) or ordinal weekdays (`monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri`) for monthly, never mixed. Prefer `last-fri` to `5th-fri`. Invalid recurrence, alarm, and priority values fail before writing. Recurrence and relative alarms (`15m`, `1h`, `1d`) need a due date: pass `-d` (MCP `due`) with `add`, while `edit` can also use the due date the reminder already has. Without one, a relative alarm stops with `code: "relative_alarm_requires_due_date"` and Reminders refuses to save a repeating reminder; nothing is written.
 
 ## Private metadata
 
