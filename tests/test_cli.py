@@ -8613,6 +8613,59 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_timed_reminders_bucket_by_the_date_reminders_shows(self):
+        from datetime import datetime, timedelta
+
+        db = self._due_window_db()
+        try:
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday = today - timedelta(days=1)
+            # Due in two days, but its alarm stayed at yesterday 15:00, so
+            # Reminders lists it in Today as overdue.
+            self._insert_due_reminder(
+                db, 1, "Moved Due Date",
+                due_ts=self.remctl.to_ts((today + timedelta(days=2)).replace(hour=15)),
+                display_ts=self.remctl.to_ts(yesterday.replace(hour=15)),
+                all_day=False,
+            )
+            # Due yesterday, but its alarm is tomorrow at 09:00, which is
+            # where Reminders lists it.
+            self._insert_due_reminder(
+                db, 2, "Alarm After Due",
+                due_ts=self.remctl.to_ts(yesterday.replace(hour=9)),
+                display_ts=self.remctl.to_ts((today + timedelta(days=1)).replace(hour=9)),
+                all_day=False,
+            )
+
+            def titles(rows):
+                return [row["ZTITLE"] for row in rows]
+
+            self.assertEqual(titles(self.remctl.q_due_today(db, include_overdue=True)), ["Moved Due Date"])
+            self.assertEqual(titles(self.remctl.q_due_today(db, include_overdue=False)), [])
+            self.assertEqual(titles(self.remctl.q_overdue(db)), ["Moved Due Date"])
+            self.assertEqual(titles(self.remctl.q_upcoming(db, days=7)), ["Alarm After Due"])
+
+            moved = self.remctl.q_overdue(db)[0]
+            self.assertIn("(overdue", self.remctl._strip_ansi(self.remctl.fmt(moved)))
+
+            args = SimpleNamespace(json=False, no_overdue=False, format=None, via_eventkit=False, verbose=False)
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "q_hashtags", return_value=[]),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_today(args)
+            plain = self.remctl._strip_ansi(stdout.getvalue())
+            self.assertIn("Overdue (1):", plain)
+            self.assertIn("Moved Due Date", plain)
+            self.assertNotIn("Due Today", plain)
+
+            payload = self.remctl.to_dict(moved, db=None)
+            self.assertEqual(payload["dueDate"][:10], (today + timedelta(days=2)).strftime("%Y-%m-%d"))
+            self.assertEqual(payload["displayDate"], yesterday.replace(hour=15).isoformat())
+        finally:
+            db.close()
+
     def test_orphaned_reminder_excluded_from_read_queries(self):
         db = self._due_window_db()
         try:
@@ -9071,6 +9124,61 @@ class CliTests(unittest.TestCase):
         plain = self.remctl._strip_ansi(stdout.getvalue())
         self.assertIn("Early:", plain)
         self.assertIn("1 hour before", plain)
+
+    def test_cmd_info_text_shows_when_reminders_lists_it_at_another_time(self):
+        from datetime import datetime
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        reminder = {
+            "Z_PK": 42,
+            "ZTITLE": "Write about Deflector",
+            "ZNOTES": None,
+            "ZCOMPLETED": 0,
+            "ZFLAGGED": 0,
+            "ZPRIORITY": 0,
+            "ZISURGENTSTATEENABLEDFORCURRENTUSER": 0,
+            "ZDUEDATEDELTAALERTSDATA": None,
+            "ZDUEDATE": self.remctl.to_ts(datetime(2026, 9, 24, 15, 0, 0)),
+            "ZDISPLAYDATEDATE": self.remctl.to_ts(datetime(2026, 9, 22, 15, 0, 0)),
+            "ZALLDAY": 0,
+            "ZCOMPLETIONDATE": None,
+            "ZCREATIONDATE": None,
+            "ZPARENTREMINDER": None,
+            "ZLIST": 1,
+            "ZICSURL": None,
+            "ZCKIDENTIFIER": None,
+            "list_name": "Work",
+            "recurrence_frequency": None,
+            "recurrence_interval": None,
+            "recurrence_count": None,
+            "recurrence_end_date": None,
+            "recurrence_days_of_week": None,
+            "recurrence_days_of_month": None,
+            "recurrence_months_of_year": None,
+            "recurrence_days_of_year": None,
+            "recurrence_weeks_of_year": None,
+            "recurrence_set_positions": None,
+        }
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=conn),
+                mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+                mock.patch.object(self.remctl, "q_reminders", return_value=[]),
+                mock.patch.object(self.remctl, "q_attachments", return_value=[]),
+                mock.patch.object(self.remctl, "q_alarms", return_value=[]),
+                mock.patch.object(self.remctl, "q_hashtags", return_value=[]),
+                mock.patch.object(self.remctl, "q_section_memberships", return_value={}),
+                mock.patch.object(self.remctl, "q_rich_link", return_value=None),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                self.remctl.cmd_info(SimpleNamespace(id=42, json=False))
+        finally:
+            conn.close()
+
+        plain = self.remctl._strip_ansi(stdout.getvalue())
+        self.assertIn("Due:       Sep 24, 2026 at 03:00 PM", plain)
+        self.assertIn("Shown at:  Sep 22, 2026 at 03:00 PM", plain)
 
     def test_existing_early_reminder_identifiers_fall_back_to_delta_alert_table(self):
         row = {"Z_PK": 1, "ZDUEDATEDELTAALERTSDATA": None}

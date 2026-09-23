@@ -262,8 +262,9 @@ const RemCTLWidget = (() => {
     return Number.isNaN(date.getTime()) ? null : { date, hasTime: !!m[4] };
   }
   const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  // Reminders lists a row at displayDate when it has one (an alarm at another time).
   function whenLabel(row) {
-    const parsed = parseISO(row.dueDate);
+    const parsed = parseISO(row.displayDate || row.dueDate);
     if (!parsed) return { text: '—', overdue: false };
     const allDay = row.allDay === true || !parsed.hasTime;
     const now = new Date();

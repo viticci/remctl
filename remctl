@@ -1988,17 +1988,17 @@ def due_expr(table_alias="r"):
     return f"{table_alias}.ZDUEDATE"
 
 def due_filter_expr(db, table_alias="r"):
-    """Date used for due-window bucketing.
+    """Date used for due-window bucketing: the one Reminders.app shows.
 
-    Reminders stores all-day items with a synthetic due timestamp, while
-    ZDISPLAYDATEDATE is the local day Reminders.app displays.
+    Reminders.app lists and labels a reminder at ZDISPLAYDATEDATE. For an
+    all-day item it is the local day, while ZDUEDATE is a synthetic
+    midnight-UTC timestamp. For a timed item it follows an absolute alarm at
+    another time than the due date, such as one an EventKit due edit left at
+    the old time, so Today keeps showing the reminder there.
     """
     due = f"{table_alias}.ZDUEDATE"
-    if reminder_has_column(db, "ZALLDAY") and reminder_has_column(db, "ZDISPLAYDATEDATE"):
-        return (
-            f"(CASE WHEN {table_alias}.ZALLDAY = 1 "
-            f"THEN COALESCE({table_alias}.ZDISPLAYDATEDATE, {due}) ELSE {due} END)"
-        )
+    if reminder_has_column(db, "ZDISPLAYDATEDATE"):
+        return f"COALESCE({table_alias}.ZDISPLAYDATEDATE, {due})"
     return due
 
 def rem_cols(db):
@@ -2866,13 +2866,25 @@ def _item_is_all_day(item):
 
 
 def row_effective_due(item):
-    """Raw due timestamp used for day bucketing and human all-day labels."""
+    """Raw due timestamp, with the local day for an all-day item."""
     due = _item_get(item, "ZDUEDATE", _item_get(item, "dueDate"))
     if _item_is_all_day(item):
         display = _item_get(item, "ZDISPLAYDATEDATE", _item_get(item, "displayDate"))
         if display is not None:
             return display
     return due
+
+
+def row_shown_date(item):
+    """Raw timestamp Reminders.app lists and labels the reminder at.
+
+    Matches due_filter_expr: the display date when Reminders stores one,
+    otherwise the due date.
+    """
+    display = _item_get(item, "ZDISPLAYDATEDATE", _item_get(item, "displayDate"))
+    if display is not None:
+        return display
+    return row_effective_due(item)
 
 
 def _priority_value_from_item(item):
@@ -3104,7 +3116,7 @@ def fmt(r, db=None, verbose=False, indent="", _sc=None, _ht=None, _img=None, _in
     id_str = reminder_id_from_item(r, db)
     title = safe_display((r["ZTITLE"] if _item_has(r, "ZTITLE") else _item_get(r, "title")) or "(untitled)")
     all_day = _item_is_all_day(r)
-    due_str = fmt_due(row_effective_due(r), all_day=all_day)
+    due_str = fmt_due(row_shown_date(r), all_day=all_day)
     repeat_badge = recurrence_badge(r)
     recur_str = f" {repeat_badge}" if repeat_badge else ""
     if completed:
@@ -3429,7 +3441,7 @@ def reminders_to_table_data(items, db=None):
     for r in items:
         due_str = ""
         all_day = _item_is_all_day(r)
-        due_value = row_effective_due(r)
+        due_value = row_shown_date(r)
         if due_value:
             if isinstance(due_value, str):
                 try:
@@ -9727,7 +9739,7 @@ def cmd_today(a):
         print(f"Nothing due today ({datetime.now().strftime('%Y-%m-%d')})")
         return
     sod = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    overdue = [i for i in items if ts(row_effective_due(i)) < sod]
+    overdue = [i for i in items if ts(row_shown_date(i)) < sod]
     overdue_pks = {i["Z_PK"] for i in overdue}
     due = [i for i in items if i["Z_PK"] not in overdue_pks]
     img = _image_render_config_verbose(a)
@@ -9880,6 +9892,9 @@ def cmd_info(a):
             print(f"  Due:       {effective_due.strftime('%b %d, %Y')} (all-day)")
         else:
             print(f"  Due:       {effective_due.strftime('%b %d, %Y at %I:%M %p')}")
+            shown = ts(row_shown_date(r))
+            if shown and not _same_datetime_second(shown, effective_due):
+                print(f"  Shown at:  {shown.strftime('%b %d, %Y at %I:%M %p')} {C.dim('(Reminders lists it here)')}")
     early_reminders = due_date_delta_alerts_from_row(r, ts=ts)
     if not early_reminders and r["ZCKIDENTIFIER"]:
         try:
@@ -10200,7 +10215,7 @@ def cmd_upcoming(a):
     # Group by day
     groups = {}
     for i in items:
-        dt = ts(row_effective_due(i))
+        dt = ts(row_shown_date(i))
         day_key = dt.strftime("%Y-%m-%d")
         day_label = dt.strftime("%A, %b %d")
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
