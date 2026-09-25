@@ -1,18 +1,33 @@
 ---
 name: remctl
-description: Use when an agent needs to read or change Apple Reminders through RemCTL (its MCP tools or the remctl CLI), or diagnose its installation, signed Capability Host, permissions, or client connections on macOS.
+description: Read or change Apple Reminders through RemCTL 2.0's local MCP tools, or diagnose its signed Capability Host, permissions, and client connections on macOS.
 ---
 
 # RemCTL
 
 RemCTL is a Reminders CLI and MCP server for macOS. Data commands run inside a signed app, `RemCTL Capability Host.app`, which holds the macOS permissions. You never need Full Disk Access, Reminders, or Automation access for your own process. Reads come from the local Reminders database. Writes go through EventKit, or through Apple's private ReminderKit framework when the user opts in with `--private`. RemCTL never writes the database directly.
 
-## Which surface to use
+## Use the local MCP server
 
-1. **MCP tools, when your host has them.** They are named `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `doctor`, and `run`. In Claude Code they appear as `mcp__remctl__<tool>`. They validate arguments, return `structuredContent`, and use the same numeric ids as the CLI. Use `run` for any CLI command that has no dedicated tool: pass exact argument items, include `--json`, and add `--force` to destructive commands.
-2. **The CLI, otherwise.** Resolve the installed command with `command -v remctl`; if it is not on `PATH`, use `~/bin/remctl`. Invoke the absolute path. Use `--json` for every read and write.
+Use **`mcp__remctl__<tool>`**, the RemCTL 2.0 server running locally on this Mac, for all reminder reads and writes. Prefer it over the Mac Remote connector's RemCTL wrappers. Do not shell out to the CLI for reminder work or silently fall back to it when an MCP connection fails.
 
-Everything below applies to both. Where a rule names a CLI flag, the `run` tool takes the same flag.
+The dedicated tools are `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, and `doctor`. They validate arguments and return `structuredContent`; list results wrap rows in `items` with a `count`. Check `isError` and `structuredContent.error` before treating a call as successful.
+
+Use `run` only for operations without a dedicated tool, including private metadata. Pass an `args` array of exact argument items, include `--json`, and add `--force` for an authorized destructive operation. This still runs through MCP. `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open`. Shell commands are reserved for installation, connection repair, and permission setup, or an explicit user request for CLI usage. If tools are missing, inspect or repair the local registration and reconnect the client.
+
+Examples of MCP tool arguments:
+
+```text
+today({"include_overdue":true})
+show_list({"list":"Work"})
+get_reminder({"reminder_id":23880})
+create_reminder({"title":"Research","list":"Work","due":"2026-09-20 15:00","priority":"high"})
+update_reminder({"reminder_id":23880,"due":"clear"})
+run({"args":["sections","--json"]})
+run({"args":["edit","23880","--private","--set-tags","remctl,work","--json"]})
+```
+
+The command syntax below documents the underlying options; it is not an instruction to use the shell. Use the named dedicated MCP tool where available, otherwise translate that syntax into `run.args`, omitting the `remctl` executable. Read [docs/mcp.md](docs/mcp.md) for the current typed argument contract and connection details. Inspect the live tool schema before a call; for example, dedicated `create_reminder` supports `tags` and `flagged`, while private synced tags, rich links, and other unsupported fields require `run` with `--private`.
 
 ## Setup and diagnosis
 
@@ -29,7 +44,7 @@ remctl onboard
 launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
 ```
 
-Check readiness:
+Check readiness with the `doctor` MCP tool. If MCP itself cannot start, use this setup diagnostic:
 
 ```bash
 remctl doctor --for-agent --json
@@ -139,13 +154,13 @@ Rules:
 
 ## Verification
 
-After a write, read the data back:
+After a write, read the data back through MCP:
 
-- Reminder fields, tags, section, subtasks, alarms, Early Reminders, rich link, assignment: `info <id> --json`.
-- List order: `show <list> --json`.
-- List appearance, Groceries metadata, groups: `lists --json`, `group-info --json`.
-- Smart lists and pins: `smart-lists --json`.
-- Templates: `templates --json`, `template-info`.
+- Reminder fields, tags, section, subtasks, alarms, Early Reminders, rich link, assignment: `get_reminder({"reminder_id":ID})`.
+- List order: `show_list` with the exact `list` or `list_id`.
+- List appearance and Groceries metadata: `lists`; groups: `run` with `group-info` and `--json`.
+- Smart lists and pins: `run({"args":["smart-lists","--json"]})`.
+- Templates: `run` with `templates` or `template-info` and `--json`.
 - When cross-device sync matters, ask the user to check another device.
 
 When debugging a date mismatch, compare `dueDate`, `displayDate`, and `alarms` before assuming a bug.
