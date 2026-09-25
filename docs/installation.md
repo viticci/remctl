@@ -131,7 +131,7 @@ remctl --version
 remctl doctor
 ```
 
-The installer keeps the host's signing identity, so its permissions carry over. Run `remctl onboard` again only if `doctor` reports a permission problem. If the tailnet endpoint is set up, the installer republishes the server code; restart the endpoint service with `remctl mcp install --client tailscale` or `launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.mcp-http"`.
+The installer keeps the host's signing identity, so its permissions carry over. Run `remctl onboard` again only if `doctor` reports a permission problem. If the HTTP endpoint is loaded, the installer restarts it and verifies its new process and health response. If this step fails, the installer reports the failure; inspect `remctl mcp status` and repair the endpoint with `remctl mcp install --client tailscale`. Existing stdio connections keep their imported code until the client reconnects or starts a new session.
 
 For an install under `~/.local/bin`, keep the same prefix: `PREFIX="$HOME/.local" ./install.sh`.
 

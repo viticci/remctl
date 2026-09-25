@@ -97,9 +97,15 @@ The server is transport-agnostic inside: `MCPServer.handle_message` takes one JS
 
 Every tool builds an argument list for the CLI and spawns `<python> <remctl> <args> --json` with `REMCTL_SKIP_ONBOARD=1`. Standard output becomes `structuredContent` (arrays wrapped as `{"items", "count"}`); a nonzero exit becomes `isError: true` with RemCTL's structured stderr error when it emitted one. Calls run concurrently on a small thread pool; `notifications/cancelled` terminates the subprocess. Because the CLI is the only path, the host and its permissions are unchanged.
 
+Cancellation is scoped to the stdio connection or the legacy HTTP session, including stdio calls waiting for a worker. Stateless HTTP requests have separate request-ID namespaces; a cancellation notification cannot cancel a different stateless request by guessing its ID. Partial writes retain their structured result, including created IDs, even when the command exits with an error.
+
 The MCP Apps widget is one HTML file, `remctl_mcp_widget.html`, served as the resource `ui://remctl/reminders-v1.html`. The server attaches the widget to tools and results only for clients that negotiate the `io.modelcontextprotocol/ui` extension, and adds result hints under `_meta["net.macstories.remctl/ui"]` that tell the widget which view to render and which tools its buttons call.
 
 The HTTP endpoint requires `Authorization: Bearer <token>`, validates `Origin` and `Host` against loopback and the Mac's Tailscale identity, mirrors the modern headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) against the body, mints `Mcp-Session-Id` values for legacy clients, and answers `GET /health` without a token. `remctl mcp install --client tailscale` stores the token in `~/.config/remctl/mcp-http.json`, installs the `net.macstories.remctl.mcp-http` LaunchAgent, and runs `tailscale serve` so Tailscale provides HTTPS and the network boundary. [mcp.md](mcp.md) documents the tools and the setup.
+
+HTTP checks authentication before reading a body and closes rejected connections. It accepts one nonnegative `Content-Length`, up to 4 MiB, and does not accept transfer encoding. It allows 32 open connections and 256 legacy sessions; sessions expire after an hour without activity. An expired session gets HTTP 404 and must initialize again. Installation reloads an already-loaded HTTP service after publishing and checks its new process and health response.
+
+Installed HTTP endpoints read the current token file for each request. Token rotation therefore revokes old credentials even when the endpoint was started manually. A missing or malformed token file denies access. Rotation does not undo a tool call that was already authenticated and started.
 
 ## Data model notes
 

@@ -34,6 +34,7 @@ import shutil
 import stat as stat_module
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -337,7 +338,7 @@ def _flag(args: dict[str, Any], key: str, option: str) -> list[str]:
 
 def _option(args: dict[str, Any], key: str, option: str) -> list[str]:
     value = args.get(key)
-    if value is None or value == "":
+    if value is None:
         return []
     text = str(value)
     if text.startswith("-"):
@@ -728,6 +729,10 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
             value = raw
             if "\x00" in value:
                 raise ToolArgumentError(f"{param.name} must not contain NUL bytes.")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ToolArgumentError(f"{param.name} must contain valid Unicode.") from None
             if param.max_length is not None and len(value) > param.max_length:
                 raise ToolArgumentError(f"{param.name} is longer than {param.max_length} characters.")
             if param.enum and value not in param.enum:
@@ -737,7 +742,11 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
                 raise ToolArgumentError(f"{param.name} must be an array of strings.")
             if any("\x00" in item for item in raw):
                 raise ToolArgumentError(f"{param.name} must not contain NUL bytes.")
-            if len(raw) > 128 or sum(len(item.encode("utf-8")) for item in raw) > 48 * 1024:
+            try:
+                size = sum(len(item.encode("utf-8")) for item in raw)
+            except UnicodeEncodeError:
+                raise ToolArgumentError(f"{param.name} must contain valid Unicode.") from None
+            if len(raw) > 128 or size > 48 * 1024:
                 raise ToolArgumentError(f"{param.name} is too large (max 128 items, 48 KiB).")
             value = list(raw)
         else:  # pragma: no cover - catalog bug
@@ -926,6 +935,23 @@ class CommandExecutor:
         self.command = list(command)
         self._lock = threading.Lock()
         self._processes: dict[Any, subprocess.Popen[bytes]] = {}
+        self._cancelled: set[Any] = set()
+        self._queued: dict[Any, object] = {}
+
+    def reserve(self, key: Any) -> object | None:
+        """Register stdio work before it waits for a worker, so cancellation can find it."""
+        with self._lock:
+            if key in self._processes or key in self._queued:
+                return None
+            ticket = object()
+            self._queued[key] = ticket
+            return ticket
+
+    def release(self, key: Any, ticket: object) -> None:
+        with self._lock:
+            if self._queued.get(key) is ticket:
+                del self._queued[key]
+                self._cancelled.discard(key)
 
     def run(self, key: Any, argv: list[str], *, timeout: float, stdin_text: str | None = None) -> CommandResult:
         env = dict(os.environ)
@@ -933,17 +959,25 @@ class CommandExecutor:
         env["REMCTL_SKIP_ONBOARD"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env.pop("REMCTL_IMAGES", None)
-        try:
-            process = subprocess.Popen(
-                [*self.command, *argv],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
-        except OSError as exc:
-            return CommandResult(argv, None, "", f"could not start RemCTL: {exc}")
         with self._lock:
+            if key in self._processes:
+                return CommandResult(argv, 1, "", json.dumps({
+                    "code": "duplicate_request_id", "message": "This request id is already running."
+                }))
+            self._queued.pop(key, None)
+            if key in self._cancelled:
+                self._cancelled.discard(key)
+                return CommandResult(argv, None, "", "", cancelled=True)
+            try:
+                process = subprocess.Popen(
+                    [*self.command, *argv],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+            except OSError as exc:
+                return CommandResult(argv, None, "", f"could not start RemCTL: {exc}")
             self._processes[key] = process
         timed_out = False
         try:
@@ -956,7 +990,9 @@ class CommandExecutor:
                 stdout, stderr = process.communicate()
         finally:
             with self._lock:
-                cancelled = self._processes.pop(key, None) is None
+                self._processes.pop(key, None)
+                cancelled = key in self._cancelled
+                self._cancelled.discard(key)
         return CommandResult(
             argv,
             process.returncode,
@@ -968,13 +1004,15 @@ class CommandExecutor:
 
     def cancel(self, key: Any) -> bool:
         with self._lock:
-            process = self._processes.pop(key, None)
-        if process is None:
-            return False
-        try:
-            process.terminate()
-        except OSError:
-            pass
+            process = self._processes.get(key)
+            if (process is None and key not in self._queued) or key in self._cancelled:
+                return False
+            self._cancelled.add(key)
+            if process is not None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
         return True
 
 
@@ -1008,6 +1046,15 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
     if result.returncode is None:
         return _error_result({"code": "spawn_failed", "message": result.stderr.strip() or "RemCTL could not start."})
     if result.returncode != 0:
+        # A failed import or private add can already have saved reminders.
+        # Preserve its ids and retry details so clients do not repeat the write.
+        ok, partial = _parse_json_document(result.stdout)
+        if ok and isinstance(partial, dict) and partial.get("status") == "partial":
+            if tool.normalize_result is not None:
+                partial = tool.normalize_result(partial)
+            partial["exitCode"] = result.returncode
+            return {"content": [{"type": "text", "text": json.dumps(partial, ensure_ascii=False)}],
+                    "structuredContent": partial, "isError": True}
         error = _structured_error_from_stderr(result.stderr)
         if error is None:
             message = result.stderr.strip() or result.stdout.strip() or f"RemCTL exited with status {result.returncode}."
@@ -1081,6 +1128,8 @@ class LegacySession:
     id: str | None = None
     version: str | None = None
     capabilities: dict[str, Any] = field(default_factory=dict)
+    request_scope: object = field(default_factory=object, repr=False)
+    last_used: float = field(default_factory=time.monotonic, repr=False)
 
 
 @dataclass
@@ -1190,7 +1239,7 @@ class MCPServer:
                 return self._error_response(request_id, ERR_INVALID_PARAMS, "params must be an object")
             return None
         if not has_id or request_id is None:
-            self._handle_notification(method, params or {})
+            self._handle_notification(method, params or {}, session)
             return None
         if not isinstance(request_id, (str, int)) or isinstance(request_id, bool):
             return self._error_response(None, ERR_INVALID_REQUEST, "Invalid Request")
@@ -1205,12 +1254,12 @@ class MCPServer:
             return self._error_response(request_id, ERR_INTERNAL, "Internal error")
         return self._result_response(request_id, result, context)
 
-    def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
+    def _handle_notification(self, method: str, params: dict[str, Any], session: LegacySession) -> None:
         _debug(f"notification {method}")
         if method == "notifications/cancelled":
             request_id = params.get("requestId")
-            if request_id is not None:
-                self.config.executor.cancel(request_id)
+            if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+                self.config.executor.cancel((session.request_scope, request_id))
         # notifications/initialized and unknown notifications are ignored by contract.
 
     def _dispatch(self, method: str, params: dict[str, Any], context: RequestContext, request_id: Any,
@@ -1237,7 +1286,7 @@ class MCPServer:
         if method == "tools/list":
             return self._tools_list(context)
         if method == "tools/call":
-            return self._tools_call(params, context, request_id)
+            return self._tools_call(params, context, (session.request_scope, request_id))
         if method == "resources/list":
             return self._resources_list(context)
         if method == "resources/templates/list":
@@ -1371,7 +1420,7 @@ class MCPServer:
 # ── stdio transport ──────────────────────────────────────────────────────────
 
 def _encode(message: Any) -> bytes:
-    return (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return (json.dumps(message, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def serve_stdio(server: MCPServer, stdin: io.BufferedReader | None = None, stdout: io.BufferedWriter | None = None) -> int:
@@ -1405,12 +1454,26 @@ def serve_stdio(server: MCPServer, stdin: io.BufferedReader | None = None, stdou
                 continue
             try:
                 message = json.loads(line.decode("utf-8"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 send(MCPServer._error_response(None, ERR_PARSE, "Parse error"))
                 continue
 
-            def work(payload: Any = message) -> None:
-                send(server.handle_message(payload))
+            ticket = None
+            key = None
+            if (isinstance(message, dict) and message.get("method") == "tools/call"
+                    and isinstance(message.get("id"), (str, int)) and not isinstance(message.get("id"), bool)):
+                key = (server.default_session.request_scope, message["id"])
+                ticket = server.config.executor.reserve(key)
+                if ticket is None:
+                    send(MCPServer._error_response(message["id"], ERR_INVALID_REQUEST, "This request id is already running"))
+                    continue
+
+            def work(payload: Any = message, reserved_key: Any = key, reserved_ticket: Any = ticket) -> None:
+                try:
+                    send(server.handle_message(payload))
+                finally:
+                    if reserved_ticket is not None:
+                        server.config.executor.release(reserved_key, reserved_ticket)
 
             is_notification = isinstance(message, dict) and ("id" not in message or message.get("id") is None)
             if is_notification:
@@ -1613,13 +1676,22 @@ def _write_json_config(path: Path, value: dict[str, Any]) -> Path | None:
     mode = 0o600
     if path.exists():
         mode = stat_module.S_IMODE(path.stat().st_mode)
-        backup = path.with_name(path.name + f".remctl-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(path, backup)
+        descriptor, name = tempfile.mkstemp(prefix=path.name + ".remctl-backup-", dir=path.parent)
+        backup = Path(name)
+        with os.fdopen(descriptor, "wb") as target, path.open("rb") as source:
+            shutil.copyfileobj(source, target)
+            os.fchmod(target.fileno(), mode)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".remctl-tmp")
-    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.chmod(temp, mode)
-    os.replace(temp, path)
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".remctl-", dir=path.parent)
+    temp = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
     return backup
 
 
@@ -1825,16 +1897,20 @@ def build_bundle(cli_path: Path, version: str, output: Path, *, icon_path: Path 
     icon_bytes = icon_path.read_bytes() if icon_path and icon_path.is_file() else None
     manifest = bundle_manifest(cli_path, version, icon=icon_bytes is not None)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temp = output.with_name(output.name + ".tmp")
-    with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest, indent=2) + "\n")
-        launcher = zipfile.ZipInfo("server/remctl-mcp.py")
-        launcher.external_attr = 0o755 << 16
-        launcher.compress_type = zipfile.ZIP_DEFLATED
-        archive.writestr(launcher, BUNDLE_LAUNCHER.format(command=command, args=args))
-        if icon_bytes is not None:
-            archive.writestr("icon.png", icon_bytes)
-    os.replace(temp, output)
+    descriptor, temporary = tempfile.mkstemp(prefix=output.name + ".", dir=output.parent)
+    temp = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w+b") as stream, zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2) + "\n")
+            launcher = zipfile.ZipInfo("server/remctl-mcp.py")
+            launcher.external_attr = 0o755 << 16
+            launcher.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(launcher, BUNDLE_LAUNCHER.format(command=command, args=args))
+            if icon_bytes is not None:
+                archive.writestr("icon.png", icon_bytes)
+        os.replace(temp, output)
+    finally:
+        temp.unlink(missing_ok=True)
     return output
 
 
@@ -1847,6 +1923,9 @@ def bundle_default_output() -> Path:
 
 HTTP_DEFAULT_PORT = 7362
 HTTP_MAX_BODY = 4 * 1024 * 1024
+HTTP_MAX_CONNECTIONS = 32
+HTTP_MAX_SESSIONS = 256
+HTTP_SESSION_TTL = 60 * 60
 HTTP_HEALTH_PATH = "/health"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
@@ -1879,6 +1958,7 @@ def _host_of(value: str | None) -> str:
 class HTTPTransportConfig:
     token: str
     allowed_hosts: frozenset[str] = LOOPBACK_HOSTS
+    token_path: Path | None = None
 
 
 def _http_status_for_error(code: int) -> int:
@@ -1908,7 +1988,6 @@ class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
     transport: HTTPTransportConfig
     sessions: dict[str, LegacySession]
     sessions_lock: threading.Lock
-    anonymous_session: LegacySession
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - BaseHTTPRequestHandler API
         _debug("http " + (format % args))
@@ -1916,12 +1995,14 @@ class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
     # -- helpers --------------------------------------------------------------
 
     def _send_json(self, status: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
-        body = b"" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = b"" if payload is None else _encode(payload)
         self.send_response(status)
         if body:
             self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -1937,42 +2018,60 @@ class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         scheme, _, credential = header.strip().partition(" ")
         if scheme.lower() != "bearer" or not credential.strip():
             return False
-        return secrets.compare_digest(credential.strip(), self.transport.token)
+        expected = self.transport.token
+        if self.transport.token_path is not None:
+            # Revoke old credentials even for a manually started endpoint that
+            # launchd cannot restart. A missing/broken config fails closed.
+            config = load_http_config(self.transport.token_path)
+            if not config:
+                return False
+            expected = config["token"]
+        return secrets.compare_digest(credential.strip().encode("utf-8"), expected.encode("utf-8"))
 
     def _origin_allowed(self) -> bool:
-        origin = self.headers.get("Origin")
-        if origin and origin.lower() != "null" and _host_of(origin) not in self.transport.allowed_hosts:
+        try:
+            origin = self.headers.get("Origin")
+            if origin and origin.lower() != "null" and _host_of(origin) not in self.transport.allowed_hosts:
+                return False
+            host = _host_of(self.headers.get("Host"))
+        except ValueError:
             return False
-        host = _host_of(self.headers.get("Host"))
         return not host or host in self.transport.allowed_hosts
 
     def _gate(self) -> bool:
         if not self._origin_allowed():
+            self.close_connection = True
             self._rpc_error(403, ERR_INVALID_REQUEST, "Origin or Host not allowed")
             return False
         if not self._authorized():
+            self.close_connection = True
             self._rpc_error(401, ERR_INVALID_REQUEST, "Authentication required", extra_headers={"WWW-Authenticate": 'Bearer realm="remctl"'})
             return False
         return True
 
     def _read_raw_body(self) -> bytes:
-        """Read the whole body up front so a rejected request never leaves bytes on a keep-alive connection."""
+        """Accept only one bounded Content-Length, never ambiguous HTTP framing."""
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
             self.close_connection = True
-            raise RPCError(ERR_INVALID_REQUEST, "Invalid Content-Length") from None
-        if length > HTTP_MAX_BODY:
+            raise RPCError(ERR_INVALID_REQUEST, "One nonnegative Content-Length is required; Transfer-Encoding is not supported")
+        digits = lengths[0].lstrip("0") or "0"
+        if len(digits) > len(str(HTTP_MAX_BODY)) or int(digits) > HTTP_MAX_BODY:
             self.close_connection = True
             raise RPCError(ERR_INVALID_REQUEST, "Request body too large")
-        return self.rfile.read(length) if length else b""
+        length = int(digits)
+        raw = self.rfile.read(length) if length else b""
+        if len(raw) != length:
+            self.close_connection = True
+            raise RPCError(ERR_INVALID_REQUEST, "Incomplete request body")
+        return raw
 
     @staticmethod
     def _parse_body(raw: bytes) -> Any:
         try:
             return json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, RecursionError):
             raise RPCError(ERR_PARSE, "Parse error") from None
 
     @staticmethod
@@ -2033,12 +2132,14 @@ class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(200 if removed else 404, None)
 
     def do_POST(self) -> None:  # noqa: N802
+        # Reject without waiting for an untrusted client to finish its body.
+        # The gate closes rejected connections instead of leaving unread bytes.
+        if not self._gate():
+            return
         try:
             raw = self._read_raw_body()
         except RPCError as exc:
             self._rpc_error(413 if "large" in exc.message else 400, exc.code, exc.message)
-            return
-        if not self._gate():
             return
         try:
             message = self._parse_body(raw)
@@ -2078,22 +2179,70 @@ class MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         if isinstance(message, dict) and message.get("method") == "initialize":
             session = LegacySession(id=uuid.uuid4().hex)
             with self.sessions_lock:
-                self.sessions[session.id] = session
+                expired = [key for key, item in self.sessions.items()
+                           if time.monotonic() - item.last_used > HTTP_SESSION_TTL]
+                for key in expired:
+                    del self.sessions[key]
+                full = len(self.sessions) >= HTTP_MAX_SESSIONS
+                if not full:
+                    self.sessions[session.id] = session
+            if full:
+                self._rpc_error(503, ERR_INTERNAL, "Session limit reached; close an existing session and retry")
+                return
             extra["Mcp-Session-Id"] = session.id
         elif session_id:
             with self.sessions_lock:
                 session = self.sessions.get(session_id)
+                if session is not None:
+                    if time.monotonic() - session.last_used > HTTP_SESSION_TTL:
+                        del self.sessions[session_id]
+                        session = None
+                    else:
+                        session.last_used = time.monotonic()
             if session is None:
                 self._rpc_error(404, ERR_INVALID_REQUEST, "Session not found; send initialize again")
                 return
         else:
-            session = self.anonymous_session
+            # No session id means no shared request-id or cancellation namespace.
+            session = LegacySession()
         response = self.mcp_server.handle_message(message, session)
         extra["MCP-Protocol-Version"] = session.version or LATEST_LEGACY_PROTOCOL_VERSION
         if response is None:
             self._send_json(202, None, extra)
             return
         self._send_json(200, response, extra)
+
+
+class BoundedHTTPServer(http.server.ThreadingHTTPServer):
+    """Cap open connections before allocating request threads or reading headers."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._connections = threading.BoundedSemaphore(HTTP_MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
 
 
 def make_http_server(server: MCPServer, transport: HTTPTransportConfig, host: str = "127.0.0.1",
@@ -2103,10 +2252,8 @@ def make_http_server(server: MCPServer, transport: HTTPTransportConfig, host: st
         "transport": transport,
         "sessions": {},
         "sessions_lock": threading.Lock(),
-        "anonymous_session": LegacySession(),
     })
-    httpd = http.server.ThreadingHTTPServer((host, port), handler)
-    httpd.daemon_threads = True
+    httpd = BoundedHTTPServer((host, port), handler)
     return httpd
 
 
@@ -2273,7 +2420,9 @@ def install_http_agent(cli_path: Path, *, runner: Callable[..., Any] | None = No
         # The old job is still loaded, so restart it in place. After a clean
         # bootstrap, RunAtLoad has already started the job: kickstart -k would
         # kill it, and launchd holds that restart for its 10-second throttle.
-        _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+        restarted = _launchctl("kickstart", "-k", f"{domain}/{HTTP_AGENT_LABEL}", runner=runner)
+        if restarted.returncode != 0:
+            return {"ok": False, "error": (restarted.stderr or restarted.stdout).strip() or "launchctl kickstart failed", "plist": str(plist)}
     return {"ok": True, "plist": str(plist)}
 
 
@@ -2436,14 +2585,15 @@ def install_tailscale(cli_path: Path, *, port: int | None = None, runner: Callab
         time.sleep(0.25)
     return {
         "client": "tailscale",
-        "ok": True,
+        "ok": bool(health and health["ok"]),
         "url": url,
         "port": config["port"],
         "token": config["token"],
         "health": health,
         "agent": agent,
         "snippets": remote_snippets(config),
-        "note": "Devices on your tailnet can now connect with the token. Reprint the commands with `remctl mcp config --format tailscale`.",
+        "note": ("Devices on your tailnet can now connect with the token. Reprint the commands with `remctl mcp config --format tailscale`."
+                 if health and health["ok"] else "The endpoint did not become healthy. Check `remctl mcp status` before connecting devices."),
     }
 
 

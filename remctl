@@ -12940,7 +12940,8 @@ def cmd_mcp(a):
         icons = remctl_mcp.icon_data_uri(mcp_asset_path("remctl-mcp-icon.png"))
         if getattr(a, "http", False):
             config = remctl_mcp.ensure_http_config(port=getattr(a, "port", None))
-            transport = remctl_mcp.HTTPTransportConfig(token=config["token"], allowed_hosts=remctl_mcp.allowed_hosts_for(config))
+            transport = remctl_mcp.HTTPTransportConfig(token=config["token"], allowed_hosts=remctl_mcp.allowed_hosts_for(config),
+                                                     token_path=remctl_mcp.http_config_path())
             server = remctl_mcp.build_server(cli_path, VERSION, widget_path=widget, icons=icons)
             host = getattr(a, "host", None) or config.get("host", "127.0.0.1")
             sys.exit(remctl_mcp.serve_http(server, transport, host=host, port=int(config["port"])))
@@ -13003,7 +13004,17 @@ def cmd_mcp(a):
     if action == "token":
         if getattr(a, "rotate", False):
             config = remctl_mcp.rotate_http_token()
-            restarted = remctl_mcp.restart_http_agent() if remctl_mcp.http_agent_status()["loaded"] else False
+            loaded = remctl_mcp.http_agent_status()["loaded"]
+            restarted = remctl_mcp.restart_http_agent() if loaded else False
+            if loaded and not restarted:
+                message = ("The new token was saved, but the running endpoint could not restart. "
+                           "It may still accept the old token. Run `remctl mcp install --client tailscale` "
+                           "to reload it before using the new token.")
+                if json_mode:
+                    print(json.dumps({"ok": False, "rotated": True, "restarted": False, "error": message}, indent=2))
+                else:
+                    print(message, file=sys.stderr)
+                sys.exit(1)
             if json_mode:
                 print(json.dumps({"ok": True, "token": config["token"], "rotated": True, "restarted": restarted}, indent=2))
                 return

@@ -762,6 +762,33 @@ then
 fi
 SERVICE_QUIESCED=0
 
+# The HTTP process imports the client modules once. Reload an already-running
+# endpoint after publishing, or it will keep serving the previous runtime.
+if [[ "$CAPABILITY_SIMULATION" != "1" ]]; then
+    if ! "$CAPABILITY_PYTHON" -I -S - "$BIN_DIR" <<'PY'
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import remctl_mcp
+before = remctl_mcp.http_agent_status()
+if before["loaded"]:
+    config = remctl_mcp.load_http_config()
+    if config is None or not remctl_mcp.restart_http_agent():
+        raise SystemExit("Could not reload the active MCP HTTP endpoint.")
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        after = remctl_mcp.http_agent_status()
+        if after["running"] and after["pid"] != before["pid"] and remctl_mcp.http_health(config)["ok"]:
+            print("Reloaded and verified the active MCP HTTP endpoint.")
+            break
+        time.sleep(0.25)
+    else:
+        raise SystemExit("The MCP HTTP endpoint did not become healthy after reloading.")
+PY
+    then
+        fail "The new RemCTL generation is installed, but the MCP HTTP endpoint did not reload. Check 'remctl mcp status' before using it."
+    fi
+fi
+
 if [[ "$BOOTSTRAP" == "1" || "$COMPLETION_SHELL" != "none" ]]; then
     setup_shell="$COMPLETION_SHELL"
     [[ "$setup_shell" == "none" ]] && setup_shell="skip"

@@ -52,6 +52,12 @@ class FakeExecutor:
         self.cancelled.append(key)
         return True
 
+    def reserve(self, key):
+        return object()
+
+    def release(self, key, ticket):
+        pass
+
 
 def make_server(executor=None, widget_path=None):
     executor = executor or FakeExecutor()
@@ -409,7 +415,7 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(result["resultType"], "complete")
         self.assertNotIn("ui", result["_meta"])
         self.assertEqual(executor.calls[0]["argv"], ["today", "--json"])
-        self.assertEqual(executor.calls[0]["key"], "call-1")
+        self.assertEqual(executor.calls[0]["key"], (server.default_session.request_scope, "call-1"))
         self.assertEqual(executor.calls[0]["timeout"], remctl_mcp.TOOLS_BY_NAME["today"].timeout)
 
     def test_object_output_passes_through_and_stderr_is_attached(self):
@@ -524,7 +530,7 @@ class ToolCallTests(unittest.TestCase):
         self.assertEqual(executor.calls[0]["stdin"], "[]")
         self.assertEqual(executor.calls[0]["timeout"], 600)
         self.assertIsNone(server.handle_message({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}}))
-        self.assertEqual(executor.cancelled, [7])
+        self.assertEqual(executor.cancelled, [executor.calls[0]["key"]])
 
 
 class CommandExecutorTests(unittest.TestCase):
@@ -1035,6 +1041,7 @@ def http_call(port, method="POST", path="/mcp", body=None, headers=None):
     response = connection.getresponse()
     data = response.read().decode("utf-8")
     payload = json.loads(data) if data else None
+    connection.close()
     return response.status, {k.lower(): v for k, v in response.getheaders()}, payload
 
 
@@ -1164,7 +1171,7 @@ class HTTPTransportTests(unittest.TestCase):
         connection.request("POST", "/mcp", body=body, headers={**self.AUTH, "Content-Type": "application/json"})
         second = connection.getresponse()
         payload = json.loads(second.read().decode("utf-8"))
-        self.assertEqual(second.status, 200, "the unauthenticated body must be drained before the next request")
+        self.assertEqual(second.status, 200, "the rejected connection must close so the client reconnects cleanly")
         self.assertEqual(payload["result"], {})
         connection.close()
 
@@ -1177,6 +1184,7 @@ class HTTPTransportTests(unittest.TestCase):
         payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(response.status, 400)
         self.assertEqual(payload["error"]["code"], remctl_mcp.ERR_PARSE)
+        connection.close()
         status, _, payload = http_call(self.port, body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"jsonrpc": "2.0", "id": 2, "method": "ping"}], headers=self.AUTH)
         self.assertEqual(status, 200)
         self.assertEqual([item["id"] for item in payload], [1, 2])

@@ -2,6 +2,14 @@
 
 ## 2.0.0 — Unreleased
 
+### Runtime review fixes
+
+- Reject unauthenticated HTTP requests before reading their bodies. Reject negative, duplicate, and unsupported body framing; bound open connections and legacy sessions. Malformed headers, cancellation IDs, and Unicode no longer crash request handling.
+- Keep request IDs and cancellation within each client session. Reject duplicate active IDs and honor cancellation while a stdio command is still queued, before it can write.
+- Pass empty notes through MCP so `update_reminder` can clear them. Preserve created IDs and retry details when imports or private writes partly succeed.
+- Write private config files atomically. Use private, unique temporary files for client registration and preserve each backup, avoiding predictable temporary-path overwrites.
+- Read the current token for each HTTP request so rotation also revokes credentials on manually started endpoints. Report failed service restarts and unhealthy Tailscale setup as failures. Upgrades reload and verify an already-loaded HTTP endpoint so it uses the new runtime.
+
 ### MCP server
 
 - Added `remctl mcp`, a local MCP (Model Context Protocol) server over stdio with no third-party dependencies. It implements the stateless MCP 2026-07-28 revision (`server/discover`, per-request `_meta` protocol and capability fields, `resultType`, `serverInfo` and cache hints on every result, `-32022` version errors with the supported list) and stays a dual-era server for `initialize`-based clients on 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Verified against the official MCP Python SDK 2.2 client in modern and legacy modes.

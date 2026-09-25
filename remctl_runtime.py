@@ -6,6 +6,7 @@ import ipaddress
 import os
 import shutil
 import socket
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -154,19 +155,19 @@ def ensure_private_dir(path: Path) -> None:
 
 
 def write_private_text_file(path: Path, text: str) -> None:
+    """Publish complete private state without exposing a truncated token/config."""
     ensure_private_dir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
+    if path.is_symlink():
+        raise OSError(f"Refusing to overwrite a symbolic link: {path}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
     finally:
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        Path(temporary).unlink(missing_ok=True)
 
 
 def resolve_binary_path(script_path: str, binary_name: str, env_var: str) -> Path:
