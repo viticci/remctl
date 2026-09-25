@@ -31,7 +31,8 @@ remctl mcp remove --client codex
 | Claude Code | Runs `claude mcp add --scope user --transport stdio remctl -- <python> <remctl> mcp`. An older entry is replaced. | New sessions see the server. In an open session, type `/mcp` to reconnect. Tools appear as `mcp__remctl__<tool>`. |
 | Codex | Runs `codex mcp add remctl -- <python> <remctl> mcp`. | Codex CLI, the ChatGPT desktop app, and the IDE extension share that entry. |
 | Claude Desktop and Cowork | Adds `mcpServers.remctl` to `~/Library/Application Support/Claude/claude_desktop_config.json`. Every other key stays as it was, the file keeps its permissions, and a timestamped backup is saved next to it. | Quit and reopen Claude Desktop. The server appears in Claude chats and in Cowork on this Mac. |
-| Other clients | `remctl mcp config` prints JSON, TOML, and shell snippets. | Paste into the client's MCP settings. |
+| Hermes Agent | Nothing automatic. `remctl mcp config --format hermes` prints the `mcp_servers` entry for `~/.hermes/config.yaml`. | Paste it, then start a new Hermes session. See [hermes.md](hermes.md). |
+| Other clients | `remctl mcp config` prints JSON, TOML, YAML, and shell snippets. | Paste into the client's MCP settings. |
 
 The launch command uses an absolute Python path so GUI apps with a minimal `PATH` can start the server. `remctl mcp config --format command` shows it. For a Homebrew Python, RemCTL registers the formula's stable `opt` path, such as `/opt/homebrew/opt/python@3.14/bin/python3.14`, not the versioned `Cellar` folder that `brew upgrade` deletes.
 
@@ -112,15 +113,19 @@ Every tool returns `structuredContent` plus the same JSON as a text block, so cl
 | `upcoming` | `days` 1 to 365 (default 7) | `upcoming N --json` |
 | `overdue` | none | `overdue --json` |
 | `flagged` | none | `flagged --json` |
-| `search` | `query`, `include_completed` | `search QUERY --json` |
+| `search` | `query`, `include_completed`, `list` or `list_id`, `limit` (1 to 500, default 100), `offset` | `search … --limit N --offset N --json -- QUERY` |
 | `show_list` | `list` or `list_id`, `include_completed` | `show LIST --json` |
 | `lists` | none | `lists --json` |
+| `get_list` | `list` or `list_id` | `list-info LIST --json` |
 | `get_reminder` | `reminder_id` | `info ID --json` |
-| `create_reminder` | `title`, `list` or `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url`, `tags`, `flagged` | `add … --json -- TITLE` |
-| `update_reminder` | `reminder_id` plus one or more of `title`, `list`, `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url` | `edit ID … --json` |
-| `set_completion` | `reminder_id`, `completed`, optional `completion_date` | `done` or `undone ID --json` |
+| `resolve_location` | `query` | `location-lookup --json -- QUERY` |
+| `create_reminder` | `title`, `list` or `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url`, `tags`, `flagged`, and with `private: true`: `section`, `section_id`, `new_section`, `subtasks`, `assign`, `early_reminder`, `urgent`, `location_address` or `latitude` and `longitude`, `location_title`, `radius`, `proximity` | `add … --json -- TITLE` |
+| `update_reminder` | `reminder_id` plus one or more of `title`, `list`, `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url`, and with `private: true`: `tags`, `set_tags`, `remove_tags`, `clear_tags`, `unassign`, and the `create_reminder` metadata fields | `edit ID … --json` |
+| `set_completion` | `reminder_id` or `reminder_ids` (up to 50), `completed`, optional `completion_date` | `done` or `undone ID… --json` |
 | `set_flagged` | `reminder_id`, `flagged` | `flag` or `unflag ID --json` |
-| `delete_reminder` | `reminder_id` | `delete ID --force --json` |
+| `delete_reminder` | `reminder_id` or `reminder_ids` (up to 50) | `delete ID… --force --json` |
+| `create_list` | `name`, `color`, and with `private: true`: `symbol`, `emoji`, `groceries`, `grocery_locale`, `group` or `group_id` | `list-create … --json -- NAME` |
+| `update_list` | `list` or `list_id`, plus `new_name`, and with `private: true`: `color`, `symbol`, `emoji` | `list-rename` or `list-edit --private` |
 | `doctor` | none | `doctor --for-agent --json` |
 | `run` | `args` (exact CLI arguments), optional `stdin` | that command |
 
@@ -136,9 +141,16 @@ Notes:
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.
 - `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.
 - `priority` accepts the names `high`, `medium`, `low`, and `none`, and Apple's numbers (`0`, `1`-`4`, `5`, `6`-`9`).
-- `tags` accepts a list of strings as well as a comma-separated string. Both spellings append `#hashtags` to the title; neither creates Reminders tags.
+- `tags` accepts a list of strings as well as a comma-separated string. Without `private`, `create_reminder` appends them to the title as `#hashtags`; with `private: true` they are synced Reminders tags.
+- `private: true` is the typed form of the CLI's `--private`. It is required for synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, and location alarms, which RemCTL writes through Apple's private ReminderKit framework. Without it, those arguments are refused before anything runs, and `url` and `tags` keep their plain fallbacks: the URL is appended to the notes and the tags become `#hashtags`. See [private-metadata.md](private-metadata.md).
+- `subtasks` takes titles. An item can also be a JSON object string, such as `{"title":"Follow up","due":"2026-10-02"}`, with the fields the CLI's `--subtask` accepts.
+- `get_list` returns the list plus the section ids that `section_id` needs when two sections share a name, and the sharees that `assign` accepts. Prefer a sharee's address or id to a name.
+- `search` covers titles, notes, and saved rich links, ignoring case and accents. It always returns a page: `items`, `count`, `total`, `offset`, `limit`, `hasMore`, and `nextOffset`. While `hasMore` is true, call again with `offset` set to `nextOffset`. When two lists share a name, `list` fails and names their ids; use `list_id`.
+- `set_completion` and `delete_reminder` take `reminder_ids` for a batch of up to 50, and always return the batch shape for them, even for one id. The result lists each id under `results`, plus `succeeded`, `failed` (not changed), and `uncertain`. It is an error unless every id succeeded, and the per-id results are kept either way. Do not retry an `uncertain` id without checking it with `get_reminder`: a repeating reminder advances one occurrence per completion, which is also why `set_completion` is not marked idempotent. Repeated ids are written once. A batch stops after a stalled or uncertain write and starts no write after 60 seconds; both tools allow 300 seconds.
+- `location_address` is resolved to coordinates before anything is written. RemCTL uses the match only when it is the only one, street-sized, names the street or place typed, and the address gives a town or postal code. Anything else, or a personal label such as `Home`, stops the call with a structured error (`location_not_found`, `location_ambiguous`, `location_imprecise`, `location_unconfirmed`, `location_label_not_address`) and changes nothing. `resolve_location` runs the same lookup without writing; it is the one tool that contacts a service outside the Mac (Apple's geocoder), so it is marked `openWorldHint: true`.
+- `create_list` reports the new list's numeric `id`. `update_list` without `private` can only rename, through EventKit; with `private: true` it renames and changes appearance through ReminderKit.
 
-Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint: false`).
+Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`, which is true only for `resolve_location`).
 
 Errors use the two channels the specification defines. A malformed request or an unknown tool is a JSON-RPC error (`-32602`). A tool that ran but failed returns `isError: true` with `structuredContent.error`. When RemCTL emitted a structured error on stderr, for example `invalid_due_date` or `confirmation_required`, that object is passed through so the model can correct the call.
 
@@ -152,7 +164,7 @@ What it shows:
 
 - **Reminder rows** (`today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`): check circles, title with flag, priority, and urgent marks, the list name when rows span lists, friendly due dates with overdue in red, a Repeats column when any row recurs, and section headers for `show_list`. Row actions: Mark Done, Reschedule and Edit Title with an inline field, and Delete with a two-step confirmation.
 - **Reminder card** (`get_reminder`): notes, tags, link, subtasks, alarms, attachment count, and the same actions.
-- **Change confirmation** (`create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`): a headline per outcome, the new id, the resolved list, and warnings in amber, for example a created reminder whose flag step failed.
+- **Change confirmation** (`create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`): a headline per outcome, the new id, the resolved list, and warnings in amber, for example a created reminder whose flag step failed. A batch shows how many ids changed and lists each id that did not, with its reason.
 - **Lists**, **doctor**, and a safe summary for `run`. `run` output shaped like reminder rows gets the rows view.
 
 Widget actions are ordinary `tools/call` requests routed through the host, so the host's approval rules apply. A failed action shows a visible Failed state with the CLI's message; it never resets silently.
@@ -184,7 +196,7 @@ Commands:
 | `remctl mcp install [--client …]` | Connect apps; `tailscale` only when named |
 | `remctl mcp remove [--client …]` | Disconnect apps or stop the tailnet endpoint |
 | `remctl mcp status` | Which apps are connected, and the endpoint state |
-| `remctl mcp config [--format …]` | Snippets: `command`, `json`, `toml`, `claude-code`, `codex`, `tailscale` |
+| `remctl mcp config [--format …]` | Snippets: `command`, `json`, `toml`, `claude-code`, `codex`, `hermes`, `tailscale` |
 | `remctl mcp token [--rotate]` | Print or rotate the endpoint token |
 | `remctl mcp bundle [--output PATH] [--open]` | Build the Claude Desktop extension |
 

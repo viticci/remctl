@@ -44,11 +44,11 @@ Details, including the manual Full Disk Access steps, are in [docs/installation.
 remctl today                      # due today and overdue
 remctl upcoming 7                 # the next week
 remctl show Work --format table   # one list, in Reminders' order
-remctl search "invoice" --json    # titles and notes
+remctl search "invoice" --json    # titles, notes, and saved links
 remctl add "Review PR" -l Work -d "tomorrow 10:00" -p high
 remctl add "Pay rent" -d 2026-06-01 --recurrence monthly
 remctl edit 23880 -d clear
-remctl done 23880
+remctl done 23880 23881            # one id or a batch of up to 50
 remctl delete 23880 --force
 remctl info 23880 --json          # everything RemCTL knows about one reminder
 ```
@@ -58,7 +58,7 @@ Every read command has `--json`. Every reminder has a stable numeric `id` that w
 | Task | Commands |
 | --- | --- |
 | See what is due | `today`, `upcoming`, `overdue`, `flagged`, `urgent` |
-| Browse | `lists`, `groups`, `group-info`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `info`, `subtasks`, `sections`, `tags`, `sharees`, `stats` |
+| Browse | `lists`, `list-info`, `groups`, `group-info`, `smart-lists`, `templates`, `template-info`, `show`, `search`, `info`, `subtasks`, `sections`, `tags`, `sharees`, `location-lookup`, `stats` |
 | Create and edit | `add`, `edit`, `done`, `undone`, `delete`, `flag`, `unflag`, `reminder-move` |
 | Organize | `list-create`, `list-edit`, `list-rename`, `list-delete`, `list-pin`, `list-unpin`, `list-symbols`, `section-create`, `section-rename`, `section-delete`, `group-create`, `group-edit`, `group-delete`, `smart-list-create`, `smart-list-edit`, `smart-list-delete`, `template-create`, `template-apply`, `template-delete` |
 | Move data | `export`, `import`, `link`, `open` |
@@ -84,7 +84,7 @@ remctl mcp bundle --open                    # or a one-click .mcpb extension for
 remctl mcp status
 ```
 
-Tools: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_reminder`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `doctor`, and `run` (any other CLI command with exact arguments). Each tool has a schema, annotations, and structured results. In Claude Desktop and other hosts that support MCP Apps, results render as a reminders widget with check-off, reschedule, rename, and delete.
+Tools: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`, `doctor`, and `run` (any other CLI command with exact arguments). Search is paged and can be scoped to one list; completion and deletion take batches; `private: true` unlocks synced tags, rich links, sections, subtasks, assignment, Early Reminders, and location alarms, including ones set from a street address. Each tool has a schema, annotations, and structured results. In Claude Desktop and other hosts that support MCP Apps, results render as a reminders widget with check-off, reschedule, rename, and delete.
 
 Serve the same tools to your other devices:
 
@@ -104,7 +104,7 @@ AI app (Claude Code, Claude Desktop, Cowork, Codex, other MCP clients)
 Terminal, scripts, agents
   -> remctl client (Python 3.10+)
      -> 7 setup commands run in the caller
-     -> 49 data commands go over an owner-only socket to
+     -> 51 data commands go over an owner-only socket to
         RemCTL Capability Host.app (signed, always running)
            reads:   the Reminders SQLite database (Full Disk Access)
            writes:  EventKit through remctl-bridge (Reminders access)

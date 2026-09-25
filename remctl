@@ -6,7 +6,8 @@ owns database, Reminders, and Automation access. The client supports Python
 3.10+ and has zero third-party dependencies.
 """
 
-import argparse, base64, contextlib, csv, hashlib, html as html_lib, io, json, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+import argparse, base64, contextlib, csv, hashlib, html as html_lib, io, json, math, os, platform, plistlib, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time, unicodedata, uuid
+from collections import Counter
 
 import remctl_broker
 
@@ -193,7 +194,9 @@ def confirm_destructive_action(a, prompt, *, identifier=None, cancel_message="Ca
                 "code": "confirmation_required",
                 "message": message,
             }
-            if identifier is not None:
+            if isinstance(identifier, list):
+                payload["ids"] = identifier
+            elif identifier is not None:
                 payload["id"] = identifier
             print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         else:
@@ -1691,6 +1694,45 @@ def q_list_exact_name_count(db, name):
     return row["count"] if row else 0
 
 
+def q_list_ids_named(db, name):
+    return {
+        row["Z_PK"]
+        for row in db.execute(
+            "SELECT Z_PK FROM ZREMCDBASELIST WHERE ZMARKEDFORDELETION = 0 AND Z_ENT = 3 AND ZNAME = ?",
+            (name,),
+        ).fetchall()
+    }
+
+
+def list_ids_named_or_empty(name):
+    # Best effort: this only helps report the new id, so a read failure must not stop the create.
+    try:
+        return q_list_ids_named(open_db(), name)
+    except Exception:
+        return set()
+
+
+def wait_for_new_list_id(name, before_ids, attempts=8):
+    """The numeric id of a list just created, once the local store shows it.
+
+    Compares ids before and after, so an older list with the same name is never
+    mistaken for the new one. Returns None if the new row does not appear.
+    """
+    for attempt in range(attempts):
+        try:
+            new_ids = q_list_ids_named(open_db(), name) - set(before_ids)
+        except Exception:
+            # The list already exists; failing to read its id must not turn that into an error.
+            return None
+        if len(new_ids) == 1:
+            return next(iter(new_ids))
+        if new_ids:
+            return None
+        if attempt < attempts - 1:
+            time.sleep(0.25)
+    return None
+
+
 def q_group_exact_name_count(db, name):
     if "ZISGROUP" not in table_column_names(db, "ZREMCDBASELIST"):
         return 0
@@ -2742,21 +2784,71 @@ def hydrate_reminder_detail(db, payload, reminder_id):
         payload["alarms"] = alarms
     return payload
 
-def q_search(db, query, completed=False):
-    # Escape LIKE metacharacters so `%` and `_` in the query match literally;
-    # previously `search "%"` dumped every reminder in the store.
-    safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    c = [
+SEARCH_DEFAULT_LIMIT = 100
+SEARCH_MAX_LIMIT = 500
+
+
+def search_fold(value):
+    """Fold text for search: case-insensitive and accent-insensitive.
+
+    NFKD splits "é" into "e" plus a combining accent, which is dropped, and
+    casefold() handles cases lower() misses ("ß" matches "ss"). The query and
+    every searched field go through the same fold, so "cafe" finds "Café".
+    """
+    if value is None:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", str(value))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+def _search_where(db, query, completed=False, list_pk=None):
+    """WHERE clause and parameters shared by the search page and its total count.
+
+    Matching uses instr() on folded text instead of LIKE, so %, _, and
+    backslashes in a query are ordinary characters. Saved rich links live in
+    ZREMCDOBJECT rows, not in the notes, so they are matched separately.
+    """
+    db.create_function("remctl_fold", 1, search_fold, deterministic=True)
+    folded = search_fold(query)
+    fields = ["instr(remctl_fold(r.ZTITLE), ?) > 0", "instr(remctl_fold(r.ZNOTES), ?) > 0"]
+    params = [folded, folded]
+    if "ZURL" in table_column_names(db, "ZREMCDOBJECT"):
+        fields.append(
+            "EXISTS (SELECT 1 FROM ZREMCDOBJECT o WHERE o.ZREMINDER2 = r.Z_PK "
+            "AND o.ZURL IS NOT NULL AND o.ZMARKEDFORDELETION = 0 "
+            "AND instr(remctl_fold(o.ZURL), ?) > 0)"
+        )
+        params.append(folded)
+    clauses = [
         "r.ZMARKEDFORDELETION = 0", "r.ZACCOUNT IS NOT NULL", "l.Z_PK IS NOT NULL",
-        "(r.ZTITLE LIKE ? ESCAPE '\\' OR r.ZNOTES LIKE ? ESCAPE '\\')"
+        f"({' OR '.join(fields)})",
     ]
-    if not completed: c.append("r.ZCOMPLETED = 0")
-    pat = f"%{safe}%"
+    if not completed:
+        clauses.append("r.ZCOMPLETED = 0")
+    if list_pk is not None:
+        clauses.append("r.ZLIST = ?")
+        params.append(list_pk)
+    return " AND ".join(clauses), params
+
+
+def q_search(db, query, completed=False, *, list_pk=None, limit=SEARCH_DEFAULT_LIMIT, offset=0):
+    """One page of matches in titles, notes, and saved links, newest first."""
+    where, params = _search_where(db, query, completed=completed, list_pk=list_pk)
     return db.execute(
         f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
-        f"ON r.ZLIST = l.Z_PK WHERE {' AND '.join(c)} ORDER BY r.Z_PK DESC LIMIT 100",
-        (pat, pat)
+        f"ON r.ZLIST = l.Z_PK WHERE {where} ORDER BY r.Z_PK DESC LIMIT ? OFFSET ?",
+        (*params, limit, offset),
     ).fetchall()
+
+
+def q_search_count(db, query, completed=False, *, list_pk=None):
+    """How many reminders match, across every page."""
+    where, params = _search_where(db, query, completed=completed, list_pk=list_pk)
+    return db.execute(
+        f"SELECT COUNT(*) FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l "
+        f"ON r.ZLIST = l.Z_PK WHERE {where}",
+        params,
+    ).fetchone()[0]
 
 def q_due_today(db, include_overdue=True):
     sod, eod = due_today_window()
@@ -3924,12 +4016,12 @@ def cmd_show_eventkit(a):
 
 def cmd_search_eventkit(a):
     validate_eventkit_read_args(a)
-    payload = limited_eventkit_read(
-        "search",
-        a,
-        query=getattr(a, "query", None),
-        completed=bool(getattr(a, "completed", False)),
-    )
+    if getattr(a, "limit", None) is not None or getattr(a, "offset", None) is not None:
+        _eventkit_read_error("--via-eventkit search does not support --limit or --offset.", a)
+    extra = {"query": getattr(a, "query", None), "completed": bool(getattr(a, "completed", False))}
+    if getattr(a, "list", None):
+        extra["list"] = a.list
+    payload = limited_eventkit_read("search", a, **extra)
     output_eventkit_read(
         payload,
         a,
@@ -4569,24 +4661,272 @@ def validate_private_args(a):
 
     latitude = getattr(a, "latitude", None)
     longitude = getattr(a, "longitude", None)
-    if latitude is not None or longitude is not None:
-        if latitude is None or longitude is None:
+    location_address = getattr(a, "location_address", None)
+    if location_address is not None and (latitude is not None or longitude is not None):
+        fail_location(a, "location_address_conflict", "Pass --location-address or --latitude/--longitude, not both.")
+    if latitude is not None or longitude is not None or location_address is not None:
+        if location_address is None and (latitude is None or longitude is None):
             print("Error: location alarms require both --latitude and --longitude", file=sys.stderr)
             sys.exit(1)
-        if getattr(a, "address", None):
-            print("Error: --address is not currently supported for location alarms.", file=sys.stderr)
-            sys.exit(1)
-        if latitude < -90 or latitude > 90:
+        if latitude is not None and not (math.isfinite(latitude) and -90 <= latitude <= 90):
             print("Error: --latitude must be between -90 and 90.", file=sys.stderr)
             sys.exit(1)
-        if longitude < -180 or longitude > 180:
+        if longitude is not None and not (math.isfinite(longitude) and -180 <= longitude <= 180):
             print("Error: --longitude must be between -180 and 180.", file=sys.stderr)
             sys.exit(1)
-        if getattr(a, "radius", 100) is not None and getattr(a, "radius", 100) <= 0:
-            print("Error: --radius must be greater than 0.", file=sys.stderr)
-            sys.exit(1)
+        radius = getattr(a, "radius", 100)
+        if radius is not None and not (math.isfinite(radius) and 1 <= radius <= LOCATION_MAX_RADIUS):
+            fail_location(a, "invalid_location_radius", f"--radius must be between 1 and {LOCATION_MAX_RADIUS:g} meters.")
 
     parse_subtask_specs(getattr(a, "subtask", None))
+
+
+# ── Address-based location alarms ────────────────────────────────────────────
+
+LOCATION_MAX_RADIUS = 100_000.0  # meters; remctl-bridge refuses anything larger
+GEOCODE_TIMEOUT_SECONDS = 10
+GEOCODE_MAX_PRECISE_RADIUS = 1000.0  # meters; a larger match covers a whole area
+# Words that name a place only the user knows. Geocoding them would pick some
+# unrelated spot that happens to share the name.
+PERSONAL_PLACE_LABELS = frozenset({
+    "home", "my home", "house", "my house", "my place", "work", "my work", "office", "my office",
+    "school", "my school", "gym", "my gym", "here", "current location", "my location",
+})
+
+
+def fail_location(a, code, message, **extra):
+    """Stop before any write, with a structured error in --json mode."""
+    if getattr(a, "json", False):
+        print(json.dumps({"status": "error", "code": code, "message": message, **extra}, ensure_ascii=False), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+        for candidate in extra.get("candidates") or []:
+            label = candidate.get("address") or candidate.get("name") or "?"
+            print(
+                f"  {safe_display(label)} ({candidate['latitude']:.5f}, {candidate['longitude']:.5f}; {candidate['precision']})",
+                file=sys.stderr,
+            )
+    sys.exit(1)
+
+
+def is_personal_place_label(value):
+    text = re.sub(r"[^\w\s]", "", str(value or "")).strip()
+    return " ".join(text.casefold().split()) in PERSONAL_PLACE_LABELS
+
+
+def geocoded_candidate(raw):
+    """A bridge geocoder match, reduced to what the user reviews, with its precision.
+
+    Street addresses come back with a region of about 70 m. A city or region
+    comes back as one best guess with a region several kilometers wide, so the
+    region size, not the number of matches, is what exposes a vague query.
+    """
+    radius = raw.get("regionRadius")
+    radius = float(radius) if isinstance(radius, (int, float)) and not isinstance(radius, bool) else None
+    if radius is not None and radius > GEOCODE_MAX_PRECISE_RADIUS:
+        precision = "area"
+    elif raw.get("thoroughfare"):
+        precision = "street"
+    elif raw.get("areasOfInterest") or radius is not None:
+        precision = "place"
+    else:
+        precision = "area"
+    candidate = {
+        "name": raw.get("name"),
+        "address": raw.get("address"),
+        "latitude": float(raw["latitude"]),
+        "longitude": float(raw["longitude"]),
+        "precision": precision,
+    }
+    if radius is not None:
+        candidate["regionRadius"] = round(radius, 1)
+    return {key: value for key, value in candidate.items() if value is not None}
+
+
+STREET_ABBREVIATIONS = {
+    "st": "street", "str": "street", "ave": "avenue", "av": "avenue", "rd": "road", "blvd": "boulevard",
+    "dr": "drive", "ln": "lane", "ct": "court", "pl": "place", "sq": "square", "hwy": "highway", "pkwy": "parkway",
+}
+
+
+def _address_tokens(text):
+    return [STREET_ABBREVIATIONS.get(token, token) for token in re.findall(r"[^\W_]+", search_fold(text))]
+
+
+def address_mismatch_reason(query, raw):
+    """Why one precise geocoder match may still not be the place the user meant.
+
+    Apple's geocoder returns its single best guess even for a street it did not
+    find ("Main Street 1" came back as Rykneld Court in England) or for a street
+    name found in thousands of towns ("Via Roma 1"). Returns "street_mismatch"
+    when the match names no street or place the user typed, "no_town" when the
+    query gives nothing beyond the street and house number, or None.
+    """
+    query_tokens = _address_tokens(query)
+    available = Counter(query_tokens)
+    named = None
+    for field in (raw.get("thoroughfare"), *(raw.get("areasOfInterest") or []), raw.get("name")):
+        tokens = Counter(token for token in _address_tokens(field or "") if not token[0].isdigit())
+        if tokens and not tokens - available:
+            named = tokens
+            break
+    if named is None:
+        return "street_mismatch"
+    postal = re.sub(r"\s+", "", search_fold(raw.get("postalCode") or ""))
+    if postal and postal in re.sub(r"\s+", "", search_fold(query)):
+        return None
+    leftover = [token for token in (available - named).elements() if not token[0].isdigit()]
+    return None if leftover else "no_town"
+
+
+def lookup_location(query, *, timeout=GEOCODE_TIMEOUT_SECONDS):
+    """Geocode an address through remctl-bridge and judge the result.
+
+    Returns {"query", "status", "candidates", "location"?}. status is
+    "resolved" (one precise match that names the street or place typed, in a
+    town or postal code the query gives), "ambiguous" (several matches),
+    "imprecise" (one match that covers a whole area), "unconfirmed" (one
+    match RemCTL cannot tie to the query; "reason" says why), or "not_found".
+    Lookup failures return {"error": {code, message}} instead. Nothing is
+    written in any case.
+    """
+    query = str(query or "").strip()
+    if not query:
+        return {"error": {"code": "location_address_required", "message": "Pass an address to look up."}}
+    if len(query) > 512:
+        return {"error": {"code": "location_address_too_long", "message": "Addresses are limited to 512 characters."}}
+    if is_personal_place_label(query):
+        return {"error": {
+            "code": "location_label_not_address",
+            "message": (
+                f"{query!r} names a place only you know, so RemCTL will not guess its address. "
+                "Pass the street address or coordinates, and use --location-title to label it."
+            ),
+        }}
+    if not bridge_available():
+        return {"error": {"code": "location_lookup_unavailable", "message": "remctl-bridge is required to look up addresses."}}
+    result = bridge_call_result({"action": "geocode", "address": query, "timeoutSeconds": timeout}, timeout=timeout + 5)
+    payload = result.get("payload") if isinstance(result, dict) else None
+    if not bridge_result_ok(result, "ok") or not isinstance(payload, dict):
+        code = payload.get("code") if isinstance(payload, dict) else None
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if code == "timeout" or status == "timeout":
+            error_code = "location_lookup_timeout"
+        elif code == "denied":
+            error_code = "location_lookup_denied"
+        else:
+            error_code = "location_lookup_failed"
+        return {"error": {"code": error_code, "message": bridge_failure_message(result)}}
+    raws, candidates = [], []
+    for raw in payload.get("candidates") or []:
+        try:
+            candidates.append(geocoded_candidate(raw))
+            raws.append(raw)
+        except (KeyError, TypeError, ValueError):
+            continue
+    lookup = {"query": query, "candidates": candidates[:5]}
+    if not candidates:
+        lookup["status"] = "not_found"
+    elif len(candidates) > 1:
+        lookup["status"] = "ambiguous"
+    elif candidates[0]["precision"] == "area":
+        lookup["status"] = "imprecise"
+    elif reason := address_mismatch_reason(query, raws[0]):
+        lookup["status"] = "unconfirmed"
+        lookup["reason"] = reason
+    else:
+        lookup["status"] = "resolved"
+        lookup["location"] = candidates[0]
+    return lookup
+
+
+LOCATION_LOOKUP_MESSAGES = {
+    "not_found": "No place matches {query!r}. Check the address, or pass --latitude and --longitude.",
+    "ambiguous": "{query!r} matches {count} places. Pass a fuller address, or the coordinates of the right one.",
+    "imprecise": (
+        "{query!r} only matches a whole area ({label}), not a spot a location alarm can use. "
+        "Pass a street address, or pass its coordinates if the area is really what you want."
+    ),
+    "street_mismatch": (
+        "{query!r} came back as {label}, which is not the street or place you typed. "
+        "Check the address, or pass --latitude and --longitude."
+    ),
+    "no_town": (
+        "{query!r} names a street but no town, and many towns have one; Apple's geocoder picked {label}. "
+        "Add the town or postal code, or pass --latitude and --longitude."
+    ),
+}
+
+
+def location_lookup_message(lookup):
+    candidates = lookup["candidates"]
+    label = (candidates[0].get("address") or candidates[0].get("name")) if candidates else ""
+    template = LOCATION_LOOKUP_MESSAGES[lookup.get("reason") or lookup["status"]]
+    return template.format(query=lookup["query"], count=len(candidates), label=label)
+
+
+def resolve_location_address_or_die(a):
+    """Turn --location-address into coordinates before anything is written.
+
+    Sets a.latitude, a.longitude, a default a.location_title, and
+    a.resolved_location for the result. Any status but "resolved" stops the
+    command, so no reminder is created or changed.
+    """
+    query = getattr(a, "location_address", None)
+    if query is None:
+        return None
+    lookup = lookup_location(query)
+    if "error" in lookup:
+        fail_location(a, lookup["error"]["code"], lookup["error"]["message"])
+    if lookup["status"] != "resolved":
+        extra = {"reason": lookup["reason"]} if lookup.get("reason") else {}
+        fail_location(
+            a, f"location_{lookup['status']}", location_lookup_message(lookup),
+            query=lookup["query"], candidates=lookup["candidates"], **extra,
+        )
+    location = lookup["location"]
+    a.latitude = location["latitude"]
+    a.longitude = location["longitude"]
+    if not getattr(a, "location_title", None):
+        a.location_title = location.get("name") or location.get("address") or lookup["query"]
+    a.resolved_location = {
+        "query": lookup["query"],
+        "title": a.location_title,
+        "address": location.get("address"),
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        "precision": location["precision"],
+        "radius": getattr(a, "radius", None) or 100,
+        "proximity": getattr(a, "proximity", None) or "arriving",
+        "source": "geocoded",
+    }
+    return a.resolved_location
+
+
+def cmd_location_lookup(a):
+    """Show what an address resolves to, without writing anything."""
+    timeout = getattr(a, "timeout", None) or GEOCODE_TIMEOUT_SECONDS
+    if not 1 <= timeout <= 30:
+        print("Error: --timeout must be between 1 and 30 seconds.", file=sys.stderr)
+        sys.exit(1)
+    lookup = lookup_location(a.query, timeout=timeout)
+    if "error" in lookup:
+        fail_location(a, lookup["error"]["code"], lookup["error"]["message"])
+    lookup["usable"] = lookup["status"] == "resolved"
+    if a.json:
+        print(json.dumps(lookup, indent=2, ensure_ascii=False))
+        return
+    if lookup["status"] == "resolved":
+        location = lookup["location"]
+        print(f"Resolved: {safe_display(location.get('address') or location.get('name') or '')}")
+        print(f"Coordinates: {location['latitude']:.6f}, {location['longitude']:.6f} ({location['precision']})")
+        return
+    print(location_lookup_message(lookup))
+    for candidate in lookup["candidates"]:
+        print(
+            f"  {safe_display(candidate.get('address') or candidate.get('name') or '?')} "
+            f"({candidate['latitude']:.5f}, {candidate['longitude']:.5f}; {candidate['precision']})"
+        )
 
 
 def early_reminder_requires_due_date(a):
@@ -5242,6 +5582,7 @@ def private_changes_from_args(a):
         getattr(a, "location_title", None),
         getattr(a, "latitude", None) is not None,
         getattr(a, "longitude", None) is not None,
+        getattr(a, "location_address", None) is not None,
         getattr(a, "assign", None),
         getattr(a, "unassign", False),
     ])
@@ -5264,6 +5605,7 @@ def private_only_changes_from_args(a):
         getattr(a, "location_title", None),
         getattr(a, "latitude", None) is not None,
         getattr(a, "longitude", None) is not None,
+        getattr(a, "location_address", None) is not None,
         getattr(a, "assign", None),
         getattr(a, "unassign", False),
     ])
@@ -5563,6 +5905,7 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
             print(f"Error: {message}", file=sys.stderr)
             sys.exit(1)
         proximity = 2 if getattr(a, "proximity", "arriving") == "leaving" else 1
+        resolved_location = getattr(a, "resolved_location", None)
         results.append(private_location_action({
             "action": "add_location_alarm",
             "id": reminder_ckid,
@@ -5571,8 +5914,11 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
             "longitude": a.longitude,
             "radius": getattr(a, "radius", None) or 100,
             "proximity": proximity,
-            "address": getattr(a, "address", None),
+            "address": (resolved_location or {}).get("address"),
         }, partial_context=partial_context))
+        if resolved_location:
+            # Report what the address resolved to, so the caller can review it.
+            results[-1] = {**results[-1], "resolvedLocation": resolved_location}
 
     if getattr(a, "assign", None):
         if db is None:
@@ -6560,9 +6906,11 @@ def create_list_with_applescript(name):
     return {"status": "created", "id": rid, "fallback": "applescript"}
 
 
-def osa_by_id_try(rem_id, action, timeout=120):
+def osa_by_id_try(rem_id, action, timeout=120, outcome=None):
     """Non-fatal variant: returns True on success, False on failure.
     Used for AppleScript-first write paths that want to fall back to bridge.
+    Pass an `outcome` dict to learn whether a failure was a timeout, after
+    which Reminders may still apply the change.
 
     The reminder is addressed at application level (`reminder id ...`), as in
     osa_set_flagged_result: a `tell list "<name>"` scope throws -1728 for
@@ -6581,6 +6929,8 @@ def osa_by_id_try(rem_id, action, timeout=120):
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0
     except subprocess.TimeoutExpired:
+        if outcome is not None:
+            outcome["timedOut"] = True
         return False
 
 
@@ -8826,6 +9176,8 @@ def cmd_add(a):
         if db is None:
             db = open_db()
         validate_private_add_ready(a, db, target_list_pk)
+        # Last check before the reminder exists: a failed lookup creates nothing.
+        resolve_location_address_or_die(a)
 
     if a.tags and not wants_private:
         for t in a.tags.split(","):
@@ -9017,21 +9369,148 @@ def _refuse_unsafe_title_fallback(reminder, operation, reason):
     )
     sys.exit(1)
 
+REMINDER_BATCH_MAX = 50
+# No new write starts after this many seconds, so a batch finishes, and prints
+# every result, well inside the MCP server's 300-second limit for these tools.
+REMINDER_BATCH_BUDGET_SECONDS = 60
+
+# bridge action, bridge success status, AppleScript statement, error-message verb
+STATE_WRITES = {
+    "done": ("complete", "completed", "set completed of r to true", "complete it"),
+    "undone": ("uncomplete", "uncompleted", "set completed of r to false", "uncomplete it"),
+    "delete": ("delete", "deleted", "delete r", "delete it"),
+}
+
+
+def bridge_outcome_uncertain(result):
+    """True unless a failed remctl-bridge call proves that nothing was saved.
+
+    Only two failures prove it: the bridge never started, or it exited nonzero
+    after printing its own {"status": "error"} report. A timeout, a crash, a
+    success report followed by a crash, or an exit 0 without the expected
+    status can all come after EventKit committed.
+    """
+    if not result:
+        return False
+    payload = result.get("payload")
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status in {"missing_bridge", "exec_error"}:
+        return False
+    try:
+        reported = json.loads(result.get("stdout") or "")
+    except (TypeError, ValueError):
+        reported = None
+    reported_error = isinstance(reported, dict) and reported.get("status") == "error"
+    return not (result.get("returncode") != 0 and reported_error)
+
+
+def bridge_timed_out(result):
+    payload = result.get("payload") if isinstance(result, dict) else None
+    return isinstance(payload, dict) and payload.get("status") == "timeout"
+
+
+def write_reminder_state(r, operation, *, completion_dt=None, completion_iso=None):
+    """Complete, uncomplete, or delete one reminder row and report what happened.
+
+    Returns {"outcome": "ok" | "failed" | "uncertain", ...}, plus
+    "stalled": True when the bridge timed out, which tells a batch to stop.
+    "failed" means nothing was written; "uncertain" means a write may have
+    landed, so the caller must check before retrying. The AppleScript fallback
+    runs only when repeating the write is harmless: it never follows an
+    uncertain bridge result for a repeating reminder's completion, because
+    every completion advances the series by one occurrence.
+    """
+    bridge_action, success_status, statement, _verb = STATE_WRITES[operation]
+    recurring = operation == "done" and _row_get(r, "recurrence_frequency") is not None
+    bridge_uncertain = stalled = False
+    if bridge_available() and r["ZCKIDENTIFIER"]:
+        data = {"action": bridge_action, "id": r["ZCKIDENTIFIER"]}
+        if completion_iso:
+            data["completionDate"] = completion_iso
+        result = bridge_call_result(data)
+        if bridge_result_ok(result, success_status):
+            return {"outcome": "ok"}
+        bridge_uncertain = bridge_outcome_uncertain(result)
+        stalled = bridge_timed_out(result)
+        if bridge_uncertain and recurring:
+            return {**state_write_uncertain(r, operation, recurring=True), "stalled": stalled}
+
+    rid = _rem_id(r)
+    if not rid:
+        return {"outcome": "failed", "code": "no_stable_identifier", "reason": "The reminder has no stable identifier", "stalled": stalled}
+    action = statement
+    if completion_dt:
+        action += "\n" + as_date_assign(completion_dt, "completion date of r")
+    details = {}
+    if osa_by_id_try(rid, action, outcome=details):
+        return {"outcome": "ok", "stalled": stalled}
+    if bridge_uncertain or details.get("timedOut"):
+        return {**state_write_uncertain(r, operation, recurring=recurring), "stalled": stalled}
+    return {"outcome": "failed", "code": "write_failed", "reason": "Identifier-based writes failed", "stalled": stalled}
+
+
+def state_write_uncertain(r, operation, *, recurring=False):
+    reminder_id = _row_get(r, "Z_PK", "?")
+    title = safe_display(_row_get(r, "ZTITLE") or "(untitled)")
+    verb = STATE_WRITES[operation][3]
+    if recurring:
+        message = (
+            f"RemCTL could not confirm whether #{reminder_id} ('{title}') was completed. It repeats, "
+            "so completing it again could skip an occurrence. "
+            f"Check it with `remctl info {reminder_id}` before retrying."
+        )
+        code = "completion_uncertain"
+    else:
+        message = (
+            f"RemCTL could not confirm whether it managed to {verb} for #{reminder_id} ('{title}'). "
+            f"Check it with `remctl info {reminder_id}` before retrying."
+        )
+        code = "write_uncertain"
+    return {"outcome": "uncertain", "code": code, "message": message}
+
+
+def fail_state_write(a, r, operation, outcome):
+    """Exit for a single-reminder write that did not succeed."""
+    if outcome["outcome"] == "failed":
+        _refuse_unsafe_title_fallback(r, STATE_WRITES[operation][3], outcome["reason"])
+    if getattr(a, "json", False):
+        print(json.dumps({
+            "status": "error",
+            "code": outcome["code"],
+            "message": outcome["message"],
+            "id": _row_get(r, "Z_PK"),
+        }), file=sys.stderr)
+    else:
+        print(f"Error: {outcome['message']}", file=sys.stderr)
+    sys.exit(1)
+
+
+def requested_reminder_ids(a):
+    """Every id the command received, in order, repeats included."""
+    return [a.id, *(getattr(a, "more_ids", None) or [])]
+
+
+def completion_date_or_die(a):
+    completion_arg = getattr(a, "date", None)
+    if not completion_arg:
+        return None, None
+    completion_dt = parse_completion_date(completion_arg)
+    if not completion_dt:
+        fail_invalid_completion_date(completion_arg, json_mode=getattr(a, "json", False))
+    return completion_dt, completion_dt.isoformat()
+
+
 def cmd_done(a):
+    if getattr(a, "batch", False) or len(requested_reminder_ids(a)) > 1:
+        run_reminder_state_batch(a, "done")
+        return
     db = open_db()
     r = q_reminder(db, a.id)
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    completion_arg = getattr(a, "date", None)
-    completion_dt = None
-    completion_iso = None
-    if completion_arg:
-        completion_dt = parse_completion_date(completion_arg)
-        if not completion_dt:
-            fail_invalid_completion_date(completion_arg, json_mode=getattr(a, "json", False))
-        completion_iso = completion_dt.isoformat()
+    completion_dt, completion_iso = completion_date_or_die(a)
     if completion_iso and _row_get(r, "recurrence_frequency") is not None:
         message = (
             "--date is not supported for recurring reminders. "
@@ -9050,46 +9529,22 @@ def cmd_done(a):
 
     # Bridge-first for speed (post-2026-04-17 bridge fix: dueDateComponents
     # now reach CloudKit correctly). AppleScript stays as a fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "complete", "id": r["ZCKIDENTIFIER"]}
+    outcome = write_reminder_state(r, "done", completion_dt=completion_dt, completion_iso=completion_iso)
+    if outcome["outcome"] != "ok":
+        fail_state_write(a, r, "done", outcome)
+    if a.json:
+        payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
         if completion_iso:
-            data["completionDate"] = completion_iso
-        result = bridge_call(data)
-        if result and result.get("status") == "completed":
-            if a.json:
-                payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
-                if completion_iso:
-                    payload["completionDate"] = completion_iso
-                print(json.dumps(payload))
-            else:
-                suffix = f" ({completion_iso})" if completion_iso else ""
-                print(f"Completed: {safe_display(r['ZTITLE'])}{suffix}")
-            return
-
-    # AppleScript fallback
-    rid = _rem_id(r)
-    action = "set completed of r to true"
-    if completion_dt:
-        action += "\n" + as_date_assign(completion_dt, "completion date of r")
-    if rid and osa_by_id_try(rid, action):
-        if a.json:
-            payload = {"status": "completed", "id": a.id, "title": r["ZTITLE"]}
-            if completion_iso:
-                payload["completionDate"] = completion_iso
-            print(json.dumps(payload))
-        else:
-            suffix = f" ({completion_iso})" if completion_iso else ""
-            print(f"Completed: {safe_display(r['ZTITLE'])}{suffix}")
-        return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "complete it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "complete it",
-        "Identifier-based writes failed",
-    )
+            payload["completionDate"] = completion_iso
+        print(json.dumps(payload))
+    else:
+        suffix = f" ({completion_iso})" if completion_iso else ""
+        print(f"Completed: {safe_display(r['ZTITLE'])}{suffix}")
 
 def cmd_undone(a):
+    if getattr(a, "batch", False) or len(requested_reminder_ids(a)) > 1:
+        run_reminder_state_batch(a, "undone")
+        return
     db = open_db()
     r = q_reminder(db, a.id)
     if not r:
@@ -9097,32 +9552,18 @@ def cmd_undone(a):
         sys.exit(1)
 
     # Bridge-first for speed; AppleScript fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "uncomplete", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "uncompleted":
-            if a.json:
-                print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
-            return
-
-    rid = _rem_id(r)
-    if rid and osa_by_id_try(rid, "set completed of r to false"):
-        if a.json:
-            print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
-        else:
-            print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
-        return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "uncomplete it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "uncomplete it",
-        "Identifier-based writes failed",
-    )
+    outcome = write_reminder_state(r, "undone")
+    if outcome["outcome"] != "ok":
+        fail_state_write(a, r, "undone", outcome)
+    if a.json:
+        print(json.dumps({"status": "uncompleted", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
 
 def cmd_delete(a):
+    if getattr(a, "batch", False) or len(requested_reminder_ids(a)) > 1:
+        run_reminder_state_batch(a, "delete")
+        return
     db = open_db()
     r = q_reminder(db, a.id)
     if not r:
@@ -9136,30 +9577,136 @@ def cmd_delete(a):
         return
 
     # Bridge-first for speed; AppleScript fallback.
-    if bridge_available() and r["ZCKIDENTIFIER"]:
-        data = {"action": "delete", "id": r["ZCKIDENTIFIER"]}
-        result = bridge_call(data)
-        if result and result.get("status") == "deleted":
-            if a.json:
-                print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
-            else:
-                print(f"Deleted: {safe_display(r['ZTITLE'])}")
+    outcome = write_reminder_state(r, "delete")
+    if outcome["outcome"] != "ok":
+        fail_state_write(a, r, "delete", outcome)
+    if a.json:
+        print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
+    else:
+        print(f"Deleted: {safe_display(r['ZTITLE'])}")
+
+
+def run_reminder_state_batch(a, operation):
+    """Complete, uncomplete, or delete several reminders by numeric id.
+
+    Every id is resolved before the first write, repeats are dropped, and each
+    reminder is written at most once. The batch stops at the first write whose
+    result is uncertain or whose bridge call timed out, because the next ones
+    would likely hit the same stalled bridge, and it starts no write after
+    REMINDER_BATCH_BUDGET_SECONDS. Ids it did not reach are reported as
+    skipped; they were not changed.
+    """
+    json_mode = bool(getattr(a, "json", False))
+    requested = requested_reminder_ids(a)
+    if len(requested) > REMINDER_BATCH_MAX:
+        message = f"Pass at most {REMINDER_BATCH_MAX} reminder ids per call; got {len(requested)}. Nothing was changed."
+        if json_mode:
+            print(json.dumps({"status": "error", "code": "batch_too_large", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    unique, duplicates = [], []
+    for reminder_id in requested:
+        (duplicates if reminder_id in unique else unique).append(reminder_id)
+    completion_dt, completion_iso = completion_date_or_die(a) if operation == "done" else (None, None)
+
+    db = open_db()
+    success_status = STATE_WRITES[operation][1]
+    rows, results, targets = {}, {}, []
+    for reminder_id in unique:
+        r = q_reminder(db, reminder_id)
+        if not r:
+            results[reminder_id] = {
+                "id": reminder_id, "status": "not_found", "code": "reminder_not_found",
+                "message": f"#{reminder_id} not found",
+            }
+            continue
+        rows[reminder_id] = r
+        if operation == "done" and completion_iso and _row_get(r, "recurrence_frequency") is not None:
+            results[reminder_id] = {
+                "id": reminder_id, "status": "error", "code": "completion_date_unsupported_for_recurring",
+                "message": "--date is not supported for recurring reminders; complete it without --date to advance the series.",
+            }
+            continue
+        targets.append(reminder_id)
+
+    if operation == "delete" and targets:
+        lines = "\n".join(
+            f"  #{reminder_id} '{safe_display(rows[reminder_id]['ZTITLE'])}' ({safe_display(rows[reminder_id]['list_name'])})"
+            for reminder_id in targets
+        )
+        noun = "reminder" if len(targets) == 1 else "reminders"
+        if not confirm_destructive_action(a, f"Delete {len(targets)} {noun}?\n{lines}\n[y/N] ", identifier=targets):
             return
 
-    rid = _rem_id(r)
-    if rid and osa_by_id_try(rid, "delete r"):
-        if a.json:
-            print(json.dumps({"status": "deleted", "id": a.id, "title": r["ZTITLE"]}))
+    started = time.monotonic()
+    stop = None  # (code, message) once the batch stops starting writes
+    for reminder_id in targets:
+        r = rows[reminder_id]
+        if stop is None and time.monotonic() - started > REMINDER_BATCH_BUDGET_SECONDS:
+            stop = ("batch_time_budget", f"Not attempted: the batch ran past {REMINDER_BATCH_BUDGET_SECONDS} seconds; nothing was changed.")
+        if stop is not None:
+            results[reminder_id] = {"id": reminder_id, "status": "skipped", "code": stop[0], "message": stop[1]}
+            continue
+        outcome = write_reminder_state(r, operation, completion_dt=completion_dt, completion_iso=completion_iso)
+        if outcome["outcome"] == "ok":
+            item = {"id": reminder_id, "status": success_status}
+            if completion_iso:
+                item["completionDate"] = completion_iso
+        elif outcome["outcome"] == "uncertain":
+            item = {"id": reminder_id, "status": "uncertain", "code": outcome["code"], "message": outcome["message"]}
+        elif operation == "delete" and q_reminder(db, reminder_id) is None:
+            # Gone anyway, for example removed with a parent deleted earlier in this batch.
+            item = {"id": reminder_id, "status": success_status}
         else:
-            print(f"Deleted: {safe_display(r['ZTITLE'])}")
-        return
-    if not rid:
-        _refuse_unsafe_title_fallback(r, "delete it", "The reminder has no stable identifier")
-    _refuse_unsafe_title_fallback(
-        r,
-        "delete it",
-        "Identifier-based writes failed",
-    )
+            item = {
+                "id": reminder_id, "status": "error", "code": outcome["code"],
+                "message": f"{outcome['reason']}; #{reminder_id} was not changed.",
+            }
+        results[reminder_id] = item
+        if item["status"] == "uncertain" or outcome.get("stalled"):
+            stop = ("batch_stopped", f"Not attempted after the stalled or uncertain write for #{reminder_id}; nothing was changed.")
+
+    items = []
+    for reminder_id in unique:
+        item = results[reminder_id]
+        r = rows.get(reminder_id)
+        if r is not None:
+            item["title"] = r["ZTITLE"]
+            item["list"] = _row_get(r, "list_name")
+            if operation == "done" and _row_get(r, "recurrence_frequency") is not None:
+                item["recurring"] = True
+        items.append(item)
+    succeeded = [item["id"] for item in items if item["status"] == success_status]
+    uncertain = [item["id"] for item in items if item["status"] == "uncertain"]
+    failed = [item["id"] for item in items if item["id"] not in succeeded and item["id"] not in uncertain]
+    # "failed" promises that nothing changed; anything that may have changed is "partial".
+    status = success_status if len(succeeded) == len(items) else ("partial" if succeeded or uncertain else "failed")
+    payload = {
+        "status": status,
+        "operation": operation,
+        "requested": requested,
+        "succeeded": succeeded,
+        "failed": failed,
+        "uncertain": uncertain,
+        "results": items,
+    }
+    if duplicates:
+        payload["duplicatesIgnored"] = duplicates
+    if json_mode:
+        print(json.dumps(payload))
+    else:
+        verb = {"done": "Completed", "undone": "Uncompleted", "delete": "Deleted"}[operation]
+        for item in items:
+            if item["status"] == success_status:
+                print(f"{verb}: #{item['id']} {safe_display(item.get('title') or '')}")
+            else:
+                print(f"Error: {item['message']}", file=sys.stderr)
+        if duplicates:
+            print(f"Ignored repeated ids: {', '.join(str(i) for i in duplicates)}")
+        print(f"{len(succeeded)} of {len(items)} {verb.lower()}")
+    if status != success_status:
+        sys.exit(1)
 
 def cmd_edit(a):
     refuse_private_args_without_opt_in(a)
@@ -9234,6 +9781,9 @@ def cmd_edit(a):
                 sys.exit(1)
     if alarm_is_relative(parsed_alarm) and (a.due == "clear" or (dt is None and not r["ZDUEDATE"])):
         fail_relative_alarm_without_due(json_mode=getattr(a, "json", False))
+    if wants_private:
+        # Last check before the first write: a failed lookup changes nothing.
+        resolve_location_address_or_die(a)
 
     # Auto double-tap: if Reminders' displayed due date already equals the
     # requested target, AppleScript treats it as a no-op and pushes only
@@ -9702,30 +10252,85 @@ def cmd_reminder_move(a):
         print(f"Moved #{a.id} {relation}{anchor_text} in {destination}.")
 
 
+def search_page_args(a):
+    """Validated (limit, offset, paged) for search; paged means the caller asked for pages."""
+    limit = getattr(a, "limit", None)
+    offset = getattr(a, "offset", None)
+    if limit is not None and not 1 <= limit <= SEARCH_MAX_LIMIT:
+        print(f"Error: --limit must be between 1 and {SEARCH_MAX_LIMIT}.", file=sys.stderr)
+        sys.exit(1)
+    if offset is not None and offset < 0:
+        print("Error: --offset must be 0 or more.", file=sys.stderr)
+        sys.exit(1)
+    paged = limit is not None or offset is not None
+    return (limit or SEARCH_DEFAULT_LIMIT), (offset or 0), paged
+
+
 def cmd_search(a):
     if eventkit_read_requested(a):
         cmd_search_eventkit(a)
         return
+    limit, offset, paged = search_page_args(a)
     db = open_db()
-    items = q_search(db, a.query, completed=a.completed)
+    list_ref = None
+    if getattr(a, "list", None) or getattr(a, "list_id", None) is not None:
+        list_ref = resolve_required_list_target_or_die(db, name=getattr(a, "list", None), list_id=getattr(a, "list_id", None))
+    list_pk = list_ref["id"] if list_ref else None
+    items = q_search(db, a.query, completed=a.completed, list_pk=list_pk, limit=limit, offset=offset)
+    total = q_search_count(db, a.query, completed=a.completed, list_pk=list_pk)
+    next_offset = offset + len(items) if offset + len(items) < total else None
     pks = [i["Z_PK"] for i in items]
     sc, ht = preload_extras(db, pks)
     att = preload_attachments(db, pks)
     ind = preload_indicators(db, pks)
     if a.json:
-        print(json.dumps([to_dict(i, db, _sc=sc, _ht=ht, _att=att) for i in items], indent=2))
+        rows = [to_dict(i, db, _sc=sc, _ht=ht, _att=att) for i in items]
+        if paged:
+            payload = {
+                "query": a.query,
+                "items": rows,
+                "count": len(rows),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": next_offset is not None,
+                "nextOffset": next_offset,
+            }
+            if list_ref:
+                payload["list"] = {"id": list_ref["id"], "title": list_ref["title"]}
+            print(json.dumps(payload, indent=2))
+        else:
+            # The bare array stays for existing scripts; stderr says when it is cut short.
+            if next_offset is not None:
+                print(
+                    f"Warning: showing {len(rows)} of {total} matches. "
+                    f"Pass --offset {next_offset} --limit {limit} for the next page.",
+                    file=sys.stderr,
+                )
+            print(json.dumps(rows, indent=2))
         return
     if getattr(a, 'format', None) == 'table':
         print_reminder_table(items, db, args=a)
+        if next_offset is not None:
+            print(f"Showing {len(items)} of {total} matches. Next page: --offset {next_offset}", file=sys.stderr)
         return
+    scope = f" in {safe_display(list_ref['title'])}" if list_ref else ""
     if not items:
-        print(f"No reminders matching '{safe_display(a.query)}'")
+        if total and offset:
+            print(f"No reminders matching '{safe_display(a.query)}'{scope} past offset {offset} ({total} total)")
+        else:
+            print(f"No reminders matching '{safe_display(a.query)}'{scope}")
         return
-    print(f"Search: {C.bold(safe_display(a.query))}")
+    print(f"Search: {C.bold(safe_display(a.query))}{scope}")
     img = _image_render_config_verbose(a)
     for i in items:
         print(fmt(i, db, verbose=a.verbose, _sc=sc, _ht=ht, _img=img, _ind=ind))
-    print(f"\n{len(items)} result{'s' if len(items) != 1 else ''}")
+    if len(items) == total:
+        print(f"\n{total} result{'s' if total != 1 else ''}")
+    else:
+        print(f"\nShowing {offset + 1}-{offset + len(items)} of {total} results")
+        if next_offset is not None:
+            print(f"Next page: --offset {next_offset}")
 
 def cmd_today(a):
     if eventkit_read_requested(a):
@@ -10033,6 +10638,48 @@ def cmd_sharees(a):
     print(f"\n{len(rows)} sharee{'s' if len(rows) != 1 else ''}")
 
 
+def cmd_list_info(a):
+    """One list plus what writes into it need: its section ids and its sharees."""
+    db = open_db()
+    list_ref = resolve_required_list_target_or_die(
+        db,
+        name=getattr(a, "name", None),
+        list_id=getattr(a, "list_id", None),
+    )
+    row = q_list_by_pk(db, list_ref["id"])
+    payload = list_to_dict(row) if row else {"id": list_ref["id"], "title": list_ref["title"]}
+    if list_ref.get("method") not in (None, "exact", "id"):
+        payload["resolvedFrom"] = list_ref.get("requested")
+    payload["sections"] = [
+        {"id": section["ZCKIDENTIFIER"], "name": section["ZDISPLAYNAME"]}
+        for section in q_sections(db, list_ref["id"])
+    ]
+    current_user_ckid = q_list_shared_owner_ckid(db, list_ref["id"])
+    payload["sharees"] = [
+        sharee_to_dict(sharee, current_user_ckid=current_user_ckid)
+        for sharee in q_sharees(db, list_ref["id"])
+    ]
+    payload["shared"] = bool(payload["sharees"])
+    if a.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(f"{C.bold(safe_display(payload['title']))} {C.dim('(id: ' + str(payload['id']) + ')')}")
+    print(f"Type: {payload.get('listType', 'standard')}")
+    if payload["sections"]:
+        print("Sections:")
+        for section in payload["sections"]:
+            print(f"  - {safe_display(section['name'])} {C.dim('(' + str(section['id']) + ')')}")
+    else:
+        print("Sections: none")
+    if payload["sharees"]:
+        print("Shared with:")
+        for sharee in payload["sharees"]:
+            current = C.dim(" (me)") if sharee.get("currentUser") else ""
+            print(f"  - {safe_display(sharee['name'])}{current} {C.dim('(id: ' + str(sharee['id']) + ')')}")
+    else:
+        print("Not shared")
+
+
 def cmd_stats(a):
     db = open_db()
     due_column = due_filter_expr(db)
@@ -10303,10 +10950,15 @@ def cmd_list_create(a):
             if created_ref is None:
                 print(f"Error: created list '{a.name}' was not visible for group assignment.", file=sys.stderr)
                 sys.exit(1)
+        # Duplicate names were refused above, so any list with this name is the new one.
+        created_id = created_ref["id"] if created_ref is not None else wait_for_new_list_id(a.name, set())
         if a.json:
             payload = {"status": "created", "name": a.name, "private": result}
+            if created_id is not None:
+                payload["id"] = created_id
+            else:
+                payload["warnings"] = ["list_id_unavailable: the list was created, but its numeric id was not visible yet. Find it with lists."]
             if created_ref is not None:
-                payload["id"] = created_ref["id"]
                 payload["objectUUID"] = created_ref.get("objectUUID")
             if group_ref is not None:
                 payload["group"] = {
@@ -10335,6 +10987,7 @@ def cmd_list_create(a):
     data = {"action": "create_list", "title": a.name}
     if hasattr(a, 'color') and a.color and is_supported_public_list_color(a.color):
         data["color"] = a.color
+    before_ids = list_ids_named_or_empty(a.name)
     bridge_result = None
     result = None
     if bridge_available():
@@ -10369,10 +11022,18 @@ def cmd_list_create(a):
     else:
         result = create_list_with_applescript(a.name)
     if result and result.get("status") == "created":
+        created_id = wait_for_new_list_id(a.name, before_ids)
         if a.json:
-            print(json.dumps({"status": "created", "name": a.name}))
+            payload = {"status": "created", "name": a.name}
+            if created_id is not None:
+                payload["id"] = created_id
+            else:
+                payload["warnings"] = ["list_id_unavailable: the list was created, but its numeric id was not visible yet. Find it with lists."]
+            print(json.dumps(payload))
         else:
             print(f"Created list: {safe_display(a.name)}")
+            if created_id is not None:
+                print(f"ID: {created_id}")
     else:
         message = result.get("message") if isinstance(result, dict) else None
         print(f"Error: Failed to create list '{a.name}'" + (f": {message}" if message else ""), file=sys.stderr)
@@ -10884,11 +11545,11 @@ _remctl() {
         'template-info:Show a saved Reminders template'
         'show:Show reminders in a list'
         'add:Add a reminder'
-        'done:Complete a reminder'
-        'undone:Uncomplete a reminder'
+        'done:Complete reminders'
+        'undone:Uncomplete reminders'
         'edit:Edit a reminder'
         'reminder-move:Reorder a reminder in a list or custom smart list'
-        'delete:Delete a reminder'
+        'delete:Delete reminders'
         'search:Search reminders'
         'today:Due today + overdue'
         'upcoming:Next N days'
@@ -10905,6 +11566,8 @@ _remctl() {
         'section-rename:Rename a section in a list'
         'section-delete:Delete a section in a list'
         'sharees:Show people available for assignment in a shared list'
+        'list-info:Show one list with its section ids and sharees'
+        'location-lookup:Resolve an address to coordinates for a location alarm'
         'stats:Statistics'
         'link:Get deep links'
         'open:Open in Reminders.app'
@@ -10946,6 +11609,10 @@ _remctl() {
         search)
             _arguments \
                 '--completed[Include completed reminders]' \
+                '(-l --list --list-id)'{-l,--list}'[Only search one list]:list:' \
+                '(-l --list)--list-id[Only search one list by stable numeric ID]:id:' \
+                '--limit[Matches per page]:limit:' \
+                '--offset[Matches to skip before this page]:offset:' \
                 '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
                 '--images[Render image attachments inline]' \
@@ -11068,6 +11735,12 @@ _remctl() {
                 '--urgent[Set private urgent state]' \
                 '--no-urgent[Clear private urgent state]' \
                 '--early-reminder[Set Early Reminder delta, e.g. 15m, 1h, clear]:delta:' \
+                '--location-title[Location alarm title]:title:' \
+                '--location-address[Location alarm street address]:address:' \
+                '--latitude[Location alarm latitude]:latitude:' \
+                '--longitude[Location alarm longitude]:longitude:' \
+                '--radius[Location alarm radius meters]:radius:' \
+                '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
                 '--url[URL, web rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
@@ -11103,6 +11776,7 @@ _remctl() {
                 '--no-urgent[Clear private urgent state]' \
                 '--early-reminder[Set Early Reminder delta, e.g. 15m, 1h, clear]:delta:' \
                 '--location-title[Location alarm title]:title:' \
+                '--location-address[Location alarm street address]:address:' \
                 '--latitude[Location alarm latitude]:latitude:' \
                 '--longitude[Location alarm longitude]:longitude:' \
                 '--radius[Location alarm radius meters]:radius:' \
@@ -11153,6 +11827,18 @@ _remctl() {
         sharees)
             _arguments \
                 '--list-id[Shared list by stable numeric ID]:id:' \
+                '--json[JSON output]'
+            return
+            ;;
+        list-info)
+            _arguments \
+                '--list-id[List by stable numeric ID]:id:' \
+                '--json[JSON output]'
+            return
+            ;;
+        location-lookup)
+            _arguments \
+                '--timeout[Seconds to wait for the geocoder]:seconds:' \
                 '--json[JSON output]'
             return
             ;;
@@ -11355,17 +12041,17 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees list-info location-lookup stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "done" ]; then
         COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "reminder-move" ]; then
         COMPREPLY=( $(compgen -W "--before --after --first --last --smart-list --smart-list-id --private --json" -- "$cur") )
@@ -11377,7 +12063,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--list-id --completed --via-eventkit --verbose -v --json" -- "$cur") )
         return
     elif [ "$cmd" = "search" ]; then
-        COMPREPLY=( $(compgen -W "--completed --via-eventkit --verbose -v --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--completed --list -l --list-id --limit --offset --via-eventkit --verbose -v --json" -- "$cur") )
         return
     elif [ "$cmd" = "today" ]; then
         COMPREPLY=( $(compgen -W "--no-overdue --via-eventkit --verbose -v --json" -- "$cur") )
@@ -11423,6 +12109,12 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ "$cmd" = "sharees" ]; then
         COMPREPLY=( $(compgen -W "--list-id --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "list-info" ]; then
+        COMPREPLY=( $(compgen -W "--list-id --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "location-lookup" ]; then
+        COMPREPLY=( $(compgen -W "--timeout --json" -- "$cur") )
         return
     elif [ "$cmd" = "template-info" ]; then
         COMPREPLY=( $(compgen -W "--template-id --json" -- "$cur") )
@@ -11478,11 +12170,11 @@ complete -c remctl -n "__fish_use_subcommand" -a templates -d "Inspect saved Rem
 complete -c remctl -n "__fish_use_subcommand" -a template-info -d "Show a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a show -d "Show reminders in a list"
 complete -c remctl -n "__fish_use_subcommand" -a add -d "Add a reminder"
-complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete a reminder"
-complete -c remctl -n "__fish_use_subcommand" -a undone -d "Uncomplete a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete reminders"
+complete -c remctl -n "__fish_use_subcommand" -a undone -d "Uncomplete reminders"
 complete -c remctl -n "__fish_use_subcommand" -a edit -d "Edit a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a reminder-move -d "Reorder a reminder in a list or custom smart list"
-complete -c remctl -n "__fish_use_subcommand" -a delete -d "Delete a reminder"
+complete -c remctl -n "__fish_use_subcommand" -a delete -d "Delete reminders"
 complete -c remctl -n "__fish_use_subcommand" -a search -d "Search reminders"
 complete -c remctl -n "__fish_use_subcommand" -a today -d "Due today + overdue"
 complete -c remctl -n "__fish_use_subcommand" -a upcoming -d "Next N days"
@@ -11499,6 +12191,8 @@ complete -c remctl -n "__fish_use_subcommand" -a section-create -d "Create a sec
 complete -c remctl -n "__fish_use_subcommand" -a section-rename -d "Rename a section in a list"
 complete -c remctl -n "__fish_use_subcommand" -a section-delete -d "Delete a section in a list"
 complete -c remctl -n "__fish_use_subcommand" -a sharees -d "Show people available for assignment in a shared list"
+complete -c remctl -n "__fish_use_subcommand" -a list-info -d "Show one list with its section ids and sharees"
+complete -c remctl -n "__fish_use_subcommand" -a location-lookup -d "Resolve an address to coordinates for a location alarm"
 complete -c remctl -n "__fish_use_subcommand" -a stats -d "Statistics"
 complete -c remctl -n "__fish_use_subcommand" -a link -d "Get deep links"
 complete -c remctl -n "__fish_use_subcommand" -a open -d "Open in Reminders.app"
@@ -11533,6 +12227,10 @@ complete -c remctl -n "__fish_seen_subcommand_from show" -l completed -d "Includ
 complete -c remctl -n "__fish_seen_subcommand_from show" -l via-eventkit -d "Limited signed-host or direct read-only fallback; no numeric ids or private metadata"
 complete -c remctl -n "__fish_seen_subcommand_from show" -s v -l verbose -d "Verbose output"
 complete -c remctl -n "__fish_seen_subcommand_from search" -l completed -d "Include completed reminders"
+complete -c remctl -n "__fish_seen_subcommand_from search" -s l -l list -d "Only search one list" -r
+complete -c remctl -n "__fish_seen_subcommand_from search" -l list-id -d "Only search one list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from search" -l limit -d "Matches per page" -r
+complete -c remctl -n "__fish_seen_subcommand_from search" -l offset -d "Matches to skip before this page" -r
 complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -l via-eventkit -d "Limited signed-host or direct read-only fallback; no numeric ids or private metadata"
 complete -c remctl -n "__fish_seen_subcommand_from search today upcoming" -s v -l verbose -d "Verbose output"
 complete -c remctl -n "__fish_seen_subcommand_from today" -l no-overdue -d "Exclude overdue reminders"
@@ -11601,6 +12299,10 @@ complete -c remctl -n "__fish_seen_subcommand_from smart-list-delete" -l json -d
 complete -c remctl -n "__fish_seen_subcommand_from templates" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from sharees" -l list-id -d "Shared list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from sharees" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from list-info" -l list-id -d "List by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from list-info" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from location-lookup" -l timeout -d "Seconds to wait for the geocoder" -r
+complete -c remctl -n "__fish_seen_subcommand_from location-lookup" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from template-info" -l template-id -d "Read by numeric template ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from template-info" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from group-create" -l add-list -d "Move existing list into the new group" -r
@@ -11703,11 +12405,12 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-flagged -d "Clear
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l urgent -d "Set private urgent state"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-urgent -d "Clear private urgent state"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l early-reminder -d "Set Early Reminder delta, e.g. 15m, 1h, clear" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l location-title -d "Location alarm title" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l latitude -d "Location alarm latitude" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l longitude -d "Location alarm longitude" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l radius -d "Location alarm radius" -r
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l proximity -d "Location trigger" -a "arriving leaving"
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l location-title -d "Location alarm title" -r
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l latitude -d "Location alarm latitude" -r
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l longitude -d "Location alarm longitude" -r
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l radius -d "Location alarm radius" -r
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l proximity -d "Location trigger" -a "arriving leaving"
+complete -c remctl -n "__fish_seen_subcommand_from add edit" -l location-address -d "Location alarm street address" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s l -l list -d "Move to list; pure moves may return new id" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l list-id -d "Move to list by stable numeric ID; pure moves may return new id" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -s t -l tags -d "Synced tags with --private" -r
@@ -13076,8 +13779,10 @@ def cmd_mcp(a):
             print(snippets["json"])
             print(C.bold("TOML (Codex config.toml)"))
             print(snippets["toml"], end="")
+            print(C.bold("YAML (Hermes Agent ~/.hermes/config.yaml)"))
+            print(snippets["hermes"], end="")
             return
-        print(snippets[fmt], end="" if fmt == "toml" else "\n")
+        print(snippets[fmt], end="" if fmt in {"toml", "hermes"} else "\n")
         return
 
     if action == "bundle":
@@ -13236,6 +13941,17 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
     def js(c): c.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    def location_alarm_arguments(c):
+        c.add_argument("--location-title", help="Guarded metadata: location alarm title; saved through EventKit")
+        c.add_argument("--latitude", type=float, help="Guarded metadata: location alarm latitude; saved through EventKit")
+        c.add_argument("--longitude", type=float, help="Guarded metadata: location alarm longitude; saved through EventKit")
+        c.add_argument(
+            "--location-address",
+            help="Guarded metadata: street address for the location alarm; resolved to coordinates before anything is written",
+        )
+        c.add_argument("--address", dest="location_address", help=argparse.SUPPRESS)
+        c.add_argument("--radius", type=float, default=100.0, help="Guarded metadata: location alarm radius in meters (up to 100000)")
+        c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
     def img(c):
         # Re-declare the global image flags so they also parse after the command name.
         # argparse.SUPPRESS keeps an unused re-declaration from overwriting the
@@ -13411,6 +14127,7 @@ def build_parser():
             "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
             "  remctl add \"Leave now\" -l Work --private --urgent\n"
             "  remctl add \"Leave early\" -l Work -d \"today 14:00\" --private --early-reminder 15m\n"
+            "  remctl add \"Buy stamps\" --private --location-address \"Piazza Navona, Rome\" --radius 150\n"
             "  remctl add \"Launch assets\" -l Projects --private --subtask '{\"title\":\"Export PNG\",\"notes\":\"Use final crop\",\"due\":\"tomorrow\",\"url\":\"https://example.com\",\"tags\":[\"media\"]}'\n"
             "\n"
             "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
@@ -13449,28 +14166,53 @@ def build_parser():
     c.add_argument("--unassign", action="store_true", help="Private metadata: clear any existing assignment")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
+    location_alarm_arguments(c)
     js(c)
+
+    batch_epilog = (
+        f"Several ids make one batch of up to {REMINDER_BATCH_MAX}; list every id before the options. Every id is "
+        "checked before the first write, repeated ids are written once, and --json reports each id under results "
+        "with succeeded, failed (not changed), and uncertain lists. An uncertain id may have changed: check it "
+        "before retrying. A batch stops after a stalled or uncertain write, and starts no write after "
+        f"{REMINDER_BATCH_BUDGET_SECONDS} seconds; ids it did not reach are skipped. It exits 1 unless every id "
+        "succeeded. --batch gives one id the same result shape."
+    )
+
+    def reminder_ids(c):
+        c.add_argument("id", type=int, metavar="ID", help="Reminder numeric ID")
+        c.add_argument("more_ids", type=int, nargs="*", metavar="ID", help="More reminder IDs for one batch")
+        c.add_argument("--batch", action="store_true", help="Report the batch result shape even for one id")
 
     c = sub.add_parser(
         "done",
-        help="Complete a reminder",
-        description="Complete a reminder, optionally recording an explicit completion date.",
+        help="Complete reminders",
+        description="Complete one or more reminders, optionally recording an explicit completion date.",
         epilog=(
             "Examples:\n"
             "  remctl done 23880\n"
             "  remctl done 23880 --date 2026-05-27\n"
             "  remctl done 23880 --date \"2026-05-27 09:30\"\n"
+            "  remctl done 23880 23881 23882 --json\n"
             "\n"
             "--date accepts only absolute YYYY-MM-DD or YYYY-MM-DD HH:MM values. "
             "It also updates an already-completed reminder's completion date. "
-            "Recurring reminders reject --date; use plain done to advance the series."
+            "Recurring reminders reject --date; use plain done to advance the series. "
+            "A repeating reminder is retried only when the bridge reported that it saved nothing.\n"
+            + batch_epilog
         ),
         formatter_class=HelpFormatter,
     )
-    c.add_argument("id", type=int)
+    reminder_ids(c)
     c.add_argument("--date", metavar="WHEN", help="Set completion date to YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
     js(c)
-    c = sub.add_parser("undone", help="Uncomplete a reminder"); c.add_argument("id", type=int); js(c)
+    c = sub.add_parser(
+        "undone",
+        help="Uncomplete reminders",
+        description="Mark one or more completed reminders as not done.",
+        epilog="Examples:\n  remctl undone 23880\n  remctl undone 23880 23881 --json\n\n" + batch_epilog,
+        formatter_class=HelpFormatter,
+    )
+    reminder_ids(c); js(c)
 
     c = sub.add_parser(
         "edit",
@@ -13496,12 +14238,15 @@ def build_parser():
             "  remctl edit 23880 --private --flagged --urgent\n"
             "  remctl edit 23880 --private --early-reminder 15m\n"
             "  remctl edit 23880 --private --location-title \"Apple Park\" --latitude 37.3349 --longitude -122.0090 --radius 200\n"
+            "  remctl edit 23880 --private --location-title Office --location-address \"1 Apple Park Way, Cupertino, CA\" --proximity leaving\n"
             "\n"
             "Without --private, --url is appended to notes. Synced tags, web rich links, sections, shared-list assignments, subtasks, images, "
             "real flag state, urgent state, and location alarms require --private. "
             "A pure list move may return a new id plus oldId when RemCTL uses its verified clone-delete fallback across list/container boundaries. "
             "--assign USER accepts a unique name, email/phone, numeric sharee ID, object UUID, or me; use remctl sharees LIST --json before scripting. "
-            "Location alarms are saved through the EventKit bridge as structured-location alarms; replaces any existing location alarm."
+            "Location alarms are saved through the EventKit bridge as structured-location alarms; replaces any existing location alarm. "
+            "--location-address is looked up first (remctl location-lookup shows the result); unless it is the only match, "
+            "street-sized, names the street typed, and the address gives a town or postal code, the edit stops before anything changes."
         ),
         formatter_class=HelpFormatter,
     )
@@ -13530,12 +14275,7 @@ def build_parser():
     c.add_argument("--flagged", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set the real flagged state")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
-    c.add_argument("--location-title", help="Guarded metadata: location alarm title; saved through EventKit")
-    c.add_argument("--latitude", type=float, help="Guarded metadata: location alarm latitude; saved through EventKit")
-    c.add_argument("--longitude", type=float, help="Guarded metadata: location alarm longitude; saved through EventKit")
-    c.add_argument("--radius", type=float, default=100.0, help="Guarded metadata: location alarm radius in meters")
-    c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
-    c.add_argument("--address", help=argparse.SUPPRESS)
+    location_alarm_arguments(c)
     js(c)
 
     c = sub.add_parser(
@@ -13566,11 +14306,42 @@ def build_parser():
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit ordering")
     js(c)
 
-    c = sub.add_parser("delete", help="Delete a reminder")
-    c.add_argument("id", type=int); c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation"); js(c)
+    c = sub.add_parser(
+        "delete",
+        help="Delete reminders",
+        description="Permanently delete one or more reminders. A terminal session asks first; --json and scripts need --force.",
+        epilog="Examples:\n  remctl delete 23880\n  remctl delete 23880 23881 --force --json\n\n" + batch_epilog,
+        formatter_class=HelpFormatter,
+    )
+    reminder_ids(c); c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation"); js(c)
 
-    c = sub.add_parser("search", help="Search reminders")
-    c.add_argument("query"); c.add_argument("--completed", action="store_true"); vb(c); js(c)
+    c = sub.add_parser(
+        "search",
+        help="Search reminders",
+        description=(
+            "Search reminder titles, notes, and saved links. Matching ignores case and accents, "
+            "so 'cafe' finds 'Café'. Results are newest first, 100 per page by default."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl search invoice\n"
+            "  remctl search macstories.net --list Work --json\n"
+            "  remctl search invoice --list-id 153 --completed --json\n"
+            "  remctl search invoice --limit 50 --offset 50 --json\n"
+            "  remctl search -- -urgent\n"
+            "\n"
+            "--json without --limit or --offset prints a plain array and warns on stderr when more matches exist. "
+            "With --limit or --offset it prints {items, count, total, offset, limit, hasMore, nextOffset}."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("query"); c.add_argument("--completed", action="store_true")
+    search_scope = c.add_mutually_exclusive_group()
+    search_scope.add_argument("-l", "--list", help="Only search one list, by name")
+    search_scope.add_argument("--list-id", type=int, help="Only search one list, by stable numeric ID")
+    c.add_argument("--limit", type=int, help=f"Matches per page, 1-{SEARCH_MAX_LIMIT}; {SEARCH_DEFAULT_LIMIT} when omitted")
+    c.add_argument("--offset", type=int, help="Matches to skip before this page; 0 when omitted")
+    vb(c); js(c)
     eventkit_read(c)
     display_format(c)
     img(c)
@@ -13608,6 +14379,46 @@ def build_parser():
     )
     c.add_argument("list", nargs="?", help="Shared list name")
     c.add_argument("--list-id", type=int, help="Shared list numeric ID")
+    js(c)
+
+    c = sub.add_parser(
+        "list-info",
+        help="Show one list with its section ids and sharees",
+        description=(
+            "Show one list's details plus what writes into it need: section ids for --section-id "
+            "and sharees for --assign."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl list-info Work --json\n"
+            "  remctl list-info --list-id 153 --json"
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("name", nargs="?", help="List name")
+    c.add_argument("--list-id", type=int, help="List numeric ID")
+    js(c)
+
+    c = sub.add_parser(
+        "location-lookup",
+        help="Resolve an address to coordinates for a location alarm",
+        description=(
+            "Look up an address with Apple's geocoder inside the signed host and report the match. "
+            "Read-only: nothing is written. add and edit use the same lookup for --location-address."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl location-lookup \"Piazza Navona, Rome\"\n"
+            "  remctl location-lookup \"1 Apple Park Way, Cupertino, CA\" --json\n"
+            "\n"
+            "status is resolved (safe to use), ambiguous (several matches), imprecise (one match covering a whole "
+            "city or region), unconfirmed (a different street, or no town or postal code; see reason), or not_found. Personal labels such as "
+            "Home or Work are refused: pass the real address and use --location-title for the label."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    c.add_argument("query", help="Street address or place to look up")
+    c.add_argument("--timeout", type=int, help="Seconds to wait for the geocoder, 1-30; 10 when omitted")
     js(c)
 
     c = sub.add_parser("stats", help="Statistics"); js(c)
@@ -14078,7 +14889,7 @@ def build_parser():
     js(s)
     s = msub.add_parser("status", help="Show which apps are connected"); js(s)
     s = msub.add_parser("config", help="Print connection snippets for any MCP client")
-    s.add_argument("--format", dest="format_kind", choices=["all", "command", "json", "toml", "claude-code", "codex", "tailscale"], default="all", help="Snippet to print; tailscale prints the commands for other devices")
+    s.add_argument("--format", dest="format_kind", choices=["all", "command", "json", "toml", "claude-code", "codex", "hermes", "tailscale"], default="all", help="Snippet to print; hermes prints a ~/.hermes/config.yaml entry; tailscale prints the commands for other devices")
     js(s)
     s = msub.add_parser("token", help="Print or rotate the bearer token for tailnet access")
     s.add_argument("--rotate", action="store_true", help="Generate a new token and restart the endpoint")
@@ -14187,6 +14998,8 @@ def main():
         "info": cmd_info,
         "sections": cmd_sections,
         "sharees": cmd_sharees,
+        "list-info": cmd_list_info,
+        "location-lookup": cmd_location_lookup,
         "stats": cmd_stats,
         "link": cmd_link,
         "open": cmd_open,

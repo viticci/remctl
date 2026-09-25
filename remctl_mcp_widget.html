@@ -617,11 +617,13 @@ const RemCTLWidget = (() => {
     const box = el('div', 'rw-change');
     const icon = el('div', 'rw-change-icon'); icon.append(status === 'partial' ? I.alert() : I.checkTint());
     if (status === 'partial') { icon.style.color = 'var(--warn)'; icon.style.background = 'var(--warn-tint)'; }
-    const head = el('div', 'rw-change-head', icon, el('div', 'rw-change-title', CHANGE_TITLES[status] || 'Done'));
+    const listTool = p.toolName === 'create_list' || p.toolName === 'update_list';
+    const heading = listTool ? (status === 'created' ? 'List created' : 'List updated') : (CHANGE_TITLES[status] || 'Done');
+    const head = el('div', 'rw-change-head', icon, el('div', 'rw-change-title', heading));
     const id = value.numericId != null ? value.numericId : value.id;
     if (id != null && (typeof id === 'number' || /^\d+$/.test(String(id)))) head.append(el('span', 'rw-idchip', '#' + id));
     box.append(head);
-    const title = safeText(value.title, 300);
+    const title = safeText(value.title || value.name || value.new_name, 300);
     if (title) box.append(el('div', 'rw-change-sub', title));
     if (isObject(value.resolvedList) && value.resolvedList.title) {
       box.append(el('div', 'rw-change-sub', 'List: ' + safeText(value.resolvedList.title, 120) + ' (resolved from ' + safeText(value.resolvedList.requested, 120) + ')'));
@@ -641,6 +643,38 @@ const RemCTLWidget = (() => {
       box.append(warn);
     }
     return { node: el('div', 'rw-body', box), warning: warnings.length > 0 };
+  }
+
+  /* ---------- batch change (several ids in one call) ---------- */
+  const BATCH_VERBS = { done: 'Marked done', undone: 'Marked not done', delete: 'Deleted' };
+  function renderBatch(p, value) {
+    const results = value.results.filter(isObject);
+    const ids = (key) => new Set(Array.isArray(value[key]) ? value[key].map(String) : []);
+    const succeeded = ids('succeeded'); const uncertain = ids('uncertain');
+    const done = results.filter(item => succeeded.has(String(item.id)));
+    const maybe = results.filter(item => uncertain.has(String(item.id)));
+    const unchanged = results.filter(item => !succeeded.has(String(item.id)) && !uncertain.has(String(item.id)));
+    const box = el('div', 'rw-change');
+    const icon = el('div', 'rw-change-icon'); icon.append(done.length === results.length ? I.checkTint() : I.alert());
+    if (done.length < results.length) { icon.style.color = 'var(--warn)'; icon.style.background = 'var(--warn-tint)'; }
+    const verb = BATCH_VERBS[safeText(value.operation, 20)] || 'Changed';
+    box.append(el('div', 'rw-change-head', icon, el('div', 'rw-change-title', verb + ': ' + done.length + ' of ' + results.length)));
+    const label = (item) => '#' + safeText(item.id, 20) + (item.title ? ' ' + safeText(item.title, 200) : '');
+    const reason = (item) => label(item) + ': ' + (safeText(item.message, 400) || safeText(item.status, 40));
+    for (const item of done) box.append(el('div', 'rw-change-sub', label(item)));
+    // Uncertain ids may have changed; keep them apart from ids that certainly did not.
+    const groups = [
+      [maybe, maybe.length === 1 ? 'May have changed: check it before retrying' : 'May have changed: check these before retrying'],
+      [unchanged, unchanged.length === 1 ? 'One id was not changed' : unchanged.length + ' ids were not changed'],
+    ];
+    for (const [items, heading] of groups) {
+      if (!items.length) continue;
+      const warn = el('div', 'rw-warning'); const wi = el('div'); wi.append(I.alert());
+      const list = el('ul'); for (const item of items) list.append(el('li', null, reason(item)));
+      warn.append(wi, el('div', null, el('div', null, heading), list));
+      box.append(warn);
+    }
+    return { node: el('div', 'rw-body', box), changedOrMaybe: done.length + maybe.length, warning: done.length < results.length };
   }
 
   /* ---------- lists ---------- */
@@ -763,7 +797,12 @@ const RemCTLWidget = (() => {
       else if (isObject(value) && REMINDER_KEYS.every(k => k in value) && !items) profile = 'reminder';
       else profile = 'generic';
     }
-    if (p.status === 'failed') body = renderError(p);
+    const batch = isObject(value) && Array.isArray(value.results);
+    if (batch) {
+      const change = renderBatch(p, value);
+      body = change.node;
+      status = change.changedOrMaybe === 0 ? 'failed' : change.warning ? 'warning' : 'success';
+    } else if (p.status === 'failed') body = renderError(p);
     else if (profile === 'reminders') {
       count = items ? items.length : 0;
       body = items && items.length ? renderReminderRows(p, items) : renderEmpty(p, 'Nothing here', p.toolTitle + ' found no reminders.');

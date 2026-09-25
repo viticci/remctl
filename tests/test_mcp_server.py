@@ -90,7 +90,8 @@ class CatalogTests(unittest.TestCase):
             annotations = descriptor["annotations"]
             self.assertEqual(annotations["readOnlyHint"], tool.read_only)
             self.assertEqual(annotations["destructiveHint"], tool.destructive)
-            self.assertFalse(annotations["openWorldHint"])
+            # Only the geocoder lookup reaches a service outside this Mac.
+            self.assertEqual(annotations["openWorldHint"], tool.name == "resolve_location")
             self.assertNotIn("_meta", descriptor)
         delete = remctl_mcp.TOOLS_BY_NAME["delete_reminder"]
         self.assertTrue(delete.destructive)
@@ -107,8 +108,10 @@ class CatalogTests(unittest.TestCase):
             (("upcoming", ()), ["upcoming", "7", "--json"]),
             (("overdue", ()), ["overdue", "--json"]),
             (("flagged", ()), ["flagged", "--json"]),
-            (("search", (("query", "milk"), ("include_completed", True))), ["search", "--completed", "--json", "--", "milk"]),
-            (("search", (("query", "-urgent"),)), ["search", "--json", "--", "-urgent"]),
+            (("search", (("query", "milk"), ("include_completed", True))), ["search", "--completed", "--limit", "100", "--offset", "0", "--json", "--", "milk"]),
+            (("search", (("query", "-urgent"),)), ["search", "--limit", "100", "--offset", "0", "--json", "--", "-urgent"]),
+            (("search", (("query", "invoice"), ("list", "-Work"), ("limit", 20), ("offset", 40))), ["search", "--list=-Work", "--limit", "20", "--offset", "40", "--json", "--", "invoice"]),
+            (("search", (("query", "invoice"), ("list_id", 153))), ["search", "--list-id", "153", "--limit", "100", "--offset", "0", "--json", "--", "invoice"]),
             (("show_list", (("list", "Work"),)), ["show", "--json", "--", "Work"]),
             (("show_list", (("list_id", 153), ("include_completed", True))), ["show", "--list-id", "153", "--completed", "--json"]),
             (("lists", ()), ["lists", "--json"]),
@@ -121,6 +124,16 @@ class CatalogTests(unittest.TestCase):
             (("set_completion", (("reminder_id", 7), ("completed", False))), ["undone", "7", "--json"]),
             (("set_flagged", (("reminder_id", 7), ("flagged", False))), ["unflag", "7", "--json"]),
             (("delete_reminder", (("reminder_id", 7),)), ["delete", "7", "--force", "--json"]),
+            (("delete_reminder", (("reminder_ids", [7, 8, 7]),)), ["delete", "7", "8", "7", "--batch", "--force", "--json"]),
+            (("set_completion", (("reminder_ids", ["7", 8]), ("completed", True))), ["done", "7", "8", "--batch", "--json"]),
+            (("set_completion", (("reminder_ids", [7]), ("completed", False))), ["undone", "7", "--batch", "--json"]),
+            (("get_list", (("list", "Work"),)), ["list-info", "--json", "--", "Work"]),
+            (("get_list", (("list_id", 153),)), ["list-info", "--list-id", "153", "--json"]),
+            (("resolve_location", (("query", "Piazza Navona, Rome"),)), ["location-lookup", "--json", "--", "Piazza Navona, Rome"]),
+            (("create_list", (("name", "-Errands"), ("color", "blue"))), ["list-create", "--color", "blue", "--json", "--", "-Errands"]),
+            (("create_list", (("name", "Food"), ("private", True), ("groceries", True), ("group_id", 4))), ["list-create", "--private", "--groceries", "--group-id", "4", "--json", "--", "Food"]),
+            (("update_list", (("list_id", 9), ("new_name", "Chores"))), ["list-rename", "--list-id", "9", "--new-name", "Chores", "--json"]),
+            (("update_list", (("list", "Work"), ("emoji", "💼"), ("private", True))), ["list-edit", "--emoji", "💼", "--private", "--json", "--", "Work"]),
             (("doctor", ()), ["doctor", "--for-agent", "--json"]),
             (("run", (("args", ["groups", "--json"]),)), ["groups", "--json"]),
         ]
@@ -136,8 +149,12 @@ class CatalogTests(unittest.TestCase):
             if tool.name == "run":
                 continue
             sample = {param.name: {"integer": 5, "boolean": True, "string": "x", "array": ["a"]}[param.type] for param in tool.params if param.required}
-            if tool.name == "show_list":
+            if tool.name in {"show_list", "get_list"}:
                 sample = {"list": "Work"}
+            if tool.name in {"set_completion", "delete_reminder"}:
+                sample["reminder_id"] = 5
+            if tool.name == "update_list":
+                sample = {"list": "Work", "new_name": "Office"}
             if tool.name == "update_reminder":
                 sample["title"] = "New"
             if tool.name == "create_reminder":
@@ -809,6 +826,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn(command, snippets["command"])
         self.assertTrue(snippets["claude-code"].startswith("claude mcp add --scope user --transport stdio remctl -- "))
         self.assertTrue(snippets["codex"].startswith("codex mcp add remctl -- "))
+        self.assertIn(f"  remctl:\n    command: {json.dumps(command)}\n    args: {json.dumps(args)}\n", snippets["hermes"])
         self.assertEqual(remctl_mcp._shell_quote("it's"), "'it'\\''s'")
 
     def test_bundle_contains_manifest_launcher_and_icon(self):

@@ -21,6 +21,7 @@ import concurrent.futures
 import http.server
 import io
 import json
+import math
 import os
 import plistlib
 import secrets
@@ -89,6 +90,11 @@ SERVER_INSTRUCTIONS = (
     "Lists are targeted by name or by numeric list_id; use lists when a name might be "
     "ambiguous. When a row has `displayDate`, Reminders shows it at that time instead of "
     "`dueDate`, and today, overdue, and upcoming place it there too. "
+    "search covers titles, notes, and saved links and is paged: follow nextOffset while hasMore is true. "
+    "set_completion and delete_reminder take reminder_ids for batches; never retry an id reported as "
+    "uncertain without checking it first. Synced tags, rich links, sections, subtasks, assignment, "
+    "Early Reminders, and location alarms need private: true; get_list returns the section ids and "
+    "sharees they use, and resolve_location checks an address first. "
     "delete_reminder is permanent, so confirm with the user first. Use run only "
     "for commands the dedicated tools do not cover; pass exact argv items and include "
     "--json. Destructive run commands need --force. If a tool reports that the Capability "
@@ -96,6 +102,7 @@ SERVER_INSTRUCTIONS = (
 )
 
 TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+HOST_ARGV_MAX = 128  # the Capability Host refuses longer argument lists
 INTEGER_ID_RANGE = (1, 999_999_999)
 
 _DEBUG = os.environ.get("REMCTL_MCP_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -163,15 +170,16 @@ def client_supports_apps(capabilities: Any) -> bool:
 @dataclass(frozen=True)
 class Param:
     name: str
-    type: str  # string | integer | boolean | array
+    type: str  # string | integer | number | boolean | array
     description: str
     required: bool = False
     enum: tuple[str, ...] | None = None
-    minimum: int | None = None
-    maximum: int | None = None
+    minimum: float | None = None
+    maximum: float | None = None
     max_length: int | None = None
     default: Any = None
-    items_type: str | None = None
+    items_type: str | None = None  # string (default) or integer
+    max_items: int | None = None
     coerce: Callable[[Any], Any] | None = None
 
     def schema(self) -> dict[str, Any]:
@@ -187,7 +195,13 @@ class Param:
         if self.default is not None:
             schema["default"] = self.default
         if self.type == "array":
-            schema["items"] = {"type": self.items_type or "string"}
+            items: dict[str, Any] = {"type": self.items_type or "string"}
+            if self.items_type == "integer":
+                items.update({"minimum": INTEGER_ID_RANGE[0], "maximum": INTEGER_ID_RANGE[1]})
+            schema["items"] = items
+            if self.max_items is not None:
+                schema["minItems"] = 1
+                schema["maxItems"] = self.max_items
         return schema
 
 
@@ -202,6 +216,7 @@ class Tool:
     read_only: bool
     destructive: bool = False
     idempotent: bool = False
+    open_world: bool = False  # true only for a tool that asks an outside service
     timeout: float = 60.0
     require_one_of: tuple[str, ...] = ()
     mutually_exclusive: tuple[tuple[str, ...], ...] = ()
@@ -223,7 +238,7 @@ class Tool:
             "readOnlyHint": self.read_only,
             "destructiveHint": self.destructive,
             "idempotentHint": self.idempotent,
-            "openWorldHint": False,
+            "openWorldHint": self.open_world,
         }
 
 
@@ -364,7 +379,14 @@ def _argv_flagged(args):
 
 
 def _argv_search(args):
-    return ["search", *_flag(args, "include_completed", "--completed"), "--json", "--", str(args["query"])]
+    # Explicit paging makes the CLI answer with {items, total, hasMore, nextOffset}.
+    argv = ["search", *_flag(args, "include_completed", "--completed")]
+    if args.get("list_id") is not None:
+        argv += ["--list-id", str(args["list_id"])]
+    argv += _option(args, "list", "--list")
+    argv += ["--limit", str(args.get("limit", SEARCH_PAGE_DEFAULT)), "--offset", str(args.get("offset", 0))]
+    argv += ["--json", "--", str(args["query"])]
+    return argv
 
 
 def _argv_show_list(args):
@@ -386,6 +408,74 @@ def _argv_get_reminder(args):
     return ["info", str(args["reminder_id"]), "--json"]
 
 
+SEARCH_PAGE_DEFAULT = 100
+BATCH_MAX_IDS = 50
+
+# Reminders-only metadata. RemCTL writes it through ReminderKit only when the
+# caller opts in with `private: true`, the typed form of the CLI's --private.
+PRIVATE_FIELDS = (
+    "section", "section_id", "new_section", "subtasks", "assign", "unassign", "early_reminder", "urgent",
+    "location_title", "location_address", "latitude", "longitude", "radius", "proximity",
+    "set_tags", "remove_tags", "clear_tags",
+)
+LIST_PRIVATE_FIELDS = ("symbol", "emoji", "groceries", "grocery_locale", "group", "group_id")
+
+
+def _requested(args: dict[str, Any], key: str) -> bool:
+    value = args.get(key)
+    if value is None or value == []:
+        return False
+    if value is False:
+        return key == "urgent"  # urgent: false clears the urgent state; other false flags ask for nothing
+    return True
+
+
+def _repeated(values: list[str] | None, option: str) -> list[str]:
+    argv: list[str] = []
+    for value in values or []:
+        argv += _option({"value": value}, "value", option)
+    return argv
+
+
+def _private_metadata_argv(args: dict[str, Any], *, extra_private: tuple[str, ...] = ()) -> list[str]:
+    """--private plus the Reminders-only options, or nothing without the opt-in."""
+
+    used = [key for key in (*extra_private, *PRIVATE_FIELDS) if _requested(args, key)]
+    if not args.get("private"):
+        if used:
+            raise ToolArgumentError(
+                f"{', '.join(used)} {'needs' if len(used) == 1 else 'need'} private: true. They are Reminders-only "
+                "metadata that RemCTL writes through ReminderKit, and only when you opt in."
+            )
+        return []
+    has_location = any(_requested(args, key) for key in ("location_address", "latitude", "longitude"))
+    location_extras = [key for key in ("location_title", "radius", "proximity") if _requested(args, key)]
+    if location_extras and not has_location:
+        raise ToolArgumentError(f"{', '.join(location_extras)} need location_address, or latitude and longitude.")
+    if _requested(args, "latitude") != _requested(args, "longitude"):
+        raise ToolArgumentError("Pass latitude and longitude together.")
+    argv = ["--private"]
+    argv += _option(args, "section", "--section")
+    argv += _option(args, "section_id", "--section-id")
+    argv += _option(args, "new_section", "--new-section")
+    argv += _repeated(args.get("subtasks"), "--subtask")
+    argv += _option(args, "assign", "--assign")
+    argv += _flag(args, "unassign", "--unassign")
+    argv += _option(args, "early_reminder", "--early-reminder")
+    if args.get("urgent") is not None:
+        argv.append("--urgent" if args["urgent"] else "--no-urgent")
+    argv += _option(args, "set_tags", "--set-tags")
+    argv += _repeated(args.get("remove_tags"), "--remove-tag")
+    argv += _flag(args, "clear_tags", "--clear-tags")
+    argv += _option(args, "location_title", "--location-title")
+    argv += _option(args, "location_address", "--location-address")
+    argv += _option(args, "latitude", "--latitude")
+    argv += _option(args, "longitude", "--longitude")
+    argv += _option(args, "radius", "--radius")
+    argv += _option(args, "proximity", "--proximity")
+    return argv
+
+
 def _argv_create_reminder(args):
     argv = ["add"]
     argv += _option(args, "list", "--list")
@@ -398,6 +488,7 @@ def _argv_create_reminder(args):
     argv += _option(args, "url", "--url")
     argv += _option(args, "tags", "--tags")
     argv += _flag(args, "flagged", "--flag")
+    argv += _private_metadata_argv(args)
     argv += ["--json", "--", str(args["title"])]
     return argv
 
@@ -413,16 +504,27 @@ def _argv_update_reminder(args):
     argv += _option(args, "recurrence", "--recurrence")
     argv += _option(args, "alarm", "--alarm")
     argv += _option(args, "url", "--url")
+    # edit only adds synced tags, so tags join the private fields here.
+    argv += _option(args, "tags", "--tags")
+    argv += _private_metadata_argv(args, extra_private=("tags",))
     argv.append("--json")
     return argv
 
 
+def _reminder_ids(args: dict[str, Any]) -> list[str]:
+    """The ids for done, undone, or delete; reminder_ids always asks for the batch result shape."""
+    ids = args.get("reminder_ids")
+    if ids is not None:
+        return [*(str(reminder_id) for reminder_id in ids), "--batch"]
+    return [str(args["reminder_id"])]
+
+
 def _argv_set_completion(args):
     if args["completed"]:
-        return ["done", str(args["reminder_id"]), *_option(args, "completion_date", "--date"), "--json"]
+        return ["done", *_reminder_ids(args), *_option(args, "completion_date", "--date"), "--json"]
     if args.get("completion_date") is not None:
         raise ToolArgumentError("completion_date applies only when completed is true.")
-    return ["undone", str(args["reminder_id"]), "--json"]
+    return ["undone", *_reminder_ids(args), "--json"]
 
 
 def _argv_set_flagged(args):
@@ -430,7 +532,60 @@ def _argv_set_flagged(args):
 
 
 def _argv_delete_reminder(args):
-    return ["delete", str(args["reminder_id"]), "--force", "--json"]
+    return ["delete", *_reminder_ids(args), "--force", "--json"]
+
+
+def _list_target(args: dict[str, Any], command: str, options: list[str]) -> list[str]:
+    """`command [--list-id N] options --json [-- NAME]`, with the name kept a value."""
+
+    if args.get("list") is None and args.get("list_id") is None:
+        raise ToolArgumentError("Pass list or list_id.")
+    argv = [command]
+    if args.get("list_id") is not None:
+        argv += ["--list-id", str(args["list_id"])]
+    argv += options
+    argv.append("--json")
+    if args.get("list") is not None:
+        argv += ["--", str(args["list"])]
+    return argv
+
+
+def _argv_get_list(args):
+    return _list_target(args, "list-info", [])
+
+
+def _argv_create_list(args):
+    used = [key for key in LIST_PRIVATE_FIELDS if _requested(args, key)]
+    if used and not args.get("private"):
+        raise ToolArgumentError(f"{', '.join(used)} need private: true; they are written through ReminderKit.")
+    argv = ["list-create"]
+    argv += _option(args, "color", "--color")
+    argv += _flag(args, "private", "--private")
+    argv += _option(args, "symbol", "--symbol")
+    argv += _option(args, "emoji", "--emoji")
+    argv += _flag(args, "groceries", "--groceries")
+    argv += _option(args, "grocery_locale", "--grocery-locale")
+    argv += _option(args, "group", "--group")
+    argv += _option(args, "group_id", "--group-id")
+    argv += ["--json", "--", str(args["name"])]
+    return argv
+
+
+def _argv_update_list(args):
+    appearance = [key for key in ("color", "symbol", "emoji") if args.get(key) is not None]
+    if not args.get("private"):
+        if appearance:
+            raise ToolArgumentError(f"{', '.join(appearance)} need private: true; list appearance is written through ReminderKit.")
+        # A plain rename goes through EventKit.
+        return _list_target(args, "list-rename", _option(args, "new_name", "--new-name"))
+    options = _option(args, "new_name", "--new-name")
+    for key in ("color", "symbol", "emoji"):
+        options += _option(args, key, f"--{key}")
+    return _list_target(args, "list-edit", [*options, "--private"])
+
+
+def _argv_resolve_location(args):
+    return ["location-lookup", "--json", "--", str(args["query"])]
 
 
 def _argv_doctor(args):
@@ -480,7 +635,92 @@ def _argv_run(args):
     return argv
 
 
-UPDATE_FIELDS = ("title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url")
+PRIVATE_OPT_IN = Param(
+    "private",
+    "boolean",
+    "Opt in to Reminders-only metadata written through ReminderKit (RemCTL's --private). Required for "
+    "synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, and location "
+    "alarms. Without it, url is appended to the notes and create_reminder's tags become #hashtags in the title.",
+    default=False,
+)
+TAGS_HELP = (
+    "Tags as a list or comma-separated string. With private: true they are synced Reminders tags; "
+    "otherwise create_reminder appends them to the title as #hashtags."
+)
+REMINDER_METADATA_PARAMS = (
+    Param("section", "string", "Existing section name in the target list (private).", max_length=512),
+    Param("section_id", "string", "Section id from get_list, for lists with duplicate section names (private).", max_length=512),
+    Param("new_section", "string", "Create this section in the target list and file the reminder there (private).", max_length=512),
+    Param(
+        "subtasks",
+        "array",
+        "Subtasks to add (private). Each item is a title, or a JSON object string with title, notes, due, "
+        "priority, alarm, recurrence, earlyReminder, url, tags, flagged, or urgent.",
+        items_type="string",
+        max_items=20,
+    ),
+    Param("assign", "string", "Assign in a shared list: a sharee id, address, or objectUUID from get_list, or me (private).", max_length=512),
+    Param("early_reminder", "string", "Early Reminder before the due date: 15m, 1h, 2d, 1w, 1mo, or clear (private).", max_length=16),
+    Param("urgent", "boolean", "Set (true) or clear (false) the urgent state (private)."),
+    Param(
+        "location_address",
+        "string",
+        "Street address with town or postal code for a location alarm (private). RemCTL resolves it first and creates "
+        "or changes nothing unless it finds exactly one street-sized match for the street typed. Check it with resolve_location.",
+        max_length=512,
+    ),
+    Param("latitude", "number", "Location alarm latitude (private); pass with longitude instead of location_address.", minimum=-90, maximum=90),
+    Param("longitude", "number", "Location alarm longitude (private); pass with latitude.", minimum=-180, maximum=180),
+    Param("location_title", "string", "Label shown for the location alarm, such as Home (private).", max_length=512),
+    Param("radius", "number", "Location alarm radius in meters, default 100 (private).", minimum=1, maximum=100_000),
+    Param("proximity", "string", "Trigger when arriving (default) or leaving (private).", enum=("arriving", "leaving")),
+)
+METADATA_EXCLUSIVE = (
+    ("list", "list_id"),
+    ("section", "section_id", "new_section"),
+    ("location_address", "latitude"),
+    ("location_address", "longitude"),
+)
+REMINDER_IDS = Param(
+    "reminder_ids",
+    "array",
+    f"Up to {BATCH_MAX_IDS} numeric reminder ids to change in one call, instead of reminder_id.",
+    items_type="integer",
+    max_items=BATCH_MAX_IDS,
+)
+OPTIONAL_REMINDER_ID = Param(
+    "reminder_id",
+    "integer",
+    "Numeric reminder id from RemCTL results.",
+    minimum=INTEGER_ID_RANGE[0],
+    maximum=INTEGER_ID_RANGE[1],
+)
+BATCH_HELP = (
+    " A batch reports each id under results, plus succeeded, failed (not changed), and uncertain id lists, and is "
+    "an error unless every id succeeded. Never retry an uncertain id without checking it with get_reminder: a "
+    "repeating reminder advances one occurrence per completion. A batch stops after a stalled or uncertain write "
+    "and reports the ids it did not reach as skipped."
+)
+SEARCH_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {"type": "array", "items": {"type": "object"}},
+        "count": {"type": "integer"},
+        "total": {"type": "integer"},
+        "offset": {"type": "integer"},
+        "limit": {"type": "integer"},
+        "hasMore": {"type": "boolean"},
+        "nextOffset": {"type": ["integer", "null"]},
+    },
+    "required": ["items", "count", "total", "hasMore"],
+}
+
+UPDATE_FIELDS = (
+    "title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url",
+    "tags", "set_tags", "remove_tags", "clear_tags", "section", "section_id", "new_section", "subtasks",
+    "assign", "unassign", "early_reminder", "urgent", "location_address", "latitude", "longitude",
+    "location_title", "radius", "proximity",
+)
 
 TOOLS: tuple[Tool, ...] = (
     Tool(
@@ -514,12 +754,19 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "search",
         "Find Reminders",
-        "Search reminder titles and notes. Active reminders only unless include_completed is true.",
+        "Search reminder titles, notes, and saved links, ignoring case and accents. Active reminders only unless "
+        "include_completed is true. Scope to one list with list or list_id. Results are newest first and paged: "
+        "total counts every match; when hasMore is true, call again with offset set to nextOffset.",
         (
-            Param("query", "string", "Text to find in reminder titles or notes.", required=True, max_length=512),
+            Param("query", "string", "Text to find in reminder titles, notes, or saved links.", required=True, max_length=512),
             Param("include_completed", "boolean", "Include completed reminders.", default=False),
+            LIST_NAME,
+            LIST_ID,
+            Param("limit", "integer", "Matches per page.", minimum=1, maximum=500, default=SEARCH_PAGE_DEFAULT),
+            Param("offset", "integer", "Matches to skip; use nextOffset from the previous page.", minimum=0, maximum=INTEGER_ID_RANGE[1], default=0),
         ),
-        _argv_search, "reminders", read_only=True, idempotent=True, timeout=45, output_schema=ROWS_OUTPUT_SCHEMA,
+        _argv_search, "reminders", read_only=True, idempotent=True, timeout=45,
+        mutually_exclusive=(("list", "list_id"),), output_schema=SEARCH_OUTPUT_SCHEMA,
     ),
     Tool(
         "show_list",
@@ -542,6 +789,14 @@ TOOLS: tuple[Tool, ...] = (
         _argv_lists, "lists", read_only=True, idempotent=True, timeout=45, output_schema=ROWS_OUTPUT_SCHEMA,
     ),
     Tool(
+        "get_list",
+        "Get List",
+        "Return one list with its section ids (for section_id) and its sharees (for assign). Target by list name or list_id.",
+        (LIST_NAME, LIST_ID),
+        _argv_get_list, "generic", read_only=True, idempotent=True, timeout=45,
+        require_one_of=("list", "list_id"), mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+    ),
+    Tool(
         "get_reminder",
         "Get Reminder",
         "Return one reminder's complete record: notes, due date, recurrence, alarms, tags, section, subtasks, attachments, and deep link.",
@@ -549,9 +804,23 @@ TOOLS: tuple[Tool, ...] = (
         _argv_get_reminder, "reminder", read_only=True, idempotent=True, timeout=45, output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
+        "resolve_location",
+        "Resolve Location",
+        "Look up a street address with Apple's geocoder before using it for a location alarm. Writes nothing. "
+        "status is resolved (usable), ambiguous, imprecise (a whole city or region), unconfirmed (a different street, or no town "
+        "or postal code in the query; see reason), or not_found. "
+        "Personal labels such as Home are refused: ask the user for the address.",
+        (Param("query", "string", "Street address or place to look up.", required=True, max_length=512),),
+        _argv_resolve_location, "generic", read_only=True, idempotent=True, open_world=True, timeout=45,
+        output_schema=OBJECT_OUTPUT_SCHEMA,
+    ),
+    Tool(
         "create_reminder",
         "Create Reminder",
-        "Create one reminder. Returns status, the new numeric id, and any warnings (a failed flag step keeps the reminder).",
+        "Create one reminder. Returns status, the new numeric id, and any warnings (a failed flag step keeps the reminder). "
+        "Set private to true for synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, "
+        "and location alarms. If a private step fails after the reminder exists, the result has status partial and the id: "
+        "finish with update_reminder instead of creating it again.",
         (
             Param("title", "string", "Reminder title.", required=True, max_length=1024),
             LIST_NAME,
@@ -561,25 +830,22 @@ TOOLS: tuple[Tool, ...] = (
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP, max_length=64),
-            Param("url", "string", "URL appended to the notes.", max_length=2048),
-            Param(
-                "tags",
-                "string",
-                "Tags appended to the title as #hashtags. This edits the title text; it does not "
-                "create Reminders tags. A list of strings is accepted as well.",
-                max_length=512,
-                coerce=_coerce_tag_list,
-            ),
+            Param("url", "string", "URL. A synced rich link with private: true; otherwise appended to the notes.", max_length=2048),
+            Param("tags", "string", TAGS_HELP, max_length=512, coerce=_coerce_tag_list),
             Param("flagged", "boolean", "Flag the reminder after creating it.", default=False),
+            PRIVATE_OPT_IN,
+            *REMINDER_METADATA_PARAMS,
         ),
         _argv_create_reminder, "change", read_only=False, timeout=150,
-        mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+        mutually_exclusive=METADATA_EXCLUSIVE, output_schema=OBJECT_OUTPUT_SCHEMA,
         normalize_result=_normalize_created_reminder,
     ),
     Tool(
         "update_reminder",
         "Update Reminder",
-        "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. A list move can return a new id plus oldId.",
+        "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. A list move can return a new "
+        "id plus oldId: use the new id afterwards. Set private to true for synced tags, rich links, sections, subtasks, "
+        "assignment, Early Reminders, urgent state, and location alarms.",
         (
             REMINDER_ID,
             Param("title", "string", "Replacement title.", max_length=1024),
@@ -590,21 +856,33 @@ TOOLS: tuple[Tool, ...] = (
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP, max_length=128),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
-            Param("url", "string", "URL appended to the notes.", max_length=2048),
+            Param("url", "string", "URL. A synced rich link with private: true (added, never replaced); otherwise appended to the notes.", max_length=2048),
+            Param("tags", "string", "Synced tags to add (private), as a list or comma-separated string.", max_length=512, coerce=_coerce_tag_list),
+            Param("set_tags", "string", "Replace every synced tag with these (private).", max_length=512, coerce=_coerce_tag_list),
+            Param("remove_tags", "array", "Synced tags to remove (private).", items_type="string", max_items=20),
+            Param("clear_tags", "boolean", "Remove every synced tag (private).", default=False),
+            Param("unassign", "boolean", "Clear the shared-list assignment (private).", default=False),
+            PRIVATE_OPT_IN,
+            *REMINDER_METADATA_PARAMS,
         ),
         _argv_update_reminder, "change", read_only=False, idempotent=True, timeout=90,
-        require_one_of=UPDATE_FIELDS, mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+        require_one_of=UPDATE_FIELDS, mutually_exclusive=(*METADATA_EXCLUSIVE, ("assign", "unassign")),
+        output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
         "set_completion",
         "Set Completion",
-        "Mark a reminder done or not done. An optional completion_date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM') records when it was done.",
+        "Mark reminders done or not done. An optional completion_date (YYYY-MM-DD or 'YYYY-MM-DD HH:MM') records when it was done."
+        + BATCH_HELP,
         (
-            REMINDER_ID,
-            Param("completed", "boolean", "true marks the reminder done; false marks it not done.", required=True),
+            OPTIONAL_REMINDER_ID,
+            REMINDER_IDS,
+            Param("completed", "boolean", "true marks the reminders done; false marks them not done.", required=True),
             Param("completion_date", "string", "Completion date for completed=true; not allowed for recurring reminders.", max_length=32),
         ),
-        _argv_set_completion, "change", read_only=False, idempotent=True, timeout=150, output_schema=OBJECT_OUTPUT_SCHEMA,
+        _argv_set_completion, "change", read_only=False, timeout=300,
+        require_one_of=("reminder_id", "reminder_ids"), mutually_exclusive=(("reminder_id", "reminder_ids"),),
+        output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
         "set_flagged",
@@ -619,9 +897,47 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "delete_reminder",
         "Delete Reminder",
-        "Permanently delete one reminder by numeric id. Confirm with the user before calling.",
-        (REMINDER_ID,),
-        _argv_delete_reminder, "change", read_only=False, destructive=True, idempotent=True, timeout=150,
+        "Permanently delete reminders by numeric id: reminder_id for one, reminder_ids for a batch. Confirm with the user before calling."
+        + BATCH_HELP,
+        (OPTIONAL_REMINDER_ID, REMINDER_IDS),
+        _argv_delete_reminder, "change", read_only=False, destructive=True, idempotent=True, timeout=300,
+        require_one_of=("reminder_id", "reminder_ids"), mutually_exclusive=(("reminder_id", "reminder_ids"),),
+        output_schema=OBJECT_OUTPUT_SCHEMA,
+    ),
+    Tool(
+        "create_list",
+        "Create List",
+        "Create a Reminders list and return its numeric id. A color name works without private; an exact #RRGGBB "
+        "color, symbol, emoji, Groceries mode, and a group need private: true.",
+        (
+            Param("name", "string", "List name.", required=True, max_length=512),
+            Param("color", "string", "Color name (red, orange, yellow, green, blue, purple, brown, cyan), or #RRGGBB with private.", max_length=32),
+            PRIVATE_OPT_IN,
+            Param("symbol", "string", "Official Reminders list symbol name (private).", max_length=128),
+            Param("emoji", "string", "Emoji badge (private).", max_length=32),
+            Param("groceries", "boolean", "Create a Groceries list (private).", default=False),
+            Param("grocery_locale", "string", "Groceries locale such as en_US (private).", max_length=32),
+            Param("group", "string", "Create inside this list group (private).", max_length=512),
+            Param("group_id", "integer", "Create inside this list group by numeric id (private).", minimum=INTEGER_ID_RANGE[0], maximum=INTEGER_ID_RANGE[1]),
+        ),
+        _argv_create_list, "change", read_only=False, timeout=90,
+        mutually_exclusive=(("group", "group_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+    ),
+    Tool(
+        "update_list",
+        "Update List",
+        "Rename a list, or change its color, symbol, or emoji with private: true. Target by list name or list_id.",
+        (
+            LIST_NAME,
+            LIST_ID,
+            Param("new_name", "string", "New list name.", max_length=512),
+            Param("color", "string", "Color name or #RRGGBB (private).", max_length=32),
+            Param("symbol", "string", "Official Reminders list symbol name (private).", max_length=128),
+            Param("emoji", "string", "Emoji badge (private).", max_length=32),
+            PRIVATE_OPT_IN,
+        ),
+        _argv_update_list, "change", read_only=False, idempotent=True, timeout=90,
+        require_one_of=("new_name", "color", "symbol", "emoji"), mutually_exclusive=(("list", "list_id"),),
         output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
@@ -675,6 +991,21 @@ def _coerce_integer(value: Any) -> int | None:
     return None
 
 
+def _coerce_number(value: Any) -> float | int | None:
+    """A finite number; numeric strings are accepted as for integers."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value) if isinstance(value, float) and value.is_integer() and abs(value) < 1e15 else value
+    return None
+
+
 def _coerce_boolean(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -719,6 +1050,23 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
                 raise ToolArgumentError(f"{param.name} must be at least {param.minimum}.")
             if param.maximum is not None and value > param.maximum:
                 raise ToolArgumentError(f"{param.name} must be at most {param.maximum}.")
+        elif param.type == "number":
+            value = _coerce_number(raw)
+            if value is None:
+                raise ToolArgumentError(f"{param.name} must be a finite number.")
+            if param.minimum is not None and value < param.minimum:
+                raise ToolArgumentError(f"{param.name} must be at least {param.minimum:g}.")
+            if param.maximum is not None and value > param.maximum:
+                raise ToolArgumentError(f"{param.name} must be at most {param.maximum:g}.")
+        elif param.type == "array" and param.items_type == "integer":
+            numbers = [_coerce_integer(item) for item in raw] if isinstance(raw, list) else None
+            if numbers is None or any(number is None for number in numbers):
+                raise ToolArgumentError(f"{param.name} must be an array of integers.")
+            if not numbers or (param.max_items is not None and len(numbers) > param.max_items):
+                raise ToolArgumentError(f"{param.name} must hold 1 to {param.max_items} ids.")
+            if any(not INTEGER_ID_RANGE[0] <= number <= INTEGER_ID_RANGE[1] for number in numbers):
+                raise ToolArgumentError(f"{param.name} must hold positive numeric ids.")
+            value = numbers
         elif param.type == "boolean":
             value = _coerce_boolean(raw)
             if value is None:
@@ -746,17 +1094,23 @@ def validate_arguments(tool: Tool, arguments: Any) -> dict[str, Any]:
                 size = sum(len(item.encode("utf-8")) for item in raw)
             except UnicodeEncodeError:
                 raise ToolArgumentError(f"{param.name} must contain valid Unicode.") from None
-            if len(raw) > 128 or size > 48 * 1024:
-                raise ToolArgumentError(f"{param.name} is too large (max 128 items, 48 KiB).")
+            limit = min(param.max_items or 128, 128)
+            if len(raw) > limit or size > 48 * 1024:
+                raise ToolArgumentError(f"{param.name} is too large (max {limit} items, 48 KiB).")
             value = list(raw)
         else:  # pragma: no cover - catalog bug
             raise ToolArgumentError(f"Unsupported parameter type for {param.name}.")
         values[param.name] = value
+    # Passing a boolean's default (false) is the same as leaving it out.
+    defaults_false = {param.name for param in tool.params if param.type == "boolean" and param.default is False}
+
+    def present(name: str) -> bool:
+        return values.get(name) is not None and not (name in defaults_false and values[name] is False)
+
     for group in tool.mutually_exclusive:
-        present = [name for name in group if values.get(name) is not None]
-        if len(present) > 1:
+        if sum(present(name) for name in group) > 1:
             raise ToolArgumentError(f"Pass only one of: {', '.join(group)}.")
-    if tool.require_one_of and not any(values.get(name) is not None for name in tool.require_one_of):
+    if tool.require_one_of and not any(present(name) for name in tool.require_one_of):
         raise ToolArgumentError(f"Pass at least one of: {', '.join(tool.require_one_of)}.")
     return values
 
@@ -1046,10 +1400,12 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
     if result.returncode is None:
         return _error_result({"code": "spawn_failed", "message": result.stderr.strip() or "RemCTL could not start."})
     if result.returncode != 0:
-        # A failed import or private add can already have saved reminders.
-        # Preserve its ids and retry details so clients do not repeat the write.
+        # A failed import, private add, or batch can already have saved changes.
+        # Preserve its ids and per-item results so clients do not repeat a write.
         ok, partial = _parse_json_document(result.stdout)
-        if ok and isinstance(partial, dict) and partial.get("status") == "partial":
+        if ok and isinstance(partial, dict) and (
+            partial.get("status") == "partial" or isinstance(partial.get("results"), list)
+        ):
             if tool.normalize_result is not None:
                 partial = tool.normalize_result(partial)
             partial["exitCode"] = result.returncode
@@ -1372,6 +1728,11 @@ class MCPServer:
         try:
             arguments = validate_arguments(tool, params.get("arguments"))
             argv = tool.build_argv(arguments)
+            if len(argv) > HOST_ARGV_MAX:
+                raise ToolArgumentError(
+                    f"This call needs {len(argv)} command arguments; RemCTL accepts {HOST_ARGV_MAX}. "
+                    "Split subtasks or tags across more than one call."
+                )
         except ToolArgumentError as exc:
             result = _error_result({"code": "invalid_argument", "message": str(exc)})
         else:
@@ -1833,6 +2194,14 @@ def config_snippets(cli_path: Path) -> dict[str, str]:
         "toml": toml_snippet,
         "claude-code": f"claude mcp add --scope user --transport stdio {SERVER_NAME} -- {shell}",
         "codex": f"codex mcp add {SERVER_NAME} -- {shell}",
+        # Hermes Agent reads mcp_servers from ~/.hermes/config.yaml. JSON strings are valid YAML scalars.
+        "hermes": (
+            "mcp_servers:\n"
+            f"  {SERVER_NAME}:\n"
+            f"    command: {json.dumps(command)}\n"
+            f"    args: {json.dumps(args)}\n"
+            "    timeout: 300  # RemCTL's batch tools allow up to 300 seconds\n"
+        ),
     }
 
 

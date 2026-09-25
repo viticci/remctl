@@ -22,15 +22,20 @@ remctl show Shopping          # one list, in Reminders' display order
 remctl show --list-id 153
 remctl show Work --completed
 remctl show Family -v
-remctl search "milk"          # titles and notes, active reminders
+remctl search "milk"          # titles, notes, and saved links; active reminders
 remctl search "milk" --completed
+remctl search "macstories.net" --list Work
+remctl search "invoice" --list-id 153 --limit 50 --offset 50 --json
 remctl info 23880             # everything about one reminder
 remctl subtasks 23880
 remctl sections
 remctl tags
 remctl sharees Shopping       # people you can assign to in a shared list
+remctl list-info Shopping     # one list, its section ids, and its sharees
 remctl stats
 ```
+
+`search` matches titles, notes, and saved rich links. It ignores case and accents, so `cafe` finds `Café`, and `%`, `_`, and `\` are ordinary characters. `--list NAME` or `--list-id ID` limits it to one list; if several lists share a name, the command stops and prints their ids. Results are newest first, 100 per page. With `--json` and no paging option, the output is a plain array, and stderr warns when more matches exist. `--limit N` (1 to 500) or `--offset N` switch `--json` to a page: `{"items", "count", "total", "offset", "limit", "hasMore", "nextOffset"}`. Pass `nextOffset` as the next `--offset` until `hasMore` is false. A query that starts with `-` needs a separator: `remctl search -- -urgent`.
 
 `show <list>` follows the manual order stored by Reminders. `show <group>` reads every child list and applies each list's own order. A reminder that has not entered the ordering record yet is shown after the ordered ones.
 
@@ -167,11 +172,13 @@ remctl edit 23880 --alarm 1h
 remctl done 23880
 remctl done 23880 --date 2026-05-27
 remctl done 23880 --date "2026-05-27 09:30"
+remctl done 23880 23881 23882               # a batch of up to 50 ids
 remctl undone 23880
 remctl flag 23880
 remctl unflag 23880
 remctl delete 23880                         # asks first
 remctl delete 23880 --force                 # required with --json or without a terminal
+remctl delete 23880 23881 --force --json
 ```
 
 `edit` needs at least one change. With `--json` it prints `{"status": "updated", "id": 23880, "title": "…"}`.
@@ -181,6 +188,21 @@ Rescheduling: when a reminder has one absolute alarm at the old due time, `edit 
 Moving between lists: `edit -l` and `edit --list-id` use EventKit. Some moves are rejected by EventKit, for example a parent reminder with subtasks or a move across a shared-list boundary. For a pure move, RemCTL then clones the reminder into the destination through ReminderKit, verifies the clone and its subtask count, and deletes the original. The JSON then has `"method": "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved`. Continue with the new `id`. Move first; apply other edits afterwards.
 
 `done --date WHEN` records a specific completion time, also on an already completed reminder. `WHEN` must be `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`. Recurring reminders reject `--date`; plain `done` advances the series.
+
+Batches: `done`, `undone`, and `delete` accept up to 50 numeric ids. RemCTL looks up every id before the first write, writes each reminder once even if its id repeats, and never writes a missing id. `delete` asks once for the whole batch, listing each reminder; with `--json` it needs `--force`. The `--json` result looks like this:
+
+```json
+{"status": "partial", "operation": "done", "requested": [1, 2, 1, 999],
+ "succeeded": [1, 2], "failed": [999], "uncertain": [], "duplicatesIgnored": [1],
+ "results": [{"id": 1, "status": "completed", "title": "…", "list": "Work"}, …,
+             {"id": 999, "status": "not_found", "code": "reminder_not_found", "message": "#999 not found"}]}
+```
+
+`status` is the operation's usual status when every id succeeded, `failed` when nothing changed, and `partial` when some ids changed or may have; the exit code is 1 unless every id succeeded. `failed` lists every id that was not changed, including skipped ones. An id under `uncertain` may have changed: a write timed out or crashed after it could have saved. Check it with `info` before retrying.
+
+Completing a repeating reminder advances it by one occurrence. RemCTL retries a completion through its AppleScript fallback only when the bridge reported that it saved nothing; after a timeout or crash it reports `completion_uncertain` instead, for a single `done` as well as in a batch.
+
+A batch stops after the first write that is uncertain or whose bridge call timed out, because the next ones would likely stall too, and it starts no write after 60 seconds. Ids it did not reach are `skipped` and were not changed. List every id before the options. `--batch` gives a single id the batch result shape.
 
 Every destructive command (`delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, `template-delete`) asks for confirmation on a terminal. With `--json`, or when stdin is not a terminal, it requires `--force`. Without it, nothing is written, stdout stays empty, stderr gets `{"status": "error", "code": "confirmation_required", …}`, and the exit code is 1.
 
@@ -228,6 +250,8 @@ remctl list-rename --list-id 144 --new-name "Project Y"
 remctl list-delete "Project Y" --force
 ```
 
+`list-create --json` reports the new list's numeric `id`. If the new list is not visible yet, it adds a `list_id_unavailable` warning instead.
+
 `list-create --color NAME` uses EventKit and accepts Reminders color names (`red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, `cyan`). Exact `#RRGGBB` colors, official icon names, emoji badges, Groceries mode, and pin state are private metadata and need `--private`.
 
 `--symbol` accepts only the official icon names from `list-symbols`, because Reminders draws unknown names as the default icon. Use `--emoji` for any emoji.
@@ -238,7 +262,7 @@ remctl list-delete "Project Y" --force
 
 ### List names and ids
 
-A list can be named positionally or with `-l/--list`, or targeted exactly with `--list-id`. Names resolve in three passes: exact, case-insensitive, then normalized (ignoring decorative punctuation and emoji, so `Weekly 513` matches `🗓️ Weekly 513`). If more than one list matches, the command stops and prints the candidate ids. Passing both a name and `--list-id` is an error. This applies to `show`, `add`, `edit`, `link`, `export`, the `section-*` commands, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter.
+A list can be named positionally or with `-l/--list`, or targeted exactly with `--list-id`. Names resolve in three passes: exact, case-insensitive, then normalized (ignoring decorative punctuation and emoji, so `Weekly 513` matches `🗓️ Weekly 513`). If more than one list matches, the command stops and prints the candidate ids. Passing both a name and `--list-id` is an error. This applies to `show`, `search`, `add`, `edit`, `link`, `export`, `list-info`, the `section-*` commands, `list-edit`, `list-pin`, `list-unpin`, `list-rename`, `list-delete`, and the smart-list `--include-list-id` filter.
 
 Write commands that need a real list reject a group and name the child lists you can target instead.
 
@@ -377,6 +401,9 @@ remctl edit 23880 --private --subtask "Follow up"
 remctl edit 23880 --private --image ~/Desktop/mockup.png
 remctl edit 23880 --private --flagged --urgent
 remctl edit 23880 --private --early-reminder clear
+remctl edit 23880 --private --location-title Office --latitude 37.3349 --longitude -122.0090 --radius 200
+remctl add "Buy stamps" --private --location-address "Piazza Navona, Rome" --proximity arriving
+remctl location-lookup "Piazza Navona, Rome" --json
 ```
 
 | Field | Options | Notes |
@@ -389,10 +416,28 @@ remctl edit 23880 --private --early-reminder clear
 | Images | `--image PATH` (repeatable) | Additive. Other file types are rejected because Reminders does not show them. |
 | Flag, urgent | `--flagged`/`--no-flagged`, `--urgent`/`--no-urgent` | |
 | Early Reminder | `--early-reminder 15m|1h|2d|1w|1mo|clear` | Needs a due date. |
-| Location alarm | `--location-title`, `--latitude`, `--longitude`, `--radius`, `--proximity` | Saved through EventKit. |
+| Location alarm | `--location-title`, `--latitude` and `--longitude` or `--location-address`, `--radius`, `--proximity` | Saved through EventKit. Replaces an existing location alarm. `--radius` is 1 to 100000 meters, 100 by default. |
 | Groceries | `--grocery` | Only in a Groceries list. |
 
 Rich links and images are additive: RemCTL adds them and does not remove or replace existing ones.
+
+### Location alarms from an address
+
+`--location-address` turns a street address into coordinates with Apple's geocoder, inside the signed host, before anything is written. It works on `add` and `edit` with `--private`, like the rest of the location options, and cannot be combined with `--latitude`/`--longitude`. The lookup has a 10-second limit.
+
+RemCTL uses the match only when all four hold: there is exactly one match; it covers less than about a kilometer; it names the street or place you typed; and your address also gives a town or postal code. Apple's geocoder returns its single best guess even for a street it did not find, so the last two checks matter most: `Main Street 1` came back as a different street in England, and `Via Roma 1` as one of thousands of towns with that street. Otherwise the command stops and changes nothing:
+
+| Code | Meaning |
+| --- | --- |
+| `location_not_found` | No match. Check the address, or pass coordinates. |
+| `location_ambiguous` | Several matches. `candidates` lists them; pass a fuller address or one candidate's coordinates. |
+| `location_imprecise` | One match that covers a whole city or region, such as `Rome`. Pass a street address, or its coordinates if the area is really meant. |
+| `location_unconfirmed` | One match RemCTL cannot tie to what you typed. `reason` is `street_mismatch` (the match is a different street or place) or `no_town` (the address gives no town or postal code). `candidates` shows the guess. |
+| `location_label_not_address` | A personal label such as `Home` or `Work`. RemCTL cannot know that address and will not guess it. Pass the address and use `--location-title Home`. |
+| `location_lookup_timeout`, `location_lookup_failed`, `location_lookup_denied` | The geocoder did not answer, failed, or refused. |
+| `invalid_location_radius`, `location_address_conflict` | Checked before the lookup. |
+
+The location title defaults to the match's name. The result reports what was used under the location step's `resolvedLocation`: the query, title, address, coordinates, precision, radius, and proximity. `remctl location-lookup ADDRESS` runs the same lookup without writing, so a person or an agent can review the match first. Apple's geocoder resolves addresses better than business names: `1 Apple Park Way, Cupertino` resolves, while `Apple Park` may not.
 
 If a private step fails after the reminder was created, `add --json` prints `{"status": "partial", "id": …, "numericId": …, "failed": "…", "error": "…"}`. The reminder exists. Finish it with `edit`; do not run `add` again.
 

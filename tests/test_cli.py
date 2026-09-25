@@ -1827,7 +1827,7 @@ class CliTests(unittest.TestCase):
             parser_commands,
             remctl_runtime.LOCAL_COMMANDS | remctl_runtime.HOSTED_COMMANDS,
         )
-        self.assertEqual(len(parser_commands), 56)
+        self.assertEqual(len(parser_commands), 58)
 
     def test_internal_host_tty_state_requires_active_marker(self):
         non_tty = SimpleNamespace(isatty=lambda: False)
@@ -6500,14 +6500,14 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
-                self.remctl, "bridge_call",
-                return_value={
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result({
                     "status": {
                         "complete": "completed", "uncomplete": "uncompleted",
                         "delete": "deleted", "update": "updated",
                     }.get(expected_action, expected_action),
                     "id": reminder["ZCKIDENTIFIER"],
-                },
+                }),
             ) as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
             contextlib.redirect_stdout(io.StringIO()),
@@ -6543,7 +6543,10 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "open_db", return_value=None),
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
             mock.patch.object(self.remctl, "bridge_available", return_value=bridge_available) as bridge_available_mock,
-            mock.patch.object(self.remctl, "bridge_call", return_value=bridge_result) as bridge_call,
+            mock.patch.object(
+                self.remctl, "bridge_call_result",
+                return_value=self._bridge_result(bridge_result) if bridge_result is not None else None,
+            ) as bridge_call,
             mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa_try,
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
@@ -10640,6 +10643,7 @@ class InlineImageTests(unittest.TestCase):
                     "q_search",
                     return_value=[self._reminder_row()],
                 ),
+                mock.patch.object(self.remctl, "q_search_count", return_value=1),
                 mock.patch.object(self.remctl, "q_rich_link", return_value=None),
                 mock.patch.object(self.remctl, "q_assignment", return_value=None),
                 mock.patch.object(

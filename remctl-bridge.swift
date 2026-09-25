@@ -33,6 +33,8 @@ struct Command: Decodable {
     let days: Int?
     let includeOverdue: Bool?
     let limit: Int?
+    let address: String?
+    let timeoutSeconds: Double?
 }
 
 struct RecurrenceSpec: Decodable {
@@ -568,7 +570,94 @@ func containsQuery(_ reminder: EKReminder, _ query: String) -> Bool {
     let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
     if (reminder.title ?? "").range(of: query, options: options) != nil { return true }
     if (reminder.notes ?? "").range(of: query, options: options) != nil { return true }
+    if (reminder.url?.absoluteString ?? "").range(of: query, options: options) != nil { return true }
     return false
+}
+
+// MARK: - Geocoding
+
+/// One geocoder match with the fields RemCTL needs to judge its precision.
+func placemarkPayload(_ placemark: CLPlacemark) -> [String: Any]? {
+    guard let location = placemark.location else { return nil }
+    var payload: [String: Any] = [
+        "latitude": location.coordinate.latitude,
+        "longitude": location.coordinate.longitude,
+    ]
+    func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
+    }
+    let street = [placemark.subThoroughfare, placemark.thoroughfare].compactMap(nonEmpty).joined(separator: " ")
+    let address = [nonEmpty(street), placemark.locality, placemark.administrativeArea, placemark.postalCode, placemark.country]
+        .compactMap(nonEmpty)
+    if !address.isEmpty { payload["address"] = address.joined(separator: ", ") }
+    if let name = nonEmpty(placemark.name) { payload["name"] = name }
+    if let thoroughfare = nonEmpty(placemark.thoroughfare) { payload["thoroughfare"] = thoroughfare }
+    // Separate parts let RemCTL check the match against the words the user typed.
+    let parts: [(String, String?)] = [
+        ("subLocality", placemark.subLocality), ("locality", placemark.locality),
+        ("subAdministrativeArea", placemark.subAdministrativeArea), ("administrativeArea", placemark.administrativeArea),
+        ("postalCode", placemark.postalCode), ("country", placemark.country),
+    ]
+    for (key, value) in parts {
+        if let value = nonEmpty(value) { payload[key] = value }
+    }
+    if let areas = placemark.areasOfInterest, !areas.isEmpty { payload["areasOfInterest"] = areas }
+    if let region = placemark.region as? CLCircularRegion { payload["regionRadius"] = region.radius }
+    if let country = nonEmpty(placemark.isoCountryCode) { payload["isoCountryCode"] = country }
+    return payload
+}
+
+/// Forward-geocode an address with a hard deadline. Needs no Reminders or
+/// Location Services permission: it only asks Apple's geocoder, and it never
+/// writes anything. On the deadline it cancels the request and reports timeout.
+func runGeocode(_ cmd: Command) -> Never {
+    guard let address = cmd.address?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty else {
+        fail("address is required for geocode")
+    }
+    guard address.count <= 512 else { fail("address is longer than 512 characters") }
+    let timeout = min(max(cmd.timeoutSeconds ?? 10, 1), 30)
+    let geocoder = CLGeocoder()
+    var placemarks: [CLPlacemark] = []
+    var failure: Error?
+    var finished = false
+    geocoder.geocodeAddressString(address) { results, error in
+        placemarks = results ?? []
+        failure = error
+        finished = true
+    }
+    // The completion handler arrives on the main queue, which this loop services.
+    let deadline = Date().addingTimeInterval(timeout)
+    while !finished && Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: min(deadline, Date().addingTimeInterval(0.05)))
+    }
+    if !finished {
+        geocoder.cancelGeocode()
+        output(["status": "error", "code": "timeout", "message": "Geocoding did not finish within \(Int(timeout)) seconds."])
+        exit(1)
+    }
+    if let error = failure as? CLError {
+        switch error.code {
+        case .geocodeFoundNoResult, .geocodeFoundPartialResult:
+            output(["status": "ok", "query": address, "candidates": [] as [Any]])
+            exit(0)
+        case .network:
+            output(["status": "error", "code": "network", "message": "Apple's geocoder could not be reached: \(error.localizedDescription)"])
+        case .denied:
+            output(["status": "error", "code": "denied", "message": "Geocoding was denied: \(error.localizedDescription)"])
+        case .geocodeCanceled:
+            output(["status": "error", "code": "timeout", "message": "Geocoding was cancelled."])
+        default:
+            output(["status": "error", "code": "failed", "message": "Geocoding failed: \(error.localizedDescription)"])
+        }
+        exit(1)
+    }
+    if let error = failure {
+        output(["status": "error", "code": "failed", "message": "Geocoding failed: \(error.localizedDescription)"])
+        exit(1)
+    }
+    output(["status": "ok", "query": address, "candidates": placemarks.compactMap(placemarkPayload)])
+    exit(0)
 }
 
 func runLimitedEventKitRead(_ cmd: Command, store: EKEventStore) {
@@ -671,6 +760,11 @@ let dueExplicitlyNull: Bool = {
     return obj.keys.contains("due") && obj["due"] is NSNull
 }()
 
+// Geocoding touches no reminders, so it runs before EventKit is opened or asked for access.
+if cmd.action == "geocode" {
+    runGeocode(cmd)
+}
+
 let store = EKEventStore()
 
 if cmd.action == "authorize" {
@@ -678,6 +772,7 @@ if cmd.action == "authorize" {
     output(authorizationSummary(store))
     exit(0)
 }
+
 
 requestAccess(store)
 

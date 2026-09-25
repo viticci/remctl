@@ -12,13 +12,13 @@ AI app (Claude Code, Claude Desktop, Cowork, Codex, other MCP clients)
 Terminal, scripts, agents
   └─ remctl                         the client (Python 3.10+)
        ├─ 7 local commands           completion, doctor, list-symbols, mcp, onboard, permissions, setup
-       └─ 49 hosted commands         sent over an owner-only Unix socket (protocol 2)
+       └─ 51 hosted commands         sent over an owner-only Unix socket (protocol 2)
 
 RemCTL Capability Host.app            signed, persistent, started by a LaunchAgent
   ├─ holds Full Disk Access, Reminders, and Automation
   └─ runs the same CLI from a sealed archive on a protected Python 3.13+
        ├─ reads the Reminders SQLite database
-       ├─ remctl-bridge (Swift)       EventKit writes
+       ├─ remctl-bridge (Swift)       EventKit writes, address lookup
        ├─ remctl-private (ObjC)       ReminderKit writes, --private only
        └─ AppleScript                 flags
 
@@ -86,6 +86,8 @@ Attachments: each attachment row stores a filename, a UTI, pixel dimensions, and
 3. **ReminderKit through `remctl-private`.** Used only with `--private`, plus one automatic case: when EventKit rejects a pure list move (parents with subtasks, shared-list boundaries), RemCTL clones the reminder into the destination with ReminderKit, verifies the clone and its subtasks, and deletes the original. It is not used for permission errors, timeouts, or moves combined with other edits.
 
 `remctl-private` reads one bounded JSON request on stdin, performs one of a fixed set of actions, and saves through the Reminders stack. It never runs a shell, never accepts arbitrary selectors, and never writes the database. It answers a `protocol_version` handshake (currently 2); the client refuses an older helper. Paths that once failed silently now return explicit errors, and the account lookup accepts only CloudKit accounts.
+
+**Address lookup.** `location-lookup` and `--location-address` ask `remctl-bridge` to geocode an address with CoreLocation's public geocoder. The bridge handles that action before it opens EventKit, so it needs no Reminders or Location Services permission, and it cancels the request after a deadline (10 seconds by default). It returns every match with its coordinates, address parts, and region size. The client then decides: it uses a match only when there is exactly one, its region is under about a kilometer, it names the street or place in the query, and the query also gives a town or postal code. Otherwise it stops before any write. The last two checks exist because Apple's geocoder returns one best guess even for a street it did not find. Geocoding is the only step in RemCTL that contacts a network service.
 
 Private rich URLs must resolve to public `http` or `https` hosts. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
 
