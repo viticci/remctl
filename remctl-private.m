@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#define REMCTL_PRIVATE_PROTOCOL_VERSION 2
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 3
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <dlfcn.h>

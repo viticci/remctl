@@ -62,6 +62,7 @@ except ImportError:
 
 VERSION = "2.0.0"
 PRIVATE_PROTOCOL_VERSION = 2
+RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 _private_protocol_probe = None
 
 MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
@@ -1463,50 +1464,49 @@ def resolve_list_ref(db, name=None, list_id=None, *, allow_groups=False):
         }
     return None
 
-def _print_list_resolution_error(requested, result=None):
+def _print_list_resolution_error(requested, result=None, *, json_mode=False):
+    code = "list_not_found"
     if result and result.get("error") == "ambiguous":
+        code = "list_ambiguous"
         options = ", ".join(
             f"{candidate['id']} ({candidate['title']})"
             for candidate in result.get("candidates", [])
         )
-        print(
-            f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}",
-            file=sys.stderr,
-        )
+        message = f"multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}"
     elif result and result.get("error") == "group":
+        code = "list_is_group"
         group = result.get("group", {})
         title = group.get("title") or requested
         children = group.get("children") or []
+        message = f"{title!r} is a Reminders list group, not a writable list."
         if children:
             options = ", ".join(f"{child['title']} (id {child['id']})" for child in children)
-            print(
-                f"Error: {title!r} is a Reminders list group, not a writable list. Use one of its child lists: {options}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"Error: {title!r} is a Reminders list group, not a writable list.",
-                file=sys.stderr,
-            )
+            message += f" Use one of its child lists: {options}"
     else:
-        print(f"Error: list not found: {requested}", file=sys.stderr)
+        message = f"list not found: {requested}"
+    if json_mode:
+        print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
 
-def resolve_list_or_die(db, name=None, list_id=None, *, allow_groups=False):
+def resolve_list_or_die(db, name=None, list_id=None, *, allow_groups=False, json_mode=False):
     result = resolve_list_ref(db, name=name, list_id=list_id, allow_groups=allow_groups)
     if result and not result.get("error"):
         return result
     requested = f"id {list_id}" if list_id is not None else name
-    _print_list_resolution_error(requested, result)
+    _print_list_resolution_error(requested, result, json_mode=json_mode)
     sys.exit(1)
 
-def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_groups=False):
-    if name and list_id is not None:
-        print("Error: pass either a list name or --list-id, not both.", file=sys.stderr)
+def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_groups=False, json_mode=False):
+    if (name and list_id is not None) or (not name and list_id is None):
+        message = "pass either a list name or --list-id, not both." if name else "pass a list name or --list-id."
+        if json_mode:
+            print(json.dumps({"status": "error", "code": "invalid_list_target", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
-    if not name and list_id is None:
-        print("Error: pass a list name or --list-id.", file=sys.stderr)
-        sys.exit(1)
-    return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups)
+    return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups, json_mode=json_mode)
+
 
 
 def bridge_list_target_payload(list_ref):
@@ -4240,7 +4240,7 @@ def _probe_private_protocol_version():
     return _private_protocol_probe
 
 
-def require_private_metadata(a=None, *, json_mode=False):
+def require_private_helper(*, json_mode=False, minimum_protocol=PRIVATE_PROTOCOL_VERSION):
     def fail(code, message):
         if json_mode:
             print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
@@ -4248,19 +4248,28 @@ def require_private_metadata(a=None, *, json_mode=False):
             print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
 
-    if not private_metadata_enabled(a):
-        fail("private_required", "private metadata writes require --private.")
     if not private_available():
         fail("private_helper_unavailable", "remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.")
     probe = _probe_private_protocol_version()
-    if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
+    if probe.get("ok") and probe.get("version", 0) >= minimum_protocol:
         return
     if probe.get("reason") == "outdated" or (
-        probe.get("ok") and probe.get("version", 0) < PRIVATE_PROTOCOL_VERSION
+        probe.get("ok") and probe.get("version", 0) < minimum_protocol
     ):
         version = probe.get("version", 0)
-        fail("private_helper_outdated", f"remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.")
+        fail("private_helper_outdated", f"remctl-private is outdated (protocol {version} < required {minimum_protocol}); re-run install.sh to rebuild.")
     fail("private_helper_unavailable", probe.get("message") or "remctl-private protocol check failed.")
+
+
+def require_private_metadata(a=None, *, json_mode=False, minimum_protocol=PRIVATE_PROTOCOL_VERSION):
+    if not private_metadata_enabled(a):
+        message = "private metadata writes require --private."
+        if json_mode:
+            print(json.dumps({"status": "error", "code": "private_required", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    require_private_helper(json_mode=json_mode, minimum_protocol=minimum_protocol)
 
 
 
@@ -9650,6 +9659,7 @@ def recovery_error(code, message, *, json_mode=False):
 
 def deleted_reminders(db, *, json_mode=False):
     """Join Apple's recovery list to local numeric IDs, preserving parent/subtask groups."""
+    require_private_helper(json_mode=json_mode, minimum_protocol=RECOVERY_PRIVATE_PROTOCOL_VERSION)
     result = private_call({"action": "recently_deleted"})
     if result.get("status") != "ok" or not isinstance(result.get("reminders"), list):
         recovery_error("recently_deleted_unavailable", result.get("message") or "Recently Deleted query failed.", json_mode=json_mode)
@@ -9718,9 +9728,9 @@ def cmd_deleted(a):
 
 
 def cmd_restore(a):
-    require_private_metadata(a, json_mode=a.json)
+    require_private_metadata(a, json_mode=a.json, minimum_protocol=RECOVERY_PRIVATE_PROTOCOL_VERSION)
     db = open_db()
-    target = resolve_required_list_target_or_die(db, name=a.list, list_id=a.list_id)
+    target = resolve_required_list_target_or_die(db, name=a.list, list_id=a.list_id, json_mode=a.json)
     active = q_reminder(db, a.id)
     if active:
         if active["ZLIST"] != target["id"]:

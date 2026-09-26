@@ -11,6 +11,7 @@ import remctl_mcp as mcp
 
 cli = load_module('remctl_recovery_test', 'remctl')
 require_private_metadata = cli.require_private_metadata
+resolve_required_list_target = cli.resolve_required_list_target_or_die
 
 
 def run(command, argv):
@@ -62,6 +63,8 @@ class RecoveryTests(unittest.TestCase):
         self.helper = self.stack.enter_context(mock.patch.object(cli, 'private_call', return_value=self.result))
         self.stack.enter_context(mock.patch.object(cli, 'resolve_required_list_target_or_die', return_value=self.target))
         self.stack.enter_context(mock.patch.object(cli, 'require_private_metadata'))
+        self.stack.enter_context(mock.patch.object(cli, 'private_available', return_value=True))
+        self.stack.enter_context(mock.patch.object(cli, '_probe_private_protocol_version', return_value={'ok': True, 'version': 3}))
         self.stack.enter_context(mock.patch.object(cli, '_read_fresh_db_value', side_effect=lambda f: f(self.db)))
         self.stack.enter_context(mock.patch.object(cli.time, 'sleep'))
 
@@ -137,6 +140,37 @@ class RecoveryTests(unittest.TestCase):
                         mock.patch.object(cli, 'private_available', return_value=available), \
                         mock.patch.object(cli, '_probe_private_protocol_version', return_value=probe):
                     code, payload, err = run(cli.cmd_restore, ['restore', '1', '--list-id', '10'] + (['--json'] if json_mode else []))
+                    self.assertEqual(code, 1)
+                    self.assertIsNone(payload)
+                    if json_mode:
+                        self.assertEqual(json.loads(err)['code'], expected)
+                    else:
+                        self.assertTrue(err.startswith('Error: '))
+                    self.helper.assert_not_called()
+
+    def test_recovery_rejects_old_helper_before_querying_or_writing(self):
+        for command, argv in ((cli.cmd_deleted, ['deleted', '--json']),
+                              (cli.cmd_info, ['info', '1', '--include-deleted', '--json']),
+                              (cli.cmd_restore, ['restore', '1', '--list-id', '10', '--private', '--json'])):
+            with self.subTest(command=argv[0]), \
+                    mock.patch.object(cli, 'require_private_metadata', side_effect=require_private_metadata), \
+                    mock.patch.object(cli, '_probe_private_protocol_version', return_value={'ok': True, 'version': 2}):
+                code, payload, err = run(command, argv)
+                self.assertEqual(code, 1)
+                self.assertIsNone(payload)
+                self.assertEqual(json.loads(err)['code'], 'private_helper_outdated')
+                self.assertIn('protocol 2 < required 3', json.loads(err)['message'])
+                self.helper.assert_not_called()
+
+    def test_restore_destination_errors_follow_output_mode(self):
+        cases = [(None, 'list_not_found'), ({'error': 'ambiguous', 'candidates': [{'id': 10, 'title': 'Recovered'}]}, 'list_ambiguous'),
+                 ({'error': 'group', 'group': {'title': 'Group', 'children': []}}, 'list_is_group')]
+        for result, expected in cases:
+            for json_mode in (False, True):
+                with self.subTest(code=expected, json=json_mode), \
+                        mock.patch.object(cli, 'resolve_required_list_target_or_die', side_effect=resolve_required_list_target), \
+                        mock.patch.object(cli, 'resolve_list_ref', return_value=result):
+                    code, payload, err = run(cli.cmd_restore, ['restore', '1', '--list', 'Missing', '--private'] + (['--json'] if json_mode else []))
                     self.assertEqual(code, 1)
                     self.assertIsNone(payload)
                     if json_mode:
