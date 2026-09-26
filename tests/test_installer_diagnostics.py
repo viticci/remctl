@@ -79,3 +79,19 @@ class InstallerDiagnosticTests(unittest.TestCase):
                     self.assertEqual(status['contractValid'],variant==template)
                     if variant != template:
                         self.assertIsNone(cli.capability_host_start_fix({'app':{'installed':True,'signature':{'valid':True}},'launchAgent':status}))
+
+    def test_direct_mode_does_not_recommend_starting_the_bypassed_host(self):
+        cli = load_module('remctl_direct_diagnostics', 'remctl')
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = Path(tmp) / 'missing'
+            with (mock.patch.object(cli,'capability_host_requested_mode',return_value='direct'),
+                  mock.patch.object(cli,'capability_host_start_fix',return_value='START THE HOST') as start_fix,
+                  mock.patch.object(cli,'reminders_store_access_error',return_value='blocked'),
+                  mock.patch.object(cli,'find_main_db_path',return_value=None),
+                  mock.patch.object(cli,'current_bridge_path',return_value=absent),
+                  mock.patch.object(cli,'current_private_path',return_value=absent)):
+                checks = cli.gather_doctor_checks({'installed':True,'ready':False})
+            start_fix.assert_not_called()
+            effective = next(check for check in checks if check['name']=='effective_access')
+            self.assertIn('route=direct',effective['detail'])
+            self.assertNotIn('START THE HOST',effective['fix'])

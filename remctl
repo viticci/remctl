@@ -12764,7 +12764,7 @@ def gather_doctor_checks(capability_host=None):
     mode = capability_host_requested_mode()
     host_effective = capability_host_is_effective(host_status)
     host_store_ready = host_effective and bool(host_status.get("ready"))
-    host_start_fix = capability_host_start_fix(host_status)
+    host_start_fix = capability_host_start_fix(host_status) if host_effective else None
 
     def add(name, status, detail, fix=None):
         checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
