@@ -201,6 +201,19 @@ class InstallerLifecycleTests(unittest.TestCase):
             self.assertIn("requires a LaunchAgent directory under PREFIX", result.stdout)
         self.assertFalse(self.app.exists())
 
+    def test_custom_prefix_reinstall_repairs_missing_legacy_agent(self) -> None:
+        self.run_script(INSTALL, "--shell-completions", "none")
+        self.agent.unlink()
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.agent = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        self.assert_installed_contract()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(self.agent.exists())
+
     def test_custom_prefix_new_install_uses_home_launchagents(self) -> None:
         environment = self.environment.copy()
         environment["HOME"] = str(self.prefix / "home")

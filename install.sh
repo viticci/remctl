@@ -701,9 +701,11 @@ if [[ "$AGENT_PATH" != "$LEGACY_AGENT_PATH" && -d "$APP_PATH" &&
       "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
     installed_app_owned || fail "The legacy LaunchAgent has no valid signed host."
     [[ "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-socket-path" 2>/dev/null || true)" == "$SOCKET_PATH" ]] || fail "The legacy host socket does not match this installation."
-    installed_agent_owned "$LEGACY_AGENT_PATH" || fail "Refusing to migrate a legacy LaunchAgent that does not match the RemCTL contract."
-    [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; resolve the duplicate before migrating."
-    OLD_AGENT_PATH="$LEGACY_AGENT_PATH"
+    if [[ -e "$LEGACY_AGENT_PATH" || -L "$LEGACY_AGENT_PATH" ]]; then
+        installed_agent_owned "$LEGACY_AGENT_PATH" || fail "Refusing to migrate a legacy LaunchAgent that does not match the RemCTL contract."
+        [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; resolve the duplicate before migrating."
+        OLD_AGENT_PATH="$LEGACY_AGENT_PATH"
+    fi
 fi
 assert_no_backup "$APP_PATH"; assert_no_backup "$AGENT_PATH"; assert_no_backup "$OLD_AGENT_PATH"
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \

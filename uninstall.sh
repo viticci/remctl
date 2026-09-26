@@ -216,7 +216,10 @@ if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$AGENT_PATH" != "$LEGACY_AGENT_PATH"
       "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
     [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; nothing was removed."
     AGENT_PATH="$LEGACY_AGENT_PATH"
-    app_owned && agent_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+    app_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+    if [[ -e "$AGENT_PATH" || -L "$AGENT_PATH" ]]; then
+        agent_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+    fi
 fi
 
 # An interrupted install owns the recovery decision. Never delete either side.

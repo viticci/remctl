@@ -859,6 +859,23 @@ def _handle_run_response(response: dict[str, Any]) -> int:
 def _launch_agent_status() -> dict[str, Any]:
     path = launch_agent_path()
     installed = path.is_file()
+    contract_valid = False
+    if installed and not path.is_symlink():
+        try:
+            with path.open("rb") as handle:
+                value = plistlib.load(handle)
+            contract_valid = value == {
+                "Label": LAUNCH_AGENT_LABEL,
+                "ProgramArguments": [str(executable_path()), "--run-capability-host", "--socket", str(socket_path())],
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "LimitLoadToSessionType": "Aqua",
+                "Umask": 0o77,
+                "StandardOutPath": "/dev/null",
+                "StandardErrorPath": "/dev/null",
+            }
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            pass
     loaded = False
     if installed:
         try:
@@ -872,7 +889,7 @@ def _launch_agent_status() -> dict[str, Any]:
             loaded = process.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
-    return {"path": str(path), "installed": installed, "loaded": loaded}
+    return {"path": str(path), "installed": installed, "loaded": loaded, "contractValid": contract_valid}
 
 
 def _app_status() -> dict[str, Any]:

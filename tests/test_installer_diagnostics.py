@@ -4,6 +4,10 @@ import ast
 import contextlib
 import io
 import os
+import plistlib
+import subprocess
+import tempfile
+import remctl_broker
 import stat
 import unittest
 from pathlib import Path
@@ -41,8 +45,8 @@ class InstallerDiagnosticTests(unittest.TestCase):
     def test_doctor_gives_start_command_only_for_valid_unloaded_host(self):
         cli = load_module('remctl_installer_diagnostics', 'remctl')
         path = str(Path.home() / '.local/Library/LaunchAgents/net.macstories.remctl.capability-host.plist')
-        status = {'app':{'installed':True,'signature':{'valid':True}},
-                  'launchAgent':{'installed':True,'loaded':False,'path':path}}
+        status = {'app':{'installed':True,'bundleIdentifier':remctl_broker.BUNDLE_IDENTIFIER,'signature':{'valid':True,'identifier':remctl_broker.BUNDLE_IDENTIFIER}},
+                  'launchAgent':{'installed':True,'loaded':False,'contractValid':True,'path':path}}
         fix = cli.capability_host_start_fix(status)
         self.assertIn(f'launchctl bootstrap gui/{os.getuid()}',fix)
         self.assertIn(path,fix)
@@ -53,3 +57,25 @@ class InstallerDiagnosticTests(unittest.TestCase):
         status['app']['signature']['valid'] = True
         status['launchAgent']['loaded'] = True
         self.assertIsNone(cli.capability_host_start_fix(status))
+
+    def test_bootstrap_guidance_rejects_foreign_or_malformed_plists(self):
+        cli = load_module('remctl_plist_diagnostics', 'remctl')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'agent.plist'
+            app = Path(tmp) / 'RemCTL Capability Host.app'
+            executable = app / 'Contents/MacOS/RemCTL Capability Host'
+            sock = Path(tmp) / 'capability-host.sock'
+            template = plistlib.loads((ROOT / 'remctl-capability-host-launchagent.plist').read_bytes())
+            template['ProgramArguments'] = [str(executable),'--run-capability-host','--socket',str(sock)]
+            for variant in (template, {**template, 'Label':'foreign'}, {**template, 'Program':'/bin/sh'},
+                            {**template,'EnvironmentVariables':{'DYLD_INSERT_LIBRARIES':'/tmp/library'}}, 'broken'):
+                with self.subTest(variant=variant):
+                    path.write_bytes(plistlib.dumps(variant) if isinstance(variant,dict) else b'not a plist')
+                    with (mock.patch.object(remctl_broker,'launch_agent_path',return_value=path),
+                          mock.patch.object(remctl_broker,'executable_path',return_value=executable),
+                          mock.patch.object(remctl_broker,'socket_path',return_value=sock),
+                          mock.patch.object(remctl_broker.subprocess,'run',return_value=subprocess.CompletedProcess([],1))):
+                        status = remctl_broker._launch_agent_status()
+                    self.assertEqual(status['contractValid'],variant==template)
+                    if variant != template:
+                        self.assertIsNone(cli.capability_host_start_fix({'app':{'installed':True,'signature':{'valid':True}},'launchAgent':status}))

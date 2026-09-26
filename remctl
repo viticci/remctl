@@ -6343,7 +6343,9 @@ def capability_host_start_fix(status):
     app = status.get("app") or {}
     agent = status.get("launchAgent") or {}
     if (app.get("installed") and (app.get("signature") or {}).get("valid")
-            and agent.get("installed") and agent.get("loaded") is False
+            and app.get("bundleIdentifier") == remctl_broker.BUNDLE_IDENTIFIER
+            and (app.get("signature") or {}).get("identifier") == remctl_broker.BUNDLE_IDENTIFIER
+            and agent.get("contractValid") is True and agent.get("loaded") is False
             and isinstance(agent.get("path"), str) and Path(agent["path"]).is_absolute()):
         import shlex
         path = agent["path"]
