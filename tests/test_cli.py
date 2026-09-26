@@ -10304,6 +10304,7 @@ class CliTests(unittest.TestCase):
             "HOME": str(tmp / "home"),
             "PREFIX": str(tmp / "prefix"),
             "REMCTL_BIN_DIR": str(tmp / "bin"),
+            "REMCTL_LAUNCH_AGENT_DIR": str(tmp / "prefix" / "Library" / "LaunchAgents"),
             "REMCTL_CONFIG_DIR": str(tmp / "home" / ".config" / "remctl"),
             "REMCTL_SKIP_LAUNCHSERVICES": "1",
         })
