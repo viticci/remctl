@@ -230,7 +230,7 @@ check_backup() {
     [[ ! -e "$1.remctl-transaction-backup" && ! -L "$1.remctl-transaction-backup" ]] || \
         fail "Unresolved installer backup found: $1.remctl-transaction-backup. Re-run install.sh only after recovering that exact transaction."
 }
-check_backup "$APP_PATH"; check_backup "$AGENT_PATH"; check_backup "$ORIGINAL_AGENT_PATH"
+check_backup "$APP_PATH"; check_backup "$AGENT_PATH"; check_backup "$ORIGINAL_AGENT_PATH"; check_backup "$LEGACY_AGENT_PATH"
 for bin_dir in "${BIN_DIRS[@]}"; do
     for name in "${FILES[@]}"; do check_backup "$bin_dir/$name"; done
 done

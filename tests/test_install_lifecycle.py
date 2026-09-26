@@ -197,6 +197,17 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.agent = destination
         self.assert_installed_contract()
         self.assert_no_backups()
+        # A committed migration can still leave an old-plist backup if cleanup stops.
+        old_backup = Path(str(legacy) + ".remctl-transaction-backup")
+        old_backup.write_bytes(original)
+        for script in (INSTALL, UNINSTALL):
+            blocked = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("backup", blocked.stdout)
+            self.assertTrue(self.app.exists())
+            self.assertTrue(destination.exists())
+            self.assertTrue(old_backup.exists())
+        old_backup.unlink()
         self.run_script(UNINSTALL, "--keep-config", environment=environment)
         self.assertFalse(destination.exists())
         self.assertFalse(self.app.exists())
