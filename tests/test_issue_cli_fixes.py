@@ -76,6 +76,12 @@ class IssueCliFixTests(unittest.TestCase):
                 add.assert_not_called()
                 self.assertEqual(json.loads(err.getvalue())['code'], 'invalid_import')
 
+    def test_subtask_rejects_empty_or_invalid_recurrence_objects(self):
+        for value in ({}, [], False, 0, "", {"frequency":"daily","count":False}):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.cli.parse_subtask_specs([json.dumps({'title':'Child','recurrence':value})])
+        self.assertEqual(self.cli.parse_subtask_specs(['{"title":"Child","recurrence":null}']), [{'title':'Child'}])
+
     def test_fake_ip_dns_allows_names_but_not_literals_or_mixed_private_answers(self):
         def addresses(*ips):
             return [(None,None,None,None,(ip,443)) for ip in ips]

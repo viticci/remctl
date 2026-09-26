@@ -4433,7 +4433,7 @@ def parse_subtask_specs(values):
                 sys.exit(1)
             normalized["alarm"] = alarm
 
-        if spec.get("recurrence"):
+        if spec.get("recurrence") is not None:
             recurrence = parse_recurrence(spec["recurrence"])
             if recurrence is None:
                 print(
