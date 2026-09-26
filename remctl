@@ -4240,19 +4240,18 @@ def _probe_private_protocol_version():
     return _private_protocol_probe
 
 
-def require_private_metadata(a=None):
+def require_private_metadata(a=None, *, json_mode=False):
+    def fail(code, message):
+        if json_mode:
+            print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
     if not private_metadata_enabled(a):
-        print(
-            "Error: private metadata writes require --private.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fail("private_required", "private metadata writes require --private.")
     if not private_available():
-        print(
-            "Error: remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fail("private_helper_unavailable", "remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.")
     probe = _probe_private_protocol_version()
     if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
         return
@@ -4260,17 +4259,9 @@ def require_private_metadata(a=None):
         probe.get("ok") and probe.get("version", 0) < PRIVATE_PROTOCOL_VERSION
     ):
         version = probe.get("version", 0)
-        print(
-            f"Error: remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    message = probe.get("message")
-    if message:
-        print(f"Error: {message}", file=sys.stderr)
-        sys.exit(1)
-    print("Error: remctl-private protocol check failed.", file=sys.stderr)
-    sys.exit(1)
+        fail("private_helper_outdated", f"remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.")
+    fail("private_helper_unavailable", probe.get("message") or "remctl-private protocol check failed.")
+
 
 
 def split_csv(value):
@@ -9727,7 +9718,7 @@ def cmd_deleted(a):
 
 
 def cmd_restore(a):
-    require_private_metadata(a)
+    require_private_metadata(a, json_mode=a.json)
     db = open_db()
     target = resolve_required_list_target_or_die(db, name=a.list, list_id=a.list_id)
     active = q_reminder(db, a.id)

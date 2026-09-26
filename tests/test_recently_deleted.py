@@ -10,6 +10,7 @@ from helpers import load_module
 import remctl_mcp as mcp
 
 cli = load_module('remctl_recovery_test', 'remctl')
+require_private_metadata = cli.require_private_metadata
 
 
 def run(command, argv):
@@ -122,6 +123,27 @@ class RecoveryTests(unittest.TestCase):
                         self.assertEqual(json.loads(err)['code'], 'recently_deleted_unavailable')
                     else:
                         self.assertEqual(err, 'Error: No account supports Recently Deleted on this Mac\n')
+
+    def test_restore_preflight_errors_follow_output_mode_without_writes(self):
+        cases = [(False, True, {}, 'private_required'),
+                 (True, False, {}, 'private_helper_unavailable'),
+                 (True, True, {'ok': True, 'version': 1}, 'private_helper_outdated'),
+                 (True, True, {'ok': False, 'message': 'Protocol probe failed'}, 'private_helper_unavailable')]
+        for enabled, available, probe, expected in cases:
+            for json_mode in (False, True):
+                with self.subTest(code=expected, json=json_mode), \
+                        mock.patch.object(cli, 'require_private_metadata', side_effect=require_private_metadata), \
+                        mock.patch.object(cli, 'private_metadata_enabled', return_value=enabled), \
+                        mock.patch.object(cli, 'private_available', return_value=available), \
+                        mock.patch.object(cli, '_probe_private_protocol_version', return_value=probe):
+                    code, payload, err = run(cli.cmd_restore, ['restore', '1', '--list-id', '10'] + (['--json'] if json_mode else []))
+                    self.assertEqual(code, 1)
+                    self.assertIsNone(payload)
+                    if json_mode:
+                        self.assertEqual(json.loads(err)['code'], expected)
+                    else:
+                        self.assertTrue(err.startswith('Error: '))
+                    self.helper.assert_not_called()
 
     def test_unknown_and_child_restore_do_not_write(self):
         for n, expected in [(4, 'reminder_not_recoverable'), (2, 'restore_parent_required')]:
