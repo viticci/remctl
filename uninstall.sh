@@ -86,11 +86,20 @@ plist_value() {
 
 agent_owned() {
     [[ -f "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || return 1
-    [[ "$(plist_value "$AGENT_PATH" Label)" == "$AGENT_LABEL" ]] || return 1
-    local arguments
-    arguments="$(plutil -extract ProgramArguments json -o - "$AGENT_PATH" 2>/dev/null || true)"
-    /usr/bin/python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]) == sys.argv[2:] else 1)' \
-        "$arguments" "$HOST_EXECUTABLE" --run-capability-host --socket "$SOCKET_PATH" >/dev/null 2>&1 || return 1
+    /usr/bin/python3 -I -S - "$AGENT_PATH" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PYTHON'
+import plistlib, sys
+path, label, host, socket = sys.argv[1:]
+try:
+    with open(path, "rb") as handle: value = plistlib.load(handle)
+except (OSError, ValueError, plistlib.InvalidFileException): raise SystemExit(1)
+valid = value == {
+    "Label": label,
+    "ProgramArguments": [host,"--run-capability-host","--socket",socket],
+    "RunAtLoad": True, "KeepAlive": True, "LimitLoadToSessionType": "Aqua",
+    "Umask": 0o77, "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
+}
+raise SystemExit(0 if valid else 1)
+PYTHON
 }
 
 app_owned() {

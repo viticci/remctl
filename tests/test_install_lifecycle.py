@@ -176,6 +176,18 @@ class InstallerLifecycleTests(unittest.TestCase):
         new_backup.unlink()
         self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
 
+        # Matching label/arguments alone must not authorize a different program.
+        modified = plistlib.loads(original)
+        modified["Program"] = "/bin/sh"
+        modified_bytes = plistlib.dumps(modified)
+        legacy.write_bytes(modified_bytes)
+        for script in (INSTALL, UNINSTALL):
+            refused = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(legacy.read_bytes(), modified_bytes)
+            self.assertTrue(self.app.exists())
+        legacy.write_bytes(original)
+
         # An unrelated file at the old path must never be adopted or removed.
         legacy.write_text("foreign plist")
         refused = self.run_script(INSTALL, "--shell-completions", "none", environment=environment, check=False)

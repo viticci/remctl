@@ -581,8 +581,12 @@ path,label,host,socket=sys.argv[1:]
 try:
     with open(path,"rb") as handle: value=plistlib.load(handle)
 except (OSError, plistlib.InvalidFileException): raise SystemExit(1)
-valid=(value.get("Label") == label and value.get("ProgramArguments") ==
-    [host,"--run-capability-host","--socket",socket])
+valid = value == {
+    "Label": label,
+    "ProgramArguments": [host,"--run-capability-host","--socket",socket],
+    "RunAtLoad": True, "KeepAlive": True, "LimitLoadToSessionType": "Aqua",
+    "Umask": 0o77, "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
+}
 raise SystemExit(0 if valid else 1)
 PY
 }
