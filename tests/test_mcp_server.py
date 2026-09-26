@@ -153,6 +153,8 @@ class CatalogTests(unittest.TestCase):
                 sample = {"list": "Work"}
             if tool.name in {"set_completion", "delete_reminder"}:
                 sample["reminder_id"] = 5
+            if tool.name == "restore_reminder":
+                sample.update(list="Work", private=True)
             if tool.name == "update_list":
                 sample = {"list": "Work", "new_name": "Office"}
             if tool.name == "update_reminder":

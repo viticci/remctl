@@ -82,7 +82,7 @@ SIGNAL_CONTROL_GRACE_SECONDS = 2.0
 CLIENT_SIGNAL_WAIT_SECONDS = 5.0
 MAX_CLIENT_WORKERS = 16
 MAX_ANCILLARY_FDS = 256
-PRIVATE_PROTOCOL_VERSION = 2
+SUPPORTED_PRIVATE_PROTOCOL_VERSIONS = (2, 3)
 NATIVE_PROTOCOL_VERSION = 1
 NATIVE_PERMISSION_FD = 199
 MAX_NATIVE_REQUEST_BYTES = 4096
@@ -2525,7 +2525,7 @@ def _private_protocol(runtime: HostedRuntime) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         return {"compatible": False, "version": None, "error": str(exc)}
     version = payload.get("protocolVersion") if isinstance(payload, dict) else None
-    return {"compatible": version == PRIVATE_PROTOCOL_VERSION, "version": version}
+    return {"compatible": version in SUPPORTED_PRIVATE_PROTOCOL_VERSIONS, "version": version}
 
 
 def _server_status(runtime: HostedRuntime) -> dict[str, Any]:

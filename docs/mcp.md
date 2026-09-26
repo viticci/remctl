@@ -117,12 +117,14 @@ Every tool returns `structuredContent` plus the same JSON as a text block, so cl
 | `show_list` | `list` or `list_id`, `include_completed` | `show LIST --json` |
 | `lists` | none | `lists --json` |
 | `get_list` | `list` or `list_id` | `list-info LIST --json` |
-| `get_reminder` | `reminder_id` | `info ID --json` |
+| `get_reminder` | `reminder_id`, `include_deleted` (default false) | `info ID [--include-deleted] --json` |
 | `resolve_location` | `query` | `location-lookup --json -- QUERY` |
 | `create_reminder` | `title`, `list` or `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url`, `tags`, `flagged`, and with `private: true`: `section`, `section_id`, `new_section`, `subtasks`, `assign`, `early_reminder`, `urgent`, `location_address` or `latitude` and `longitude`, `location_title`, `radius`, `proximity` | `add … --json -- TITLE` |
 | `update_reminder` | `reminder_id` plus one or more of `title`, `list`, `list_id`, `notes`, `due`, `priority`, `recurrence`, `alarm`, `url`, and with `private: true`: `tags`, `set_tags`, `remove_tags`, `clear_tags`, `unassign`, and the `create_reminder` metadata fields | `edit ID … --json` |
 | `set_completion` | `reminder_id` or `reminder_ids` (up to 50), `completed`, optional `completion_date` | `done` or `undone ID… --json` |
 | `set_flagged` | `reminder_id`, `flagged` | `flag` or `unflag ID --json` |
+| `recently_deleted` | `limit` (1 to 500, default 100), `offset` | `deleted --limit N --offset N --json` |
+| `restore_reminder` | `reminder_id`, `list` or `list_id`, `private: true` | `restore ID --list LIST --private --json` |
 | `delete_reminder` | `reminder_id` or `reminder_ids` (up to 50) | `delete ID… --force --json` |
 | `create_list` | `name`, `color`, and with `private: true`: `symbol`, `emoji`, `groceries`, `grocery_locale`, `group` or `group_id` | `list-create … --json -- NAME` |
 | `update_list` | `list` or `list_id`, plus `new_name`, and with `private: true`: `color`, `symbol`, `emoji` | `list-rename` or `list-edit --private` |
@@ -137,7 +139,8 @@ Notes:
 - `recurrence` needs a due date. It accepts `daily`, `weekly`, `monthly`, `yearly`, an interval such as `daily x2`, weekdays such as `weekly mon,wed,fri`, month days such as `monthly 1,15`, and ordinal weekdays such as `monthly 4th-fri` or `monthly last-fri`.
 - `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open` because they are interactive or setup commands, including when top-level options such as `--format json` come first. Include `--json`. Destructive commands need `--force`.
 - Values that start with `-`, such as a search for `-urgent`, are passed as values, never as options.
-- `delete_reminder` is annotated as destructive so hosts ask for confirmation.
+- `delete_reminder` is annotated as destructive so hosts ask for confirmation. Supported accounts retain deleted reminders in Recently Deleted for up to 30 days.
+- `recently_deleted` pages by parent and nests subtasks. Use `restoreId` with `restore_reminder`; a destination list in the same account and `private: true` are required. Recovery preserves IDs and verifies the whole hierarchy. An already active ID in that list returns `already_restored` without writing or verifying its former subtasks. For `restore_unconfirmed`, read `get_reminder` with `include_deleted: true` and refresh Recently Deleted before retrying. See [recovery details](commands.md#recently-deleted).
 - Integer-like and boolean-like strings are accepted for typed arguments, because widget actions and some models send them as text.
 - `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.
 - `priority` accepts the names `high`, `medium`, `low`, and `none`, and Apple's numbers (`0`, `1`-`4`, `5`, `6`-`9`).

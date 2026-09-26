@@ -34,6 +34,8 @@ HOSTED_COMMANDS = frozenset(
     {
         "add",
         "delete",
+        "deleted",
+        "restore",
         "done",
         "edit",
         "export",

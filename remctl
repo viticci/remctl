@@ -62,6 +62,7 @@ except ImportError:
 
 VERSION = "2.0.0"
 PRIVATE_PROTOCOL_VERSION = 2
+RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 _private_protocol_probe = None
 
 MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
@@ -1463,50 +1464,49 @@ def resolve_list_ref(db, name=None, list_id=None, *, allow_groups=False):
         }
     return None
 
-def _print_list_resolution_error(requested, result=None):
+def _print_list_resolution_error(requested, result=None, *, json_mode=False):
+    code = "list_not_found"
     if result and result.get("error") == "ambiguous":
+        code = "list_ambiguous"
         options = ", ".join(
             f"{candidate['id']} ({candidate['title']})"
             for candidate in result.get("candidates", [])
         )
-        print(
-            f"Error: multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}",
-            file=sys.stderr,
-        )
+        message = f"multiple lists match {requested!r}. Use the exact list name or --list-id with one of: {options}"
     elif result and result.get("error") == "group":
+        code = "list_is_group"
         group = result.get("group", {})
         title = group.get("title") or requested
         children = group.get("children") or []
+        message = f"{title!r} is a Reminders list group, not a writable list."
         if children:
             options = ", ".join(f"{child['title']} (id {child['id']})" for child in children)
-            print(
-                f"Error: {title!r} is a Reminders list group, not a writable list. Use one of its child lists: {options}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"Error: {title!r} is a Reminders list group, not a writable list.",
-                file=sys.stderr,
-            )
+            message += f" Use one of its child lists: {options}"
     else:
-        print(f"Error: list not found: {requested}", file=sys.stderr)
+        message = f"list not found: {requested}"
+    if json_mode:
+        print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
 
-def resolve_list_or_die(db, name=None, list_id=None, *, allow_groups=False):
+def resolve_list_or_die(db, name=None, list_id=None, *, allow_groups=False, json_mode=False):
     result = resolve_list_ref(db, name=name, list_id=list_id, allow_groups=allow_groups)
     if result and not result.get("error"):
         return result
     requested = f"id {list_id}" if list_id is not None else name
-    _print_list_resolution_error(requested, result)
+    _print_list_resolution_error(requested, result, json_mode=json_mode)
     sys.exit(1)
 
-def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_groups=False):
-    if name and list_id is not None:
-        print("Error: pass either a list name or --list-id, not both.", file=sys.stderr)
+def resolve_required_list_target_or_die(db, *, name=None, list_id=None, allow_groups=False, json_mode=False):
+    if (name and list_id is not None) or (not name and list_id is None):
+        message = "pass either a list name or --list-id, not both." if name else "pass a list name or --list-id."
+        if json_mode:
+            print(json.dumps({"status": "error", "code": "invalid_list_target", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
-    if not name and list_id is None:
-        print("Error: pass a list name or --list-id.", file=sys.stderr)
-        sys.exit(1)
-    return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups)
+    return resolve_list_or_die(db, name=name, list_id=list_id, allow_groups=allow_groups, json_mode=json_mode)
+
 
 
 def bridge_list_target_payload(list_ref):
@@ -4240,37 +4240,37 @@ def _probe_private_protocol_version():
     return _private_protocol_probe
 
 
-def require_private_metadata(a=None):
-    if not private_metadata_enabled(a):
-        print(
-            "Error: private metadata writes require --private.",
-            file=sys.stderr,
-        )
+def require_private_helper(*, json_mode=False, minimum_protocol=PRIVATE_PROTOCOL_VERSION):
+    def fail(code, message):
+        if json_mode:
+            print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
+
     if not private_available():
-        print(
-            "Error: remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        fail("private_helper_unavailable", "remctl-private is unavailable. Reinstall or set REMCTL_PRIVATE_PATH.")
     probe = _probe_private_protocol_version()
-    if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
+    if probe.get("ok") and probe.get("version", 0) >= minimum_protocol:
         return
     if probe.get("reason") == "outdated" or (
-        probe.get("ok") and probe.get("version", 0) < PRIVATE_PROTOCOL_VERSION
+        probe.get("ok") and probe.get("version", 0) < minimum_protocol
     ):
         version = probe.get("version", 0)
-        print(
-            f"Error: remctl-private is outdated (protocol {version} < required {PRIVATE_PROTOCOL_VERSION}); re-run install.sh to rebuild.",
-            file=sys.stderr,
-        )
+        fail("private_helper_outdated", f"remctl-private is outdated (protocol {version} < required {minimum_protocol}); re-run install.sh to rebuild.")
+    fail("private_helper_unavailable", probe.get("message") or "remctl-private protocol check failed.")
+
+
+def require_private_metadata(a=None, *, json_mode=False, minimum_protocol=PRIVATE_PROTOCOL_VERSION):
+    if not private_metadata_enabled(a):
+        message = "private metadata writes require --private."
+        if json_mode:
+            print(json.dumps({"status": "error", "code": "private_required", "message": message}), file=sys.stderr)
+        else:
+            print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
-    message = probe.get("message")
-    if message:
-        print(f"Error: {message}", file=sys.stderr)
-        sys.exit(1)
-    print("Error: remctl-private protocol check failed.", file=sys.stderr)
-    sys.exit(1)
+    require_private_helper(json_mode=json_mode, minimum_protocol=minimum_protocol)
+
 
 
 def split_csv(value):
@@ -9649,6 +9649,124 @@ def cmd_undone(a):
     else:
         print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
 
+def recovery_error(code, message, *, json_mode=False):
+    if json_mode:
+        print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def deleted_reminders(db, *, json_mode=False):
+    """Join Apple's recovery list to local numeric IDs, preserving parent/subtask groups."""
+    require_private_helper(json_mode=json_mode, minimum_protocol=RECOVERY_PRIVATE_PROTOCOL_VERSION)
+    result = private_call({"action": "recently_deleted"})
+    if result.get("status") != "ok" or not isinstance(result.get("reminders"), list):
+        recovery_error("recently_deleted_unavailable", result.get("message") or "Recently Deleted query failed.", json_mode=json_mode)
+    native = result["reminders"]
+    identifiers = []
+
+    def collect(items, depth=0):
+        if depth > 32 or not isinstance(items, list):
+            recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted hierarchy.", json_mode=json_mode)
+        for item in items:
+            try:
+                identifier = str(uuid.UUID(item["objectID"]["uuid"])).lower()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted identifier.", json_mode=json_mode)
+            identifiers.append(identifier)
+            collect(item.get("subtasks", []), depth + 1)
+    collect(native)
+    rows = {}
+    for start in range(0, len(identifiers), 400):
+        batch = identifiers[start:start + 400]
+        placeholders = ",".join("?" for _ in batch)
+        for row in db.execute(
+            f"SELECT {rem_cols(db)} FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+            f"WHERE lower(r.ZCKIDENTIFIER) IN ({placeholders}) AND r.ZMARKEDFORDELETION = 1 AND r.ZACCOUNT IS NOT NULL", batch
+        ):
+            rows[row["ZCKIDENTIFIER"].lower()] = row
+
+    def convert(item, restore_id=None):
+        row = rows.get(item["objectID"]["uuid"].lower())
+        if row is None:
+            recovery_error("recently_deleted_changed", "Recently Deleted changed while reading. Refresh the list before restoring.", json_mode=json_mode)
+        payload = to_dict(row)
+        payload.update(deleted=True, recoverable=True, restoreId=restore_id or row["Z_PK"])
+        children = [convert(child, payload["restoreId"]) for child in item.get("subtasks", [])]
+        payload["subtaskCount"] = len(children)
+        if children:
+            payload["subtasks"] = children
+        return payload
+    return [convert(item) for item in native]
+
+
+def find_deleted_reminder(items, reminder_id):
+    for item in items:
+        if item["id"] == reminder_id:
+            return item
+        found = find_deleted_reminder(item.get("subtasks", []), reminder_id)
+        if found:
+            return found
+    return None
+
+def cmd_deleted(a):
+    limit, offset, _ = search_page_args(a)
+    items = deleted_reminders(open_db(), json_mode=a.json)
+    page = items[offset:offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(items) else None
+    if a.json:
+        print(json.dumps({"items": page, "count": len(page), "total": len(items), "offset": offset,
+                          "limit": limit, "hasMore": next_offset is not None, "nextOffset": next_offset}, indent=2))
+    else:
+        if not page:
+            print("No recently deleted reminders")
+        for item in page:
+            print(f"  #{item['id']} {safe_display(item['title'])}" + (f" ({item['subtaskCount']} subtasks)" if item['subtaskCount'] else ""))
+        if next_offset is not None:
+            print(f"More results: remctl deleted --offset {next_offset} --limit {limit}")
+
+
+def cmd_restore(a):
+    require_private_metadata(a, json_mode=a.json, minimum_protocol=RECOVERY_PRIVATE_PROTOCOL_VERSION)
+    db = open_db()
+    target = resolve_required_list_target_or_die(db, name=a.list, list_id=a.list_id, json_mode=a.json)
+    active = q_reminder(db, a.id)
+    if active:
+        if active["ZLIST"] != target["id"]:
+            recovery_error("reminder_not_deleted", "Reminder is already active in another list; restore does not move active reminders.", json_mode=a.json)
+        payload = {"status": "already_restored", "id": a.id, "list": target["title"]}
+    else:
+        item = find_deleted_reminder(deleted_reminders(db, json_mode=a.json), a.id)
+        if not item:
+            recovery_error("reminder_not_recoverable", f"#{a.id} is not in Recently Deleted.", json_mode=a.json)
+        if item["restoreId"] != a.id:
+            recovery_error("restore_parent_required", f"Restore parent #{item['restoreId']} to recover this subtask with its hierarchy.", json_mode=a.json)
+        identifier = item["deepLink"].rsplit("/", 1)[-1]
+        result = private_call({"action": "restore_reminder", "reminderId": identifier, "listId": target["objectUUID"]})
+        def restored_tree_matches(current_db, node, parent_id=None):
+            row = q_reminder(current_db, node["id"])
+            if (not row or row["ZLIST"] != target["id"]
+                    or row["ZCKIDENTIFIER"].lower() != node["deepLink"].rsplit("/", 1)[-1].lower()
+                    or (row["ZPARENTREMINDER"] or None) != parent_id):
+                return False
+            return all(restored_tree_matches(current_db, child, node["id"]) for child in node.get("subtasks", []))
+
+        verified = False
+        for attempt in range(15):
+            verified = _read_fresh_db_value(lambda current_db: restored_tree_matches(current_db, item))
+            if verified:
+                break
+            time.sleep(0.2)
+        if not verified:
+            recovery_error("restore_unconfirmed", (result.get("message") or "Could not verify recovery of the reminder and all its subtasks.") + " Check info and deleted before retrying.", json_mode=a.json)
+        payload = {"status": "restored", "id": a.id, "title": item["title"], "list": target["title"], "verified": True}
+    if a.json:
+        print(json.dumps(payload))
+    else:
+        print(f"{payload['status'].replace('_', ' ').capitalize()}: #{a.id} in {safe_display(target['title'])}")
+
+
 def cmd_delete(a):
     if getattr(a, "batch", False) or len(requested_reminder_ids(a)) > 1:
         run_reminder_state_batch(a, "delete")
@@ -10544,6 +10662,15 @@ def cmd_subtasks(a):
 def cmd_info(a):
     db = open_db()
     r = q_reminder(db, a.id)
+    if not r and getattr(a, "include_deleted", False):
+        item = find_deleted_reminder(deleted_reminders(db, json_mode=a.json), a.id)
+        if item:
+            if a.json:
+                print(json.dumps(item, indent=2))
+            else:
+                print(f"Recently deleted: #{a.id} {safe_display(item['title'])}")
+                print(f"Restore with: remctl restore {item['restoreId']} --list LIST --private")
+            return
     if not r:
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
@@ -11639,6 +11766,8 @@ _remctl() {
         'edit:Edit a reminder'
         'reminder-move:Reorder a reminder in a list or custom smart list'
         'delete:Delete reminders'
+        'deleted:Show Recently Deleted'
+        'restore:Recover a deleted reminder'
         'search:Search reminders'
         'today:Due today + overdue'
         'upcoming:Next N days'
@@ -11749,8 +11878,17 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        deleted)
+            _arguments '--limit[Parents per page]:limit:' '--offset[Parents to skip]:offset:' '--json[JSON output]'
+            return
+            ;;
+        restore)
+            _arguments '(-l --list --list-id)'{-l,--list}'[Destination list]:list:' '--list-id[Destination list ID]:id:' '--private[Required for recovery]' '--json[JSON output]'
+            return
+            ;;
         info)
             _arguments \
+                '--include-deleted[Also look in Recently Deleted]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
                 '--image-width[Image render width in cells]:width:' \
@@ -12130,7 +12268,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees list-info location-lookup stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete deleted restore search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees list-info location-lookup stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -12150,6 +12288,15 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ "$cmd" = "show" ]; then
         COMPREPLY=( $(compgen -W "--list-id --completed --via-eventkit --verbose -v --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "deleted" ]; then
+        COMPREPLY=( $(compgen -W "--limit --offset --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "restore" ]; then
+        COMPREPLY=( $(compgen -W "--list -l --list-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "info" ]; then
+        COMPREPLY=( $(compgen -W "--include-deleted --images --image-mode --image-width --json" -- "$cur") )
         return
     elif [ "$cmd" = "search" ]; then
         COMPREPLY=( $(compgen -W "--completed --list -l --list-id --limit --offset --via-eventkit --verbose -v --json" -- "$cur") )
@@ -12248,6 +12395,15 @@ complete -F _remctl remctl
 '''
 
 FISH_COMPLETION = '''# Fish completion for remctl
+complete -c remctl -n "__fish_use_subcommand" -a deleted -d "Show Recently Deleted"
+complete -c remctl -n "__fish_use_subcommand" -a restore -d "Recover a deleted reminder"
+complete -c remctl -n "__fish_seen_subcommand_from deleted" -l limit -d "Parents per page" -r
+complete -c remctl -n "__fish_seen_subcommand_from deleted" -l offset -d "Parents to skip" -r
+complete -c remctl -n "__fish_seen_subcommand_from deleted restore" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from restore" -s l -l list -d "Destination list" -r
+complete -c remctl -n "__fish_seen_subcommand_from restore" -l list-id -d "Destination list ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from restore" -l private -d "Required for recovery"
+complete -c remctl -n "__fish_seen_subcommand_from info" -l include-deleted -d "Also look in Recently Deleted"
 complete -c remctl -n "__fish_use_subcommand" -a lists -d "List all iCloud reminder lists"
 complete -c remctl -n "__fish_use_subcommand" -a groups -d "List Reminders list groups"
 complete -c remctl -n "__fish_use_subcommand" -a group-info -d "Show details for a Reminders list group"
@@ -14398,10 +14554,24 @@ def build_parser():
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit ordering")
     js(c)
 
+    c = sub.add_parser("deleted", help="Show recoverable reminders and their subtasks",
+                       description="Read Apple’s Recently Deleted list. Results are paged; subtasks stay with their parent.")
+    c.add_argument("--limit", type=int, help="Reminders per page, 1-500; default 100")
+    c.add_argument("--offset", type=int, help="Reminders to skip; default 0")
+    js(c)
+    c = sub.add_parser("restore", help="Recover a deleted reminder into a list",
+                       description="Restore a reminder and its subtasks, keeping their IDs. Requires --private and a destination list in the same account.")
+    c.add_argument("id", type=int, help="Numeric ID from deleted")
+    target = c.add_mutually_exclusive_group(required=True)
+    target.add_argument("-l", "--list", help="Destination list name")
+    target.add_argument("--list-id", type=int, help="Destination list numeric ID")
+    c.add_argument("--private", action="store_true", help="Required for private ReminderKit recovery")
+    js(c)
+
     c = sub.add_parser(
         "delete",
         help="Delete reminders",
-        description="Permanently delete one or more reminders. A terminal session asks first; --json and scripts need --force.",
+        description="Delete one or more reminders. Supported accounts keep them in Recently Deleted for up to 30 days. A terminal session asks first; --json and scripts need --force.",
         epilog="Examples:\n  remctl delete 23880\n  remctl delete 23880 23881 --force --json\n\n" + batch_epilog,
         formatter_class=HelpFormatter,
     )
@@ -14451,6 +14621,7 @@ def build_parser():
     c.add_argument("id", type=int); vb(c); js(c); img(c)
 
     c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c); img(c)
+    c.add_argument("--include-deleted", action="store_true", help="Also look in Recently Deleted; deleted details omit unavailable private metadata")
 
     c = sub.add_parser("sections", help="Show sections across lists"); js(c)
 
@@ -15080,6 +15251,8 @@ def main():
         "undone": cmd_undone,
         "edit": cmd_edit,
         "reminder-move": cmd_reminder_move,
+        "deleted": cmd_deleted,
+        "restore": cmd_restore,
         "delete": cmd_delete,
         "search": cmd_search,
         "today": cmd_today,

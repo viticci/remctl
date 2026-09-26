@@ -73,7 +73,7 @@ remctl mcp bundle --open                    # or a one-click .mcpb extension for
 remctl mcp status
 ```
 
-The server provides 19 tools for reading, creating, and editing reminders and lists. Search supports pages and list filters; completion and deletion support batches. Private metadata requires `private: true`. The `run` tool handles other data commands.
+The server provides 21 tools for reading, creating, and editing reminders and lists. Search supports pages and list filters; completion and deletion support batches. Recently Deleted can be inspected and reminders restored with their original IDs. Private metadata requires `private: true`. The `run` tool handles other data commands.
 
 Clients that support MCP Apps can show a reminders widget with completion, rescheduling, renaming, and deletion. [The MCP guide](docs/mcp.md) covers tools and connections; [the Hermes guide](docs/hermes.md) covers Hermes Agent.
 
