@@ -699,6 +699,7 @@ assert_no_backup() {
 LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
 if [[ "$AGENT_PATH" != "$LEGACY_AGENT_PATH" && -d "$APP_PATH" &&
       "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
+    assert_no_backup "$LEGACY_AGENT_PATH"
     installed_app_owned || fail "The legacy LaunchAgent has no valid signed host."
     [[ "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-socket-path" 2>/dev/null || true)" == "$SOCKET_PATH" ]] || fail "The legacy host socket does not match this installation."
     if [[ -e "$LEGACY_AGENT_PATH" || -L "$LEGACY_AGENT_PATH" ]]; then

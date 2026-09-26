@@ -203,10 +203,16 @@ class InstallerLifecycleTests(unittest.TestCase):
 
     def test_custom_prefix_reinstall_repairs_missing_legacy_agent(self) -> None:
         self.run_script(INSTALL, "--shell-completions", "none")
-        self.agent.unlink()
+        backup = Path(str(self.agent) + ".remctl-transaction-backup")
+        self.agent.rename(backup)
         environment = self.environment.copy()
         environment["HOME"] = str(self.prefix / "home")
         environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        blocked = self.run_script(INSTALL, "--shell-completions", "none", environment=environment, check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Stale transaction backup", blocked.stdout)
+        self.assertTrue(backup.exists())
+        backup.unlink()
         self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
         self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
         self.agent = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
