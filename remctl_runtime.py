@@ -227,21 +227,40 @@ def is_safe_remote_url(url: str) -> bool:
     if parsed.username or parsed.password:
         return False
 
-    hostname = parsed.hostname
-    if not hostname or hostname.endswith(".local"):
+    try:
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
         return False
-
+    if not hostname or hostname.rstrip(".").endswith((".local", ".localhost")) or hostname.rstrip(".") == "localhost":
+        return False
+    # TUN proxies use this range for DNS placeholders. Never allow it as an
+    # explicit IP target, including legacy IPv4 spellings such as 0xc6120001.
+    literal = False
+    try:
+        ipaddress.ip_address(hostname)
+        literal = True
+    except ValueError:
+        try:
+            socket.inet_aton(hostname)
+            literal = True
+        except OSError:
+            pass
     try:
         addrinfo = socket.getaddrinfo(
             hostname,
-            parsed.port or (443 if parsed.scheme == "https" else 80),
+            port,
             type=socket.SOCK_STREAM,
         )
     except socket.gaierror:
         return False
 
+    if not addrinfo:
+        return False
     for _, _, _, _, sockaddr in addrinfo:
         ip = ipaddress.ip_address(sockaddr[0])
+        if not literal and ip.version == 4 and ip in ipaddress.ip_network("198.18.0.0/15"):
+            continue
         if (
             ip.is_private
             or ip.is_loopback

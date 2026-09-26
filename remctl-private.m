@@ -547,6 +547,12 @@ static BOOL hostResolvesOnlyToPublicAddresses(NSString *host) {
     if ([lower isEqualToString:@"localhost"] || [lower hasSuffix:@".local"]) {
         return NO;
     }
+    // Fake-IP DNS placeholders are accepted for names, never literal targets.
+    struct in_addr literal;
+    if (inet_aton(host.UTF8String, &literal) != 0 &&
+        (ntohl(literal.s_addr) & 0xfffe0000) == 0xc6120000) {
+        return NO;
+    }
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));

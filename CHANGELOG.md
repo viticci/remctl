@@ -2,6 +2,12 @@
 
 ## 2.0.0 — Unreleased
 
+### Images, rich links, and recurrence imports
+
+- `add` and `edit` accept `--image` without confusing it with global image display options.
+- Private rich links accept hostname DNS results in the fake-IP range used by TUN proxies. Literal fake-IP targets and other private DNS results remain blocked.
+- JSON import and subtask JSON accept exported recurrence objects, including weekday positions, date filters, occurrence counts, and end dates. Invalid rules fail validation before writing.
+
 ### Notes, list colors, and live tests
 
 - `edit ID --url URL` preserves existing notes. An explicit `--notes` value replaces them before appending the URL. The AppleScript fallback also supports clearing notes with `--notes ""`.

@@ -34,7 +34,7 @@ remctl add "Flagged private task" -l Work --private -f
 remctl add "Leave early" -l Work -d "today 14:00" --private --early-reminder 15m
 ```
 
-With `--private`, `--url` creates a web rich link attachment and `-t/--tags` creates real synced Reminders tags. Private rich URLs must resolve to public `http` or `https` hosts; loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts fail before writing. Without `--private`, `--url` is appended to notes and `-t/--tags` appends inline hashtags to the title.
+With `--private`, `--url` creates a web rich link attachment and `-t/--tags` creates real synced Reminders tags. Private rich URLs must resolve to public `http` or `https` hosts. DNS results in `198.18.0.0/15` are also accepted for hostnames to support TUN proxies. Literal fake-IP URLs, loopback, `.local`, other private or reserved addresses, and unresolved hosts fail before writing. Without `--private`, `--url` is appended to notes and `-t/--tags` appends inline hashtags to the title.
 
 ## Edit
 

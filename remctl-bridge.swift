@@ -43,6 +43,11 @@ struct RecurrenceSpec: Decodable {
     let daysOfWeek: [Int]?
     let weekNumbers: [Int]?
     let daysOfMonth: [Int]?
+    let monthsOfYear: [Int]?
+    let daysOfYear: [Int]?
+    let weeksOfYear: [Int]?
+    let setPositions: [Int]?
+    let count: Int?
     let end: String?
 }
 
@@ -191,13 +196,26 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
 
     var daysOfMonth: [NSNumber]?
     if let days = spec.daysOfMonth {
-        guard !days.isEmpty, days.allSatisfy({ 1...31 ~= $0 }) else { return nil }
+        guard !days.isEmpty, days.allSatisfy({ $0 != 0 && -31...31 ~= $0 }) else { return nil }
         daysOfMonth = days.map { NSNumber(value: $0) }
     }
 
+    for (values, bound, allowsNegative) in [
+        (spec.monthsOfYear, 12, false), (spec.daysOfYear, 366, true),
+        (spec.weeksOfYear, 53, true), (spec.setPositions, 366, true)
+    ] {
+        if let values = values {
+            let lower = allowsNegative ? -bound : 1
+            guard !values.isEmpty, values.allSatisfy({ $0 != 0 && lower...bound ~= $0 }) else { return nil }
+        }
+    }
     var end: EKRecurrenceEnd?
-    if let endStr = spec.end, let endDate = parseISO(endStr) {
+    if let endStr = spec.end {
+        guard spec.count == nil, let endDate = parseISO(endStr) else { return nil }
         end = EKRecurrenceEnd(end: endDate)
+    } else if let count = spec.count {
+        guard count > 0 else { return nil }
+        end = EKRecurrenceEnd(occurrenceCount: count)
     }
 
     return EKRecurrenceRule(
@@ -205,10 +223,10 @@ func buildRecurrenceRule(_ spec: RecurrenceSpec) -> EKRecurrenceRule? {
         interval: interval,
         daysOfTheWeek: daysOfWeek,
         daysOfTheMonth: daysOfMonth,
-        monthsOfTheYear: nil,
-        weeksOfTheYear: nil,
-        daysOfTheYear: nil,
-        setPositions: nil,
+        monthsOfTheYear: spec.monthsOfYear?.map { NSNumber(value: $0) },
+        weeksOfTheYear: spec.weeksOfYear?.map { NSNumber(value: $0) },
+        daysOfTheYear: spec.daysOfYear?.map { NSNumber(value: $0) },
+        setPositions: spec.setPositions?.map { NSNumber(value: $0) },
         end: end
     )
 }

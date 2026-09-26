@@ -4434,7 +4434,7 @@ def parse_subtask_specs(values):
             normalized["alarm"] = alarm
 
         if spec.get("recurrence"):
-            recurrence = parse_recurrence(str(spec["recurrence"]))
+            recurrence = parse_recurrence(spec["recurrence"])
             if recurrence is None:
                 print(
                     f"Error: could not parse subtask recurrence {spec['recurrence']!r}. Use daily, "
@@ -7285,10 +7285,73 @@ def parse_nth_weekday_tokens(tokens):
     return days, weeks
 
 
+def normalize_recurrence_object(spec):
+    """Validate exported recurrence fields and translate them for EventKit."""
+    fields = {"frequency", "interval", "daysOfWeek", "daysOfWeekDetailed", "weekNumbers",
+              "daysOfMonth", "monthsOfYear", "daysOfYear", "weeksOfYear", "setPositions",
+              "count", "endDate", "end"}
+    if set(spec) - fields or spec.get("frequency") not in ("daily", "weekly", "monthly", "yearly"):
+        return None
+    result = dict(spec)
+    interval = result.setdefault("interval", 1)
+    if type(interval) is not int or not 1 <= interval <= 2**31 - 1:
+        return None
+    detailed = result.pop("daysOfWeekDetailed", None)
+    if detailed is not None:
+        if not isinstance(detailed, list) or not detailed:
+            return None
+        if any(not isinstance(day, dict) or set(day) - {"dayOfTheWeek", "weekNumber"}
+               or "dayOfTheWeek" not in day for day in detailed):
+            return None
+        days = [day["dayOfTheWeek"] for day in detailed]
+        weeks = [day.get("weekNumber", 0) for day in detailed]
+        if "daysOfWeek" in result and result["daysOfWeek"] != days:
+            return None
+        if "weekNumbers" in result and result["weekNumbers"] != weeks:
+            return None
+        result.update(daysOfWeek=days, weekNumbers=weeks)
+    for field, low, high in (("daysOfWeek", 1, 7), ("daysOfMonth", -31, 31),
+                             ("monthsOfYear", 1, 12), ("daysOfYear", -366, 366),
+                             ("weeksOfYear", -53, 53), ("setPositions", -366, 366)):
+        if field not in result:
+            continue
+        values = result[field]
+        if not isinstance(values, list) or not values or any(
+            type(value) is not int or not low <= value <= high or value == 0 for value in values
+        ):
+            return None
+    if "weekNumbers" in result:
+        weeks = result["weekNumbers"]
+        bound = {"monthly": 5, "yearly": 53}.get(result["frequency"], 0)
+        if not isinstance(weeks, list) or len(weeks) != len(result.get("daysOfWeek", [])) or any(
+            type(week) is not int or not -bound <= week <= bound for week in weeks
+        ):
+            return None
+    if "count" in result:
+        count = result["count"]
+        if type(count) is not int or not 1 <= count <= 2**31 - 1:
+            return None
+    if "endDate" in result:
+        end_date = result.pop("endDate")
+        if "end" in result and result["end"] != end_date:
+            return None
+        result["end"] = end_date
+    if "end" in result:
+        if "count" in result or not isinstance(result["end"], str):
+            return None
+        try:
+            datetime.fromisoformat(result["end"].replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return result
+
+
 def parse_recurrence(spec):
     """Parse recurrence spec like 'daily', 'weekly mon,wed,fri', 'monthly 1,15',
     'daily x2', 'monthly x2 4th-fri', or 'monthly last-fri'."""
-    if not spec:
+    if isinstance(spec, dict):
+        return normalize_recurrence_object(spec)
+    if not isinstance(spec, str) or not spec:
         return None
     parts = spec.lower().split()
     if not parts:
@@ -11399,7 +11462,7 @@ def cmd_import(a):
         if not isinstance(title, str) or not title.strip():
             validation_errors.append({"index": index, "message": "item requires a non-empty string title"})
             continue
-        string_fields = ("list", "notes", "due", "dueDate", "priority", "url", "recurrence", "alarm")
+        string_fields = ("list", "notes", "due", "dueDate", "priority", "url", "alarm")
         invalid_field = next(
             (field for field in string_fields if item.get(field) is not None and not isinstance(item.get(field), str)),
             None,
@@ -11412,7 +11475,7 @@ def cmd_import(a):
             validation_errors.append({"index": index, "message": f"could not parse due date {due!r}"})
             continue
         recurrence = item.get("recurrence")
-        if recurrence and parse_recurrence(recurrence) is None:
+        if recurrence is not None and parse_recurrence(recurrence) is None:
             validation_errors.append({"index": index, "message": f"could not parse recurrence {recurrence!r}"})
             continue
         alarm = item.get("alarm")
@@ -13926,6 +13989,7 @@ def build_parser():
             "template-create/template-apply/template-delete."
         ),
         formatter_class=HelpFormatter,
+        allow_abbrev=False,
     )
     p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--no-color", action="store_true", help="Disable color output")

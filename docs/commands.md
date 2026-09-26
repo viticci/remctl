@@ -455,6 +455,8 @@ remctl import - --json < shopping.json
 
 `import` reads a JSON array from a file, or from standard input with `-` (up to 8 MiB, not from a terminal). Supported fields: `title` (required), `list`, `notes`, `due` or `dueDate`, `priority`, `url`, `recurrence`, `alarm`, and boolean `flagged`. Other keys are ignored. It creates ordinary reminders through `add`; it does not restore completion state, tags, sections, subtasks, attachments, assignments, or private metadata. An export is therefore not a full backup.
 
+`recurrence` accepts a CLI spec string or the structured object produced by JSON export. Structured rules preserve intervals, weekday positions, month/year filters, occurrence counts, and end dates. The same object works in `--subtask` JSON. Invalid or unknown recurrence fields are rejected.
+
 The whole array is validated before the first write. Invalid input creates nothing and exits 1; with `--json`, field errors come back as `{"status": "error", "code": "invalid_import", "errors": [...]}` on stderr. During the import, each success is reported on stderr as `imported index=N id=ID`. The final line on stdout is one JSON object with `status` (`completed` or `partial`), `created`, `createdIds`, `errors`, and `total`. A partial import exits 1 and keeps what was created; retry only the failed indexes.
 
 ## Links

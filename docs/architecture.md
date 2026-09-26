@@ -89,7 +89,7 @@ Attachments: each attachment row stores a filename, a UTI, pixel dimensions, and
 
 **Address lookup.** `location-lookup` and `--location-address` ask `remctl-bridge` to geocode an address with CoreLocation's public geocoder. The bridge handles that action before it opens EventKit, so it needs no Reminders or Location Services permission, and it cancels the request after a deadline (10 seconds by default). It returns every match with its coordinates, address parts, and region size. The client then decides: it uses a match only when there is exactly one, its region is under about a kilometer, it names the street or place in the query, and the query also gives a town or postal code. Otherwise it stops before any write. The last two checks exist because Apple's geocoder returns one best guess even for a street it did not find. Address lookup contacts Apple; rich-link validation and Reminders synchronization may also use the network.
 
-Private rich URLs must resolve to public `http` or `https` hosts. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
+Private rich URLs must resolve to public `http` or `https` hosts, or to `198.18.0.0/15` DNS placeholders used by TUN proxies. The placeholder exception applies only to hostnames, never literal IP URLs. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
 
 ## The MCP server
 
