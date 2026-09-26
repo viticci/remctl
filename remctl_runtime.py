@@ -237,12 +237,13 @@ def is_safe_remote_url(url: str) -> bool:
     # TUN proxies use this range for DNS placeholders. Never allow it as an
     # explicit IP target, including legacy IPv4 spellings such as 0xc6120001.
     literal = False
+    literal_host = hostname.rstrip(".")
     try:
-        ipaddress.ip_address(hostname)
+        ipaddress.ip_address(literal_host)
         literal = True
     except ValueError:
         try:
-            socket.inet_aton(hostname)
+            socket.inet_aton(literal_host)
             literal = True
         except OSError:
             pass

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import socket
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -89,7 +90,7 @@ class IssueCliFixTests(unittest.TestCase):
             with mock.patch('socket.getaddrinfo',return_value=addresses(ip)):
                 self.assertTrue(remctl_runtime.is_safe_remote_url('https://example.com/'))
                 self.assertFalse(remctl_runtime.is_safe_remote_url(f'https://{ip}/'))
-        for url in ('https://0xc6120001/', 'https://3323068417/', 'https://198.18.1/', 'https://[::ffff:198.18.0.1]/'):
+        for url in ('https://198.18.0.1./', 'https://0xc6120001./', 'https://0xc6120001/', 'https://3323068417/', 'https://198.18.1/', 'https://[::ffff:198.18.0.1]/'):
             with mock.patch('socket.getaddrinfo',return_value=addresses('198.18.0.1')):
                 self.assertFalse(remctl_runtime.is_safe_remote_url(url))
         for ips in (('198.18.0.1','10.0.0.1'), ('198.17.255.255',), ('198.20.0.0',)):
@@ -126,3 +127,43 @@ assert(buildRecurrenceRule(endSpec)!.recurrenceEnd!.endDate == parseISO("2028-09
             path.write_text(source)
             subprocess.run(["swiftc", str(path), "-o", str(binary)], check=True, capture_output=True)
             subprocess.run([str(binary)], check=True, capture_output=True)
+
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("clang"), "requires macOS clang")
+    def test_native_rich_link_validator_rejects_fake_ip_literals_with_dns_dot(self):
+        native = (Path(__file__).resolve().parents[1] / "remctl-private.m").read_text()
+        validators = native[native.index('static BOOL ipv4AddressIsPrivateOrLocal'):native.index('static NSData *decodedBase64Data')]
+        source = r'''
+#import <Foundation/Foundation.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <assert.h>
+static int fake_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **out) {
+    static struct sockaddr_in address;
+    static struct addrinfo result;
+    address.sin_family = AF_INET;
+    inet_pton(AF_INET, "198.18.0.1", &address.sin_addr);
+    result.ai_addr = (struct sockaddr *)&address;
+    result.ai_family = AF_INET;
+    *out = &result;
+    return 0;
+}
+static void fake_freeaddrinfo(struct addrinfo *value) {}
+#define getaddrinfo fake_getaddrinfo
+#define freeaddrinfo fake_freeaddrinfo
+''' + validators + r'''
+int main(void) {
+    @autoreleasepool {
+        assert(looksLikeWebURL(@"https://example.com/"));
+        for (NSString *url in @[@"https://198.18.0.1/", @"https://198.18.0.1./", @"https://0xc6120001./", @"http://localhost./"]) {
+            assert(!looksLikeWebURL(url));
+        }
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'urls.m'
+            binary = Path(tmp) / 'urls'
+            path.write_text(source)
+            subprocess.run(['clang','-fobjc-arc','-framework','Foundation',str(path),'-o',str(binary)],check=True,capture_output=True)
+            subprocess.run([str(binary)],check=True,capture_output=True)
