@@ -100,7 +100,7 @@ class IssueCliFixTests(unittest.TestCase):
             self.assertFalse(remctl_runtime.is_safe_remote_url('https://example.com/'))
         self.assertFalse(remctl_runtime.is_safe_remote_url('https://example.com:invalid/'))
 
-    @unittest.skipUnless(shutil.which("swiftc"), "requires Swift")
+    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"), "requires macOS Swift")
     def test_eventkit_keeps_advanced_rule_fields(self):
         source = (Path(__file__).resolve().parents[1] / "remctl-bridge.swift").read_text()
         source = source.split("// MARK: - Color mapping")[0]
@@ -154,7 +154,7 @@ static void fake_freeaddrinfo(struct addrinfo *value) {}
 int main(void) {
     @autoreleasepool {
         assert(looksLikeWebURL(@"https://example.com/"));
-        for (NSString *url in @[@"https://198.18.0.1/", @"https://198.18.0.1./", @"https://0xc6120001./", @"http://localhost./"]) {
+        for (NSString *url in @[@"https://198.18.0.1/", @"https://198.18.0.1./", @"https://0xc6120001./", @"http://localhost./", @"https://[::ffff:198.18.0.1]/", @"https://[::ffff:c612:1]/", @"https://[::ffff:127.0.0.1]/"]) {
             assert(!looksLikeWebURL(url));
         }
     }

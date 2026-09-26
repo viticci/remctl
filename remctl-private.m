@@ -519,6 +519,10 @@ static BOOL ipv4AddressIsPrivateOrLocal(uint32_t address) {
         ((ip & 0xf0000000) == 0xe0000000);        // multicast/reserved
 }
 
+static BOOL ipv4AddressIsFakeIP(uint32_t address) {
+    return (ntohl(address) & 0xfffe0000) == 0xc6120000;
+}
+
 static BOOL sockaddrIsPrivateOrLocal(const struct sockaddr *addr) {
     if (!addr) return YES;
     if (addr->sa_family == AF_INET) {
@@ -528,6 +532,11 @@ static BOOL sockaddrIsPrivateOrLocal(const struct sockaddr *addr) {
     if (addr->sa_family == AF_INET6) {
         const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)addr;
         const struct in6_addr *address = &ipv6->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(address)) {
+            uint32_t mapped;
+            memcpy(&mapped, &address->s6_addr[12], sizeof(mapped));
+            return ipv4AddressIsPrivateOrLocal(mapped) || ipv4AddressIsFakeIP(mapped);
+        }
         return IN6_IS_ADDR_UNSPECIFIED(address) ||
             IN6_IS_ADDR_LOOPBACK(address) ||
             IN6_IS_ADDR_LINKLOCAL(address) ||
@@ -550,9 +559,18 @@ static BOOL hostResolvesOnlyToPublicAddresses(NSString *host) {
     }
     // Fake-IP DNS placeholders are accepted for names, never literal targets.
     struct in_addr literal;
-    if (inet_aton(lower.UTF8String, &literal) != 0 &&
-        (ntohl(literal.s_addr) & 0xfffe0000) == 0xc6120000) {
+    if (inet_aton(lower.UTF8String, &literal) != 0 && ipv4AddressIsFakeIP(literal.s_addr)) {
         return NO;
+    }
+    NSString *ipv6Host = lower;
+    if ([ipv6Host hasPrefix:@"["] && [ipv6Host hasSuffix:@"]"]) {
+        ipv6Host = [ipv6Host substringWithRange:NSMakeRange(1, ipv6Host.length - 2)];
+    }
+    struct in6_addr literal6;
+    if (inet_pton(AF_INET6, ipv6Host.UTF8String, &literal6) == 1 && IN6_IS_ADDR_V4MAPPED(&literal6)) {
+        uint32_t mapped;
+        memcpy(&mapped, &literal6.s6_addr[12], sizeof(mapped));
+        if (ipv4AddressIsPrivateOrLocal(mapped) || ipv4AddressIsFakeIP(mapped)) return NO;
     }
 
     struct addrinfo hints;
