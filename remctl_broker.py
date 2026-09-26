@@ -874,6 +874,8 @@ def _launch_agent_status() -> dict[str, Any]:
                 "StandardOutPath": "/dev/null",
                 "StandardErrorPath": "/dev/null",
             }
+            contract_valid = (contract_valid and type(value["RunAtLoad"]) is bool
+                              and type(value["KeepAlive"]) is bool and type(value["Umask"]) is int)
         except (OSError, ValueError, plistlib.InvalidFileException):
             pass
     loaded = False

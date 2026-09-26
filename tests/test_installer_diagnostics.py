@@ -68,7 +68,8 @@ class InstallerDiagnosticTests(unittest.TestCase):
             template = plistlib.loads((ROOT / 'remctl-capability-host-launchagent.plist').read_bytes())
             template['ProgramArguments'] = [str(executable),'--run-capability-host','--socket',str(sock)]
             for variant in (template, {**template, 'Label':'foreign'}, {**template, 'Program':'/bin/sh'},
-                            {**template,'EnvironmentVariables':{'DYLD_INSERT_LIBRARIES':'/tmp/library'}}, 'broken'):
+                            {**template,'EnvironmentVariables':{'DYLD_INSERT_LIBRARIES':'/tmp/library'}},
+                            {**template,'RunAtLoad':1}, {**template,'KeepAlive':1}, {**template,'Umask':63.0}, 'broken'):
                 with self.subTest(variant=variant):
                     path.write_bytes(plistlib.dumps(variant) if isinstance(variant,dict) else b'not a plist')
                     with (mock.patch.object(remctl_broker,'launch_agent_path',return_value=path),
@@ -76,8 +77,8 @@ class InstallerDiagnosticTests(unittest.TestCase):
                           mock.patch.object(remctl_broker,'socket_path',return_value=sock),
                           mock.patch.object(remctl_broker.subprocess,'run',return_value=subprocess.CompletedProcess([],1))):
                         status = remctl_broker._launch_agent_status()
-                    self.assertEqual(status['contractValid'],variant==template)
-                    if variant != template:
+                    self.assertEqual(status['contractValid'],variant is template)
+                    if variant is not template:
                         self.assertIsNone(cli.capability_host_start_fix({'app':{'installed':True,'signature':{'valid':True}},'launchAgent':status}))
 
     def test_direct_mode_does_not_recommend_starting_the_bypassed_host(self):
@@ -95,3 +96,18 @@ class InstallerDiagnosticTests(unittest.TestCase):
             effective = next(check for check in checks if check['name']=='effective_access')
             self.assertIn('route=direct',effective['detail'])
             self.assertNotIn('START THE HOST',effective['fix'])
+
+    def test_installer_and_uninstaller_require_boolean_and_integer_plist_types(self):
+        scripts = []
+        for filename, function, terminator in (('install.sh','installed_agent_owned()', 'PY'), ('uninstall.sh','agent_owned()', 'PYTHON')):
+            section = (ROOT / filename).read_text().split(function,1)[1]
+            code = section.split("<<'"+terminator+"'\n",1)[1].split('\n'+terminator+'\n',1)[0]
+            scripts.append(code)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'agent.plist'
+            expected = plistlib.loads((ROOT / 'remctl-capability-host-launchagent.plist').read_bytes())
+            expected['ProgramArguments'] = ['/host','--run-capability-host','--socket','/socket']
+            for value, code in ((value,code) for value in (expected, {**expected,'RunAtLoad':1}, {**expected,'KeepAlive':1}, {**expected,'Umask':63.0}) for code in scripts):
+                path.write_bytes(plistlib.dumps(value))
+                result = subprocess.run([os.sys.executable,'-I','-S','-',str(path),expected['Label'],'/host','/socket'], input=code, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0 if value is expected else 1, result.stderr)

@@ -587,6 +587,7 @@ valid = value == {
     "RunAtLoad": True, "KeepAlive": True, "LimitLoadToSessionType": "Aqua",
     "Umask": 0o77, "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
 }
+valid = valid and type(value["RunAtLoad"]) is bool and type(value["KeepAlive"]) is bool and type(value["Umask"]) is int
 raise SystemExit(0 if valid else 1)
 PY
 }
