@@ -29,7 +29,7 @@ remctl mcp remove --client codex
 | Client | What `remctl mcp install` does | Afterwards |
 | --- | --- | --- |
 | Claude Code | Runs `claude mcp add --scope user --transport stdio remctl -- <python> <remctl> mcp`. An older entry is replaced. | New sessions see the server. In an open session, type `/mcp` to reconnect. Tools appear as `mcp__remctl__<tool>`. |
-| Codex | Runs `codex mcp add remctl -- <python> <remctl> mcp`. | Codex CLI, the ChatGPT desktop app, and the IDE extension share that entry. |
+| Codex | Runs `codex mcp add remctl -- <python> <remctl> mcp`. | Codex clients that read the same configuration share that entry. |
 | Claude Desktop and Cowork | Adds `mcpServers.remctl` to `~/Library/Application Support/Claude/claude_desktop_config.json`. Every other key stays as it was, the file keeps its permissions, and a timestamped backup is saved next to it. | Quit and reopen Claude Desktop. The server appears in Claude chats and in Cowork on this Mac. |
 | Hermes Agent | Nothing automatic. `remctl mcp config --format hermes` prints the `mcp_servers` entry for `~/.hermes/config.yaml`. | Paste it, then start a new Hermes session. See [hermes.md](hermes.md). |
 | Other clients | `remctl mcp config` prints JSON, TOML, YAML, and shell snippets. | Paste into the client's MCP settings. |
@@ -98,7 +98,7 @@ remctl mcp remove --client tailscale  # stop serving; the token file stays for l
 
 Security notes:
 
-- Every request needs `Authorization: Bearer <token>`. Anything else gets 401. Rotate the token if it leaks.
+- MCP requests need `Authorization: Bearer <token>`; requests without it get 401. `GET /health` is public. Rotate the token if it leaks.
 - The server checks the `Origin` and `Host` headers against loopback and your Tailscale identity, which blocks DNS-rebinding attacks from web pages.
 - The endpoint has the same power as the CLI, including deletes. Only devices you own should hold the token.
 - The endpoint is HTTP on loopback only. Tailscale provides HTTPS and the network boundary. Do not put the port on `0.0.0.0`.
@@ -142,7 +142,7 @@ Notes:
 - `create_reminder` reports the new reminder's numeric `id`, the same id `get_reminder`, `update_reminder`, `set_completion`, `set_flagged`, and `delete_reminder` take. The CloudKit identifier that `remctl add --json` calls `id` is reported as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning instead of an id that cannot be used.
 - `priority` accepts the names `high`, `medium`, `low`, and `none`, and Apple's numbers (`0`, `1`-`4`, `5`, `6`-`9`).
 - `tags` accepts a list of strings as well as a comma-separated string. Without `private`, `create_reminder` appends them to the title as `#hashtags`; with `private: true` they are synced Reminders tags.
-- `private: true` is the typed form of the CLI's `--private`. It is required for synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, and location alarms, which RemCTL writes through Apple's private ReminderKit framework. Without it, those arguments are refused before anything runs, and `url` and `tags` keep their plain fallbacks: the URL is appended to the notes and the tags become `#hashtags`. See [private-metadata.md](private-metadata.md).
+- `private: true` is the typed form of the CLI's `--private`. It is required for synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, and location alarms, which use ReminderKit except for location alarms, which use EventKit. Without it, private-only arguments are refused before anything runs. `url` appends to notes; `create_reminder` can also add tags as title `#hashtags`. `update_reminder` requires `private: true` for tags. See [private-metadata.md](private-metadata.md).
 - `subtasks` takes titles. An item can also be a JSON object string, such as `{"title":"Follow up","due":"2026-10-02"}`, with the fields the CLI's `--subtask` accepts.
 - `get_list` returns the list plus the section ids that `section_id` needs when two sections share a name, and the sharees that `assign` accepts. Prefer a sharee's address or id to a name.
 - `search` covers titles, notes, and saved rich links, ignoring case and accents. It always returns a page: `items`, `count`, `total`, `offset`, `limit`, `hasMore`, and `nextOffset`. While `hasMore` is true, call again with `offset` set to `nextOffset`. When two lists share a name, `list` fails and names their ids; use `list_id`.
@@ -173,7 +173,7 @@ Linkage follows the extension's capability rule. A client that advertises `exten
 
 ## Protocol
 
-The server follows the [2026-07-28 versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) as a dual-era server.
+The server follows the [2026-07-28 versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) with support for earlier revisions.
 
 **Modern (2026-07-28).** Every request carries `_meta["io.modelcontextprotocol/protocolVersion"]` and `_meta["io.modelcontextprotocol/clientCapabilities"]`. `server/discover` returns the supported versions, capabilities, instructions, and server identity. Every result has `resultType: "complete"` and `_meta["io.modelcontextprotocol/serverInfo"]`. List and read results carry `ttlMs` and `cacheScope`. A request naming another version gets `UnsupportedProtocolVersionError` (`-32022`) with the supported list. A 2026-07-28 request missing one of the two required fields gets `-32602` with the same list. A modern `initialize` is refused with `-32601` and the supported versions.
 
@@ -183,7 +183,7 @@ The server follows the [2026-07-28 versioning rules](https://modelcontextprotoco
 
 **Streamable HTTP.** One POST per message on any path (`/remctl` behind Tailscale, `/` locally). Modern requests must send `MCP-Protocol-Version`, `Mcp-Method`, and, for `tools/call`, `resources/read`, and `prompts/get`, `Mcp-Name`; a missing or mismatched header is `400` with `-32020`. Unknown methods are `404` with `-32601`. Notifications get `202`. Legacy clients get an `Mcp-Session-Id` on `initialize`; an unknown session id is `404`, which tells the client to initialize again. `GET` is `405` because no server-initiated stream is offered. `DELETE` ends a session. `GET /health` needs no token and returns the version and supported protocol versions.
 
-Tools are listed in a fixed order so prompt caches stay warm. The server was verified against the official MCP Python SDK 2.2 client in modern and legacy modes over both transports, and against Claude Code and Codex.
+Tools are listed in a fixed order to support prompt caching. The server was verified against the official MCP Python SDK 2.2 client in modern and legacy modes over both transports, and against Claude Code and Codex.
 
 ## Reference
 

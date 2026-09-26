@@ -1,4 +1,4 @@
-# RemCTL and remindctl: gaps closed on 2026-09-26
+# RemCTL and remindctl comparison, 2026-09-26
 
 Hermes Agent's bundled `apple-reminders` skill runs [`remindctl`](https://github.com/steipete/remindctl), a separate Reminders CLI. An audit on 2026-09-25 compared it with RemCTL 2.0 at `6666a25` and found three feature gaps plus a set of MCP usability gaps. This page records what changed. Hermes PR 51466 adds Notes, Mail, Numbers, and Photos; it does not add a Reminders integration, so `remindctl` is the right comparison.
 
@@ -48,9 +48,9 @@ These were not gaps, and `remindctl` does not offer them, by its own README: sec
 
 ## Verification
 
-- `tests/test_search_batch_location.py`: rich-link-only matches in the right list; case, accent, and literal matching; 150 matches over two pages with honest counts; duplicate list names needing `--list-id`; batches with repeated, missing, and repeating ids; an uncertain repeating completion that is not repeated; batch delete confirmation; address resolution with a mocked geocoder, and ambiguous, area-wide, missing, timed-out, denied, personal-label, bad-radius, and conflicting input creating nothing.
+- `tests/test_search_batch_location.py`: rich-link-only matches in the right list; case, accent, and literal matching; 150 matches over two pages with correct counts; duplicate list names needing `--list-id`; batches with repeated, missing, and repeating ids; an uncertain repeating completion that is not repeated; batch delete confirmation; address resolution with a mocked geocoder, and ambiguous, area-wide, missing, timed-out, denied, personal-label, bad-radius, and conflicting input creating nothing.
 - `tests/test_list_info.py`: duplicate section names keep distinct ids; the new list id ignores an older list with the same name.
 - `tests/test_mcp_typed_tools.py`: the real tool schemas, the private opt-in, every new argument parsed by the real CLI parser, readback of tags, assignment, subtasks, due and display dates, and alarms, batch results surviving a nonzero exit, and the real stdio server with a stand-in CLI.
 - The official MCP Python SDK 2.2 client listed all 19 tools and validated the new tools' structured results against their output schemas.
 - The new `remctl-bridge` geocoded real addresses read-only: street addresses returned one match with a region of about 70 meters; `Rome` and `Springfield` each returned one match covering 38 and 15 kilometers, which RemCTL reports as imprecise; `Home` and nonsense returned no match. `Main Street 1` returned `1 Rykneld Court` in England and `Via Roma 1` a Via Roma in Grottaferrata, each as a single street-sized match; RemCTL reports both as unconfirmed.
-- An independent review of the patch found that first rule gap, a batch that could outlast the MCP timeout, and a too-trusting bridge outcome check. All three are fixed and covered by tests.
+- An independent review of the patch found that first rule gap, a batch that could outlast the MCP timeout, and a bridge check that accepted incomplete success results. All three are fixed and covered by tests.

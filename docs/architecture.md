@@ -1,6 +1,6 @@
 # Architecture
 
-RemCTL separates the part that talks to you (the client) from the part that holds macOS permissions (the Capability Host). This page explains every component, how a command travels between them, and how the data model maps to Reminders.
+RemCTL separates the part that talks to you (the client) from the part that holds macOS permissions (the Capability Host). The client sends data commands to the host; setup commands run locally.
 
 ## Components
 
@@ -11,8 +11,8 @@ AI app (Claude Code, Claude Desktop, Cowork, Codex, other MCP clients)
 
 Terminal, scripts, agents
   └─ remctl                         the client (Python 3.10+)
-       ├─ 7 local commands           completion, doctor, list-symbols, mcp, onboard, permissions, setup
-       └─ 51 hosted commands         sent over an owner-only Unix socket (protocol 2)
+       ├─ local commands           completion, doctor, list-symbols, mcp, onboard, permissions, setup
+       └─ data commands         sent over an owner-only Unix socket (protocol 2)
 
 RemCTL Capability Host.app            signed, persistent, started by a LaunchAgent
   ├─ holds Full Disk Access, Reminders, and Automation
@@ -63,7 +63,7 @@ Reads open the iCloud Reminders store read-only:
 ~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/Data-*.sqlite
 ```
 
-This is why reads take milliseconds and return fields EventKit does not expose: sections, subtasks, tags, attachments, deep links, list colors and icons, recurrence details, urgent state, Early Reminders, and manual ordering. RemCTL never writes to the database.
+Database reads include fields EventKit does not expose: sections, subtasks, tags, attachments, deep links, list colors and icons, recurrence details, urgent state, Early Reminders, and manual ordering. RemCTL never writes to the database.
 
 List reads batch-load subtask counts, tags, and badge indicators in `remctl_serialization.py` and record explicit zeros so no per-reminder query follows.
 
@@ -82,12 +82,12 @@ Attachments: each attachment row stores a filename, a UTI, pixel dimensions, and
 ## Writes
 
 1. **EventKit through `remctl-bridge`.** The normal path for create, edit, list moves, complete, delete, recurrence, alarms, location alarms, notes URLs, and list management. The client validates input first; the bridge validates again and returns structured errors so the client can tell a permission denial from a move rejection.
-2. **AppleScript.** The only way to set the real flag (`flag`, `unflag`, `add --flag`), because EventKit has no flag property. Also a fallback for a few operations after a recovery check that prevents duplicates. Flag writes fail loudly rather than fall back.
+2. **AppleScript.** Sets flags for `flag`, `unflag`, and ordinary `add --flag`; EventKit has no flag property. Private flag writes use ReminderKit. Also a fallback for a few operations after a recovery check that prevents duplicates. A failed flag write returns an error.
 3. **ReminderKit through `remctl-private`.** Used only with `--private`, plus one automatic case: when EventKit rejects a pure list move (parents with subtasks, shared-list boundaries), RemCTL clones the reminder into the destination with ReminderKit, verifies the clone and its subtasks, and deletes the original. It is not used for permission errors, timeouts, or moves combined with other edits.
 
 `remctl-private` reads one bounded JSON request on stdin, performs one of a fixed set of actions, and saves through the Reminders stack. It never runs a shell, never accepts arbitrary selectors, and never writes the database. It answers a `protocol_version` handshake (currently 2); the client refuses an older helper. Paths that once failed silently now return explicit errors, and the account lookup accepts only CloudKit accounts.
 
-**Address lookup.** `location-lookup` and `--location-address` ask `remctl-bridge` to geocode an address with CoreLocation's public geocoder. The bridge handles that action before it opens EventKit, so it needs no Reminders or Location Services permission, and it cancels the request after a deadline (10 seconds by default). It returns every match with its coordinates, address parts, and region size. The client then decides: it uses a match only when there is exactly one, its region is under about a kilometer, it names the street or place in the query, and the query also gives a town or postal code. Otherwise it stops before any write. The last two checks exist because Apple's geocoder returns one best guess even for a street it did not find. Geocoding is the only step in RemCTL that contacts a network service.
+**Address lookup.** `location-lookup` and `--location-address` ask `remctl-bridge` to geocode an address with CoreLocation's public geocoder. The bridge handles that action before it opens EventKit, so it needs no Reminders or Location Services permission, and it cancels the request after a deadline (10 seconds by default). It returns every match with its coordinates, address parts, and region size. The client then decides: it uses a match only when there is exactly one, its region is under about a kilometer, it names the street or place in the query, and the query also gives a town or postal code. Otherwise it stops before any write. The last two checks exist because Apple's geocoder returns one best guess even for a street it did not find. Address lookup contacts Apple; rich-link validation and Reminders synchronization may also use the network.
 
 Private rich URLs must resolve to public `http` or `https` hosts. Loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts are rejected before writing.
 
@@ -95,7 +95,7 @@ Private rich URLs must resolve to public `http` or `https` hosts. Loopback, `.lo
 
 `remctl_mcp.py` is a Model Context Protocol server with no dependencies beyond the standard library. `remctl mcp` runs it over stdio; `remctl mcp serve --http` runs it as a Streamable HTTP endpoint on the loopback interface.
 
-The server is transport-agnostic inside: `MCPServer.handle_message` takes one JSON-RPC message and returns the response. It implements the 2026-07-28 revision (per-request `_meta`, `server/discover`, `resultType`, cache hints) and the `initialize` handshake of 2025-11-25 through 2024-11-05. A request that carries the modern `_meta` fields is served statelessly; an `initialize` selects legacy semantics for that process (stdio) or that `Mcp-Session-Id` (HTTP).
+Both transports use the same handler: `MCPServer.handle_message` takes one JSON-RPC message and returns the response. It implements the 2026-07-28 revision (per-request `_meta`, `server/discover`, `resultType`, cache hints) and the `initialize` handshake of 2025-11-25 through 2024-11-05. A request that carries the modern `_meta` fields is served statelessly; an `initialize` selects legacy semantics for that process (stdio) or that `Mcp-Session-Id` (HTTP).
 
 Every tool builds an argument list for the CLI and spawns `<python> <remctl> <args> --json` with `REMCTL_SKIP_ONBOARD=1`. Standard output becomes `structuredContent` (arrays wrapped as `{"items", "count"}`); a nonzero exit becomes `isError: true` with RemCTL's structured stderr error when it emitted one. Calls run concurrently on a small thread pool; `notifications/cancelled` terminates the subprocess. Because the CLI is the only path, the host and its permissions are unchanged.
 
@@ -103,7 +103,7 @@ Cancellation is scoped to the stdio connection or the legacy HTTP session, inclu
 
 The MCP Apps widget is one HTML file, `remctl_mcp_widget.html`, served as the resource `ui://remctl/reminders-v1.html`. The server attaches the widget to tools and results only for clients that negotiate the `io.modelcontextprotocol/ui` extension, and adds result hints under `_meta["net.macstories.remctl/ui"]` that tell the widget which view to render and which tools its buttons call.
 
-The HTTP endpoint requires `Authorization: Bearer <token>`, validates `Origin` and `Host` against loopback and the Mac's Tailscale identity, mirrors the modern headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) against the body, mints `Mcp-Session-Id` values for legacy clients, and answers `GET /health` without a token. `remctl mcp install --client tailscale` stores the token in `~/.config/remctl/mcp-http.json`, installs the `net.macstories.remctl.mcp-http` LaunchAgent, and runs `tailscale serve` so Tailscale provides HTTPS and the network boundary. [mcp.md](mcp.md) documents the tools and the setup.
+The HTTP endpoint requires `Authorization: Bearer <token>`, validates `Origin` and `Host` against loopback and the Mac's Tailscale identity, mirrors the modern headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) against the body, creates `Mcp-Session-Id` values for legacy clients, and answers `GET /health` without a token. `remctl mcp install --client tailscale` stores the token in `~/.config/remctl/mcp-http.json`, installs the `net.macstories.remctl.mcp-http` LaunchAgent, and runs `tailscale serve` so Tailscale provides HTTPS and the network boundary. [mcp.md](mcp.md) documents the tools and the setup.
 
 HTTP checks authentication before reading a body and closes rejected connections. It accepts one nonnegative `Content-Length`, up to 4 MiB, and does not accept transfer encoding. It allows 32 open connections and 256 legacy sessions; sessions expire after an hour without activity. An expired session gets HTTP 404 and must initialize again. Installation reloads an already-loaded HTTP service after publishing and checks its new process and health response.
 

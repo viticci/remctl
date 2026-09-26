@@ -2,6 +2,13 @@
 
 ## 2.0.0 — Unreleased
 
+### Notes, list colors, and live tests
+
+- `edit ID --url URL` preserves existing notes. An explicit `--notes` value replaces them before appending the URL. The AppleScript fallback also supports clearing notes with `--notes ""`.
+- `list-create --color gray` and `--color teal` now set the requested color. Color names ignore surrounding whitespace and case. The EventKit helper rejects unknown colors before saving.
+- The private live matrix now skips standalone helper writes unless `--standalone-helper` is supplied. Those writes bypass the signed host and previously failed in a normal installation where only the host has Reminders access. Hosted CLI checks still run.
+- Simplified the documentation and corrected stale tool counts, edit behavior, MCP routing guidance, and location-alarm details.
+
 ### Search, batches, locations, and typed metadata
 
 Closes the gaps found by comparing RemCTL with `remindctl`, the Reminders CLI behind Hermes Agent's bundled skill ([docs/remindctl-comparison-2026-09-26.md](docs/remindctl-comparison-2026-09-26.md)).
@@ -24,10 +31,10 @@ Closes the gaps found by comparing RemCTL with `remindctl`, the Reminders CLI be
 
 ### MCP server
 
-- Added `remctl mcp`, a local MCP (Model Context Protocol) server over stdio with no third-party dependencies. It implements the stateless MCP 2026-07-28 revision (`server/discover`, per-request `_meta` protocol and capability fields, `resultType`, `serverInfo` and cache hints on every result, `-32022` version errors with the supported list) and stays a dual-era server for `initialize`-based clients on 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Verified against the official MCP Python SDK 2.2 client in modern and legacy modes.
-- Nineteen tools with input schemas, output schemas, annotations, and structured results: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`, `doctor`, and an exact-argv `run` escape hatch. Two prompts: `daily_review` and `plan_week`. Every tool runs the installed CLI with `--json`, so the signed Capability Host keeps owning macOS permissions and clients need no grants. RemCTL's structured stderr errors surface as tool errors the model can act on; `notifications/cancelled` terminates the tool's subprocess.
+- Added `remctl mcp`, a local MCP (Model Context Protocol) server over stdio with no third-party dependencies. It implements the stateless MCP 2026-07-28 revision (`server/discover`, per-request `_meta` protocol and capability fields, `resultType`, `serverInfo` and cache hints on every result, `-32022` version errors with the supported list) and supports `initialize`-based clients on 2025-11-25, 2025-06-18, 2025-03-26, and 2024-11-05. Verified against the official MCP Python SDK 2.2 client in modern and legacy modes.
+- Nineteen tools with input schemas, output schemas, annotations, and structured results: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`, `doctor`, and a `run` tool for other data commands. Two prompts: `daily_review` and `plan_week`. Every tool runs the installed CLI with `--json`, so the signed Capability Host keeps owning macOS permissions and clients need no grants. RemCTL's structured stderr errors are returned as tool errors the model can act on; `notifications/cancelled` terminates the tool's subprocess.
 - MCP Apps widget (`ui://remctl/reminders-v1.html`, extension `io.modelcontextprotocol/ui`, spec 2026-01-26), adapted from MacRemote's shared widget: reminder rows with Reminders-style check-off, reschedule, rename, and two-step delete, section headers, single-reminder cards, change confirmations with warnings, list and doctor views, host theming, and capability-scoped linkage with legacy aliases.
-- New onboarding step and commands so nobody edits configuration files by hand: `remctl onboard` now offers to connect detected AI apps; `remctl mcp install` uses `claude mcp add` for Claude Code, `codex mcp add` for Codex, and a backed-up merge into `claude_desktop_config.json` for Claude Desktop and Cowork; `remctl mcp bundle` builds a one-click `.mcpb` desktop extension; `remctl mcp status`, `config`, and `remove` complete the set. `doctor` gained an `mcp_clients` check. `mcp` joins the local command set (seven local, 51 hosted).
+- New onboarding step and commands for supported clients: `remctl onboard` now offers to connect detected AI apps; `remctl mcp install` uses `claude mcp add` for Claude Code, `codex mcp add` for Codex, and a backed-up merge into `claude_desktop_config.json` for Claude Desktop and Cowork; `remctl mcp bundle` builds a one-click `.mcpb` desktop extension; `remctl mcp status`, `config`, and `remove` complete the set. `doctor` gained an `mcp_clients` check. `mcp` joins the local command set (seven local commands; data commands run in the host).
 - The installer publishes `remctl_mcp.py`, `remctl_mcp_widget.html`, and the MCP icons in the same ownership manifest; the uninstaller removes them.
 
 ### Other devices over Tailscale
@@ -44,7 +51,7 @@ Closes the gaps found by comparing RemCTL with `remindctl`, the Reminders CLI be
 ### Fixes
 
 - `create_reminder` now reports the new reminder's numeric `id`, the id every other tool accepts. `remctl add --json` reports the CloudKit identifier as `id` and the number as `numericId`, so a model that passed the created `id` back to `get_reminder` was told `reminder_id must be an integer`. The CloudKit identifier is still reported, as `cloudKitId`. When RemCTL cannot read the number back, the result carries a `numeric_id_unavailable` warning rather than an id that cannot be used. The CLI's own `add --json` output is unchanged.
-- `create_reminder` and `update_reminder` accept Apple's numeric priorities (`0`, `1`-`4`, `5`, `6`-`9`) as well as the names, and `tags` accepts a list of strings as well as a comma-separated string. Out-of-range numbers and unknown names are still refused. The `tags` description now says plainly that it appends `#hashtags` to the title and does not create Reminders tags.
+- `create_reminder` and `update_reminder` accept Apple's numeric priorities (`0`, `1`-`4`, `5`, `6`-`9`) as well as the names, and `tags` accepts a list of strings as well as a comma-separated string. Out-of-range numbers and unknown names are still refused. Without `private: true`, creation adds `#hashtags` to the title; synced tags require the private option.
 - `doctor` no longer reports a starting Capability Host as a broken install. The host answers `unknown` until its first permission refresh lands, and `targetNotRunning` while macOS cannot reach Reminders. `doctor` graded both as failures, so `eventkit`, `automation`, `capability_host`, and `effective_access` failed and the command exited 1 while reads and writes worked normally. `doctor` now waits up to three seconds for the host to finish verifying, reports a permission it still cannot read as a warning, and keeps `effective_access` accurate. A refused or restricted grant is still a failure. Because the `doctor` MCP tool runs the CLI, a restarted host no longer makes that tool return an error.
 - Connected AI apps and the tailnet service keep working after `brew upgrade`. `remctl mcp install` registered the Python it resolved to, which for Homebrew is a versioned folder such as `/opt/homebrew/Cellar/python@3.14/3.14.7/`. `brew upgrade` deletes that folder, and every app then failed to start the server. RemCTL now registers the formula's stable `opt` path, such as `/opt/homebrew/opt/python@3.14/bin/python3.14`. Run `remctl mcp install` once, and `remctl mcp install --client tailscale` if you use the tailnet endpoint, to rewrite existing entries.
 - `doctor` and `remctl mcp status` judge an MCP connection by whether its Python still works, not by whether it is the Python that runs the check. Before, every app registered from another Python was reported as pointing at a different RemCTL path, and the verdict changed with the shell that ran `doctor`. A stale connection now names its reason: a different RemCTL path, a Python that no longer exists, or a versioned Homebrew Python. `doctor` also warns when the tailnet service starts such a Python.
@@ -66,7 +73,7 @@ Closes the gaps found by comparing RemCTL with `remindctl`, the Reminders CLI be
 
 ### Documentation
 
-- Rewrote the README, installation guide, command guide, MCP guide, architecture guide, and the agent SKILL in plain language, covering both the CLI and the MCP surface.
+- Rewrote the README, installation guide, command guide, MCP guide, architecture guide, and the agent SKILL in plain language, covering both the CLI and the MCP tools.
 
 ### Cleanup
 
@@ -95,7 +102,7 @@ Closes the gaps found by comparing RemCTL with `remindctl`, the Reminders CLI be
 
 ## 1.7.0 — 2026-08-13
 
-This release adds verified reminder ordering, makes every destructive command safe in non-interactive workflows, and hardens private ReminderKit behavior across Tahoe and Golden Gate.
+Added reminder ordering, required confirmation flags for scripted deletion, and fixed private API compatibility on Tahoe and Golden Gate.
 
 ### Reminder ordering
 
@@ -104,7 +111,7 @@ This release adds verified reminder ordering, makes every destructive command sa
 - Every successful move re-reads the local Reminders store and returns `verified: true`. The helper protocol is now 2, so an older helper fails the existing preflight instead of receiving an unknown ordering payload.
 - The design was informed by PR #26 from @davidgliu and implemented independently after cross-version ABI inspection and disposable write/readback testing.
 
-### Agent-safe destructive commands
+### Deletion confirmation
 
 - `delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, and `template-delete` now require `--force` whenever `--json` is present or stdin is not interactive.
 - Without `--force`, JSON workflows receive a structured `confirmation_required` error on stderr, stdout stays empty, and no write occurs. Human confirmation prompts are written to stderr and retain their existing behavior.
@@ -119,22 +126,22 @@ This release adds verified reminder ordering, makes every destructive command sa
 
 ## 1.6.1 — 2026-07-30
 
-Two things: flagging is now honest end-to-end (it writes the real flag or fails — no more reporting success while writing nothing), and the recurrence grammar learned intervals and Nth-weekday rules.
+Fixed flag writes and added recurrence intervals and rules for specific weekdays of a month.
 
 ### Recurrence: intervals and Nth-weekday rules
 
-- **`xN` interval token** right after the frequency, for every frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. N is 1–999. The bridge always supported intervals; the CLI grammar finally exposes them.
+- **`xN` interval token** right after the frequency, for every frequency: `daily x2`, `weekly x2 thu`, `monthly x3 15`, `yearly x2`. N is 1–999. The CLI now accepts intervals already supported by the bridge.
 - **Monthly Nth-weekday rules**: `monthly 4th-fri` is the 4th Friday of each month, `monthly 1st-mon,3rd-mon` the 1st and 3rd Monday, `monthly last-fri` (alias of `-1-fri`) the last Friday, with negative forms down to `-5-fri`. Ordinal suffixes are validated (`4st-fri` is rejected), Nth-weekday tokens cannot be mixed with plain day-of-month numbers, and the forms are monthly-only. Prefer `last-fri` over `5th-fri`: EventKit silently skips months without a fifth Friday.
-- **Round-trip.** Parsed rules carry a `weekNumbers` array parallel to `daysOfWeek`; `remctl-bridge` validates it before constructing `EKRecurrenceDayOfWeek` (out-of-range or wrong-frequency week numbers raise an uncatchable NSException inside EventKit, so they are rejected at the boundary) and emits it back on EventKit reads. Database reads surface the pinning as `daysOfWeekDetailed` entries with `weekNumber`, as before. Human output renders `monthly 4th Fri`, `monthly last Fri`, `every 2 months 4th Tue`.
+- **Round-trip.** Parsed rules carry a `weekNumbers` array parallel to `daysOfWeek`; `remctl-bridge` validates it before constructing `EKRecurrenceDayOfWeek` (out-of-range or wrong-frequency week numbers raise an uncatchable NSException inside EventKit, so they are rejected at the boundary) and emits it back on EventKit reads. Database reads report the pinning as `daysOfWeekDetailed` entries with `weekNumber`, as before. Human output renders `monthly 4th Fri`, `monthly last Fri`, `every 2 months 4th Tue`.
 - **Occurrence-count rendering changed**: a rule ending after N occurrences now renders as `daily, 5 times` instead of `daily x5`, because `x5` now reads as the interval input token.
 - **Hardened numeric parsing.** Recurrence digit tokens now use `isdecimal()` with bounded lengths; the old `isdigit()` path let `monthly ²` and multi-thousand-digit tokens raise tracebacks instead of a parse error.
 - Design informed by PR #23 from @edequalsawesome; implemented fresh with validated ordinal suffixes and the `last-fri` alias.
 
-### Flagging: honest end-to-end
+### Flagging fixes
 
 - **Fixed: flagging reminders in group-nested lists silently did nothing.** Reminders' AppleScript dictionary does not expose lists inside groups, so the old list-scoped script (`tell list "<name>"`) always failed for them with `-1728`; the command then fell back to remctl-bridge, which set priority as a "flag proxy" and reported success without ever touching the real flag. `flag`/`unflag` and `add --flag` now address the reminder at application level (`reminder id …`), which resolves reminders in every list, nested or not. (Reported by Brett Rosenberg.)
-- **AppleScript errors are surfaced.** When the flag write fails, `flag`/`unflag` exit 1 with the underlying osascript error — under `--json`: `{"status": "error", "code": "applescript_flag_failed", …}` on stderr — instead of a fake success. `add --flag` failures now include the error text in the stderr warning and a `warnings` array in the JSON payload.
-- **Priority is never touched by flagging.** The bridge's priority=1 proxy is gone: `flag`/`unflag` no longer fall back to the bridge, and remctl-bridge now refuses `flag`/`unflag` actions and `flagged` payload fields outright instead of mutating priority (the old `unflag` proxy could wipe a genuine High priority to none). Requires rebuilding the bridge via `./install.sh`.
+- **AppleScript errors are reported.** When the flag write fails, `flag`/`unflag` exit 1 with the underlying osascript error — under `--json`: `{"status": "error", "code": "applescript_flag_failed", …}` on stderr — instead of a success result. `add --flag` failures now include the error text in the stderr warning and a `warnings` array in the JSON payload.
+- **Priority is never touched by flagging.** The bridge's priority=1 proxy is gone: `flag`/`unflag` no longer fall back to the bridge, and remctl-bridge now refuses `flag`/`unflag` actions and `flagged` payload fields outright instead of mutating priority (the old `unflag` proxy could wipe a High priority to none). Requires rebuilding the bridge via `./install.sh`.
 - Regression coverage: app-level addressing, stderr surfacing, error-not-fallback on AppleScript failure for both commands, and the `add --flag` JSON warning.
 
 ## 1.6.0 — 2026-07-30
@@ -152,7 +159,7 @@ Write confirmations are now fully machine-readable: every `edit` outcome under `
 
 ## 1.5.0 — 2026-07-18
 
-Inline image attachments: reminders' images are now first-class data — as verified local file paths in JSON for agents, and as inline terminal previews for people.
+Image attachments now include verified local paths in JSON and can appear as terminal previews.
 
 ### For agents
 
@@ -167,7 +174,7 @@ Inline image attachments: reminders' images are now first-class data — as veri
 - **Trailing badges in list output.** Human one-line summaries can now end with 🔗 (reminder has a rich link) and/or 🌄 (reminder has an image attachment), batch-loaded so they add no per-reminder queries. Badges appear in `show`, `search`, `today`, `upcoming`, `overdue`, `flagged`, `urgent`, group show, and subtask lines — never in JSON, CSV, table mode, or EventKit fallbacks.
 - **Zero new dependencies.** Everything works on a stock macOS: rendering is stdlib-only, using Pillow if it happens to be installed and macOS `sips` with a built-in BMP decoder otherwise. First-time installs need nothing new.
 
-### Safety guarantees
+### Rendering limits
 
 - Renders only on a real TTY — never in pipes, `--json`, or table mode, so automation never sees escape sequences (`REMCTL_IMAGES_FORCE=1` exists as a test-only override).
 - Files larger than 16 MB stay in JSON but skip rendering (`(preview unavailable)`).
@@ -177,5 +184,5 @@ Inline image attachments: reminders' images are now first-class data — as veri
 ### Notes
 
 - Kitty escape sequences send `q=2` on the first chunk so terminals don't write graphics responses into your shell.
-- ASCII-art rendering was cut during dogfooding — modes are `kitty`, `iterm2`, `halfblock`, `none` only.
+- ASCII-art rendering was removed during testing — modes are `kitty`, `iterm2`, `halfblock`, `none` only.
 - Tests: 278 → 349, covering JSON shapes, path resolution and tamper rejection, schema drift, every render mode, the sips/BMP fallback, CLI guards, badges, batch-query counts, and flag parsing order.

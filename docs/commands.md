@@ -1,6 +1,6 @@
 # Command Guide
 
-`remctl --help` prints the full reference. `remctl <command> --help` prints one command. Every command below is also available through the MCP server's `run` tool with the same arguments; see [mcp.md](mcp.md).
+`remctl --help` prints the full reference. `remctl <command> --help` prints one command. Data commands are also available through MCP. Prefer a dedicated tool where one exists; `run` handles the rest and refuses setup and interactive commands. See [mcp.md](mcp.md).
 
 ## Reading
 
@@ -181,9 +181,11 @@ remctl delete 23880 --force                 # required with --json or without a 
 remctl delete 23880 23881 --force --json
 ```
 
-`edit` needs at least one change. With `--json` it prints `{"status": "updated", "id": 23880, "title": "…"}`.
+`edit --json` reports `status: "updated"`, the numeric `id`, and the title. With no changed fields, it returns `status: "unchanged"` and `code: "nothing_to_update"`.
 
-Rescheduling: when a reminder has one absolute alarm at the old due time, `edit -d` moves that alarm too, so the time shown in Reminders follows the due date. `edit -d clear` removes such an alarm as well. Other alarms are left alone.
+Without `--private`, `edit ID --url URL` appends the URL to existing notes. If `--notes` is also supplied, it replaces the notes before the URL is appended. `--notes ""` clears the notes.
+
+Rescheduling: when every alarm is an absolute alarm at the old due time, `edit -d` moves all copies, so the time shown in Reminders follows the due date. `edit -d clear` removes those alarms. Other alarms are left alone.
 
 Moving between lists: `edit -l` and `edit --list-id` use EventKit. Some moves are rejected by EventKit, for example a parent reminder with subtasks or a move across a shared-list boundary. For a pure move, RemCTL then clones the reminder into the destination through ReminderKit, verifies the clone and its subtask count, and deletes the original. The JSON then has `"method": "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved`. Continue with the new `id`. Move first; apply other edits afterwards.
 
@@ -208,7 +210,7 @@ Every destructive command (`delete`, `list-delete`, `section-delete`, `group-del
 
 ### Flags
 
-`flag` and `unflag` write the real flag through Reminders automation (AppleScript), the only API that can set it. Priority is not touched. Reminders nested in groups work.
+`flag` and `unflag` write the real flag through Reminders automation (AppleScript), without changing priority. Reminders nested in groups work.
 
 - Success under `--json`: `{"status": "flagged", "id": 23880, "title": "…"}` or `"unflagged"`.
 - Failure: exit 1 and, under `--json`, `{"status": "error", "code": "applescript_flag_failed", "id": 23880, "message": "…"}` on stderr. The flag is unchanged. Usual causes: the host lacks Automation access (error -1743), or Reminders did not respond within 120 seconds.
@@ -252,7 +254,7 @@ remctl list-delete "Project Y" --force
 
 `list-create --json` reports the new list's numeric `id`. If the new list is not visible yet, it adds a `list_id_unavailable` warning instead.
 
-`list-create --color NAME` uses EventKit and accepts Reminders color names (`red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, `cyan`). Exact `#RRGGBB` colors, official icon names, emoji badges, Groceries mode, and pin state are private metadata and need `--private`.
+`list-create --color NAME` uses EventKit and accepts Reminders color names (`red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `gray`, `cyan`, `teal`). Exact `#RRGGBB` colors, official icon names, emoji badges, Groceries mode, and pin state are private metadata and need `--private`.
 
 `--symbol` accepts only the official icon names from `list-symbols`, because Reminders draws unknown names as the default icon. Use `--emoji` for any emoji.
 
@@ -386,7 +388,7 @@ remctl edit 23880 --private --unassign
 
 ## Private metadata
 
-`--private` unlocks writes that use Apple's private ReminderKit framework through the `remctl-private` helper. They never write the database directly. Apple can change them in any release; treat them as a power-user feature. [private-metadata.md](private-metadata.md) has the full list, the safety model, and verification steps.
+`--private` enables writes that use Apple's private ReminderKit framework through the `remctl-private` helper. They never write the database directly. Apple can change these APIs in any macOS release. [private-metadata.md](private-metadata.md) has the full list, the safety model, and verification steps.
 
 ```bash
 remctl add "Research" -l Projects --private --url https://example.com -t remctl --section Research
@@ -425,7 +427,7 @@ Rich links and images are additive: RemCTL adds them and does not remove or repl
 
 `--location-address` turns a street address into coordinates with Apple's geocoder, inside the signed host, before anything is written. It works on `add` and `edit` with `--private`, like the rest of the location options, and cannot be combined with `--latitude`/`--longitude`. The lookup has a 10-second limit.
 
-RemCTL uses the match only when all four hold: there is exactly one match; it covers less than about a kilometer; it names the street or place you typed; and your address also gives a town or postal code. Apple's geocoder returns its single best guess even for a street it did not find, so the last two checks matter most: `Main Street 1` came back as a different street in England, and `Via Roma 1` as one of thousands of towns with that street. Otherwise the command stops and changes nothing:
+RemCTL uses the match only when all four hold: there is exactly one match; it covers less than about a kilometer; it names the street or place you typed; and your address also gives a town or postal code. Apple's geocoder can return one incorrect match: `Main Street 1` came back as a different street in England, and `Via Roma 1` as one of thousands of towns with that street. Otherwise the command stops and changes nothing:
 
 | Code | Meaning |
 | --- | --- |
