@@ -210,6 +210,9 @@ FILES=(
     completions/_remctl completions/_rctl completions/_reminders rctl reminders
 )
 
+# Keep the destination path for recovery checks even when removing a legacy agent.
+ORIGINAL_AGENT_PATH="$AGENT_PATH"
+
 # Recognize an unmigrated prefix-based agent only through the signed app marker.
 LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
 if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$AGENT_PATH" != "$LEGACY_AGENT_PATH" &&
@@ -227,7 +230,7 @@ check_backup() {
     [[ ! -e "$1.remctl-transaction-backup" && ! -L "$1.remctl-transaction-backup" ]] || \
         fail "Unresolved installer backup found: $1.remctl-transaction-backup. Re-run install.sh only after recovering that exact transaction."
 }
-check_backup "$APP_PATH"; check_backup "$AGENT_PATH"
+check_backup "$APP_PATH"; check_backup "$AGENT_PATH"; check_backup "$ORIGINAL_AGENT_PATH"
 for bin_dir in "${BIN_DIRS[@]}"; do
     for name in "${FILES[@]}"; do check_backup "$bin_dir/$name"; done
 done

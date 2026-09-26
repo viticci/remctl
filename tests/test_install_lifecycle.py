@@ -165,6 +165,15 @@ class InstallerLifecycleTests(unittest.TestCase):
         environment["HOME"] = str(self.prefix / "home")
         environment.pop("REMCTL_LAUNCH_AGENT_DIR")
         destination = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        destination.parent.mkdir(parents=True)
+        new_backup = Path(str(destination) + ".remctl-transaction-backup")
+        new_backup.write_bytes(original)
+        blocked = self.run_script(UNINSTALL, "--keep-config", environment=environment, check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Unresolved installer backup", blocked.stdout)
+        self.assertTrue(self.app.exists())
+        self.assertEqual(legacy.read_bytes(), original)
+        new_backup.unlink()
         self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
 
         # An unrelated file at the old path must never be adopted or removed.
