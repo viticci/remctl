@@ -130,7 +130,7 @@ Recurrence grammar: `daily`, `weekly`, `monthly`, `yearly`; an interval right af
 
 Use `recently_deleted` to find recoverable reminders. Follow `nextOffset` while `hasMore` is true; pages count parents and nest subtasks. `get_reminder` with `include_deleted: true` can inspect a deleted ID. The original list may be unavailable, and deleted details do not include all private metadata.
 
-To recover, call `restore_reminder` with the item's `restoreId`, a destination `list` or `list_id` in the same account, and `private: true`. This restores the parent and its subtasks with their original IDs. Do not recreate them with `create_reminder`. `verified: true` means the IDs and hierarchy were read back; `already_restored` is a no-op for an active ID already in that list. For `restore_unconfirmed`, inspect the ID and refresh Recently Deleted before retrying.
+To recover, call `restore_reminder` with the item's `restoreId`, a destination `list` or `list_id` in the same account, and `private: true`. This restores the parent and its subtasks with their original IDs. Do not recreate them with `create_reminder`. `verified: true` means the IDs and hierarchy were read back; `already_restored` is a no-op for an active ID already in that list and does not verify its former subtasks. For `restore_unconfirmed`, inspect the ID and refresh Recently Deleted before retrying.
 
 Apple normally keeps deleted reminders for 30 days. Do not promise a deadline or recoverability from a database deletion flag. RemCTL asks Apple's recovery view and does not expose permanent purging. See [recovery details](docs/commands.md#recently-deleted).
 

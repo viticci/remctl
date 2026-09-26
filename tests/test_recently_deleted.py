@@ -108,6 +108,21 @@ class RecoveryTests(unittest.TestCase):
                 self.assertIsNone(p)
                 self.assertIn('recently_deleted_', err)
 
+    def test_recovery_errors_follow_output_mode(self):
+        self.helper.return_value = {'status': 'error', 'message': 'No account supports Recently Deleted on this Mac'}
+        for command, argv in ((cli.cmd_deleted, ['deleted']),
+                              (cli.cmd_info, ['info', '1', '--include-deleted']),
+                              (cli.cmd_restore, ['restore', '1', '--list-id', '10', '--private'])):
+            for json_mode in (False, True):
+                with self.subTest(command=argv[0], json=json_mode):
+                    code, payload, err = run(command, argv + (['--json'] if json_mode else []))
+                    self.assertEqual(code, 1)
+                    self.assertIsNone(payload)
+                    if json_mode:
+                        self.assertEqual(json.loads(err)['code'], 'recently_deleted_unavailable')
+                    else:
+                        self.assertEqual(err, 'Error: No account supports Recently Deleted on this Mac\n')
+
     def test_unknown_and_child_restore_do_not_write(self):
         for n, expected in [(4, 'reminder_not_recoverable'), (2, 'restore_parent_required')]:
             self.helper.reset_mock()
@@ -120,6 +135,8 @@ class RecoveryTests(unittest.TestCase):
         self.db.execute('UPDATE ZREMCDREMINDER SET ZMARKEDFORDELETION=0,ZLIST=10 WHERE Z_PK=1')
         code, p, _ = run(cli.cmd_restore, ['restore', '1', '--list-id', '10', '--private', '--json'])
         self.assertEqual((code, p['status']), (0, 'already_restored'))
+        # The child is still deleted: the no-op must not claim tree verification.
+        self.assertNotIn('verified', p)
         self.helper.assert_not_called()
         self.target['id'] = 11
         code, _, err = run(cli.cmd_restore, ['restore', '1', '--list-id', '11', '--private', '--json'])

@@ -9649,27 +9649,30 @@ def cmd_undone(a):
     else:
         print(f"Uncompleted: {safe_display(r['ZTITLE'])}")
 
-def recovery_error(code, message):
-    print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+def recovery_error(code, message, *, json_mode=False):
+    if json_mode:
+        print(json.dumps({"status": "error", "code": code, "message": message}), file=sys.stderr)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
-def deleted_reminders(db):
+def deleted_reminders(db, *, json_mode=False):
     """Join Apple's recovery list to local numeric IDs, preserving parent/subtask groups."""
     result = private_call({"action": "recently_deleted"})
     if result.get("status") != "ok" or not isinstance(result.get("reminders"), list):
-        recovery_error("recently_deleted_unavailable", result.get("message") or "Recently Deleted query failed.")
+        recovery_error("recently_deleted_unavailable", result.get("message") or "Recently Deleted query failed.", json_mode=json_mode)
     native = result["reminders"]
     identifiers = []
 
     def collect(items, depth=0):
         if depth > 32 or not isinstance(items, list):
-            recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted hierarchy.")
+            recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted hierarchy.", json_mode=json_mode)
         for item in items:
             try:
                 identifier = str(uuid.UUID(item["objectID"]["uuid"])).lower()
             except (KeyError, TypeError, ValueError, AttributeError):
-                recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted identifier.")
+                recovery_error("recently_deleted_unavailable", "Unexpected Recently Deleted identifier.", json_mode=json_mode)
             identifiers.append(identifier)
             collect(item.get("subtasks", []), depth + 1)
     collect(native)
@@ -9686,7 +9689,7 @@ def deleted_reminders(db):
     def convert(item, restore_id=None):
         row = rows.get(item["objectID"]["uuid"].lower())
         if row is None:
-            recovery_error("recently_deleted_changed", "Recently Deleted changed while reading. Refresh the list before restoring.")
+            recovery_error("recently_deleted_changed", "Recently Deleted changed while reading. Refresh the list before restoring.", json_mode=json_mode)
         payload = to_dict(row)
         payload.update(deleted=True, recoverable=True, restoreId=restore_id or row["Z_PK"])
         children = [convert(child, payload["restoreId"]) for child in item.get("subtasks", [])]
@@ -9706,10 +9709,9 @@ def find_deleted_reminder(items, reminder_id):
             return found
     return None
 
-
 def cmd_deleted(a):
     limit, offset, _ = search_page_args(a)
-    items = deleted_reminders(open_db())
+    items = deleted_reminders(open_db(), json_mode=a.json)
     page = items[offset:offset + limit]
     next_offset = offset + len(page) if offset + len(page) < len(items) else None
     if a.json:
@@ -9731,14 +9733,14 @@ def cmd_restore(a):
     active = q_reminder(db, a.id)
     if active:
         if active["ZLIST"] != target["id"]:
-            recovery_error("reminder_not_deleted", "Reminder is already active in another list; restore does not move active reminders.")
-        payload = {"status": "already_restored", "id": a.id, "list": target["title"], "verified": True}
+            recovery_error("reminder_not_deleted", "Reminder is already active in another list; restore does not move active reminders.", json_mode=a.json)
+        payload = {"status": "already_restored", "id": a.id, "list": target["title"]}
     else:
-        item = find_deleted_reminder(deleted_reminders(db), a.id)
+        item = find_deleted_reminder(deleted_reminders(db, json_mode=a.json), a.id)
         if not item:
-            recovery_error("reminder_not_recoverable", f"#{a.id} is not in Recently Deleted.")
+            recovery_error("reminder_not_recoverable", f"#{a.id} is not in Recently Deleted.", json_mode=a.json)
         if item["restoreId"] != a.id:
-            recovery_error("restore_parent_required", f"Restore parent #{item['restoreId']} to recover this subtask with its hierarchy.")
+            recovery_error("restore_parent_required", f"Restore parent #{item['restoreId']} to recover this subtask with its hierarchy.", json_mode=a.json)
         identifier = item["deepLink"].rsplit("/", 1)[-1]
         result = private_call({"action": "restore_reminder", "reminderId": identifier, "listId": target["objectUUID"]})
         def restored_tree_matches(current_db, node, parent_id=None):
@@ -9756,7 +9758,7 @@ def cmd_restore(a):
                 break
             time.sleep(0.2)
         if not verified:
-            recovery_error("restore_unconfirmed", (result.get("message") or "Could not verify recovery of the reminder and all its subtasks.") + " Check info and deleted before retrying.")
+            recovery_error("restore_unconfirmed", (result.get("message") or "Could not verify recovery of the reminder and all its subtasks.") + " Check info and deleted before retrying.", json_mode=a.json)
         payload = {"status": "restored", "id": a.id, "title": item["title"], "list": target["title"], "verified": True}
     if a.json:
         print(json.dumps(payload))
@@ -10660,7 +10662,7 @@ def cmd_info(a):
     db = open_db()
     r = q_reminder(db, a.id)
     if not r and getattr(a, "include_deleted", False):
-        item = find_deleted_reminder(deleted_reminders(db), a.id)
+        item = find_deleted_reminder(deleted_reminders(db, json_mode=a.json), a.id)
         if item:
             if a.json:
                 print(json.dumps(item, indent=2))

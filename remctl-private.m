@@ -845,12 +845,15 @@ int main(void) {
             if (!accounts) fail(error.localizedDescription ?: @"Could not fetch Reminders accounts");
             if ([action isEqualToString:@"recently_deleted"]) {
                 NSMutableArray *items = [NSMutableArray array];
+                BOOL queriedAccount = NO;
                 for (REMAccount *account in accounts) {
                     id capabilities = [account capabilities];
                     if ([capabilities respondsToSelector:@selector(supportsRecentlyDeletedList)] && [capabilities supportsRecentlyDeletedList]) {
                         [items addObjectsFromArray:recentlyDeletedReminders(store, account)];
+                        queriedAccount = YES;
                     }
                 }
+                if (!queriedAccount) fail(@"No account supports Recently Deleted on this Mac");
                 output(@{@"status": @"ok", @"reminders": items});
                 return 0;
             }

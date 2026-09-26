@@ -111,7 +111,7 @@ JSON always returns `{items, count, total, offset, limit, hasMore, nextOffset}`.
 
 `info --include-deleted` checks active reminders first, then Recently Deleted. Deleted details contain the saved title, notes, dates, identity, and subtask hierarchy; they are not a complete export of private metadata. Other reads still exclude deleted reminders.
 
-`restore` requires an explicit destination list in the same account and `--private`. It restores one parent and its subtasks through ReminderKit, then checks every ID and parent relationship before reporting `verified: true`. A subtask must be recovered with its `restoreId`. The command preserves identity rather than creating a replacement. If that ID is already active in the requested list, it returns `already_restored` without writing; it never moves an active reminder to another list.
+`restore` requires an explicit destination list in the same account and `--private`. It restores one parent and its subtasks through ReminderKit, then checks every ID and parent relationship before reporting `verified: true`. A subtask must be recovered with its `restoreId`. The command preserves identity rather than creating a replacement. If that ID is already active in the requested list, it returns `already_restored` without writing or claiming that former subtasks were recovered; it never moves an active reminder to another list.
 
 For `restore_unconfirmed`, inspect `info ID --include-deleted --json` and `deleted` before retrying: a write may already have happened. RemCTL does not permanently purge Recently Deleted. Apple can expire or remove items between a read and a restore. [Apple's recovery documentation](https://support.apple.com/guide/reminders/remna83c9566/mac).
 
