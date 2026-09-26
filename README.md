@@ -9,7 +9,7 @@ A signed app, **RemCTL Capability Host**, holds the macOS permissions. Terminal,
 ## Requirements
 
 - macOS 14 or later. Release 2.0 is verified on the early macOS 27 build; the command paths also have test coverage on macOS 26.
-- Python 3.10 or later for the CLI. A python.org Python 3.13 or later for the signed host (the installer finds it).
+- Python 3.10 or later for the CLI. A protected Python 3.13 or later for the signed host. Stock python.org installs may need [permission repair](docs/installation.md#protected-python-permissions).
 - Xcode Command Line Tools (`xcode-select --install`).
 - An `Apple Development` signing identity. The installer signs the host app with it.
 - iCloud Reminders enabled.

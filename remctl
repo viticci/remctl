@@ -6338,7 +6338,26 @@ def find_app_bundle(app_name):
     return None
 
 
-def full_disk_access_fix_text(*, rerun_command="remctl doctor", mention_onboard=False):
+def capability_host_start_fix(status):
+    """Distinguish a stopped, signed installation from missing permission grants."""
+    app = status.get("app") or {}
+    agent = status.get("launchAgent") or {}
+    if (app.get("installed") and (app.get("signature") or {}).get("valid")
+            and app.get("bundleIdentifier") == remctl_broker.BUNDLE_IDENTIFIER
+            and (app.get("signature") or {}).get("identifier") == remctl_broker.BUNDLE_IDENTIFIER
+            and agent.get("contractValid") is True and agent.get("loaded") is False
+            and isinstance(agent.get("path"), str) and Path(agent["path"]).is_absolute()):
+        import shlex
+        path = agent["path"]
+        fix = ("The signed host is installed, but its LaunchAgent is not loaded. Run "
+               f"`launchctl bootstrap gui/{os.getuid()} {shlex.quote(path)}`, then `remctl doctor --for-agent`.")
+        if Path(path).parent != Path.home() / "Library/LaunchAgents":
+            fix += " This directory is not loaded at login; rerun the updated installer with the original PREFIX to migrate it."
+        return fix
+    return None
+
+
+def full_disk_access_fix_text(*, rerun_command="remctl doctor", mention_onboard=False, host_status=None):
     mode = capability_host_requested_mode()
     if mode == "direct":
         return "\n".join([
@@ -6346,6 +6365,10 @@ def full_disk_access_fix_text(*, rerun_command="remctl doctor", mention_onboard=
             "The normal RemCTL permission helper does not configure direct callers.",
             f"Manage the deliberate direct caller yourself, then rerun `{rerun_command}`.",
         ])
+    if host_status is not None:
+        start_fix = capability_host_start_fix(host_status)
+        if start_fix:
+            return start_fix
     return "\n".join([
         "The signed RemCTL Capability Host is unavailable, so effective Full Disk Access is not ready.",
         "Reinstall RemCTL to restore the exact signed host, then run `remctl onboard`.",
@@ -12741,6 +12764,7 @@ def gather_doctor_checks(capability_host=None):
     mode = capability_host_requested_mode()
     host_effective = capability_host_is_effective(host_status)
     host_store_ready = host_effective and bool(host_status.get("ready"))
+    host_start_fix = capability_host_start_fix(host_status) if host_effective else None
 
     def add(name, status, detail, fix=None):
         checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
@@ -12792,6 +12816,7 @@ def gather_doctor_checks(capability_host=None):
                 else full_disk_access_fix_text(
                     rerun_command="remctl doctor --for-agent",
                     mention_onboard=True,
+                    host_status=host_status,
                 )
             ),
         )
@@ -12827,7 +12852,7 @@ def gather_doctor_checks(capability_host=None):
     bridge_fix = None
     if host_effective:
         bridge_ok = bool(host_status.get("available"))
-        bridge_fix = None if bridge_ok else "Restart or reinstall the signed RemCTL Capability Host."
+        bridge_fix = None if bridge_ok else (host_start_fix or "Restart or reinstall the signed RemCTL Capability Host.")
     elif not bridge_ok:
         bridge_fix = "Run ./install.sh or compile remctl-bridge.swift with swiftc, then run remctl onboard."
     add(
@@ -13053,7 +13078,7 @@ def gather_doctor_checks(capability_host=None):
                 "capability_host",
                 "fail",
                 str(error_detail or "Capability Host is installed but is not fully ready."),
-                "Run `remctl onboard`, then rerun `remctl doctor --for-agent`.",
+                host_start_fix or "Run `remctl onboard`, then rerun `remctl doctor --for-agent`.",
             )
         effective_route = "capabilityHost"
         # Reads and writes run through the host's EventKit and database access,
@@ -13073,7 +13098,7 @@ def gather_doctor_checks(capability_host=None):
         "effective_access",
         "ok" if effective_ready else "fail",
         f"route={effective_route}; ready={'yes' if effective_ready else 'no'}",
-        None if effective_ready else "Run `remctl onboard` and resolve the failed checks above.",
+        None if effective_ready else (host_start_fix or "Run `remctl onboard` and resolve the failed checks above."),
     )
 
     return checks

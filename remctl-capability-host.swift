@@ -1977,12 +1977,7 @@ private func spawnArchivedPython(
         posix_spawn_file_actions_destroy(&actions)
         posix_spawnattr_destroy(&attributes)
     }
-    let chdirResult: Int32
-    if #available(macOS 26.0, *) {
-        chdirResult = posix_spawn_file_actions_addchdir(&actions, host.runtimePath)
-    } else {
-        chdirResult = posix_spawn_file_actions_addchdir_np(&actions, host.runtimePath)
-    }
+    let chdirResult = posix_spawn_file_actions_addchdir_np(&actions, host.runtimePath)
     let nativeChannelActionsReady: Bool
     if let nativeChannel {
         nativeChannelActionsReady = posix_spawn_file_actions_adddup2(
