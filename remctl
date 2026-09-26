@@ -11763,6 +11763,8 @@ _remctl() {
         'edit:Edit a reminder'
         'reminder-move:Reorder a reminder in a list or custom smart list'
         'delete:Delete reminders'
+        'deleted:Show Recently Deleted'
+        'restore:Recover a deleted reminder'
         'search:Search reminders'
         'today:Due today + overdue'
         'upcoming:Next N days'
@@ -11873,8 +11875,17 @@ _remctl() {
                 '--json[JSON output]'
             return
             ;;
+        deleted)
+            _arguments '--limit[Parents per page]:limit:' '--offset[Parents to skip]:offset:' '--json[JSON output]'
+            return
+            ;;
+        restore)
+            _arguments '(-l --list --list-id)'{-l,--list}'[Destination list]:list:' '--list-id[Destination list ID]:id:' '--private[Required for recovery]' '--json[JSON output]'
+            return
+            ;;
         info)
             _arguments \
+                '--include-deleted[Also look in Recently Deleted]' \
                 '--images[Render image attachments inline]' \
                 '--image-mode[Image rendering protocol]:mode:(kitty iterm2 halfblock none)' \
                 '--image-width[Image render width in cells]:width:' \
@@ -12254,7 +12265,7 @@ BASH_COMPLETION = '''_remctl() {
     local cur prev commands
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees list-info location-lookup stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
+    commands="lists groups group-info group-create group-edit group-delete smart-lists templates template-info show add done undone edit reminder-move delete deleted restore search today upcoming overdue flagged urgent flag unflag tags subtasks info sections section-create section-rename section-delete sharees list-info location-lookup stats link open export import list-symbols list-create smart-list-create smart-list-edit smart-list-delete template-create template-apply template-delete list-edit list-pin list-unpin list-rename list-delete onboard doctor setup permissions completion mcp"
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
@@ -12274,6 +12285,15 @@ BASH_COMPLETION = '''_remctl() {
         return
     elif [ "$cmd" = "show" ]; then
         COMPREPLY=( $(compgen -W "--list-id --completed --via-eventkit --verbose -v --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "deleted" ]; then
+        COMPREPLY=( $(compgen -W "--limit --offset --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "restore" ]; then
+        COMPREPLY=( $(compgen -W "--list -l --list-id --private --json" -- "$cur") )
+        return
+    elif [ "$cmd" = "info" ]; then
+        COMPREPLY=( $(compgen -W "--include-deleted --images --image-mode --image-width --json" -- "$cur") )
         return
     elif [ "$cmd" = "search" ]; then
         COMPREPLY=( $(compgen -W "--completed --list -l --list-id --limit --offset --via-eventkit --verbose -v --json" -- "$cur") )
@@ -12372,6 +12392,15 @@ complete -F _remctl remctl
 '''
 
 FISH_COMPLETION = '''# Fish completion for remctl
+complete -c remctl -n "__fish_use_subcommand" -a deleted -d "Show Recently Deleted"
+complete -c remctl -n "__fish_use_subcommand" -a restore -d "Recover a deleted reminder"
+complete -c remctl -n "__fish_seen_subcommand_from deleted" -l limit -d "Parents per page" -r
+complete -c remctl -n "__fish_seen_subcommand_from deleted" -l offset -d "Parents to skip" -r
+complete -c remctl -n "__fish_seen_subcommand_from deleted restore" -l json -d "JSON output"
+complete -c remctl -n "__fish_seen_subcommand_from restore" -s l -l list -d "Destination list" -r
+complete -c remctl -n "__fish_seen_subcommand_from restore" -l list-id -d "Destination list ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from restore" -l private -d "Required for recovery"
+complete -c remctl -n "__fish_seen_subcommand_from info" -l include-deleted -d "Also look in Recently Deleted"
 complete -c remctl -n "__fish_use_subcommand" -a lists -d "List all iCloud reminder lists"
 complete -c remctl -n "__fish_use_subcommand" -a groups -d "List Reminders list groups"
 complete -c remctl -n "__fish_use_subcommand" -a group-info -d "Show details for a Reminders list group"
