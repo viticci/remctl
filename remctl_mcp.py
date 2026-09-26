@@ -95,7 +95,9 @@ SERVER_INSTRUCTIONS = (
     "uncertain without checking it first. Synced tags, rich links, sections, subtasks, assignment, "
     "Early Reminders, and location alarms need private: true; get_list returns the section ids and "
     "sharees they use, and resolve_location checks an address first. "
-    "delete_reminder is permanent, so confirm with the user first. Use run only "
+    "delete_reminder moves supported reminders to Recently Deleted. Use recently_deleted to inspect recovery candidates "
+    "and restore_reminder with private: true and a destination list to recover a parent and its subtasks. "
+    "Only delete when the user authorizes it. Use run only "
     "for commands the dedicated tools do not cover; pass exact argv items and include "
     "--json. Destructive run commands need --force. If a tool reports that the Capability "
     "Host is unavailable, call doctor and follow its fix text instead of retrying blindly."
@@ -405,7 +407,7 @@ def _argv_lists(args):
 
 
 def _argv_get_reminder(args):
-    return ["info", str(args["reminder_id"]), "--json"]
+    return ["info", str(args["reminder_id"]), *_flag(args, "include_deleted", "--include-deleted"), "--json"]
 
 
 SEARCH_PAGE_DEFAULT = 100
@@ -529,6 +531,17 @@ def _argv_set_completion(args):
 
 def _argv_set_flagged(args):
     return ["flag" if args["flagged"] else "unflag", str(args["reminder_id"]), "--json"]
+
+
+def _argv_recently_deleted(args):
+    return ["deleted", "--limit", str(args.get("limit", 100)), "--offset", str(args.get("offset", 0)), "--json"]
+
+
+def _argv_restore_reminder(args):
+    if args.get("private") is not True:
+        raise ToolArgumentError("restore_reminder requires private: true for ReminderKit recovery.")
+    return ["restore", str(args["reminder_id"]), *_option(args, "list", "--list"),
+            *_option(args, "list_id", "--list-id"), "--private", "--json"]
 
 
 def _argv_delete_reminder(args):
@@ -800,7 +813,7 @@ TOOLS: tuple[Tool, ...] = (
         "get_reminder",
         "Get Reminder",
         "Return one reminder's complete record: notes, due date, recurrence, alarms, tags, section, subtasks, attachments, and deep link.",
-        (REMINDER_ID,),
+        (REMINDER_ID, Param("include_deleted", "boolean", "Also look in Recently Deleted; deleted details omit unavailable private metadata.", default=False)),
         _argv_get_reminder, "reminder", read_only=True, idempotent=True, timeout=45, output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
@@ -895,9 +908,27 @@ TOOLS: tuple[Tool, ...] = (
         _argv_set_flagged, "change", read_only=False, idempotent=True, timeout=150, output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
+        "recently_deleted",
+        "Recently Deleted",
+        "Return Apple's recoverable reminders, with nested subtasks and numeric IDs. Results are paged by parent; "
+        "follow nextOffset while hasMore is true. restoreId identifies the parent to restore. No recovery deadline is inferred.",
+        (Param("limit", "integer", "Parents per page.", minimum=1, maximum=500, default=100),
+         Param("offset", "integer", "Parents to skip; use nextOffset.", minimum=0, maximum=INTEGER_ID_RANGE[1], default=0)),
+        _argv_recently_deleted, "reminders", read_only=True, idempotent=True, timeout=45, output_schema=SEARCH_OUTPUT_SCHEMA,
+    ),
+    Tool(
+        "restore_reminder",
+        "Restore Reminder",
+        "Recover one deleted parent and its subtasks into a list in the same account, preserving IDs. Requires private: true. "
+        "Use restoreId from recently_deleted. Check info and Recently Deleted before retrying an unconfirmed result.",
+        (REMINDER_ID, LIST_NAME, LIST_ID, Param("private", "boolean", "Required opt-in to private ReminderKit recovery.", required=True)),
+        _argv_restore_reminder, "change", read_only=False, idempotent=True, timeout=45,
+        require_one_of=("list", "list_id"), mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
+    ),
+    Tool(
         "delete_reminder",
         "Delete Reminder",
-        "Permanently delete reminders by numeric id: reminder_id for one, reminder_ids for a batch. Confirm with the user before calling."
+        "Delete reminders by numeric id: reminder_id for one, reminder_ids for a batch. Supported accounts keep them in Recently Deleted for up to 30 days. Only call when the user authorizes deletion."
         + BATCH_HELP,
         (OPTIONAL_REMINDER_ID, REMINDER_IDS),
         _argv_delete_reminder, "change", read_only=False, destructive=True, idempotent=True, timeout=300,
@@ -1197,7 +1228,7 @@ def result_ui_meta(tool: Tool, *, apps: bool, legacy_aliases: bool) -> dict[str,
         "toolTitle": tool.title,
         "accent": UI_ACCENT,
     }
-    if tool.profile in {"reminders", "reminder", "generic"}:
+    if tool.profile in {"reminders", "reminder", "generic"} and tool.name != "recently_deleted":
         hints["actions"] = REMINDER_ROW_ACTIONS
     meta[UI_RESULT_META_KEY] = hints
     return meta

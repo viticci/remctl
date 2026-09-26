@@ -2,6 +2,12 @@
 
 ## 2.0.0 — Unreleased
 
+### Recently Deleted
+
+- `deleted` and the `recently_deleted` MCP tool show Apple's recoverable reminders with numeric IDs, pagination, and nested subtasks. `info --include-deleted` and `get_reminder` with `include_deleted: true` can inspect them.
+- `restore` and `restore_reminder` recover a parent and its subtasks into an explicit list in the same account. Recovery requires private API opt-in and verifies the original IDs and hierarchy.
+- Delete help explains the recovery window. Deleted reminders have no edit or delete controls in the MCP widget.
+
 ### Images, rich links, and recurrence imports
 
 - `add` and `edit` accept `--image` without confusing it with global image display options.

@@ -11,7 +11,7 @@ RemCTL is a Reminders CLI and MCP server for macOS. Data commands run inside a s
 
 Use **`mcp__remctl__<tool>`**, the RemCTL 2.0 server running locally on this Mac, for all reminder reads and writes. Prefer it over the Mac Remote connector's RemCTL wrappers. Do not shell out to the CLI for reminder work or silently fall back to it when an MCP connection fails.
 
-The dedicated tools are `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`, and `doctor`. They validate arguments and return `structuredContent`; list results wrap rows in `items` with a `count`. Check `isError` and `structuredContent.error` before treating a call as successful.
+The dedicated tools are `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `recently_deleted`, `restore_reminder`, `create_list`, `update_list`, and `doctor`. They validate arguments and return `structuredContent`; list results wrap rows in `items` with a `count`. Check `isError` and `structuredContent.error` before treating a call as successful.
 
 Use `run` only for operations without a dedicated tool, including private metadata. Pass an `args` array of exact argument items, include `--json`, and add `--force` for an authorized destructive operation. This still runs through MCP. `run` refuses `mcp`, `onboard`, `setup`, `permissions`, `completion`, and `open`. Shell commands are reserved for installation, connection repair, and permission setup, or an explicit user request for CLI usage. If tools are missing, inspect or repair the local registration and reconnect the client.
 
@@ -125,6 +125,14 @@ Row fields: `id`, `title`, `list`, `completed`, `flagged`, `urgent`, `priority`,
 - `reminder-move` needs `--private`. Within one list, the anchor must be in the same list. `--smart-list NAME` or `--smart-list-id ID` reorders an unsectioned custom smart list; sectioned smart lists are refused. Success returns `verified: true`.
 
 Recurrence grammar: `daily`, `weekly`, `monthly`, `yearly`; an interval right after the frequency (`daily x2`, N 1 to 999); weekdays for weekly (`weekly mon,wed,fri`); day numbers (`monthly 1,15`) or ordinal weekdays (`monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri`) for monthly, never mixed. Prefer `last-fri` to `5th-fri`. Invalid recurrence, alarm, and priority values fail before writing. Recurrence and relative alarms (`15m`, `1h`, `1d`) need a due date: pass `-d` (MCP `due`) with `add`, while `edit` can also use the due date the reminder already has. Without one, a relative alarm stops with `code: "relative_alarm_requires_due_date"` and Reminders refuses to save a repeating reminder; nothing is written.
+
+## Recently Deleted
+
+Use `recently_deleted` to find recoverable reminders. Follow `nextOffset` while `hasMore` is true; pages count parents and nest subtasks. `get_reminder` with `include_deleted: true` can inspect a deleted ID. The original list may be unavailable, and deleted details do not include all private metadata.
+
+To recover, call `restore_reminder` with the item's `restoreId`, a destination `list` or `list_id` in the same account, and `private: true`. This restores the parent and its subtasks with their original IDs. Do not recreate them with `create_reminder`. `verified: true` means the IDs and hierarchy were read back; `already_restored` is a no-op for an active ID already in that list. For `restore_unconfirmed`, inspect the ID and refresh Recently Deleted before retrying.
+
+Apple normally keeps deleted reminders for 30 days. Do not promise a deadline or recoverability from a database deletion flag. RemCTL asks Apple's recovery view and does not expose permanent purging. See [recovery details](docs/commands.md#recently-deleted).
 
 ## Private metadata
 

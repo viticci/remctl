@@ -324,6 +324,7 @@ const RemCTLWidget = (() => {
     return value;
   }
   function actionApplies(action, row) {
+    if (row.deleted === true) return false;
     const fields = Array.isArray(action.requiredRowFields) ? action.requiredRowFields : [];
     return fields.every(f => row[f] !== undefined && row[f] !== null);
   }
@@ -552,6 +553,7 @@ const RemCTLWidget = (() => {
     const when = whenLabel(row);
     if (when.text !== '—') { const node = el('span', when.overdue ? 'rw-overdue' : null, when.text); if (when.overdue) node.style.color = 'var(--bad)'; parts.push(node); }
     const repeat = repeatLabel(row); if (repeat) parts.push(repeat);
+    if (row.deleted === true) parts.push('Recently deleted');
     if (row.completed === true) parts.push('Completed' + (row.completionDate ? ' ' + safeText(row.completionDate).slice(0, 10) : ''));
     if (Array.isArray(row.alarms) && row.alarms.length) parts.push(row.alarms.length + (row.alarms.length === 1 ? ' alarm' : ' alarms'));
     if (Array.isArray(row.attachments) && row.attachments.length) parts.push(row.attachments.length + (row.attachments.length === 1 ? ' attachment' : ' attachments'));
@@ -608,6 +610,7 @@ const RemCTLWidget = (() => {
 
   /* ---------- change confirmation ---------- */
   const CHANGE_TITLES = {
+    restored: 'Reminder restored', already_restored: 'Reminder already restored',
     created: 'Reminder created', updated: 'Reminder updated', completed: 'Marked done', uncompleted: 'Marked not done',
     deleted: 'Reminder deleted', flagged: 'Reminder flagged', unflagged: 'Flag removed', unchanged: 'No changes',
     partial: 'Created, but one step failed', moved: 'Reminder moved'
