@@ -107,10 +107,16 @@ done
 CAPABILITY_SIMULATION=0
 if [[ "$SKIP_LAUNCHSERVICES" == "1" && "$PREFIX" != "$HOME" ]]; then
     CAPABILITY_SIMULATION=1
-    case "$LAUNCH_AGENT_DIR" in
-        "$PREFIX"/*) ;;
-        *) fail "Temp-prefix simulation requires a LaunchAgent directory under PREFIX; set REMCTL_LAUNCH_AGENT_DIR." ;;
-    esac
+    if ! /usr/bin/python3 -I -S - "$PREFIX" "$LAUNCH_AGENT_DIR" "$HOME" <<'PYTHON'
+import os, pwd, sys
+prefix, agent, home = [os.path.realpath(path) for path in sys.argv[1:]]
+login_directory = os.path.realpath(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "Library/LaunchAgents"))
+valid = prefix != home and agent != prefix and agent != login_directory and os.path.commonpath([prefix, agent]) == prefix
+raise SystemExit(0 if valid else 1)
+PYTHON
+    then
+        fail "Temp-prefix simulation requires a LaunchAgent directory under PREFIX after resolving symlinks; set REMCTL_LAUNCH_AGENT_DIR."
+    fi
 elif [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
     fail "REMCTL_SKIP_LAUNCHSERVICES is allowed only with a non-home PREFIX."
 fi

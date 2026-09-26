@@ -221,6 +221,27 @@ class InstallerLifecycleTests(unittest.TestCase):
             self.assertIn("requires a LaunchAgent directory under PREFIX", result.stdout)
         self.assertFalse(self.app.exists())
 
+    def test_simulation_rejects_dotdot_and_symlink_agent_escapes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="rctl-outside-", dir="/private/tmp") as tmp:
+            outside = Path(tmp)
+            link = self.prefix / "agent-link"
+            link.symlink_to(outside, target_is_directory=True)
+            paths = (self.prefix / ".." / outside.name / "LaunchAgents", link / "LaunchAgents")
+            for path in paths:
+                environment = dict(self.environment, REMCTL_LAUNCH_AGENT_DIR=str(path))
+                for script in (INSTALL, UNINSTALL):
+                    result = self.run_script(script, environment=environment, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("after resolving symlinks", result.stdout)
+                self.assertFalse((outside / "LaunchAgents").exists())
+            # A non-home spelling must not bypass the non-home prefix rule either.
+            environment = dict(self.environment, PREFIX=str(link), HOME=str(outside),
+                               REMCTL_LAUNCH_AGENT_DIR=str(link / "LaunchAgents"))
+            result = self.run_script(INSTALL, environment=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("after resolving symlinks", result.stdout)
+            self.assertFalse(self.app.exists())
+
     def test_custom_prefix_reinstall_repairs_missing_legacy_agent(self) -> None:
         self.run_script(INSTALL, "--shell-completions", "none")
         backup = Path(str(self.agent) + ".remctl-transaction-backup")
