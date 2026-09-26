@@ -12,7 +12,7 @@ from collections import Counter
 import remctl_broker
 
 CLI_NAME = os.path.basename(sys.argv[0])
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
@@ -7340,8 +7340,11 @@ def normalize_recurrence_object(spec):
         if "count" in result or not isinstance(result["end"], str):
             return None
         try:
-            result["end"] = datetime.fromisoformat(result["end"].replace("Z", "+00:00")).isoformat()
-        except ValueError:
+            end = datetime.fromisoformat(result["end"].replace("Z", "+00:00"))
+            if end.tzinfo is not None:
+                end = end.astimezone(timezone.utc)
+            result["end"] = end.isoformat()
+        except (ValueError, OverflowError):
             return None
     return result
 
