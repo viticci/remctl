@@ -922,7 +922,7 @@ TOOLS: tuple[Tool, ...] = (
         "Recover one deleted parent and its subtasks into a list in the same account, preserving IDs. Requires private: true. "
         "Use restoreId from recently_deleted. Check info and Recently Deleted before retrying an unconfirmed result.",
         (REMINDER_ID, LIST_NAME, LIST_ID, Param("private", "boolean", "Required opt-in to private ReminderKit recovery.", required=True)),
-        _argv_restore_reminder, "change", read_only=False, idempotent=True, timeout=45,
+        _argv_restore_reminder, "change", read_only=False, idempotent=True, timeout=90,
         require_one_of=("list", "list_id"), mutually_exclusive=(("list", "list_id"),), output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(

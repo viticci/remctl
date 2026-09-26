@@ -108,6 +108,7 @@
 @end
 
 @interface REMReminderChangeItem : NSObject
+- (void)setListID:(id)listID;
 - (id)remObjectID;
 - (id)assignmentContext;
 - (id)attachmentContext;
@@ -862,13 +863,13 @@ int main(void) {
             REMAccount *account = [list account];
             id capabilities = [account capabilities];
             if (![capabilities respondsToSelector:@selector(supportsRecentlyDeletedList)] || ![capabilities supportsRecentlyDeletedList]) fail(@"This account does not support Recently Deleted");
-            BOOL found = NO;
+            NSDictionary *deletedRoot = nil;
             for (NSDictionary *item in recentlyDeletedReminders(store, account)) {
                 id oid = [item isKindOfClass:[NSDictionary class]] ? item[@"objectID"] : nil;
                 NSString *uuid = [oid isKindOfClass:[NSDictionary class]] ? oid[@"uuid"] : nil;
-                if ([uuid isKindOfClass:[NSString class]] && [uuid caseInsensitiveCompare:reminderID] == NSOrderedSame) { found = YES; break; }
+                if ([uuid isKindOfClass:[NSString class]] && [uuid caseInsensitiveCompare:reminderID] == NSOrderedSame) { deletedRoot = item; break; }
             }
-            if (!found) fail(@"Reminder is not a recoverable top-level item in the destination account; restore its parent if it is a subtask");
+            if (!deletedRoot) fail(@"Reminder is not a recoverable top-level item in the destination account; restore its parent if it is a subtask");
             id objectID = [REMObjectID objectIDWithURL:reminderURL(reminderID)];
             if (![store respondsToSelector:@selector(fetchReminderIncludingMarkedForDeleteWithObjectID:error:)]) fail(@"Deleted reminder fetch is unavailable on this macOS version");
             id reminder = [store fetchReminderIncludingMarkedForDeleteWithObjectID:objectID error:&error];
@@ -877,6 +878,20 @@ int main(void) {
             REMListChangeItem *change = [save updateList:list];
             if (![change respondsToSelector:@selector(undeleteRemindersWithoutUndoWithIDs:)]) fail(@"Reminder recovery is unavailable on this macOS version");
             [change undeleteRemindersWithoutUndoWithIDs:@[objectID]];
+            // Deleted children can still point at the old list, including a deleted list.
+            // Reparent them in the same save request that recovers the root.
+            NSMutableArray *pending = [NSMutableArray arrayWithArray:deletedRoot[@"subtasks"] ?: @[]];
+            while (pending.count) {
+                NSDictionary *child = pending.lastObject;
+                [pending removeLastObject];
+                id childID = [REMObjectID objectIDWithURL:reminderURL(child[@"objectID"][@"uuid"])];
+                id childReminder = [store fetchReminderIncludingMarkedForDeleteWithObjectID:childID error:&error];
+                if (!childReminder) fail(error.localizedDescription ?: @"Deleted subtask is no longer available");
+                REMReminderChangeItem *childChange = [save updateReminder:childReminder];
+                if (![childChange respondsToSelector:@selector(setListID:)]) fail(@"Subtask recovery into another list is unavailable");
+                [childChange setListID:targetID];
+                [pending addObjectsFromArray:child[@"subtasks"] ?: @[]];
+            }
             if (![save saveSynchronouslyWithError:&error]) fail(error.localizedDescription ?: @"Reminder recovery failed");
             output(@{@"status": @"updated", @"action": action});
             return 0;
