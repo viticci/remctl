@@ -97,7 +97,25 @@ let localDateTimeShort: DateFormatter = {
     return f
 }()
 
+let isoFractionalFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+let localFractionalFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+    f.timeZone = TimeZone.current
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
 func parseISO(_ s: String) -> Date? {
+    if s.contains(".") {
+        if let d = isoFractionalFormatter.date(from: s) { return d }
+        if let d = localFractionalFormatter.date(from: s) { return d }
+    }
     // 1. Full ISO 8601 with timezone (e.g., "2026-03-28T15:00:00Z" or "+02:00")
     if let d = isoFormatter.date(from: s) { return d }
     // 2. Naive datetime as local time (e.g., "2026-03-28T15:00:00")

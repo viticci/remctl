@@ -51,6 +51,9 @@ class IssueCliFixTests(unittest.TestCase):
         for spec in (
             {'frequency':'yearly','interval':1,'monthsOfYear':[3,9],'daysOfMonth':[-1],'endDate':'2028-09-26T09:00:00'},
             {'frequency':'yearly','daysOfYear':[60,-1],'weeksOfYear':[1,-1],'setPositions':[1,-1]},
+            {'frequency':'daily','endDate':'2028-09-26T09:00'},
+            {'frequency':'daily','endDate':'2028-W39-2'},
+            {'frequency':'daily','endDate':'2028-09-26T09:00:00.125'},
         ):
             normalized = self.cli.parse_recurrence(spec)
             self.assertIsNotNone(normalized)
@@ -107,6 +110,10 @@ let endJSON = #"{"frequency":"daily","end":"2028-09-26T09:00:00"}"#
 let endSpec = try! JSONDecoder().decode(RecurrenceSpec.self, from: Data(endJSON.utf8))
 assert(buildRecurrenceRule(endSpec)!.recurrenceEnd!.endDate == parseISO("2028-09-26T09:00:00"))
 '''
+        for end in ('2028-09-26T09:00', '2028-W39-2', '2028-09-26T09:00:00.125', '2028-09-26T09:00:00.125+02:00'):
+            normalized = self.cli.parse_recurrence({'frequency':'daily','endDate':end})
+            literal = json.dumps(normalized)
+            source += f'\nassert(buildRecurrenceRule(try! JSONDecoder().decode(RecurrenceSpec.self, from: Data(#"{literal}"#.utf8))) != nil)\n'
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rules.swift"
             binary = Path(tmp) / "rules"

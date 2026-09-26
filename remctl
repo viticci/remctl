@@ -7340,7 +7340,7 @@ def normalize_recurrence_object(spec):
         if "count" in result or not isinstance(result["end"], str):
             return None
         try:
-            datetime.fromisoformat(result["end"].replace("Z", "+00:00"))
+            result["end"] = datetime.fromisoformat(result["end"].replace("Z", "+00:00")).isoformat()
         except ValueError:
             return None
     return result
