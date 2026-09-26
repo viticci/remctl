@@ -2,10 +2,11 @@
 
 ## 2.0.0 — Unreleased
 
-### Notes and list colors
+### Notes, list colors, and live tests
 
 - `edit ID --url URL` preserves existing notes. An explicit `--notes` value replaces them before appending the URL. The AppleScript fallback also supports clearing notes with `--notes ""`.
 - `list-create --color gray` and `--color teal` now set the requested color. Color names ignore surrounding whitespace and case. The EventKit helper rejects unknown colors before saving.
+- The private live matrix now skips standalone helper writes unless `--standalone-helper` is supplied. Those writes bypass the signed host and previously failed in a normal installation where only the host has Reminders access. Hosted CLI checks still run.
 - Simplified the documentation and corrected stale tool counts, edit behavior, MCP routing guidance, and location-alarm details.
 
 ### Search, batches, locations, and typed metadata

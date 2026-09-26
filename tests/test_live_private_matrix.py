@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 matrix_path = Path(__file__).resolve().parents[1] / "scripts" / "live_private_matrix.py"
@@ -145,6 +146,29 @@ class MatrixCleanupTests(unittest.TestCase):
             matrix.close()
 
         self.assertEqual(deletes, [])
+
+
+class StandaloneHelperTests(unittest.TestCase):
+    def test_default_matrix_refuses_direct_helper_writes(self):
+        matrix = matrix_module.LiveMatrix("remctl", "RemCTL Test Prefix")
+        try:
+            with mock.patch.object(matrix_module.subprocess, "run") as run:
+                with self.assertRaisesRegex(AssertionError, "--standalone-helper"):
+                    matrix.private_helper_json({"action": "set_smart_list_pinned"})
+                run.assert_not_called()
+        finally:
+            matrix.close()
+
+    def test_explicit_standalone_mode_runs_helper_write(self):
+        matrix = matrix_module.LiveMatrix("remctl", "RemCTL Test Prefix", standalone_helper=True)
+        try:
+            proc = mock.Mock(returncode=0, stdout='{"status":"updated"}', stderr="")
+            with mock.patch.object(matrix_module.subprocess, "run", return_value=proc) as run:
+                result = matrix.private_helper_json({"action": "set_smart_list_pinned"})
+            self.assertEqual(result["status"], "updated")
+            run.assert_called_once()
+        finally:
+            matrix.close()
 
 
 if __name__ == "__main__":

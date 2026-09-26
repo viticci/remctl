@@ -287,3 +287,13 @@ After a write, verify the result through MCP, or through the CLI when testing it
 | Templates | `run` with `template-info NAME --json`; after applying, read the new list |
 
 Do not read SQLite directly for routine verification. A saved row alone does not prove that Reminders displays or syncs a feature. Ask the user to check another device when cross-device sync is part of the task.
+
+## Live testing
+
+The default matrix tests the CLI through its selected execution route and cleans up disposable data:
+
+```bash
+REMCTL_CAPABILITY_HOST=force python3 scripts/live_private_matrix.py --remctl "$HOME/bin/remctl"
+```
+
+Standalone helper writes bypass the signed host and need separate Reminders access for the caller. They are skipped by default and reported as `skipped`, not passed. In an already authorized development context, add `--standalone-helper` to test direct grocery categorization and legacy pin payloads. Do not grant an agent extra permissions just to run those checks.

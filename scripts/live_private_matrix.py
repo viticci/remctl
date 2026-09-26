@@ -41,6 +41,7 @@ class LiveMatrix:
         prefix: str,
         keep: bool = False,
         *,
+        standalone_helper: bool = False,
         monotonic=time.monotonic,
         sleep=time.sleep,
         cleanup_quiet_seconds: float = 120,
@@ -50,6 +51,7 @@ class LiveMatrix:
         self.remctl = remctl
         self.prefix = prefix
         self.keep = keep
+        self.standalone_helper = standalone_helper
         self.tmpdir = tempfile.TemporaryDirectory(prefix="remctl-private-matrix-")
         self.image_path = Path(self.tmpdir.name) / "pixel.png"
         self.image_path.write_bytes(PNG_1X1)
@@ -173,6 +175,8 @@ class LiveMatrix:
         return Path.home() / "bin" / "remctl-private"
 
     def private_helper_json(self, payload: dict, *, expect: int = 0, retry_transient: bool = False) -> dict:
+        if payload.get("action") not in {"capabilities", "protocol_version"} and not self.standalone_helper:
+            raise AssertionError("Direct helper writes require --standalone-helper and caller Reminders access")
         helper = self.private_helper_path()
         attempts = 3 if retry_transient else 1
         for attempt in range(attempts):
@@ -343,51 +347,58 @@ class LiveMatrix:
         self.assert_true(bool(shown), "grocery reminder did not appear in list")
         self.record("add --private --grocery", "passed", str(milk.get("numericId")))
 
-        direct_title = f"{self.prefix} Bananas Direct"
-        direct = self.create_reminder(direct_title, "-l", grocery)
-        direct_id = int(direct["numericId"])
-        direct_info = self.retry(lambda: self.info(direct_id) if self.info(direct_id).get("deepLink") else None)
-        self.assert_true(bool(direct_info), "direct grocery test reminder has no stable deep link")
-        direct_object_id = direct_info["deepLink"].rstrip("/").rsplit("/", 1)[-1]
-        self.assert_true(bool(direct_object_id), "direct grocery test reminder has no object UUID")
-        grocery_caps = self.private_capabilities.get("grocery", {})
-        legacy_available = grocery_caps.get("categorizeGroceryItemsWithReminderIDs:", {}).get("available") is True
-        current_available = grocery_caps.get("autoCategorizeRemindersWithReminderIDs:", {}).get("available") is True
-        request = {
-            "action": "categorize_grocery_items",
-            "listId": grocery_row["objectUUID"],
-            "reminderIds": [direct_object_id],
-        }
-        if legacy_available or current_available:
-            expected_selector = (
-                "categorizeGroceryItemsWithReminderIDs:"
-                if legacy_available
-                else "autoCategorizeRemindersWithReminderIDs:"
-            )
-            categorized = self.private_helper_json(request, retry_transient=True)
-            self.assert_true(categorized.get("status") == "updated", "grocery selector call did not update")
-            self.assert_true(
-                categorized.get("selector") == expected_selector,
-                "grocery selector dispatch did not match capabilities",
-            )
-            categorized_row = self.retry(
-                lambda: next(
-                    (
-                        item
-                        for item in self.show_list(grocery)
-                        if item.get("title") == direct_title and item.get("section")
-                    ),
-                    None,
+        if self.standalone_helper:
+            direct_title = f"{self.prefix} Bananas Direct"
+            direct = self.create_reminder(direct_title, "-l", grocery)
+            direct_id = int(direct["numericId"])
+            direct_info = self.retry(lambda: self.info(direct_id) if self.info(direct_id).get("deepLink") else None)
+            self.assert_true(bool(direct_info), "direct grocery test reminder has no stable deep link")
+            direct_object_id = direct_info["deepLink"].rstrip("/").rsplit("/", 1)[-1]
+            self.assert_true(bool(direct_object_id), "direct grocery test reminder has no object UUID")
+            grocery_caps = self.private_capabilities.get("grocery", {})
+            legacy_available = grocery_caps.get("categorizeGroceryItemsWithReminderIDs:", {}).get("available") is True
+            current_available = grocery_caps.get("autoCategorizeRemindersWithReminderIDs:", {}).get("available") is True
+            request = {
+                "action": "categorize_grocery_items",
+                "listId": grocery_row["objectUUID"],
+                "reminderIds": [direct_object_id],
+            }
+            if legacy_available or current_available:
+                expected_selector = (
+                    "categorizeGroceryItemsWithReminderIDs:"
+                    if legacy_available
+                    else "autoCategorizeRemindersWithReminderIDs:"
                 )
-            )
-            self.assert_true(bool(categorized_row), "direct grocery selector did not persist a section")
+                categorized = self.private_helper_json(request, retry_transient=True)
+                self.assert_true(categorized.get("status") == "updated", "grocery selector call did not update")
+                self.assert_true(
+                    categorized.get("selector") == expected_selector,
+                    "grocery selector dispatch did not match capabilities",
+                )
+                categorized_row = self.retry(
+                    lambda: next(
+                        (
+                            item
+                            for item in self.show_list(grocery)
+                            if item.get("title") == direct_title and item.get("section")
+                        ),
+                        None,
+                    )
+                )
+                self.assert_true(bool(categorized_row), "direct grocery selector did not persist a section")
+                self.record(
+                    "standalone helper: direct grocery selector dispatch",
+                    "passed",
+                    f"{expected_selector} -> {categorized_row['section']}",
+                )
+            else:
+                raise AssertionError("host exposes no known grocery categorization selector")
+        else:
             self.record(
                 "standalone helper: direct grocery selector dispatch",
-                "passed",
-                f"{expected_selector} -> {categorized_row['section']}",
+                "skipped",
+                "requires --standalone-helper and caller Reminders access; hosted grocery sorting was tested above",
             )
-        else:
-            raise AssertionError("host exposes no known grocery categorization selector")
 
         child = {
             "title": f"{self.prefix} Child",
@@ -609,23 +620,30 @@ class LiveMatrix:
         self.assert_true(unpin_by_id.get("private", {}).get("pinned") is False, "ID unpin helper result is wrong")
         assert_pin_state(False, "custom smart-list unpin by ID")
 
-        legacy_pin = self.private_helper_json({
-            "action": "set_smart_list_pinned",
-            "smartListId": smart_uuid,
-            "pinned": True,
-        })
-        self.assert_true(legacy_pin.get("pinned") is True, "legacy custom smart-list pin result is wrong")
-        assert_pin_state(True, "legacy payload custom smart-list pin")
-        self.record("standalone helper: protocol-1 pin payload", "passed", str(smart_id))
+        if self.standalone_helper:
+            legacy_pin = self.private_helper_json({
+                "action": "set_smart_list_pinned",
+                "smartListId": smart_uuid,
+                "pinned": True,
+            })
+            self.assert_true(legacy_pin.get("pinned") is True, "legacy custom smart-list pin result is wrong")
+            assert_pin_state(True, "legacy payload custom smart-list pin")
+            self.record("standalone helper: protocol-1 pin payload", "passed", str(smart_id))
 
-        legacy_unpin = self.private_helper_json({
-            "action": "set_smart_list_pinned",
-            "smartListId": smart_uuid,
-            "pinned": False,
-        })
-        self.assert_true(legacy_unpin.get("pinned") is False, "legacy custom smart-list unpin result is wrong")
-        assert_pin_state(False, "legacy payload custom smart-list unpin")
-        self.record("standalone helper: protocol-1 unpin payload", "passed", str(smart_id))
+            legacy_unpin = self.private_helper_json({
+                "action": "set_smart_list_pinned",
+                "smartListId": smart_uuid,
+                "pinned": False,
+            })
+            self.assert_true(legacy_unpin.get("pinned") is False, "legacy custom smart-list unpin result is wrong")
+            assert_pin_state(False, "legacy payload custom smart-list unpin")
+            self.record("standalone helper: protocol-1 unpin payload", "passed", str(smart_id))
+        else:
+            self.record(
+                "standalone helper: protocol-1 pin/unpin payloads",
+                "skipped",
+                "requires --standalone-helper and caller Reminders access; hosted pin/unpin was tested above",
+            )
 
         built_in_after = {
             item["id"]: (item.get("pinned"), item.get("pinnedDate"))
@@ -636,7 +654,7 @@ class LiveMatrix:
         self.record(
             "custom smart-list pinning",
             "passed",
-            "name + ID + idempotent + protocol-1 payload pin/unpin with pinnedDate/filter/identity readback",
+            "name + ID + idempotent pin/unpin with pinnedDate/filter/identity readback",
         )
 
         built_in = next(
@@ -916,6 +934,7 @@ def main() -> int:
     parser.add_argument("--remctl", default=str(Path(__file__).resolve().parents[1] / "remctl"), help="remctl binary to test")
     parser.add_argument("--prefix", default=f"RemCTL Matrix {datetime.now().strftime('%Y%m%d-%H%M%S')}", help="Disposable item prefix")
     parser.add_argument("--keep", action="store_true", help="Keep disposable Reminders data for manual inspection")
+    parser.add_argument("--standalone-helper", action="store_true", help="Also test direct helper writes; requires caller Reminders access, separate from the signed host")
     args = parser.parse_args()
 
     if args.keep and not args.prefix.strip():
@@ -923,7 +942,7 @@ def main() -> int:
     if not args.keep and len(args.prefix.strip()) < 8:
         parser.error("--prefix must be at least 8 non-whitespace characters when cleanup is enabled")
 
-    matrix = LiveMatrix(args.remctl, args.prefix, keep=args.keep)
+    matrix = LiveMatrix(args.remctl, args.prefix, keep=args.keep, standalone_helper=args.standalone_helper)
     failed = False
     try:
         matrix.run()
