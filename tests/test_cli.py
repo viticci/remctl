@@ -7294,6 +7294,44 @@ class CliTests(unittest.TestCase):
         base.update(overrides)
         return SimpleNamespace(**base)
 
+    def test_edit_url_preserves_notes_on_bridge_and_applescript_paths(self):
+        cases = [
+            (None, "Existing notes", "Existing notes\n\nhttps://example.com"),
+            (None, None, "https://example.com"),
+            ("Replacement", "Old notes", "Replacement\n\nhttps://example.com"),
+            ("", "Old notes", "https://example.com"),
+        ]
+        for bridge in (True, False):
+            for supplied, existing, expected in cases:
+                with self.subTest(bridge=bridge, notes=supplied, existing=existing):
+                    reminder = dict(self._FAKE_REMINDER, ZNOTES=existing)
+                    args = self._edit_args(notes=supplied, url="https://example.com")
+                    with (
+                        mock.patch.object(self.remctl, "open_db", return_value=None),
+                        mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+                        mock.patch.object(self.remctl, "bridge_available", return_value=bridge),
+                        mock.patch.object(self.remctl, "bridge_call_result", return_value=self._bridge_result({"status": "updated"})) as call,
+                        mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa,
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        self.remctl.cmd_edit(args)
+                    if bridge:
+                        self.assertEqual(call.call_args.args[0]["notes"], expected)
+                        osa.assert_not_called()
+                    else:
+                        self.assertIn(f'set body of r to "{self.remctl.esc(expected)}"', osa.call_args.args[1])
+
+    def test_edit_empty_notes_clears_applescript_body(self):
+        with (
+            mock.patch.object(self.remctl, "open_db", return_value=None),
+            mock.patch.object(self.remctl, "q_reminder", return_value=self._FAKE_REMINDER),
+            mock.patch.object(self.remctl, "bridge_available", return_value=False),
+            mock.patch.object(self.remctl, "osa_by_id_try", return_value=True) as osa,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.remctl.cmd_edit(self._edit_args(notes=""))
+        self.assertIn('set body of r to ""', osa.call_args.args[1])
+
     def test_cmd_edit_json_echoes_the_new_title_after_a_rename(self):
         reminder = self._FAKE_REMINDER
         args = self._edit_args(title="Renamed")

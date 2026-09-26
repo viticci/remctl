@@ -81,8 +81,8 @@ class LiveEditMatrix:
             time.sleep(delay)
         return last
 
-    def create_list(self, name: str):
-        self.json_command(["list-create", name, "--json"])
+    def create_list(self, name: str, *args: str):
+        self.json_command(["list-create", name, *args, "--json"])
         self.lists.append(name)
         self.retry(lambda: self.list_exists(name))
 
@@ -132,6 +132,32 @@ class LiveEditMatrix:
         self.relative_alarm_survives_reschedule(source)
         self.title_notes_priority_preserve_schedule(source)
         self.move_list_preserves_schedule(source, target)
+        self.url_preserves_notes(source)
+        self.named_list_colors()
+
+    def url_preserves_notes(self, list_name: str):
+        rid = self.add(f"{self.prefix} URL notes", "-l", list_name, "-n", "Keep these notes")
+        cases = [
+            (("--url", "https://example.com/first"), "Keep these notes\n\nhttps://example.com/first"),
+            (("--url", "https://example.com/second"), "Keep these notes\n\nhttps://example.com/first\n\nhttps://example.com/second"),
+            (("-n", "Replacement", "--url", "https://example.com/new"), "Replacement\n\nhttps://example.com/new"),
+            (("-n", "", "--url", "https://example.com/only"), "https://example.com/only"),
+            (("-n", ""), ""),
+        ]
+        for args, expected in cases:
+            self.edit(rid, *args)
+            self.wait_info(rid, lambda p: (p.get("notes") or "") == expected, f"unexpected notes after {args}")
+        self.record("URL append, notes replacement, and notes clearing", str(rid))
+
+    def named_list_colors(self):
+        for color, expected in (("gray", "#5B626A"), ("teal", "#30B0C7")):
+            name = f"{self.prefix} {color}"
+            self.create_list(name, "--color", f" {color.upper()} ")
+            def matches():
+                rows = self.json_command(["lists", "--json"])
+                return any(row.get("title") == name and (row.get("color") or {}).get("hex", "").upper() == expected for row in rows)
+            self.assert_true(self.retry(matches), f"{color} list did not retain {expected}")
+            self.record(f"{color} list color", expected)
 
     def matching_alarm_moves_with_due(self, list_name: str):
         rid = self.add(

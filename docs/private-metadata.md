@@ -1,49 +1,16 @@
 # Private Metadata Writes
 
-RemCTL's normal write path is EventKit via `remctl-bridge`. Private metadata writes are different: they use Apple's private ReminderKit framework through `remctl-private`. Location alarms remain behind the private command guardrail because agents should treat them as Reminders-only metadata, but RemCTL saves them with EventKit structured-location alarms because that path materializes reliably on current macOS.
+Use `--private` for Reminders metadata that EventKit cannot write. RemCTL sends these changes through Apple's private ReminderKit framework using `remctl-private`. Location alarms also require this flag, but use EventKit for the actual write.
 
-This mode is unsupported by Apple, optional, and explicit. Use `--private` on `add`, `edit`, `reminder-move`, private section/list appearance, pinning, and group commands, custom smart-list creation/editing/deletion, or template creation/application/deletion.
+The helper accepts a fixed set of JSON actions, checks its protocol version, and saves through Reminders. It never writes SQLite directly, runs a shell, or accepts arbitrary Objective-C method names. Apple does not support these APIs and can change them in any macOS update.
 
-RemCTL still does not write directly to SQLite.
+## Supported fields
 
-## Safety Model
+Private writes cover synced tags and rich links, sections, assignments, subtasks, images, flags, urgent state, Early Reminders, ordering, list appearance, pins, groups, Groceries, custom smart lists, and templates. Location alarms also require `--private` but are saved through EventKit.
 
-`remctl-private` receives a bounded JSON payload on stdin, looks up the target reminder through ReminderKit, applies one of a fixed set of actions, and saves through Apple's Reminders stack. The fixed action set includes a `protocol_version` handshake that RemCTL uses to reject an outdated helper before writing. It does not spawn a shell, does not accept arbitrary Objective-C selectors, and does not mutate the SQLite store. Helper paths that previously no-op'd silently — section assignment or tag/URL writes with nil contexts — now return explicit errors instead of reporting false success.
+The [command guide](commands.md#private-metadata) lists the flags. Generic files and PDFs are rejected because Reminders does not reliably display them. Template sharing links can be read but cannot be created or revoked.
 
-The helper is still experimental. It links a private framework, so Apple can rename classes, change method signatures, reject behavior, or alter sync semantics in any macOS update. Public builds should treat this as an opt-in power-user feature, not a stability guarantee.
-
-## Supported
-
-Verified on macOS/iCloud sync:
-
-- web rich URL attachments to public HTTP(S) hosts: `--private --url https://example.com`
-- synced tag add/replace/remove: `--private -t remctl,work`, `--private --set-tags remctl,work`, `--private --remove-tag stale`, or `--private --clear-tags`
-- section assignment: `--private --section "Research"`
-- section assignment by stable ID: `--private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8`
-- section creation and assignment: `--private --new-section "Research"`
-- section management: `section-create "Research" -l Projects --private`, `section-rename "Research" --new-name "Archive" -l Projects --private`, and `section-delete "Archive" -l Projects --private --force`
-- shared-list assignment: `--private --assign Alex`, `--private --assign alex@example.com`, or `--private --assign me`
-- reminder ordering: `reminder-move 23880 --before 23881 --private`, or `reminder-move 23880 --before 23881 --smart-list "Focus" --private`
-- subtasks: `--private --subtask "Follow up"` or rich JSON objects with child metadata
-- image attachments: `--private --image ~/Desktop/mockup.png`
-- real flag state: `edit ID --private --flagged` or `add ... --private -f`
-- urgent state: `add "Leave now" --private --urgent` or `edit ID --private --urgent`
-- Early Reminders: `add "Leave early" -d "today 14:00" --private --early-reminder 15m`, `edit ID --private --early-reminder 1h`, or `edit ID --private --early-reminder clear`
-- location alarms: `add` or `edit ID --private --location-title "Apple Park" --latitude 37.3349 --longitude -122.0090`, or `--location-address "1 Apple Park Way, Cupertino, CA"` (guarded by `--private`, saved through `remctl-bridge`)
-- list appearance metadata: `list-create "Projects" --private --symbol education3`, `list-edit Projects --private --color '#FF8D28' --emoji 📌`
-- regular-list and custom-smart-list pin state: `list-pin "Project X" --private`, `list-pin "My Smart List" --private`, `list-unpin --smart-list-id 4 --private`; built-in smart-list pinning is host-capability-dependent
-- list groups: `group-create "Writing" --private --add-list Editorial`, `list-create "Ideas" --private --group Writing`, `group-edit "Writing" --private --add-list Ideas --remove-list Socials`, `group-edit "Writing" --private --move-list Ideas --last`, and `group-delete "Writing" --private --force`
-- custom smart lists with verified materializing Reminders filters: `smart-list-create "Flagged Review" --private --flagged`, `smart-list-create "Priority or Today" --private --match any --priority high,medium --date today`, `smart-list-create "Projects Today" --private --include-list Projects --date today --date-today-include-past-due`, and exact custom smart-list cleanup via `smart-list-delete "Flagged Review" --private --force`
-- Reminders templates: `template-create "Packing Template" --from-list Packing --private`, `template-apply "Packing Template" --private`, and exact cleanup via `template-delete "Packing Template" --private --force`
-
-Not exposed:
-
-- generic file/PDF attachments. They are rejected because Reminders does not reliably display them.
-- guessed or undocumented smart-list filter keys beyond the official Reminders.app samples decoded by `smart-lists`.
-- iCloud template link creation. Existing template links can be read, but publishing/revoking links is not exposed.
-- raw SQLite writes. Earlier experiments proved direct row insertion can stay local-only and fail to sync.
-
-## Create Examples
+## Create
 
 ```bash
 remctl add "Research" -l Projects --private \
@@ -69,7 +36,7 @@ remctl add "Leave early" -l Work -d "today 14:00" --private --early-reminder 15m
 
 With `--private`, `--url` creates a web rich link attachment and `-t/--tags` creates real synced Reminders tags. Private rich URLs must resolve to public `http` or `https` hosts; loopback, `.local`, private, link-local, multicast, reserved, and unresolved hosts fail before writing. Without `--private`, `--url` is appended to notes and `-t/--tags` appends inline hashtags to the title.
 
-## Edit Examples
+## Edit
 
 ```bash
 remctl edit 23880 --private --url "https://example.com"
@@ -94,7 +61,7 @@ remctl edit 23880 --private --location-title "Apple Park" --latitude 37.3349 --l
 remctl edit 23880 --private --location-title Office --location-address "1 Apple Park Way, Cupertino, CA"
 ```
 
-## Assignment Syntax
+## Assignment and reminder fields
 
 Shared-list assignment uses ReminderKit assignment rows, not SQLite writes. The list must already be shared, and assignment writes require `--private`.
 
@@ -117,9 +84,9 @@ Early Reminders are stored by Reminders as private `REMDueDateDeltaAlert` metada
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
 
-`-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other. Tag reads and rewrites ignore soft-deleted tag links, so a recently-deleted tag no longer surfaces and `--remove-tag` cannot resurrect it.
+`-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other. Tag reads and rewrites ignore soft-deleted tag links, so a recently-deleted tag is no longer returned and `--remove-tag` cannot resurrect it.
 
-## Section Management Examples
+## Sections
 
 ```bash
 remctl sections --json
@@ -130,7 +97,7 @@ remctl section-delete "Reading" -l Projects --private --force --json
 
 Section management uses ReminderKit and requires `--private`. `section-create` refuses duplicate names in the target list, `section-rename` refuses collisions with another section in the same list, and `section-delete` moves reminders out of the section using Reminders' normal behavior. Verify with `sections --json` or `show <list> --json`.
 
-## List Appearance Examples
+## List appearance
 
 ```bash
 remctl list-symbols
@@ -149,7 +116,7 @@ remctl list-unpin --smart-list-id 4 --private
 
 List colors and badge emblems were reverse-engineered from `ZREMCDBASELIST`. `ZCOLOR` stores a `REMColor` keyed archive. `ZBADGEEMBLEM` stores either an emoji JSON string or a private Reminders emblem name. `list-symbols` prints the 71 official emblem names bundled in RemindersUICore; the terminal glyph column is approximate. Use `list-symbols --preview` or `list-symbols --html PATH` for a native-asset HTML contact sheet with interactive official color swatches. RemCTL writes those values through ReminderKit change items, not by editing the database.
 
-Important limits:
+Limits:
 
 - `list-create --color NAME` works without `--private` through EventKit for normal color names.
 - `list-create --private --color '#RRGGBB'` and `list-edit --private --color '#RRGGBB'` use private ReminderKit for exact custom colors.
@@ -159,7 +126,7 @@ Important limits:
 - `list-pin` and `list-unpin` can target regular lists or smart lists by name. If a name matches both, use `--list-id` or `--smart-list-id`.
 - Verify regular list pinning with `lists --json` and smart-list pinning with `smart-lists --json`. For a custom smart list, capture its `objectUUID` and filter, pin it, require `pinned: true` with a positive `pinnedDate`, then unpin it and require `pinned: false` with no positive pin date while identity and filter remain unchanged. Successful smart-list writes can leave `ZISPINNEDBYCURRENTUSER` empty while updating `ZPINNEDDATE`; RemCTL therefore derives custom pin state from a positive pin date when needed. Built-in smart-list pinning fails before saving on hosts without the generic ReminderKit fetch.
 
-## List Group Examples
+## List groups
 
 ```bash
 remctl groups
@@ -183,7 +150,7 @@ remctl group-delete --group-id 476 --private --force --json
 
 List groups are containers for lists, not containers for reminders. `groups` and `group-info` report active/completed/total counts from child lists. `group-create` creates the group and can move existing lists under it. `list-create --private --group` creates a new list directly under a group. `group-edit` renames the group, adds or removes child lists, and can reorder a child list with `--move-list` plus `--before-list`, `--after-list`, `--first`, or `--last`. `group-delete` detaches every child list to the top level before deleting the empty group. These operations update list parentage only; reminders stay in the same child lists and should be verified with `show <list> --json`, `groups --json`, or `show <group> --json`.
 
-## Groceries List Examples
+## Groceries
 
 ```bash
 remctl lists --json
@@ -201,9 +168,9 @@ Groceries writes use `REMListChangeItem.groceryContextChangeItem`: `list-create 
 
 `add --private --grocery` and `edit --private --grocery` verify automatic grocery sorting for the target reminder IDs. The target list must already be a detected Groceries list, and RemCTL fails before writing if it is not. RemCTL first polls the local section membership table because Reminders often sorts new items immediately; if the item is still unsectioned, RemCTL falls back to ReminderKit's explicit grocery categorizer. The JSON result includes `verifiedSections` and `source: "reminders_auto"` when the automatic sorter already handled it.
 
-The private grocery fallback supports both known selectors. Tahoe retains `categorizeGroceryItemsWithReminderIDs:` on the grocery-context change with UUID values. Golden Gate calls `autoCategorizeRemindersWithReminderIDs:` on the list change with `REMObjectID` values. A selector-name-only Golden Gate branch that reused Tahoe's receiver and UUID array returned a ReminderKit helper-communication error; the full Golden Gate branch persisted Produce section membership. A Tahoe experiment that substituted `REMObjectID` values returned success but tombstoned its disposable list, reminder, and section, so RemCTL deliberately keeps the existing Tahoe argument contract. RemCTL checks the live receivers before dispatch and catches Objective-C exceptions. The normal Reminders automatic-categorization wait remains first, so this private save runs only when the item is still unsectioned.
+The grocery fallback uses different method arguments by macOS version: Tahoe takes UUIDs on the grocery-context change; Golden Gate takes `REMObjectID` values on the list change. RemCTL checks available methods before calling them. See the [compatibility audit](private-api-audit-2026-08-12.md#cross-version-follow-up) for the tested contracts and rejected alternatives.
 
-## Reminder Ordering Examples
+## Ordering
 
 ```bash
 remctl reminder-move 23880 --before 23881 --private
@@ -216,7 +183,7 @@ Ordinary-list moves use ReminderKit's list ordering changes and require both rel
 
 RemCTL intentionally refuses built-in smart lists, sectioned custom smart lists, missing manual-order records, and anchors without a persisted position. A custom smart list with no manual-order record must be manually reordered once in Reminders.app before RemCTL can preserve and update that ordering safely. Every successful command verifies the resulting identifier order from the local Reminders store before reporting success.
 
-## Smart List Examples
+## Smart lists
 
 ### Pinning compatibility
 
@@ -238,9 +205,9 @@ remctl smart-list-edit "Priority or Today" --private --priority high --color red
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-`smart-lists` is read-only and safe. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads.
+`smart-lists` is read-only. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads.
 
-`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, requires an active iCloud (CloudKit) Reminders account and fails with `No active iCloud Reminders account found` when none is available, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts private appearance flags plus the filters that currently materialize in Reminders.app through this write path: Any Tag, selected tags via the include/exclude tag payload, date any/today/on/before/after/range, time of day, priority single or Priority: Any, flagged, vehicle connected, specific location, one included list, and top-level all/any matching across those families. Known zero-filter writes are rejected before saving: legacy short selected-tag JSON, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
+`smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, requires an active iCloud (CloudKit) Reminders account and fails with `No active iCloud Reminders account found` when none is available, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts private appearance flags plus the filters that appear in Reminders.app through this write path: Any Tag, selected tags via the include/exclude tag payload, date any/today/on/before/after/range, time of day, priority single or Priority: Any, flagged, vehicle connected, specific location, one included list, and top-level all/any matching across those families. Known zero-filter writes are rejected before saving: legacy short selected-tag JSON, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
 
 `smart-list-edit` fetches an existing custom smart list by exact name or numeric `--smart-list-id`, replaces its `filterData` and/or private appearance metadata through ReminderKit, and requires `--private`. It never edits built-in smart lists.
 
@@ -248,9 +215,9 @@ remctl smart-list-delete "Flagged Review" --private --force
 
 For shapes the guarded flags do not cover, `--filter-json` accepts a raw official filter payload (inline JSON or `@path`) on `smart-list-create` and `smart-list-edit`. RemCTL still rejects payloads containing malformed date strings before writing.
 
-Developer note: on the verified macOS 26 store, `ZFILTERDATA` for custom smart lists is UTF-8 JSON bytes. The decoder also accepts older research samples that wrap the same JSON in an `NSKeyedArchiver` object whose root class is `ReminderKitInternal.REMCustomSmartListFilterDescriptor`, keyed field is `data`, and payload is UTF-8 JSON. Blobs that fail to decode surface an `error` field in `smart-lists` output instead of aborting the command. Known decoded keys are `operation`, `hashtags`, `date`, `time`, `priorities`, `flagged`, `location`, and `lists`, but not every decoded shape materializes when written back. For selected tags, Reminders.app materializes `{"hashtags":{"hashtags":{"operation":"or","include":["remctl"],"exclude":[]}}}` and can show zero filter rows for the legacy short form `{"hashtags":{"hashtags":["remctl"]}}`; RemCTL decodes the legacy form but does not write it. The `lists` key is a single filter descriptor; Reminders.app currently materializes only one included list through this write path.
+Developer note: on the verified macOS 26 store, `ZFILTERDATA` for custom smart lists is UTF-8 JSON bytes. The decoder also accepts older research samples that wrap the same JSON in an `NSKeyedArchiver` object whose root class is `ReminderKitInternal.REMCustomSmartListFilterDescriptor`, keyed field is `data`, and payload is UTF-8 JSON. Blobs that fail to decode return an `error` field in `smart-lists` output instead of aborting the command. Known decoded keys are `operation`, `hashtags`, `date`, `time`, `priorities`, `flagged`, `location`, and `lists`, but not every decoded shape works when written back. For selected tags, Reminders.app displays `{"hashtags":{"hashtags":{"operation":"or","include":["remctl"],"exclude":[]}}}` and can show zero filter rows for the legacy short form `{"hashtags":{"hashtags":["remctl"]}}`; RemCTL decodes the legacy form but does not write it. The `lists` key is a single filter descriptor; Reminders.app currently displays only one included list through this write path.
 
-## Template Examples
+## Templates
 
 ```bash
 remctl templates
@@ -272,38 +239,15 @@ Templates are stored separately from lists in `ZREMCDTEMPLATE`; their saved remi
 
 Template writes are list-level only. RemCTL does not append individual reminders to existing templates, copy selected reminders into a template, or offer flags to strip subtasks or due dates while saving. Those operations would need a separate native ReminderKit API before they are safe enough for this CLI.
 
-Existing iCloud template links are read as `publicLink` when `ZPUBLICLINKURLUUID` exists. Creating or revoking iCloud sharing links is intentionally not implemented because the private `shareTemplate` operation did not reliably materialize a public link in the local store during testing.
+Existing iCloud template links are read as `publicLink` when `ZPUBLICLINKURLUUID` exists. Creating or revoking iCloud sharing links is intentionally not implemented because the private `shareTemplate` operation did not reliably create a public link in the local store during testing.
 
-## Guardrails
+## Validation and partial writes
 
-Private-only commands and options fail before writes unless `--private` is set.
-
-Examples of rejected commands:
-
-```bash
-remctl add "Research" -l Projects --section "Research"
-remctl edit 23880 -t remctl
-remctl edit 23880 --urgent
-remctl edit 23880 --early-reminder 15m
-remctl add "Milk" -l Groceries --grocery
-remctl list-create "Groceries" --groceries
-remctl group-create "Writing" --add-list Editorial
-remctl list-create "Ideas" --group Writing
-remctl group-edit "Writing" --add-list Ideas
-remctl group-edit "Writing" --move-list Ideas --last
-remctl group-delete "Writing" --force
-remctl section-create "Research" -l Projects
-remctl section-rename "Research" --new-name Reading -l Projects
-remctl section-delete "Research" -l Projects --force
-remctl template-create "Packing Template" --from-list Packing
-remctl template-apply "Packing Template"
-```
-
-These fail because they would otherwise look successful while silently dropping private metadata.
+Private-only commands and options fail before writing unless `--private` is set. If a later step fails after creation, `add --json` returns `status: "partial"`, `numericId`, `failed`, and `error`. Finish with `edit` using that id; do not create the reminder again.
 
 Moving a reminder to another list is not private metadata: use `remctl edit ID -l LIST` or `remctl edit ID --list-id ID` through the normal EventKit bridge. If EventKit rejects a pure move across a list/container boundary, RemCTL uses a verified ReminderKit clone-delete fallback. Parent reminders with subtasks also use that fallback because EventKit rejects moving only the parent. RemCTL clones the reminder and any child reminders into the destination list, verifies the cloned reminder and subtask count, then deletes the original. The returned JSON includes the new numeric `id`, `oldId`, `method: "clone-delete"`, and `subtasksMoved` (`0` for ordinary reminders). Move first, then apply other edits to the returned ID. For ordinary reminders, if a move is combined with `--private --section` or `--private --grocery`, RemCTL validates the private metadata against the destination list but does not clone-delete combined edits.
 
-`--private --url` and subtask `url`/`urls` accept only public `http` and `https` hosts. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Tag replacement/removal is available through `edit --private --set-tags`, `--clear-tags`, and `--remove-tag`. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius (1 to 100000 meters), and proximity before saving, then write through the EventKit bridge as structured-location alarms. `--location-address` is resolved first by the bridge's `geocode` action, which uses Apple's public geocoder (CoreLocation), needs no Reminders or Location Services permission, and never writes. RemCTL uses a match only when it is the only one, covers less than about a kilometer, names the street or place the user typed, and the address also gives a town or postal code; anything else, a personal label such as `Home`, a timeout, or a failure stops the command before the reminder is created or changed. [commands.md](commands.md#location-alarms-from-an-address) lists the error codes. Re-writing a location alarm replaces the existing structured-location alarm rather than adding a second one. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without materializing an alarm.
+`--private --url` and subtask `url`/`urls` accept only public `http` and `https` hosts. Image attachments must point to readable image files. Rich-link and image edit operations are additive: RemCTL can add synced rich links and images, but it does not remove or replace existing rich links or image attachments. Tag replacement/removal is available through `edit --private --set-tags`, `--clear-tags`, and `--remove-tag`. Early Reminders validate their delta syntax and due-date anchor before saving. Location alarms validate latitude, longitude, radius (1 to 100000 meters), and proximity before saving, then write through the EventKit bridge as structured-location alarms. `--location-address` is resolved first by the bridge's `geocode` action, which uses Apple's public geocoder (CoreLocation), needs no Reminders or Location Services permission, and never writes. RemCTL uses a match only when it is the only one, covers less than about a kilometer, names the street or place the user typed, and the address also gives a town or postal code; anything else, a personal label such as `Home`, a timeout, or a failure stops the command before the reminder is created or changed. [commands.md](commands.md#location-alarms-from-an-address) lists the error codes. Re-writing a location alarm replaces the existing structured-location alarm rather than adding a second one. The previous private ReminderKit alarm mutation is intentionally not used because live testing returned a persistent helper communication failure without saving an alarm.
 
 ## Installation and Doctor
 
@@ -317,7 +261,7 @@ clang -fobjc-arc -O -F/System/Library/PrivateFrameworks \
   -o /tmp/remctl-private remctl-private.m
 ```
 
-For normal hosted `auto` execution, `remctl doctor --for-agent --json` reports authoritative private-helper readiness under `capabilityHost.privateProtocol.compatible`; use it with `capabilityHost.fullReady`. The direct `private_helper` check and path apply only to explicit direct diagnostics. An incompatible hosted protocol or outdated deliberate direct helper blocks `--private` writes while normal non-private commands can keep working. Rebuild and republish the signed generation with `install.sh` after every RemCTL update.
+For normal hosted `auto` execution, `remctl doctor --for-agent --json` reports private-helper readiness under `capabilityHost.privateProtocol.compatible`; use it with `capabilityHost.fullReady`. The direct `private_helper` check and path apply only to explicit direct diagnostics. An incompatible hosted protocol or outdated direct helper blocks `--private` writes while normal non-private commands can keep working. Rebuild and republish the signed generation with `install.sh` after every RemCTL update.
 
 Override the helper path for testing:
 
@@ -331,4 +275,15 @@ Helper overrides are supported only in direct mode for development and diagnosti
 
 ## Agent Notes
 
-Agents must verify private writes with `remctl info ID --json` and, when sync behavior matters, ask the user to check another device. `info --json` reports private rich-link URLs in `url`, parent and subtask image attachments in `attachments`, normal and location alarms in `alarms`, Early Reminders in `earlyReminder`/`earlyReminders`, and keeps actual `dueDate` separate from Reminders' optional `displayDate`. `lists --json` and `smart-lists --json` expose persisted `color`, `badge`, and `badgeEmblem` fields for appearance verification. Verify list group writes with `remctl group-info <group> --json`, `remctl groups --json`, `remctl lists --json`, and `remctl show <group-or-child-list> --json` when task preservation matters. Agents should not query SQLite directly for ordinary reminder metadata verification. For Groceries categorization, verify with `remctl show <list> --json` because the section membership lives on the list grouping rather than only in the reminder detail payload. For templates, verify with `remctl templates --json` or `remctl template-info`, then verify applied template lists with `remctl show <new list> --json`. Do not ask RemCTL to mutate individual saved reminders inside a template; current support is whole-list template create/apply/delete. Do not assume a CloudKit-clean row means the Reminders UI displays it; generic files and PDFs were the counterexample and are intentionally rejected.
+After a write, verify the result through MCP, or through the CLI when testing it explicitly:
+
+| Change | Readback |
+| --- | --- |
+| Reminder fields, tags, links, images, subtasks, assignment, alarms | `get_reminder` / `info ID --json` |
+| List appearance and pins | `lists` / `lists --json` |
+| Smart-list appearance, filters, and pins | `run` with `smart-lists --json` |
+| Groups | `run` with `group-info GROUP --json` |
+| Groceries sections and list order | `show_list` / `show LIST --json` |
+| Templates | `run` with `template-info NAME --json`; after applying, read the new list |
+
+Do not read SQLite directly for routine verification. A saved row alone does not prove that Reminders displays or syncs a feature. Ask the user to check another device when cross-device sync is part of the task.

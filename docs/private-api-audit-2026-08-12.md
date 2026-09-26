@@ -1,19 +1,21 @@
 # RemCTL private ReminderKit audit
 
+Historical test record. Versions, counts, and results below describe the dated runs, not the current installation.
+
 Date: 2026-08-12
 
-## Verdict: limited adoption
+## Decision
 
 RemCTL should adopt MachOSwiftSection as a manual compatibility and drift-audit tool. It should not link `ReminderKitInternal` or rewrite the working Objective-C helper around recovered Swift declarations.
 
-`remctl-private` is the Objective-C helper that RemCTL launches for metadata EventKit cannot write: tags, sections, subtasks, smart lists, templates, groceries, rich URLs, assignments, Early Reminders, and related list properties. It links only `ReminderKit`, Foundation, and AppKit. The audited v1.6.1 and compatibility follow-up used helper protocol 1; the later reminder-ordering follow-up below raises that boundary to protocol 2.
+`remctl-private` is the Objective-C helper that RemCTL launches for metadata EventKit cannot write: tags, sections, subtasks, smart lists, templates, groceries, rich URLs, assignments, Early Reminders, and related list properties. It links only `ReminderKit`, Foundation, and AppKit. The audited v1.6.1 and compatibility follow-up used helper protocol 1; the later reminder-ordering follow-up below raises the helper protocol to 2.
 
-The audit found two genuine current-host incompatibilities:
+The audit found two incompatibilities on the tested host:
 
 1. Grocery fallback categorization calls a removed selector.
 2. Built-in smart-list pinning depends on a fetch selector that no longer exists.
 
-Neither invalidates the CLI as a whole. Grocery items normally auto-categorize before the broken fallback runs, which explains why the CLI still works well.
+Grocery items normally sort automatically, so the broken fallback runs only when that sorting fails.
 
 The original audit changed no Reminders data and did not install, commit, push, or modify product code. The cross-version follow-up below is a separate implementation and validation pass.
 
@@ -21,7 +23,7 @@ The original audit changed no Reminders data and did not install, commit, push, 
 
 The compatibility target is Golden Gate `27.0` build `26A5406e` on the Mac Studio and the previous Tahoe release `26.2` build `25C56` on an M4 Mac mini. The Mini has Apple Command Line Tools `26.6`, Swift `6.3.3`, clang `21.0.0`, system Python `3.9.6`, and an existing `uv` Python `3.12.13`; full Xcode and Homebrew are not required. MachOSwiftSection `0.15.1` was built natively for arm64 from the pinned source checkout and installed at `~/.local/bin/swift-section` on the Mini.
 
-The implementation deliberately keeps the Objective-C helper and its protocol-1 compatibility boundary:
+The implementation deliberately keeps the Objective-C helper and its protocol-1 compatibility:
 
 1. `REMColor.colorSpace` now uses the runtime-correct unsigned declaration.
 2. Grocery fallback dispatch supports two receiver/argument contracts. Tahoe retains `categorizeGroceryItemsWithReminderIDs:` on the grocery-context change with UUID values. Golden Gate calls `autoCategorizeRemindersWithReminderIDs:` on the list change with `REMObjectID` values. A selector-name-only Golden Gate substitution failed. A Tahoe `REMObjectID` experiment was rejected because it tombstoned the disposable objects.
@@ -174,9 +176,9 @@ There are:
 | Lists and groups | Account/list change objects, group contexts; actions [remctl-private.m:775](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L775) | `list-create`, grouping, list delete/move; tests [test_cli.py:959](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L959) | **Objective-C** | Current selectors and scalar encodings are present. |
 | Sections | Section change/context and membership classes; actions [remctl-private.m:988](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L988) and [remctl-private.m:1724](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1724) | Section CRUD and assignment; tests [test_cli.py:7426](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L7426) | **Both** | Actual section change objects forward `remObjectID` and `setDisplayName:` successfully. Swift metadata exposes typed section fetches and membership/order protocols. |
 | Smart lists | Lines 61–83; create/edit/delete [remctl-private.m:1081](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1081); pin [remctl-private.m:1461](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1461) | Smart-list commands; tests [test_cli.py:2542](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L2542) | **Both plus assumptions** | Custom change setters forward correctly. Generic smart-list fetch is absent; built-in pinning is broken. Swift metadata exposes `REMCustomSmartListFilterDescriptor` and a separate non-custom fetch API. |
-| Templates | Lines 85–96; actions [remctl-private.m:1245](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1245) | Template commands; tests [test_cli.py:1496](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L1496) | **Objective-C; partial Swift** | Template context and `fetchTemplatesWithError:` are present. No safer production replacement surfaced. |
+| Templates | Lines 85–96; actions [remctl-private.m:1245](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1245) | Template commands; tests [test_cli.py:1496](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L1496) | **Objective-C; partial Swift** | Template context and `fetchTemplatesWithError:` are present. No tested replacement was found. |
 | Appearance | Lines 174–186; actions [remctl-private.m:1378](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1378) | List/smart-list appearance; tests [test_cli.py:1856](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L1856) | **Objective-C** | Color, badge, and pin selectors exist. One `REMColor` parameter is declared with the wrong signedness. |
-| Groceries | Lines 168–172; metadata helper [remctl-private.m:340](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L340); explicit categorizer [remctl-private.m:1508](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1508) | `--grocery`; orchestration [remctl:4972](https://github.com/viticci/remctl/blob/90ebd57/remctl#L4972); tests [test_cli.py:2176](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L2176) | **Both plus obsolete assumption** | Conversion and locale setters exist. Explicit fallback selector changed. Swift metadata also shows substantial grocery contract churn. |
+| Groceries | Lines 168–172; metadata helper [remctl-private.m:340](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L340); explicit categorizer [remctl-private.m:1508](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1508) | `--grocery`; orchestration [remctl:4972](https://github.com/viticci/remctl/blob/90ebd57/remctl#L4972); tests [test_cli.py:2176](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L2176) | **Both plus obsolete assumption** | Conversion and locale setters exist. Explicit fallback selector changed. Swift metadata also shows substantial grocery API changes. |
 | Tags and rich URLs | Hashtag and attachment contexts, lines 125–133; dispatch [remctl-private.m:1678](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1678) | `--tags`, `--url`, replacement/removal tests [test_cli.py:7301](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L7301) | **Objective-C** | Existing APIs are present. No better Swift path justified another dependency. |
 | Images | `addImageAttachmentWithURL:width:height:error:` line 126; use [remctl-private.m:1796](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1796) | `--image` and private-add tests | **Objective-C** | Signature and unsigned dimensions match runtime encoding. |
 | Subtasks and clone | `REMSaveRequest` additions/copy methods lines 33–35; use [remctl-private.m:1586](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1586) and [remctl-private.m:1693](https://github.com/viticci/remctl/blob/90ebd57/remctl-private.m#L1693) | Subtask tests [test_cli.py:3394](https://github.com/viticci/remctl/blob/90ebd57/tests/test_cli.py#L3394) | **Both** | Current Objective-C methods exist. Swift metadata added a subtask context type, but it does not remove the need for exception handling. |
@@ -277,7 +279,7 @@ These paths are temporary and are not intended as durable repository artifacts.
 
 ## Recovered Swift contracts
 
-High-value declarations included:
+Recovered declarations included:
 
 - `REMStore.fetchReminder(...) async throws`
 - `REMStore.fetchReminders(...) async throws`
@@ -311,9 +313,9 @@ All experiments ran headlessly from temporary binaries and never called save.
 - Temporary helper protocol handshake returned version 1.
 - ReminderKit enumeration averaged 0.38 seconds in the initial five-run probe; full SQLite JSON export averaged 5.86 seconds.
 
-That performance comparison is directional, not equivalent. The SQLite export materializes richer fields. More importantly, ReminderKit enumeration did not achieve count parity. It must not replace SQLite yet.
+That performance comparison is directional, not equivalent. The SQLite export includes more fields, and ReminderKit returned fewer reminders. It must not replace SQLite yet.
 
-## Five highest-value opportunities
+## Follow-up options
 
 | Rank | Opportunity | Benefit | Confidence | Risk |
 |---:|---|---|---|---|
@@ -333,8 +335,8 @@ That performance comparison is directional, not equivalent. The SQLite export ma
 - The newest Simulator’s ReminderKit executable is cache-only, but the installed runtime has no inspectable cache file. Its UUID and Objective-C surface are therefore unverifiable.
 - Simulator contracts are not macOS contracts. The host framework version, `4046.21`, is newer than Simulator `4043`.
 - Swift metadata proves ABI declarations. It does not prove entitlements, TCC behavior, headless compatibility, CloudKit synchronization, or production safety.
-- Field layouts are useful only for selected Swift values. Reimplementing Objective-C objects from offsets would be reckless.
-- Typed async APIs are attractive, but linking `ReminderKitInternal` would increase—not reduce—the number of private contracts RemCTL depends on.
+- Field layouts are useful only for selected Swift values. Reimplementing Objective-C objects from offsets is unsupported.
+- Using the recovered async APIs would add a private `ReminderKitInternal` dependency.
 - The read APIs did not return the same reminder/section coverage as SQLite.
 - At the time of the original read-only audit, compilation proved only that a declaration was linkable. The follow-up above separately tests the grocery write semantics and keeps built-in smart-list pinning disabled where the generic fetch is absent.
 
@@ -396,7 +398,7 @@ Warn, but do not fail, for:
 - C-imported declarations skipped by MachOSwiftSection.
 - Simulator-only changes.
 - Layout changes in types RemCTL does not instantiate.
-- New attractive APIs with no headless or entitlement proof.
+- New APIs with no headless or entitlement proof.
 
 ## Original recommendations and follow-up disposition
 

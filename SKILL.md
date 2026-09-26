@@ -75,7 +75,7 @@ Upgrades: `git pull && ./install.sh`, then `doctor`. Run `onboard` again only wh
 
 - Use the numeric `id` from JSON for `info`, `edit`, `done`, `undone`, `delete`, `link`, `open`, and `subtasks`. Never pass a UUID from `deepLink`.
 - Give deterministic due dates: `YYYY-MM-DD` for all-day reminders, `YYYY-MM-DD HH:MM` for timed ones, resolved in the user's time zone. `clear` removes a due date. An unparseable date stops the command before any write and returns `code: "invalid_due_date"` with examples; retry with a corrected value.
-- Destructive commands (`delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, `template-delete`) need `--force` with `--json` or without a terminal. Without it, nothing is written and stderr carries `code: "confirmation_required"`. Confirm with the user before deleting.
+- Destructive commands (`delete`, `list-delete`, `section-delete`, `group-delete`, `smart-list-delete`, `template-delete`) need `--force` with `--json` or without a terminal. Without it, nothing is written and stderr carries `code: "confirmation_required"`. Delete only with user authorization; an explicit deletion request already provides it.
 - Target lists by name or by `--list-id`, never both. Names resolve exact, then case-insensitive, then normalized (`Weekly 513` matches `🗓️ Weekly 513`). If several lists match, the command stops and lists candidate ids; use `--list-id`. Groups are not valid targets for reminder writes.
 - Do not pass `--private` for recurrence, alarms, priority, notes, or ordinary list moves; those are EventKit features. Use `--private` only for the metadata in [Private metadata](#private-metadata), or when the user asks for it.
 - Do not use `--via-eventkit` unless the task explicitly accepts limited data. It returns `eventKitId` values that no numeric-id command accepts, and no sections, tags, or private fields.
@@ -140,7 +140,7 @@ remctl section-create "Research" -l Projects --private --json
 
 Rules:
 
-- Rich URLs must be public `http` or `https` hosts. Without `--private`, `--url` only appends to the notes and `-t` only adds `#hashtags` to the title.
+- Rich URLs must be public `http` or `https` hosts. Without `--private`, `--url` appends to existing notes (or to an explicit replacement from `--notes`); `add -t` adds title `#hashtags`, while `edit -t` requires `--private`.
 - Rich links and images are additive; RemCTL never removes or replaces existing ones. Generic files and PDFs are rejected.
 - `--section` resolves by name; with duplicate names in one list, RemCTL uses the single non-empty one, otherwise use `--section-id`. Section create and rename refuse duplicate names.
 - `--assign` accepts a unique name, an email or phone address, the numeric sharee `id`, the `objectUUID`, or `me`. Call `sharees LIST --json` first and prefer the address or an id.
@@ -181,7 +181,7 @@ When debugging a date mismatch, compare `dueDate`, `displayDate`, and `alarms` b
 | Signal | Meaning | Action |
 | --- | --- | --- |
 | `code: "invalid_due_date"` | Due date not parseable; nothing written | Retry with `YYYY-MM-DD` or `YYYY-MM-DD HH:MM` |
-| `code: "confirmation_required"` | Destructive command without `--force`; nothing written | Confirm with the user, add `--force` |
+| `code: "confirmation_required"` | Destructive command without `--force`; nothing written | Confirm authorization, then add `--force` |
 | `status: "partial"` | Reminder created, a private step failed | `edit` the returned `numericId`; do not `add` again |
 | Batch `uncertain` ids, `code: "completion_uncertain"` or `"write_uncertain"` | A write may have landed | `get_reminder` each id before retrying; never complete a repeating reminder again blindly |
 | `code: "location_…"` | Address lookup refused; nothing written | Follow the message: fuller address, a candidate's coordinates, or ask the user |

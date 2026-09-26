@@ -32,7 +32,7 @@ PREFIX="$HOME/.local" ./install.sh --bootstrap
 
 `--bootstrap` copies the CLI, compiles the helpers, builds the sealed host runtime, signs `~/Applications/RemCTL Capability Host.app`, installs `~/Library/LaunchAgents/net.macstories.remctl.capability-host.plist`, starts the host socket at `~/Library/Application Support/RemCTL/capability-host.sock`, creates `~/.config/remctl`, installs shell completion, and creates the `rctl` and `reminders` aliases. A custom `PREFIX` moves the app, the LaunchAgent, and the socket under that prefix; `remctl doctor` reports the paths.
 
-The install is transactional. The installer stages a complete generation, verifies it, and only then replaces the previous one. It records file ownership in `.remctl-install-manifest.json`, and it restores the previous generation if anything fails.
+Installation replaces the app and its files together. The installer stages a complete generation, verifies it, and only then replaces the previous one. It records file ownership in `.remctl-install-manifest.json`, and it restores the previous generation if anything fails.
 
 If the installer prints `PATH action required`, add the line it shows to your shell profile and open a new terminal.
 
@@ -54,7 +54,7 @@ The step lists each grant with a check mark or a fix.
 
 **Step 2: Health check.** RemCTL confirms the host is ready and reads today's reminders.
 
-**Step 3: Connect your AI apps.** RemCTL looks for Claude Code, Codex, and Claude Desktop on the Mac. For each one it finds, it asks whether to connect it, then registers the MCP server through that app's own mechanism. Apps that are already connected show a check mark. See [mcp.md](mcp.md).
+**Step 3: Connect your AI apps.** RemCTL looks for Claude Code, Codex, and Claude Desktop on the Mac. For each one it finds, it asks whether to connect it, then registers the MCP server in that app's configuration. Apps that are already connected show a check mark. See [mcp.md](mcp.md).
 
 **Step 4: Your other devices (optional).** This step appears only when Tailscale is installed. RemCTL offers to serve the MCP tools to your other tailnet devices over HTTPS with a private token, and prints the command to run on those devices. The default answer is no.
 
@@ -73,7 +73,7 @@ remctl today
 
 The Capability Host is the single macOS privacy target. Terminal, scripts, AI apps, and the MCP server use its grants through the owner-only socket. Do not grant Reminders, Automation, or Full Disk Access to Terminal, Python, Hermes, Codex, or Claude; they do not need it.
 
-`remctl doctor --for-agent --json` reports two things: `access.direct` (what the current process could do on its own) and `access.effective` (what RemCTL can do through the host). `access.effective` is the one that matters. A blocked direct result is normal.
+`remctl doctor --for-agent --json` reports two things: `access.direct` (what the current process could do on its own) and `access.effective` (what RemCTL can do through the host). Use `access.effective` to check readiness. A blocked direct result is normal.
 
 ### Full Disk Access by hand
 

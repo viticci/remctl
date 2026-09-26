@@ -1,5 +1,7 @@
 # Installed RemCTL 2.0 runtime review
 
+Historical test record. Versions, counts, and results below describe the dated runs, not the current installation.
+
 Reviewed the Mac's installed RemCTL 2.0 client against local `main` at
 `ae15dd8`. The ten Python/client/widget files matched the checkout byte for
 byte. The branch was 14 commits ahead of the recorded `origin/main`; this

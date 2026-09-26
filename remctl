@@ -512,10 +512,10 @@ def validate_list_color(value, *, private=False):
         return
     if private:
         ok = is_supported_private_list_color(value)
-        examples = "red, orange, yellow, green, blue, purple, brown, gray, cyan, or #RRGGBB"
+        examples = "red, orange, yellow, green, blue, purple, brown, gray, cyan, teal, or #RRGGBB"
     else:
         ok = is_supported_public_list_color(value)
-        examples = "red, orange, yellow, green, blue, purple, brown, gray, or cyan"
+        examples = "red, orange, yellow, green, blue, purple, brown, gray, cyan, or teal"
     if not ok:
         print(f"Error: unsupported list color {value!r}. Use {examples}.", file=sys.stderr)
         sys.exit(1)
@@ -9785,6 +9785,14 @@ def cmd_edit(a):
         # Last check before the first write: a failed lookup changes nothing.
         resolve_location_address_or_die(a)
 
+    # An omitted --notes preserves the current body; an explicit value replaces it.
+    # Compute once so a bridge failure cannot append the URL twice on fallback.
+    notes_body = a.notes
+    if getattr(a, "url", None) and not wants_private:
+        if notes_body is None:
+            notes_body = _row_get(r, "ZNOTES")
+        notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
+
     # Auto double-tap: if Reminders' displayed due date already equals the
     # requested target, AppleScript treats it as a no-op and pushes only
     # lastModifiedDate. Force a real value change by setting an intermediate
@@ -9866,11 +9874,6 @@ def cmd_edit(a):
         if target_list_ref:
             data.update(bridge_list_target_payload(target_list_ref))
             has_changes = True
-        # Merge url into notes to keep URL-append semantics identical across
-        # bridge and AppleScript paths.
-        notes_body = a.notes
-        if hasattr(a, 'url') and a.url and not wants_private:
-            notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
         if notes_body is not None:
             data["notes"] = notes_body
             has_changes = True
@@ -9986,7 +9989,7 @@ def cmd_edit(a):
         or target_list_ref
     )
     has_applescript_fields = bool(
-        a.title or a.notes or a.due or a.priority
+        a.title or notes_body is not None or a.due or a.priority
         or (hasattr(a, 'url') and a.url and not wants_private)
     )
 
@@ -10004,10 +10007,7 @@ def cmd_edit(a):
             parts.append(as_date_assign(dt))
         if a.title:
             parts.append(f'set name of r to "{esc(a.title)}"')
-        notes_body = a.notes
-        if hasattr(a, 'url') and a.url and not wants_private:
-            notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
-        if notes_body:
+        if notes_body is not None:
             parts.append(f'set body of r to "{esc(notes_body)}"')
         if priority_value is not None:
             parts.append(f"set priority of r to {priority_value}")
@@ -10986,7 +10986,7 @@ def cmd_list_create(a):
         return
     data = {"action": "create_list", "title": a.name}
     if hasattr(a, 'color') and a.color and is_supported_public_list_color(a.color):
-        data["color"] = a.color
+        data["color"] = normalize_list_color(a.color)
     before_ids = list_ids_named_or_empty(a.name)
     bridge_result = None
     result = None

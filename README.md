@@ -2,13 +2,9 @@
 
 ![RemCTL](https://cdn.macstories.net/images/uploads/2026/05/26/cleanshot-2026-05-26-at-1629152x-1779805785287-9271e938c2.png)
 
-RemCTL is a command-line tool and an MCP server for Apple Reminders on macOS. It is built for two kinds of users: people who work in a terminal, and AI apps that call tools.
+RemCTL reads and changes Apple Reminders from the terminal or an AI app through MCP (Model Context Protocol). It supports reminders, lists, sections, tags, subtasks, smart lists, templates, and import/export.
 
-- **The CLI.** `remctl today`, `remctl add "Buy milk" -d tomorrow`, `remctl show Work --json`. Fifty-six commands cover reminders, lists, sections, groups, smart lists, templates, import, and export.
-- **The MCP server.** `remctl mcp` gives Claude Code, Claude Desktop, Cowork, Codex, and any other MCP client fifteen typed reminder tools, an interactive reminders widget, and access from your other devices over Tailscale.
-- **One permission owner.** A signed app, `RemCTL Capability Host.app`, holds the macOS grants. Terminal, agents, and the MCP server go through it, so no other app needs Full Disk Access.
-
-RemCTL reads the local Reminders database for speed and detail. It writes through Apple's public EventKit API, so changes sync through iCloud like any other edit. An optional `--private` mode writes Reminders-only metadata (sections, tags, subtasks, images, smart lists, templates) through Apple's private ReminderKit framework.
+A signed app, **RemCTL Capability Host**, holds the macOS permissions. Terminal, Python, and AI apps use that host and need no separate grants. Reads use the local Reminders database; writes use Apple's EventKit API or, with `--private`, its private ReminderKit framework.
 
 ## Requirements
 
@@ -27,16 +23,9 @@ cd remctl
 ~/bin/remctl onboard
 ```
 
-`install.sh` copies the CLI to `~/bin`, builds and signs the Capability Host, installs its LaunchAgent, and installs shell completion. `remctl onboard` then walks you through four steps:
+The installer builds the signed host, installs the CLI in `~/bin`, and adds a background service. `onboard` guides permission setup, checks the installation, and offers to connect AI apps and other devices through Tailscale. Run `remctl doctor` to check readiness.
 
-1. **macOS permissions.** The host asks for Reminders and Automation access. If Full Disk Access is missing, a helper shows the exact app to add in System Settings.
-2. **Health check.** RemCTL confirms the host is ready and reads today's reminders.
-3. **Connect your AI apps.** RemCTL finds Claude Code, Codex, and Claude Desktop on the Mac and asks, one at a time, whether to connect them. It uses each app's own settings; you never edit a config file.
-4. **Your other devices (optional).** If Tailscale is installed, RemCTL offers to serve the same tools to your other tailnet devices over HTTPS with a private token.
-
-Every step is optional after the first. Run `remctl onboard` again at any time; it shows what is already done and only asks about what is missing. Run `remctl doctor` to check the installation.
-
-Details, including the manual Full Disk Access steps, are in [docs/installation.md](docs/installation.md).
+See [installation](docs/installation.md) for requirements, permissions, and custom paths.
 
 ## Use the CLI
 
@@ -84,7 +73,9 @@ remctl mcp bundle --open                    # or a one-click .mcpb extension for
 remctl mcp status
 ```
 
-Tools: `today`, `upcoming`, `overdue`, `flagged`, `search`, `show_list`, `lists`, `get_list`, `get_reminder`, `resolve_location`, `create_reminder`, `update_reminder`, `set_completion`, `set_flagged`, `delete_reminder`, `create_list`, `update_list`, `doctor`, and `run` (any other CLI command with exact arguments). Search is paged and can be scoped to one list; completion and deletion take batches; `private: true` unlocks synced tags, rich links, sections, subtasks, assignment, Early Reminders, and location alarms, including ones set from a street address. Each tool has a schema, annotations, and structured results. In Claude Desktop and other hosts that support MCP Apps, results render as a reminders widget with check-off, reschedule, rename, and delete.
+The server provides 19 tools for reading, creating, and editing reminders and lists. Search supports pages and list filters; completion and deletion support batches. Private metadata requires `private: true`. The `run` tool handles other data commands.
+
+Clients that support MCP Apps can show a reminders widget with completion, rescheduling, renaming, and deletion. [The MCP guide](docs/mcp.md) covers tools and connections; [the Hermes guide](docs/hermes.md) covers Hermes Agent.
 
 Serve the same tools to your other devices:
 
@@ -94,40 +85,17 @@ remctl mcp install --client tailscale
 
 This starts a small HTTPS endpoint that only devices on your Tailscale network can reach, protected by a private token. RemCTL prints the exact commands to run on the other device. See [docs/mcp.md](docs/mcp.md) for the tool reference, protocol details (MCP 2026-07-28 with compatibility back to 2024-11-05), the widget, and troubleshooting.
 
-## How it works
+## Permissions and architecture
 
-```text
-AI app (Claude Code, Claude Desktop, Cowork, Codex, other MCP clients)
-  -> remctl mcp        stdio, or HTTPS over Tailscale
-     -> remctl <command> --json
+The Capability Host needs Full Disk Access to read the database, Reminders access for EventKit, and Automation access for AppleScript. It starts at login and serves commands through a socket accessible only to your user account. RemCTL never writes directly to the database.
 
-Terminal, scripts, agents
-  -> remctl client (Python 3.10+)
-     -> 7 setup commands run in the caller
-     -> 51 data commands go over an owner-only socket to
-        RemCTL Capability Host.app (signed, always running)
-           reads:   the Reminders SQLite database (Full Disk Access)
-           writes:  EventKit through remctl-bridge (Reminders access)
-           flags:   AppleScript (Automation access)
-           private: ReminderKit through remctl-private (--private only)
-```
-
-- Database reads return sections, subtasks, tags, attachments, deep links, list colors, recurrence, alarms, and Early Reminders in milliseconds. RemCTL opens the database read-only and never writes to it.
-- EventKit writes keep Reminders and iCloud in charge of sync.
-- The host is the only macOS privacy target. Its signature stays the same across upgrades, so the grants survive.
-- `REMCTL_CAPABILITY_HOST=auto` (default) uses the host when installed. `force` requires it. `direct` bypasses it for diagnostics, in which case the caller needs its own permissions.
-
-[docs/architecture.md](docs/architecture.md) has the full picture, including the data model.
-
-## Permissions
-
-The Capability Host needs three grants: Reminders, Automation for the Reminders app, and Full Disk Access. `remctl onboard` requests the first two and guides you through the third, which macOS only allows by hand. If you change Full Disk Access later, restart the host:
+`onboard` requests Reminders and Automation access and explains how to grant Full Disk Access. After changing Full Disk Access, restart the host:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/net.macstories.remctl.capability-host"
 ```
 
-Do not grant these permissions to Terminal, Python, or an AI app. They are not needed. [docs/installation.md](docs/installation.md#permissions) has the details.
+See [permissions](docs/installation.md#permissions) and [architecture](docs/architecture.md).
 
 ## Private metadata
 
@@ -139,14 +107,14 @@ remctl edit 23880 --private --set-tags remctl,work
 remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
 ```
 
-These writes use Apple's private ReminderKit framework through a small helper. They never touch the database directly. Apple can change them in any macOS release, so treat them as a power-user feature. [docs/private-metadata.md](docs/private-metadata.md) lists what is supported and how to verify each write.
+These writes use Apple's private ReminderKit framework through a small helper. They never touch the database directly. Apple can change these APIs in any macOS release. [docs/private-metadata.md](docs/private-metadata.md) lists what is supported and how to verify each write.
 
 ## For agents
 
-Read [SKILL.md](SKILL.md). In short:
+Read [SKILL.md](SKILL.md).
 
 - If the RemCTL MCP server is connected to your host, use its tools. They validate arguments and return the same numeric ids as the CLI.
-- Otherwise call the installed CLI with `--json` and use the absolute path (`~/bin/remctl`).
+- If MCP is unavailable, repair the connection. Use the CLI for setup, diagnostics, or an explicit CLI request.
 - Use deterministic due dates (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`). Pass `--force` to destructive commands. Verify writes with `info <id> --json`.
 - `remctl doctor --for-agent --json` reports readiness. `access.effective` is the answer that matters.
 
@@ -173,6 +141,7 @@ The uninstaller stops the host, removes the app, the LaunchAgent, the socket, an
 - [Installation and onboarding](docs/installation.md)
 - [Command guide](docs/commands.md)
 - [MCP server](docs/mcp.md)
+- [Hermes Agent](docs/hermes.md)
 - [Private metadata](docs/private-metadata.md)
 - [Architecture](docs/architecture.md)
 - [Agent manual](SKILL.md)

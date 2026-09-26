@@ -1,6 +1,6 @@
 # Hermes Agent
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) is Nous Research's open-source AI agent. It can use tools from MCP servers, and it ships skills for common apps. This page connects RemCTL to Hermes on the Mac where RemCTL is installed.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) is Nous Research's open-source AI agent. It can connect to RemCTL over MCP on the Mac where RemCTL is installed.
 
 ## RemCTL is not remindctl
 
@@ -36,7 +36,7 @@ Hermes bundles a skill named `apple-reminders`. That skill runs [`remindctl`](ht
    ```
 
 3. Merge it into `mcp_servers` in `~/.hermes/config.yaml`. If the file already has an `mcp_servers:` key, add only the `remctl:` block under it.
-4. Start a new Hermes session. Hermes lists the tools as `remctl` tools: `today`, `search`, `create_reminder`, `set_completion`, and the rest in [mcp.md](mcp.md#tools).
+4. Run `hermes mcp test remctl` to check the connection. Then start a new Hermes session. Hermes lists the tools as `remctl` tools: `today`, `search`, `create_reminder`, `set_completion`, and the rest in [mcp.md](mcp.md#tools).
 
 The command uses an absolute Python path so it works when Hermes starts with a minimal `PATH`. For a Homebrew Python it is the stable `opt` path, so `brew upgrade` does not break it.
 
@@ -70,45 +70,3 @@ mcp_servers:
 ```
 
 Put `REMCTL_MCP_TOKEN=<token>` in `~/.hermes/.env` on that machine.
-
-## Draft catalog entry
-
-Hermes also has a curated MCP catalog in its repository (`optional-mcps/<name>/manifest.yaml`), added only by pull request. This draft follows its manifest format. It has not been submitted.
-
-```yaml
-# Nous-approved MCP catalog entry.
-# Presence in this directory = approval. Merged via PR review.
-manifest_version: 1
-
-name: remctl
-description: >-
-  Apple Reminders on this Mac: lists, sections, subtasks, tags, due dates,
-  location alarms, and batches, through a signed permission host.
-source: https://github.com/viticci/remctl
-
-# Local stdio server. RemCTL's installer puts `remctl` in ~/bin; the signed
-# RemCTL Capability Host holds every macOS permission, so Hermes needs none.
-transport:
-  type: stdio
-  command: remctl
-  args: ["mcp"]
-
-auth:
-  type: none
-
-suggest:
-  keywords:
-    - reminders
-    - apple reminders
-    - remctl
-
-post_install: |
-  RemCTL must be installed on this Mac first:
-    git clone https://github.com/viticci/remctl && cd remctl
-    ./install.sh --bootstrap
-    remctl onboard
-  onboard grants Reminders, Automation, and Full Disk Access to RemCTL
-  Capability Host only. Never grant them to Hermes, Terminal, or Python.
-  If Hermes cannot find `remctl`, replace this entry with the output of
-  `remctl mcp config --format hermes`, which uses absolute paths.
-```

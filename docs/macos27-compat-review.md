@@ -1,5 +1,7 @@
 # macOS 27 Golden Gate Compatibility Review
 
+Historical test record. Versions, counts, and results below describe the dated runs, not the current installation.
+
 Date: 2026-06-12
 
 Host:
@@ -76,7 +78,7 @@ The live EventKit edit matrix passed all 8 cases:
 The live private ReminderKit matrix passed all covered paths:
 
 - private helper availability
-- guardrails for private-only metadata
+- validation for private-only metadata
 - list create/edit/pin/unpin with private appearance
 - Groceries list creation and grocery item categorization
 - rich reminder metadata: URL, tags, section, subtask, image, urgent, flag, Early Reminder
@@ -88,7 +90,7 @@ Both matrices cleaned up their disposable data; follow-up searches found no rema
 
 ## Local Patch
 
-Two compatibility hardening changes were made:
+Two compatibility changes were made:
 
 1. `lists --json` now exposes the optional grocery cache/predefined-section metadata when present.
 2. Early Reminder readback/removal now falls back to `ZREMCDDUEDATEDELTAALERT` if `ZDUEDATEDELTAALERTSDATA` is absent or stops being mirrored in a future macOS 27 build.
@@ -121,6 +123,6 @@ Results:
 - Private ReminderKit live matrix: passed.
 - Installed CLI doctor after the zsh `fpath` fix: 11 checks, 0 warnings, 0 failures. Current RemCTL also reports an explicit `eventkit` write-access check, so modern healthy runs include that additional check.
 
-## Current Take
+## Result on the tested build
 
 RemCTL is compatible with this macOS 27 Golden Gate beta build. No breaking Reminders database, EventKit, or ReminderKit change showed up in local testing. The only observed schema additions worth acting on now are defensive: expose grocery cache metadata and use the normalized Early Reminder table as a fallback.

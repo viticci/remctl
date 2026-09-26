@@ -225,9 +225,12 @@ func colorForName(_ name: String) -> CGColor? {
         "purple": (0.69, 0.32, 0.87),
         "brown":  (0.64, 0.52, 0.37),
         "cyan":   (0.35, 0.78, 0.98),
+        "gray":   (91.0 / 255, 98.0 / 255, 106.0 / 255),
+        "teal":   (48.0 / 255, 176.0 / 255, 199.0 / 255),
     ]
     guard let (r, g, b) = map[name.lowercased()] else { return nil }
-    return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+    let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    return CGColor(colorSpace: space, components: [r, g, b, 1.0])
 }
 
 // MARK: - Helpers
@@ -871,7 +874,8 @@ case "create_list":
         fail("No iCloud Reminders source found")
     }
     cal.source = source
-    if let colorName = cmd.color, let cg = colorForName(colorName) {
+    if let colorName = cmd.color {
+        guard let cg = colorForName(colorName) else { fail("Unsupported list color: \(colorName)") }
         cal.cgColor = cg
     }
     do {
