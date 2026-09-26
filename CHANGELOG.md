@@ -8,6 +8,13 @@
 - Private rich links accept hostname DNS results in the fake-IP range used by TUN proxies. Literal fake-IP targets and other private DNS results remain blocked.
 - JSON import and subtask JSON accept exported recurrence objects, including weekday positions, date filters, occurrence counts, and end dates. Invalid rules fail validation before writing.
 
+### Installation fixes
+
+- Custom-prefix installs place the LaunchAgent in `~/Library/LaunchAgents` so it starts at login. Upgrades migrate the old prefix-based plist after checking ownership, and restore it if publication fails.
+- Protected Python errors identify the failing path, owner, mode, and condition. Installation docs explain the group-write repair needed by some python.org installs.
+- The host uses the spawn working-directory function declared by older macOS SDKs.
+- `doctor` distinguishes an unloaded signed host from missing permissions and gives its startup command.
+
 ### Notes, list colors, and live tests
 
 - `edit ID --url URL` preserves existing notes. An explicit `--notes` value replaces them before appending the URL. The AppleScript fallback also supports clearing notes with `--notes ""`.

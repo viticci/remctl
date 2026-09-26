@@ -36,7 +36,7 @@ PREFIX_WAS_SET=0
 if [[ -n "${PREFIX+x}" ]]; then PREFIX_WAS_SET=1; fi
 PREFIX="${PREFIX:-$HOME}"
 APP_DIR="${REMCTL_APP_DIR:-$PREFIX/Applications}"
-LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$PREFIX/Library/LaunchAgents}"
+LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 APP_PATH="$APP_DIR/RemCTL Capability Host.app"
 HOST_EXECUTABLE="$APP_PATH/Contents/MacOS/RemCTL Capability Host"
 AGENT_LABEL="net.macstories.remctl.capability-host"
@@ -58,6 +58,12 @@ fi
 
 if [[ "$SKIP_LAUNCHSERVICES" == "1" && "$PREFIX" == "$HOME" ]]; then
     fail "REMCTL_SKIP_LAUNCHSERVICES is allowed only with a non-home PREFIX."
+fi
+if [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
+    case "$LAUNCH_AGENT_DIR" in
+        "$PREFIX"/*) ;;
+        *) fail "Temp-prefix simulation requires a LaunchAgent directory under PREFIX; set REMCTL_LAUNCH_AGENT_DIR." ;;
+    esac
 fi
 
 safe_config_dir() {
@@ -203,6 +209,15 @@ FILES=(
     .remctl-install-manifest.json
     completions/_remctl completions/_rctl completions/_reminders rctl reminders
 )
+
+# Recognize an unmigrated prefix-based agent only through the signed app marker.
+LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
+if [[ -z "${REMCTL_LAUNCH_AGENT_DIR:-}" && "$AGENT_PATH" != "$LEGACY_AGENT_PATH" &&
+      "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
+    [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; nothing was removed."
+    AGENT_PATH="$LEGACY_AGENT_PATH"
+    app_owned && agent_owned || fail "The legacy LaunchAgent does not match a valid signed installation."
+fi
 
 # An interrupted install owns the recovery decision. Never delete either side.
 check_backup() {

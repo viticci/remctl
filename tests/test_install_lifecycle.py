@@ -157,6 +157,61 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertIn("Resolve the reported checks", install_source)
         self.assertIn("Full Disk Access, Reminders, and Automation grants were not reset", uninstall_source)
 
+    def test_custom_prefix_agent_migrates_and_rolls_back(self) -> None:
+        self.run_script(INSTALL, "--shell-completions", "none")
+        legacy = self.agent
+        original = legacy.read_bytes()
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        destination = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        self.run_script(UNINSTALL, "--dry-run", "--keep-config", environment=environment)
+
+        # An unrelated file at the old path must never be adopted or removed.
+        legacy.write_text("foreign plist")
+        refused = self.run_script(INSTALL, "--shell-completions", "none", environment=environment, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Refusing to migrate", refused.stdout)
+        self.assertEqual(legacy.read_text(), "foreign plist")
+        legacy.write_bytes(original)
+
+        failed_env = dict(environment, REMCTL_TEST_PUBLISH_FAIL_AT="3")
+        failed = self.run_script(INSTALL, "--shell-completions", "none", environment=failed_env, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertFalse(destination.exists())
+        self.assert_installed_contract()
+        self.assert_no_backups()
+
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.assertFalse(legacy.exists())
+        self.agent = destination
+        self.assert_installed_contract()
+        self.assert_no_backups()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(destination.exists())
+        self.assertFalse(self.app.exists())
+
+    def test_simulation_cannot_use_real_home_launchagents_by_default(self) -> None:
+        environment = self.environment.copy()
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        for script in (INSTALL, UNINSTALL):
+            result = self.run_script(script, environment=environment, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires a LaunchAgent directory under PREFIX", result.stdout)
+        self.assertFalse(self.app.exists())
+
+    def test_custom_prefix_new_install_uses_home_launchagents(self) -> None:
+        environment = self.environment.copy()
+        environment["HOME"] = str(self.prefix / "home")
+        environment.pop("REMCTL_LAUNCH_AGENT_DIR")
+        self.run_script(INSTALL, "--shell-completions", "none", environment=environment)
+        self.assertFalse(self.agent.exists())
+        self.agent = Path(environment["HOME"]) / "Library/LaunchAgents" / f"{LABEL}.plist"
+        self.assert_installed_contract()
+        self.run_script(UNINSTALL, "--keep-config", environment=environment)
+        self.assertFalse(self.agent.exists())
+
     def test_bootstrap_rejects_doctor_before_install_work(self) -> None:
         result = self.run_script(INSTALL, "--bootstrap", "--doctor", check=False)
 

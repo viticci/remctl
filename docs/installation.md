@@ -6,7 +6,7 @@ RemCTL is not a Python package. The installer copies the CLI into a bin director
 
 - macOS 14 or later. Release 2.0 is verified on the early macOS 27 build; the command paths also have test coverage on macOS 26.
 - Python 3.10 or later for the CLI.
-- A python.org Python 3.13 or later for the signed host. The official installer places it under `/Library/Frameworks/Python.framework`. The installer finds it; set `REMCTL_CAPABILITY_PYTHON` to a specific executable if it does not. A Homebrew Python works only if it passes the same ownership and permission checks (root-owned, not writable by other users, no ACLs).
+- A python.org Python 3.13 or later for the signed host. The official installer places it under `/Library/Frameworks/Python.framework`. The installer finds it, but stock python.org installations may need the permission repair below; set `REMCTL_CAPABILITY_PYTHON` to a specific executable if it does not. A Homebrew Python works only if it passes the same ownership and permission checks (root-owned, not writable by other users, no ACLs).
 - Xcode Command Line Tools, for the Swift and Objective-C helpers:
 
   ```bash
@@ -15,6 +15,19 @@ RemCTL is not a Python package. The installer copies the CLI into a bin director
 
 - An `Apple Development` signing identity with a Team ID. Check with `security find-identity -v -p codesigning`. Xcode or an Apple Developer account can create one. RemCTL does not use ad-hoc signing for the host, because the grants are tied to the signature. Set `REMCTL_CODESIGN_IDENTITY` to a certificate hash to choose one.
 - iCloud Reminders enabled.
+
+## Protected Python permissions
+
+The signed host requires a root-owned interpreter and import paths that ordinary user processes cannot modify. Some python.org installers create the version directory as `root:admin` with mode `0775`. RemCTL rejects this because any process running as an admin-group user could replace code that runs with the host's permissions.
+
+The installer reports the first failing path, its numeric owner/group, its mode, and the failed check. For a root-owned python.org framework whose only problem is group write permission, remove that permission from the installed version tree. For example, for Python 3.13:
+
+```bash
+sudo chmod -R g-w /Library/Frameworks/Python.framework/Versions/3.13
+./install.sh --bootstrap
+```
+
+Use your actual version directory. Do not run this on Homebrew or unrelated shared directories. If an ancestor above the version tree is also reported as writable, inspect and repair that exact path separately. The installer does not change Python permissions for you or relax its checks. Python updates may restore group write permission; check again and reinstall RemCTL after updating the host interpreter.
 
 ## Install
 
@@ -30,7 +43,9 @@ To install under `~/.local/bin` instead of `~/bin`:
 PREFIX="$HOME/.local" ./install.sh --bootstrap
 ```
 
-`--bootstrap` copies the CLI, compiles the helpers, builds the sealed host runtime, signs `~/Applications/RemCTL Capability Host.app`, installs `~/Library/LaunchAgents/net.macstories.remctl.capability-host.plist`, starts the host socket at `~/Library/Application Support/RemCTL/capability-host.sock`, creates `~/.config/remctl`, installs shell completion, and creates the `rctl` and `reminders` aliases. A custom `PREFIX` moves the app, the LaunchAgent, and the socket under that prefix; `remctl doctor` reports the paths.
+`--bootstrap` copies the CLI, compiles the helpers, builds the sealed host runtime, signs `~/Applications/RemCTL Capability Host.app`, installs `~/Library/LaunchAgents/net.macstories.remctl.capability-host.plist`, starts the host socket at `~/Library/Application Support/RemCTL/capability-host.sock`, creates `~/.config/remctl`, installs shell completion, and creates the `rctl` and `reminders` aliases. A custom `PREFIX` moves the app and socket under that prefix. The LaunchAgent always defaults to `~/Library/LaunchAgents`, which macOS reads at login. `REMCTL_LAUNCH_AGENT_DIR` overrides this location, but the installer warns that other directories do not start automatically. `remctl doctor` reports the paths.
+
+The installer migrates an older `$PREFIX/Library/LaunchAgents` file only when its contents and the signed app identify the same installation. Keep the original `PREFIX` and other overrides when upgrading; remove an old LaunchAgent-directory override to use the new default. A failed migration restores the old app and plist. If the signed app is intact but its job is unloaded, `doctor` prints the exact `launchctl bootstrap` command for the installed plist.
 
 Installation replaces the app and its files together. The installer stages a complete generation, verifies it, and only then replaces the previous one. It records file ownership in `.remctl-install-manifest.json`, and it restores the previous generation if anything fails.
 

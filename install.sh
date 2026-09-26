@@ -25,7 +25,7 @@ Environment:
   PREFIX                      Install root (default: $HOME)
   REMCTL_BIN_DIR              CLI directory (default: PREFIX/bin)
   REMCTL_APP_DIR              App directory (default: PREFIX/Applications)
-  REMCTL_LAUNCH_AGENT_DIR     LaunchAgent directory (default: PREFIX/Library/LaunchAgents)
+  REMCTL_LAUNCH_AGENT_DIR     LaunchAgent directory (default: HOME/Library/LaunchAgents)
   REMCTL_CAPABILITY_PYTHON    Protected Python 3.13+ used by the signed host
   REMCTL_CODESIGN_IDENTITY    Stable signing identity (explicit selection wins)
 
@@ -64,7 +64,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-$HOME}"
 BIN_DIR="${REMCTL_BIN_DIR:-$PREFIX/bin}"
 APP_DIR="${REMCTL_APP_DIR:-$PREFIX/Applications}"
-LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$PREFIX/Library/LaunchAgents}"
+LAUNCH_AGENT_DIR="${REMCTL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 CONFIG_BASE="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_DIR="${REMCTL_CONFIG_DIR:-$CONFIG_BASE/remctl}"
 APP_NAME="RemCTL Capability Host.app"
@@ -72,6 +72,7 @@ APP_PATH="$APP_DIR/$APP_NAME"
 HOST_EXECUTABLE="$APP_PATH/Contents/MacOS/RemCTL Capability Host"
 AGENT_LABEL="net.macstories.remctl.capability-host"
 AGENT_PATH="$LAUNCH_AGENT_DIR/$AGENT_LABEL.plist"
+OLD_AGENT_PATH="$AGENT_PATH"
 SOCKET_PATH="$PREFIX/Library/Application Support/RemCTL/capability-host.sock"
 IDENTITY_MARKER="$BIN_DIR/.remctl-capability-host-signing-identity"
 APP_MARKER="$BIN_DIR/.remctl-capability-host-app"
@@ -106,6 +107,10 @@ done
 CAPABILITY_SIMULATION=0
 if [[ "$SKIP_LAUNCHSERVICES" == "1" && "$PREFIX" != "$HOME" ]]; then
     CAPABILITY_SIMULATION=1
+    case "$LAUNCH_AGENT_DIR" in
+        "$PREFIX"/*) ;;
+        *) fail "Temp-prefix simulation requires a LaunchAgent directory under PREFIX; set REMCTL_LAUNCH_AGENT_DIR." ;;
+    esac
 elif [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
     fail "REMCTL_SKIP_LAUNCHSERVICES is allowed only with a non-home PREFIX."
 fi
@@ -114,6 +119,9 @@ if [[ "${REMCTL_TEST_PUBLISH_FAIL_AT:-0}" != "0" && "$CAPABILITY_SIMULATION" != 
 fi
 if [[ "${REMCTL_TEST_ROLLBACK_FAIL_AT:-0}" != "0" && "$CAPABILITY_SIMULATION" != "1" ]]; then
     fail "REMCTL_TEST_ROLLBACK_FAIL_AT is restricted to temp-prefix simulation."
+fi
+if [[ "$LAUNCH_AGENT_DIR" != "$HOME/Library/LaunchAgents" && "$CAPABILITY_SIMULATION" != "1" ]]; then
+    echo "WARNING: launchd does not load $LAUNCH_AGENT_DIR at login. Use $HOME/Library/LaunchAgents for automatic startup." >&2
 fi
 [[ -n "$CONFIG_DIR" && "$CONFIG_DIR" == /* && "$CONFIG_DIR" != "/" && "$CONFIG_DIR" != "$HOME" && "$CONFIG_DIR" != "$CONFIG_BASE" && "$(basename "$CONFIG_DIR")" == "remctl" ]] || \
     fail "Refusing suspicious config path: $CONFIG_DIR"
@@ -138,7 +146,7 @@ CAPABILITY_PYTHON="$("$CAPABILITY_PYTHON" -I -S -c 'import os,sys; print(os.path
 
 # Validate the interpreter before creating any destination directories.
 if ! "$CAPABILITY_PYTHON" -I -S - "$CAPABILITY_PYTHON" "$CAPABILITY_SIMULATION" <<'PY'
-import grp, os, pwd, stat, subprocess, sys
+import grp, os, pwd, shlex, stat, subprocess, sys
 candidate, simulation = sys.argv[1:]
 candidate = os.path.realpath(candidate)
 def no_acl(path):
@@ -156,14 +164,26 @@ def root_only_wheel():
     except KeyError: return False
     return not any(item.pw_gid == 0 and item.pw_uid != 0 for item in pwd.getpwall())
 wheel_safe = root_only_wheel()
+def reject_path(path, reason, metadata=None):
+    details = ""
+    if metadata is not None:
+        details = f" (uid={metadata.st_uid}, gid={metadata.st_gid}, mode={stat.S_IMODE(metadata.st_mode):04o})"
+    print(f"Protected Python check failed: {path}{details}: {reason}.", file=sys.stderr)
+    if reason == "writable by a non-root group":
+        print(f"Remove group write permission: sudo chmod g-w {shlex.quote(path)}", file=sys.stderr)
+        print("Other paths may need the same repair. See docs/installation.md before changing a whole framework.", file=sys.stderr)
+    return False
 def protected(path):
     current = os.path.realpath(path)
     while True:
         try: metadata = os.stat(current)
-        except OSError: return False
+        except OSError as exc: return reject_path(current, str(exc))
         mode = stat.S_IMODE(metadata.st_mode)
-        if metadata.st_uid != 0 or mode & 0o002 or not no_acl(current): return False
-        if mode & 0o020 and not (metadata.st_gid == 0 and wheel_safe): return False
+        if metadata.st_uid != 0: return reject_path(current, "not owned by root", metadata)
+        if mode & 0o002: return reject_path(current, "writable by everyone", metadata)
+        if mode & 0o020 and not (metadata.st_gid == 0 and wheel_safe):
+            return reject_path(current, "writable by a non-root group", metadata)
+        if not no_acl(current): return reject_path(current, "has an extended ACL or its ACL could not be checked", metadata)
         parent = os.path.dirname(current)
         if parent == current: return True
         current = parent
@@ -176,13 +196,17 @@ def import_root_protected(path):
             if parent == current: return False
             current = parent
             continue
-        except OSError: return False
+        except OSError as exc: return reject_path(current, str(exc))
         return protected(current)
 try: metadata = os.stat(candidate)
-except OSError: raise SystemExit(1)
+except OSError as exc:
+    reject_path(candidate, str(exc))
+    raise SystemExit(1)
 valid = (sys.version_info >= (3,13) and os.path.isabs(candidate)
     and candidate == os.path.realpath(sys.executable) and stat.S_ISREG(metadata.st_mode)
     and os.access(candidate, os.X_OK))
+if not valid:
+    reject_path(candidate, "requires the canonical executable of a Python 3.13+ runtime", metadata)
 if simulation != "1":
     valid = valid and protected(candidate)
     valid = valid and all(import_root_protected(entry) for entry in sys.path if entry)
@@ -399,14 +423,14 @@ cleanup() {
         rollback_publish || rollback_ok=0
     fi
     if [[ "$result" -ne 0 && "$SERVICE_QUIESCED" == "1" && "$OLD_SERVICE_LOADED" == "1" && "$CAPABILITY_SIMULATION" != "1" ]]; then
-        if [[ "$rollback_ok" == "1" && -f "$AGENT_PATH" ]]; then
+        if [[ "$rollback_ok" == "1" && -f "$OLD_AGENT_PATH" ]]; then
             [[ -x "$LSREGISTER" && -d "$APP_PATH" ]] && "$LSREGISTER" -f "$APP_PATH" >/dev/null 2>&1 || true
             recovery_ready=0
-            if job_loaded || bootstrap_job "$AGENT_PATH"; then
+            if job_loaded || bootstrap_job "$OLD_AGENT_PATH"; then
                 if wait_for_transport; then recovery_ready=1; fi
             fi
             if [[ "$recovery_ready" != "1" ]]; then
-                echo -e "${RED}RECOVERY ERROR:${RESET} The previous files were restored, but its capability-host service did not recover. Re-run the installer after checking $AGENT_PATH." >&2
+                echo -e "${RED}RECOVERY ERROR:${RESET} The previous files were restored, but its capability-host service did not recover. Re-run the installer after checking $OLD_AGENT_PATH." >&2
                 RECOVERY_FAILED=1
             fi
         else
@@ -543,8 +567,9 @@ chmod 644 "$STAGED_AGENT"
 plutil -lint "$STAGED_AGENT" >/dev/null
 
 installed_agent_owned() {
-    [[ -f "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || return 1
-    "$CAPABILITY_PYTHON" -I -S - "$AGENT_PATH" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PY'
+    local path="${1:-$AGENT_PATH}"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    "$CAPABILITY_PYTHON" -I -S - "$path" "$AGENT_LABEL" "$HOST_EXECUTABLE" "$SOCKET_PATH" <<'PY'
 import plistlib, sys
 path,label,host,socket=sys.argv[1:]
 try:
@@ -670,7 +695,17 @@ assert_no_backup() {
     [[ ! -e "$1.remctl-transaction-backup" && ! -L "$1.remctl-transaction-backup" ]] || \
         fail "Stale transaction backup blocks install: $1.remctl-transaction-backup"
 }
-assert_no_backup "$APP_PATH"; assert_no_backup "$AGENT_PATH"
+# Migrate only the old prefix-based path sealed into this signed installation.
+LEGACY_AGENT_PATH="$PREFIX/Library/LaunchAgents/$AGENT_LABEL.plist"
+if [[ "$AGENT_PATH" != "$LEGACY_AGENT_PATH" && -d "$APP_PATH" &&
+      "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-launch-agent-path" 2>/dev/null || true)" == "$LEGACY_AGENT_PATH" ]]; then
+    installed_app_owned || fail "The legacy LaunchAgent has no valid signed host."
+    [[ "$(cat "$APP_PATH/Contents/Resources/remctl-capability-host-socket-path" 2>/dev/null || true)" == "$SOCKET_PATH" ]] || fail "The legacy host socket does not match this installation."
+    installed_agent_owned "$LEGACY_AGENT_PATH" || fail "Refusing to migrate a legacy LaunchAgent that does not match the RemCTL contract."
+    [[ ! -e "$AGENT_PATH" && ! -L "$AGENT_PATH" ]] || fail "Both old and new LaunchAgent paths exist; resolve the duplicate before migrating."
+    OLD_AGENT_PATH="$LEGACY_AGENT_PATH"
+fi
+assert_no_backup "$APP_PATH"; assert_no_backup "$AGENT_PATH"; assert_no_backup "$OLD_AGENT_PATH"
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
     remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html \
     remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
@@ -689,7 +724,7 @@ fi
 if [[ "$CAPABILITY_SIMULATION" != "1" ]]; then
     echo -e "${BLUE}→${RESET} Quiescing previous capability host..."
     if job_loaded; then
-        installed_agent_owned || fail "The loaded $AGENT_LABEL job has no exact installer-owned plist; refusing to stop it."
+        installed_agent_owned "$OLD_AGENT_PATH" || fail "The loaded $AGENT_LABEL job has no exact installer-owned plist; refusing to stop it."
         OLD_SERVICE_LOADED=1
     fi
     socket_owned || fail "A capability-host socket exists but is not an exact current-user 0600 socket in its canonical 0700 directory; refusing to stop or overwrite anything."
@@ -702,6 +737,7 @@ echo -e "${BLUE}→${RESET} Publishing one transactional generation..."
 PAIRS="$BUILD_STAGE/publish-pairs"; : > "$PAIRS"
 add_pair() { printf '%s\0%s\0' "$1" "$2" >> "$PAIRS"; }
 add_pair "$STAGED_APP" "$APP_PATH"; add_pair "$STAGED_AGENT" "$AGENT_PATH"
+if [[ "$OLD_AGENT_PATH" != "$AGENT_PATH" ]]; then add_pair "" "$OLD_AGENT_PATH"; fi
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
     remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_mcp_widget.html \
     remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
@@ -734,7 +770,7 @@ with open(journal_path,"x",encoding="utf-8") as journal:
         journal.write(json.dumps(entry,sort_keys=True)+"\n"); journal.flush(); os.fsync(journal.fileno())
 for index,((source,destination),entry) in enumerate(zip(pairs,entries),1):
     if entry["existed"]: os.replace(destination,entry["backup"])
-    os.replace(source,destination)
+    if source: os.replace(source,destination)
     if fail_at and index == fail_at: raise OSError("injected publish failure")
 PY
 
