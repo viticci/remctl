@@ -545,12 +545,23 @@ def parse_list_color(blob):
     try:
         data = plistlib.loads(bytes(blob))
         objects = data.get("$objects", [])
+
+        def decode_string(value):
+            if isinstance(value, plistlib.UID):
+                value = objects[value.data]
+            if isinstance(value, dict):
+                value = value.get("NS.string")
+                if isinstance(value, plistlib.UID):
+                    value = objects[value.data]
+            if not isinstance(value, str):
+                raise ValueError("Invalid archived color string")
+            return value
+
         for obj in objects:
             if isinstance(obj, dict) and "ckSymbolicColorName" in obj:
-                name_uid = obj["ckSymbolicColorName"]
+                name = decode_string(obj["ckSymbolicColorName"])
                 hex_uid = obj.get("daHexString")
-                name = objects[name_uid.data] if hasattr(name_uid, 'data') else str(name_uid)
-                hex_str = objects[hex_uid.data] if hex_uid and hasattr(hex_uid, 'data') else ""
+                hex_str = decode_string(hex_uid) if hex_uid is not None else ""
                 return {"name": name, "hex": hex_str}
     except Exception:
         pass
