@@ -68,6 +68,8 @@ This removes the plugin only. RemCTL and your reminders stay. To remove RemCTL t
 
 ## The workspace
 
+The standard reminder tools used in conversation return data without opening a workspace. Open Reminders from the sidebar, or explicitly ask to open the workspace, when you want the interface. The standalone MCP server still offers its reminders widget to compatible clients.
+
 **Lists.** The sidebar works like Reminders'. Today, Scheduled, Flagged, All, Completed, Assigned to Me, and Recently Deleted sit alongside your lists, groups, and custom smart lists, each with its real color, emoji, or Reminders symbol. Groups fold with their arrow. Hover over a list to pin it. Pinned lists become tiles at the top, in the same order as Apple Reminders, and pins sync back to Reminders.
 
 **Layouts.** Switch between list, columns, and calendar from the toolbar. Each list, smart list, and view remembers its own layout; the 'Default layout' setting covers the rest. Lists show sections and nested subtasks. In columns, drop reminders into sections. In the calendar, drag a reminder to another day (it keeps its time), or double-click a day to create one. A 'No date' strip keeps unscheduled reminders in view.

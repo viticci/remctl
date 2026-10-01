@@ -9,7 +9,7 @@ from unittest.mock import patch
 import remctl_mcp as m
 import remctl_plugin as p
 from remctl_workspace import matches_smart, _read
-from test_mcp_server import FakeExecutor, request
+from test_mcp_server import FakeExecutor, request, modern_meta, APPS_CAPS
 from datetime import date
 
 class DesktopPluginTests(unittest.TestCase):
@@ -26,6 +26,41 @@ class DesktopPluginTests(unittest.TestCase):
 
     def call(self,name,args=None,**extra):
         return request(self.server,"tools/call",{"name":name,"arguments":args or {},**extra})["result"]
+
+    def test_standard_tools_do_not_open_workspace(self):
+        # Cover negotiated Apps and the legacy aliases used by desktop hosts.
+        for meta in (None, modern_meta(APPS_CAPS), modern_meta()):
+            params = {"_meta": meta} if meta else {}
+            catalog = request(self.server, "tools/list", params)["result"]["tools"]
+            for tool in catalog:
+                if tool["name"] in m.TOOLS_BY_NAME:
+                    self.assertNotIn("_meta", tool, tool["name"])
+            for name, args in (("get_list", {"list": "Work"}),
+                               ("create_reminder", {"title": "Demo"}),
+                               ("update_reminder", {"reminder_id": 42, "title": "Edit"})):
+                value = self.call(name, args, **params)
+                self.assertFalse(value.get("isError"), value)
+                expected = m.tool_result_from_command(m.TOOLS_BY_NAME[name],
+                    m.CommandResult([], 0, self.executor.stdout, ""))
+                self.assertEqual(value["structuredContent"], expected["structuredContent"])
+                self.assertEqual(value["content"], expected["content"])
+                result_meta = value.get("_meta", {})
+                for key in ("ui", "ui/resourceUri", "openai/outputTemplate", "openai/widgetAccessible"):
+                    self.assertNotIn(key, result_meta, (name, key))
+            invalid = self.call("update_reminder", {"reminder_id": 0}, **params)
+            self.assertTrue(invalid["isError"])
+            self.assertNotIn("ui", invalid.get("_meta", {}))
+
+    def test_workspace_entrypoint_keeps_its_ui_resource(self):
+        catalog = {tool["name"]: tool for tool in request(self.server, "tools/list", {})["result"]["tools"]}
+        entry = catalog["open_workspace"]
+        self.assertEqual(entry["_meta"]["ui"]["resourceUri"], p.UI_URI)
+        self.assertIn("model", entry["_meta"]["ui"]["visibility"])
+        value = self.call("open_workspace")
+        self.assertFalse(value.get("isError"), value)
+        self.assertEqual(value["_meta"]["ui"]["resourceUri"], p.UI_URI)
+        resource = self.server.plugin.resource(p.UI_URI, None)
+        self.assertTrue(resource["contents"][0]["text"])
 
     def test_settings_merge_and_native_layout(self):
         self.call("update_settings",{"set":{"layout":"columns"}})

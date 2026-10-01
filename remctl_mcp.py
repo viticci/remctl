@@ -1784,10 +1784,9 @@ class MCPServer:
     # -- tools ----------------------------------------------------------------
 
     def _tools_list(self, context: RequestContext) -> dict[str, Any]:
-        ui_meta = tool_ui_meta(apps=context.apps, legacy_aliases=context.legacy_aliases)
-        if self.plugin and ui_meta:
-            from remctl_plugin import UI_URI
-            ui_meta = {**ui_meta, "ui": {"resourceUri": UI_URI, "visibility": ["model", "app"]}, "openai/outputTemplate": UI_URI}
+        # Plugin agent tools are data-only. The explicit workspace entrypoint
+        # owns UI linkage; otherwise every background read can open a new tab.
+        ui_meta = None if self.plugin else tool_ui_meta(apps=context.apps, legacy_aliases=context.legacy_aliases)
         tools = [tool_descriptor(tool, ui_meta=ui_meta) for tool in TOOLS]
         if self.plugin:
             tools.extend(self.plugin.descriptors())
@@ -1816,10 +1815,7 @@ class MCPServer:
             stdin_text = arguments.get("stdin") if tool.accepts_stdin else None
             command = self.config.executor.run(request_id, argv, timeout=tool.timeout, stdin_text=stdin_text)
             result = tool_result_from_command(tool, command)
-        meta = result_ui_meta(tool, apps=context.apps, legacy_aliases=context.legacy_aliases)
-        if self.plugin and meta:
-            from remctl_plugin import UI_URI
-            meta = {**meta, "ui": {"resourceUri": UI_URI}, "openai/outputTemplate": UI_URI}
+        meta = {} if self.plugin else result_ui_meta(tool, apps=context.apps, legacy_aliases=context.legacy_aliases)
         if meta:
             result["_meta"] = meta
         return result
