@@ -619,6 +619,15 @@ RUN_GLOBAL_OPTIONS = {
     "--image-mode": True,
     "--image-width": True,
 }
+# The optional multi-account extension adds top-level options (one of which
+# takes a value) and a setup-style command; the run guard must know both.
+try:
+    import remctl_accounts as _remctl_accounts
+except ImportError:
+    _remctl_accounts = None
+if _remctl_accounts is not None:
+    RUN_GLOBAL_OPTIONS.update(_remctl_accounts.RUN_GLOBAL_OPTIONS)
+    RUN_FORBIDDEN_COMMANDS = RUN_FORBIDDEN_COMMANDS | _remctl_accounts.RUN_FORBIDDEN_COMMANDS
 
 
 def _run_command_name(argv: list[str]) -> str | None:

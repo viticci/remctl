@@ -73,6 +73,8 @@ Reads open the iCloud Reminders store read-only:
 ~/Library/Group Containers/group.com.apple.reminders/Container_v1/Stores/Data-*.sqlite
 ```
 
+Each account (iCloud, Exchange, CalDAV, on-device local) has its own `Data-*.sqlite` file in that directory. The core reads the single live store; the optional multi-account extension reads across them. See [Multi-account support](#multi-account-support).
+
 Database reads include fields EventKit does not expose: sections, subtasks, tags, attachments, deep links, list colors and icons, recurrence details, urgent state, Early Reminders, and manual ordering. RemCTL never writes to the database.
 
 List reads batch-load subtask counts, tags, and badge indicators in `remctl_serialization.py` and record explicit zeros so no per-reminder query follows.
@@ -154,6 +156,25 @@ The host is the only macOS privacy target: Full Disk Access for the database, Re
 ## Private API compatibility contract
 
 `remctl-private` has a read-only `capabilities` action for drift checks. It reports the host OS, the grocery categorization selectors, the generic and custom smart-list fetch selectors, normalized Objective-C encodings when available, and `saveCalled: false`. The grocery check creates an in-memory change object but never saves. Production dispatch is capability-based, as described above. The helper links `ReminderKit`, Foundation, and AppKit only. `scripts/live_private_matrix.py` runs a disposable write, read-back, and cleanup matrix against a live store; see [the private API audit](notes/private-api-audit-2026-08-12.md) and [the macOS 27 review](notes/macos27-compat-review.md).
+
+## Multi-account support
+
+Multi-account support is an optional module, `remctl_accounts.py`. `remctl` imports it inside `try/except ImportError`; when present, it binds to the core through four hooks and leaves default paths unchanged:
+
+- `open_db()` delegates to `_db_opener` when the extension sets it, so core commands can read a different account's store.
+- `build_parser()` calls `remctl_accounts.register_cli(p, sub)` to add `--account`, `--all-accounts`, `accounts`, and `config`.
+- `main()` calls `remctl_accounts.install(cmds, a, sub)` to wrap command handlers with account scope.
+- `remctl-bridge` accepts optional `calendarIdentifier` and `account` fields and adds `list_calendars` and `find_reminder`. `findListScoped()` delegates to the unchanged iCloud-only `findList()` whenever neither field is set.
+
+`install.sh` and `scripts/build_capability_archive.py` ship the module alongside the other `remctl_*.py` sources, so it is part of the sealed host archive.
+
+The extension classifies its commands with `remctl_runtime.register_extension_commands()` (`accounts` hosted, `config` local), and `remctl_mcp.py` imports its top-level options so the `run` guard parses `--account NAME` correctly. Custom stores (`REMCTL_DB`, config `dbPath`/`storeDir`) route direct like `REMCTL_STORE_DIR` and are never honored inside the host; `REMCTL_ACCOUNT_SCOPE` is forwarded to the host as explicit flags.
+
+Accounts are discovered from each store's CoreData metadata and identified by the display name Reminders.app shows. Scope resolves from `--account`/`--all-accounts`, then `REMCTL_ACCOUNT_SCOPE`, then `accountScope` in `config.json`, then the single-account default. When it resolves to one account, output is byte-identical to the core.
+
+`Z_PK` ids are local to each store. The extension opens one connection per account, never joins across stores, and stamps `account`/`accountType` onto already-serialized rows. Single-item commands scan the stores in scope, act on a unique match, and report an ambiguity error otherwise.
+
+Exchange and other CalDAV reminders have no `ZCKIDENTIFIER`, so the extension resolves an EventKit `calendarItemIdentifier` through the bridge (`list_calendars`, then `find_reminder`), and creates reminders against a resolved `calendarIdentifier` so same-named lists in different accounts stay unambiguous. The config file also accepts `storeDir` and `dbPath`, the persistent equivalents of `REMCTL_STORE_DIR` and `REMCTL_DB`; environment variables win. Full details: [Multiple accounts](multi-account.md).
 
 ## Environment overrides
 

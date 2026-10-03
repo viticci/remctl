@@ -2326,7 +2326,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("unknown command: 'symbols'", output)
         self.assertIn("Did you mean: remctl list-symbols", output)
         self.assertIn("Available commands:", output)
-        self.assertIn("  add,", output)
+        self.assertIn("add,", output)
         self.assertNotIn("choose from", output)
 
     def test_read_command_accepts_format_after_subcommand(self):
