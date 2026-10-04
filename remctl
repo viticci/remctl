@@ -65,6 +65,7 @@ except ImportError:
 VERSION = "2.3.1"
 PRIVATE_PROTOCOL_VERSION = 2
 RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
+SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION = 4
 _private_protocol_probe = None
 
 MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
@@ -5619,6 +5620,69 @@ def resolve_section_ckid(db, list_pk, section_name=None, section_id=None):
     return matches[0]["ZCKIDENTIFIER"]
 
 
+def _list_has_section(db, list_pk, section_name=None, section_id=None):
+    if section_id:
+        return db.execute(
+            "SELECT 1 FROM ZREMCDBASESECTION "
+            "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0 AND lower(ZCKIDENTIFIER) = lower(?)",
+            (list_pk, section_id),
+        ).fetchone() is not None
+    return any((s["ZDISPLAYNAME"] or "").lower() == section_name.lower() for s in q_sections(db, list_pk))
+
+
+def _custom_smart_list_section_matches(db, section_name=None, section_id=None):
+    matches = []
+    for smart_list in q_smart_lists(db):
+        if smart_list["ZSMARTLISTTYPE"] != CUSTOM_SMART_LIST_TYPE or not smart_list["ZCKIDENTIFIER"]:
+            continue
+        for section in q_smart_list_sections(db, smart_list["Z_PK"]):
+            if not section["ZCKIDENTIFIER"]:
+                continue
+            if section_id:
+                found = section["ZCKIDENTIFIER"].lower() == section_id.lower()
+            else:
+                found = (section["ZDISPLAYNAME"] or "").lower() == section_name.lower()
+            if found:
+                matches.append((smart_list, section))
+    return matches
+
+
+def resolve_section_assignment(db, list_pk, section_name=None, section_id=None):
+    """Resolve --section/--section-id for a reminder write.
+
+    Sections in the reminder's list always win and use resolve_section_ckid unchanged.
+    Only when that list has no match does a uniquely named custom smart-list section apply.
+    """
+    section_id = normalize_section_id(section_id)
+    if (
+        not list_pk
+        or bool(section_name) == bool(section_id)
+        or _list_has_section(db, list_pk, section_name, section_id)
+    ):
+        return {"sectionId": resolve_section_ckid(db, list_pk, section_name, section_id)}
+    matches = _custom_smart_list_section_matches(db, section_name, section_id)
+    if len(matches) > 1:
+        options = ", ".join(
+            f"{section['ZCKIDENTIFIER']} (smart list {smart_list_display_name(smart_list)!r})"
+            for smart_list, section in matches
+        )
+        print(
+            f"Error: multiple custom smart-list sections named {section_name!r}. "
+            f"Use --section-id with one of: {options}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not matches:
+        return {"sectionId": resolve_section_ckid(db, list_pk, section_name, section_id)}
+    smart_list, section = matches[0]
+    return {"sectionId": section["ZCKIDENTIFIER"], "smartListId": smart_list["ZCKIDENTIFIER"]}
+
+
+def require_section_assignment_helper(target):
+    if target.get("smartListId"):
+        require_private_helper(minimum_protocol=SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION)
+
+
 def private_changes_from_args(a):
     return any([
         getattr(a, "url", None),
@@ -5787,12 +5851,12 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids, partial_co
 
 def validate_private_add_ready(a, db, list_pk):
     if getattr(a, "section", None) or getattr(a, "section_id", None):
-        resolve_section_ckid(
+        require_section_assignment_helper(resolve_section_assignment(
             db,
             list_pk,
             section_name=getattr(a, "section", None),
             section_id=getattr(a, "section_id", None),
-        )
+        ))
     if getattr(a, "assign", None):
         if list_pk is None:
             print("Error: --assign requires a target shared list via -l/--list or --list-id.", file=sys.stderr)
@@ -5838,17 +5902,17 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
     if getattr(a, "section", None) or getattr(a, "section_id", None):
         if db is None:
             db = open_db()
-        section_id = resolve_section_ckid(
+        target = resolve_section_assignment(
             db,
             list_pk,
             section_name=getattr(a, "section", None),
             section_id=getattr(a, "section_id", None),
         )
-        results.append(private_action({
-            "action": "assign_section",
-            "id": reminder_ckid,
-            "sectionId": section_id,
-        }, partial_context=partial_context))
+        require_section_assignment_helper(target)
+        payload = {"action": "assign_section", "id": reminder_ckid, "sectionId": target["sectionId"]}
+        if target.get("smartListId"):
+            payload.update(action="assign_smart_list_section", smartListId=target["smartListId"])
+        results.append(private_action(payload, partial_context=partial_context))
 
     if getattr(a, "new_section", None):
         if db is None:

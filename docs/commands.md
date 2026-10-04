@@ -317,6 +317,8 @@ remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 
 Section commands are private writes. Create and rename refuse duplicate names in the same list. `--section` resolves by name; if a list has two sections with the same name, RemCTL uses the one that is not empty when exactly one qualifies, otherwise ask for `--section-id`. Verify with `sections --json` or `show <list> --json`.
 
+When `add` or `edit` names a section that is not in the reminder's list, RemCTL looks for a section with that name in custom smart lists and assigns the reminder there if exactly one matches. RemCTL does not read smart-list section membership, so check that assignment in Reminders.
+
 ## List groups
 
 Groups are containers for lists, not for reminders.

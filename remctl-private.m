@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#define REMCTL_PRIVATE_PROTOCOL_VERSION 3
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 4
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <dlfcn.h>
@@ -26,6 +26,7 @@
 - (id)fetchListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchSmartListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchListSectionWithObjectID:(id)objectID error:(NSError **)error;
+- (id)fetchSmartListSectionWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchCustomSmartListWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchTemplateWithObjectID:(id)objectID error:(NSError **)error;
 - (id)fetchPrimaryActiveCloudKitAccountWithError:(NSError **)error;
@@ -80,6 +81,7 @@
 - (void)setParentOwnerID:(id)objectID;
 - (void)setSmartListType:(NSString *)smartListType;
 - (void)updateManualOrdering:(id)manualOrdering;
+- (id)sectionsContextChangeItem;
 - (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
 @end
 
@@ -507,6 +509,10 @@ static NSURL *smartListURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDSmartList/%@", ckIdentifier]];
 }
 
+static NSURL *smartListSectionURL(NSString *ckIdentifier) {
+    return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDSmartListSection/%@", ckIdentifier]];
+}
+
 static NSURL *manualSortHintURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDManualSortHint_v1/%@", ckIdentifier]];
 }
@@ -787,6 +793,8 @@ int main(void) {
                         selectorCapability(store, @selector(fetchSmartListWithObjectID:error:)),
                     @"fetchCustomSmartListWithObjectID:error:":
                         selectorCapability(store, @selector(fetchCustomSmartListWithObjectID:error:)),
+                    @"fetchSmartListSectionWithObjectID:error:":
+                        selectorCapability(store, @selector(fetchSmartListSectionWithObjectID:error:)),
                 },
                 @"ordering": @{
                     @"REMList.reminderIDsOrdering":
@@ -907,6 +915,7 @@ int main(void) {
             @"add_subtasks",
             @"clone_reminder_tree_to_list",
             @"assign_section",
+            @"assign_smart_list_section",
             @"add_section_and_assign",
             @"assign_sharee",
             @"clear_assignment",
@@ -2166,6 +2175,38 @@ int main(void) {
             id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
             [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
             details[@"sectionId"] = sectionID;
+        } else if ([action isEqualToString:@"assign_smart_list_section"]) {
+            NSString *sectionID = cmd[@"sectionId"];
+            NSString *smartListID = cmd[@"smartListId"];
+            if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
+            if (![smartListID isKindOfClass:[NSString class]] || smartListID.length == 0) fail(@"smartListId is required");
+            if (![store respondsToSelector:@selector(fetchSmartListSectionWithObjectID:error:)]) {
+                fail(@"Smart-list section assignment is unavailable on this macOS version");
+            }
+            id sectionObjectID = [REMObjectID objectIDWithURL:smartListSectionURL(sectionID)];
+            if (!sectionObjectID) fail(@"Could not build ReminderKit smart-list section object ID");
+            error = nil;
+            id section = [store fetchSmartListSectionWithObjectID:sectionObjectID error:&error];
+            if (!section) fail(error.localizedDescription ?: @"Smart-list section not found");
+            id smartListObjectID = [REMObjectID objectIDWithURL:smartListURL(smartListID)];
+            if (!smartListObjectID) fail(@"Could not build ReminderKit smart-list object ID");
+            error = nil;
+            id smartList = [store fetchCustomSmartListWithObjectID:smartListObjectID error:&error];
+            if (!smartList) fail(error.localizedDescription ?: @"Custom smart list not found");
+            REMSmartListChangeItem *smartListChange = [save updateSmartList:smartList];
+            if (!smartListChange) fail(@"Could not create ReminderKit smart-list change item");
+            if (![smartListChange respondsToSelector:@selector(sectionsContextChangeItem)]) {
+                fail(@"ReminderKit smart-list change item does not support sections");
+            }
+            id sectionContext = [smartListChange sectionsContextChangeItem];
+            if (!sectionContext || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]) {
+                fail(@"ReminderKit smart-list section context unavailable");
+            }
+            id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
+            id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
+            [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
+            details[@"sectionId"] = sectionID;
+            details[@"smartListId"] = smartListID;
         } else if ([action isEqualToString:@"add_section_and_assign"]) {
             NSString *name = cmd[@"name"];
             if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");

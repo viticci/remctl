@@ -9693,6 +9693,120 @@ class CliTests(unittest.TestCase):
             "existingSectionIds": ["SECTION-1", "SECTION-2"],
         }, partial_context=None)
 
+    def _smart_list_section_db(self):
+        db = self._list_db(["Projects"])
+        for column in ("ZSMARTLISTTYPE TEXT", "ZFILTERDATA BLOB", "ZMINIMUMSUPPORTEDAPPVERSION INTEGER",
+                       "ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER"):
+            db.execute(f"ALTER TABLE ZREMCDBASELIST ADD COLUMN {column}")
+        db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN ZSMARTLIST INTEGER")
+        db.executemany(
+            "INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE) "
+            "VALUES (?, ?, ?, 0, 4, ?)",
+            [
+                (2, "Focus", "SMART-FOCUS", self.remctl.CUSTOM_SMART_LIST_TYPE),
+                (3, None, "SMART-TODAY", "com.apple.reminders.smartlist.today"),
+            ],
+        )
+        db.executemany(
+            "INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+            "VALUES (?, ?, ?, ?, 0)",
+            [(20, "Next", 2, "FOCUS-NEXT"), (21, "Later", 3, "TODAY-LATER")],
+        )
+        return db
+
+    def _apply_section(self, db, protocol=4, **section):
+        args = self._private_edit_args(**section)
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(
+                self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": protocol}
+            ),
+            mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            try:
+                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+            except SystemExit:
+                pass
+        return private_action, stderr.getvalue()
+
+    def test_section_falls_back_to_unique_custom_smart_list_section(self):
+        db = self._smart_list_section_db()
+        try:
+            by_name, _ = self._apply_section(db, section="next")
+            by_id, _ = self._apply_section(
+                db, section_id="x-apple-reminderkit://REMCDSmartListSection/FOCUS-NEXT"
+            )
+        finally:
+            db.close()
+
+        expected = {
+            "action": "assign_smart_list_section",
+            "id": "REM-1",
+            "sectionId": "FOCUS-NEXT",
+            "smartListId": "SMART-FOCUS",
+        }
+        by_name.assert_called_once_with(expected, partial_context=None)
+        by_id.assert_called_once_with(expected, partial_context=None)
+
+    def test_section_in_reminder_list_wins_over_smart_list_section(self):
+        db = self._smart_list_section_db()
+        self._insert_section(db, 10, "Next", "SECTION-1")
+        try:
+            private_action, _ = self._apply_section(db, protocol=2, section="Next")
+        finally:
+            db.close()
+
+        private_action.assert_called_once_with({
+            "action": "assign_section",
+            "id": "REM-1",
+            "sectionId": "SECTION-1",
+        }, partial_context=None)
+
+    def test_smart_list_section_fallback_refuses_ambiguous_builtin_and_old_helper(self):
+        db = self._smart_list_section_db()
+        try:
+            private_action, err = self._apply_section(db, protocol=3, section="Next")
+            private_action.assert_not_called()
+            self.assertIn("protocol 3 < required 4", err)
+
+            private_action, err = self._apply_section(db, section="Later")
+            private_action.assert_not_called()
+            self.assertIn("section not found in target list: Later", err)
+
+            db.execute(
+                "INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE) "
+                "VALUES (4, 'Review', 'SMART-REVIEW', 0, 4, ?)",
+                (self.remctl.CUSTOM_SMART_LIST_TYPE,),
+            )
+            db.execute(
+                "INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+                "VALUES (22, 'Next', 4, 'REVIEW-NEXT', 0)"
+            )
+            private_action, err = self._apply_section(db, section="Next")
+            private_action.assert_not_called()
+            self.assertIn("--section-id", err)
+            self.assertIn("FOCUS-NEXT", err)
+            self.assertIn("REVIEW-NEXT", err)
+        finally:
+            db.close()
+
+    def test_section_commands_and_canonical_schema_do_not_use_smart_list_sections(self):
+        db = self._smart_list_section_db()
+        canonical = self._list_db(["Projects"])
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.remctl.resolve_section_ckid(db, 1, section_name="Next")
+            self.assertIn("section not found in target list: Next", stderr.getvalue())
+
+            private_action, err = self._apply_section(canonical, section="Next")
+            private_action.assert_not_called()
+            self.assertIn("section not found in target list: Next", err)
+        finally:
+            db.close()
+            canonical.close()
+
     def test_apply_private_changes_new_section_passes_empty_existing_section_ids(self):
         db = self._list_db(["Projects"])
         args = self._private_edit_args(new_section="Research")

@@ -1839,7 +1839,7 @@ class SignatureStatusTests(unittest.TestCase):
 class PrivateHelperProtocolTests(unittest.TestCase):
     def test_host_accepts_known_helper_versions(self):
         runtime = SimpleNamespace(private=Path('/unused/remctl-private'))
-        for version, compatible in ((None, False), (1, False), (2, True), (3, True), (4, False)):
+        for version, compatible in ((None, False), (1, False), (2, True), (3, True), (4, True), (5, False)):
             with self.subTest(version=version), mock.patch.object(
                 remctl_broker.subprocess, 'run',
                 return_value=SimpleNamespace(stdout=json.dumps({'protocolVersion': version}).encode()),
