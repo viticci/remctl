@@ -158,6 +158,21 @@ Open 'Reminders' in the Codex sidebar, or ask Codex to open your Reminders works
 
 ![The command palette](https://cdn.macstories.net/images/uploads/2026/09/30/13-command-palette-light-1790776824784-63935204c2.png)
 
+## Multiple accounts
+
+Reminders keeps a separate database for each connected account, so by default RemCTL sees one: the live iCloud store. The optional multi-account extension (`remctl_accounts.py`) adds Exchange, other CalDAV (such as Fastmail or Nextcloud), and on-device local accounts:
+
+```bash
+remctl accounts                          # what's connected, and which is default
+remctl lists --all-accounts              # every account, grouped by account
+remctl today --account Exchange          # scope one command to one account
+remctl add "Send invoice" -l Projects --account "work@example.com"
+remctl done 42 --account Exchange
+remctl config accountScope all           # or set a persistent default
+```
+
+Nothing changes until you ask for it: with no `--account`, `--all-accounts`, `REMCTL_ACCOUNT_SCOPE`, or stored `accountScope`, every command behaves exactly as it does without the extension. Reads span every account in scope; commands that act on one reminder or list refuse an ID that exists in more than one account and ask for `--account`. `export` and `import` stay single-account. [Multiple accounts](docs/multi-account.md) covers scope, account types, writes to non-iCloud accounts, and the integration contract.
+
 ## Private metadata
 
 Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, manual ordering, list icons, Groceries lists, list groups, custom smart lists, and templates. RemCTL writes them only when you pass `--private`:
@@ -190,6 +205,7 @@ It stops the Capability Host and removes the app, the CLI, its background servic
 
 - [Installation](docs/installation.md)
 - [Command guide](docs/commands.md)
+- [Multiple accounts](docs/multi-account.md)
 - [MCP server](docs/mcp.md)
 - [Codex plugin](docs/desktop-plugin.md)
 - [Hermes Agent](docs/hermes.md)

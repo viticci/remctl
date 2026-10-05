@@ -160,7 +160,7 @@ done
 
 REQUIRED_SOURCES=(
     remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_mcp_widget.html remctl_workspace.html
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_mcp_widget.html remctl_workspace.html
     remctl-bridge.swift remctl-permissions.swift remctl-private.m remctl-capability-host.swift
     remctl-capability-host-Info.plist remctl-capability-host-launchagent.plist
     scripts/build_capability_archive.py scripts/render_list_badges.swift assets/remctl.icns
@@ -594,7 +594,7 @@ fi
 
 # Stage the public generation.
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_mcp_widget.html remctl_workspace.html
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_mcp_widget.html remctl_workspace.html
 do
     source_root="$SCRIPT_DIR"
     [[ -z "$PREBUILT_APP" ]] || source_root="$STAGED_RESOURCES/Client"
@@ -704,7 +704,7 @@ import hashlib, json, os, stat, sys
 root, manifest, adopt, app_contract = sys.argv[1:]
 managed={
  "remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py",
- "remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_workspace.html",
+ "remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_accounts.py","remctl_workspace.html",
  "remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-list-symbols.json","remctl-list-artwork","remctl-bridge",
  "remctl-private","remctl-permissions","remctl-permissions-icon.png",
  ".remctl-capability-host-app",".remctl-capability-host-signing-identity",
@@ -750,7 +750,7 @@ legacy={
  "completions/_remctl":"09539986de7736caeac55741d13281426c79639c8df02b552fc48207aa585c37",
  "completions/_rctl":"2d3bcbc3fcabb3779585b1ac78ccce1d25449b72b24768d095f509487f3f382f",
  "completions/_reminders":"7592287a7643fa9f4ceeedab23193d0216a76498d7f95f91cf40484a7f607ebd"}
-allowed=set(legacy)|{"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png","rctl","reminders","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_workspace.html","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-list-symbols.json","remctl-list-artwork"}
+allowed=set(legacy)|{"remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png","rctl","reminders","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_accounts.py","remctl_workspace.html","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-list-symbols.json","remctl-list-artwork"}
 valid=present <= allowed and set(legacy) <= present
 for name,digest in legacy.items():
     path=os.path.join(root,name)
@@ -875,7 +875,7 @@ if [[ "$AGENT_PATH" != "$LEGACY_AGENT_PATH" && -d "$APP_PATH" &&
 fi
 assert_no_backup "$APP_PATH"; assert_no_backup "$AGENT_PATH"; assert_no_backup "$OLD_AGENT_PATH"
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_mcp_widget.html remctl_workspace.html \
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_mcp_widget.html remctl_workspace.html \
     remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
 do assert_no_backup "$BIN_DIR/$item"; done
 for icon in remctl-mcp-icon.png remctl-mcp-icon-512.png remctl-list-symbols.json remctl-list-artwork; do if [[ -f "$BIN_STAGE/$icon" ]]; then assert_no_backup "$BIN_DIR/$icon"; fi; done
@@ -907,7 +907,7 @@ add_pair() { printf '%s\0%s\0' "$1" "$2" >> "$PAIRS"; }
 add_pair "$STAGED_APP" "$APP_PATH"; add_pair "$STAGED_AGENT" "$AGENT_PATH"
 if [[ "$OLD_AGENT_PATH" != "$AGENT_PATH" ]]; then add_pair "" "$OLD_AGENT_PATH"; fi
 for item in remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py \
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_mcp_widget.html remctl_workspace.html \
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_mcp_widget.html remctl_workspace.html \
     remctl-bridge remctl-private remctl-permissions .remctl-capability-host-app rctl reminders
 do add_pair "$BIN_STAGE/$item" "$BIN_DIR/$item"; done
 for icon in remctl-mcp-icon.png remctl-mcp-icon-512.png remctl-list-symbols.json remctl-list-artwork; do if [[ -f "$BIN_STAGE/$icon" ]]; then add_pair "$BIN_STAGE/$icon" "$BIN_DIR/$icon"; fi; done

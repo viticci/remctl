@@ -134,6 +134,19 @@ Row fields: `id`, `title`, `list`, `completed`, `flagged`, `urgent`, `priority`,
 
 Recurrence grammar: `daily`, `weekly`, `monthly`, `yearly`; an interval right after the frequency (`daily x2`, N 1 to 999); weekdays for weekly (`weekly mon,wed,fri`); day numbers (`monthly 1,15`) or ordinal weekdays (`monthly 4th-fri`, `monthly 1st-mon,3rd-mon`, `monthly last-fri`) for monthly, never mixed. Prefer `last-fri` to `5th-fri`. `edit --recurrence clear` (or `none`, `never`) removes a repeat rule. Invalid recurrence, alarm, and priority values fail before writing. Recurrence and relative alarms (`15m`, `1h`, `1d`) need a due date: pass `-d` (MCP `due`) with `add`, while `edit` can also use the due date the reminder already has. Without one, a relative alarm stops with `code: "relative_alarm_requires_due_date"` and Reminders refuses to save a repeating reminder; nothing is written.
 
+## Multi-Account
+
+- The Mac may have several Reminders accounts (iCloud, Exchange, on-device local). By default every command operates on the primary account only; existing single-account behavior is unchanged.
+- `remctl accounts` lists connected accounts with their type. Run it first when the user mentions work/Exchange reminders or multiple accounts.
+- Read commands accept `--all-accounts` (every account, grouped/labeled) and `--account NAME` (one account). `--json` adds `account`/`accountType` fields; `--format table` adds an Account column.
+- Write commands (`add`, `done`, `undone`, `edit`, `delete`, `flag`, `unflag`) accept `--account NAME`. Account flags may be placed before or after the command.
+- Reminder IDs (`Z_PK`) are unique only within an account. When the scope spans multiple accounts, a bare ID that exists in more than one account is rejected with a disambiguation error — pass `--account` to resolve it.
+- Prefer `--account NAME` over a bare ID when acting on a non-primary account, and use `remctl accounts` plus `show <list> --account NAME --json` to find the correct ID first.
+- A user can set a default scope with `remctl config accountScope all` (or an account name); `REMCTL_ACCOUNT_SCOPE` is the environment-variable equivalent.
+- Non-iCloud accounts (Exchange/CalDAV) support create/edit/complete/delete (changes sync to the server) but not `flag`/`unflag` (no flag attribute) or `link`/`open` deep links.
+- Exchange/CalDAV sync is not instant (unlike iCloud). A write applies locally immediately but can take a minute or two to reach the server; don't re-issue the command if the server hasn't caught up yet.
+- The MCP tools do not take an account parameter; use the CLI with `--account` for non-primary accounts.
+
 ## Recently Deleted
 
 Use `recently_deleted` to find recoverable reminders. Follow `nextOffset` while `hasMore` is true; pages count parents and nest subtasks. `get_reminder` with `include_deleted: true` can inspect a deleted ID. The original list may be unavailable, and deleted details do not include all private metadata.
