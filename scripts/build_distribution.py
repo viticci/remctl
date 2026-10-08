@@ -20,7 +20,7 @@ import tarfile
 import tempfile
 
 from build_capability_archive import SOURCE_MANIFEST
-from local_signing import identity as local_identity
+from local_signing import identity as local_identity, signing_keychain
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "RemCTL Capability Host.app"
@@ -120,7 +120,8 @@ def sign(path: Path, signing: dict, release: bool, *, executable=False, entitlem
         args += ["--options", "runtime"]
     if entitlements:
         args += ["--entitlements", str(entitlements)]
-    run(*args, path, stdout=subprocess.DEVNULL)
+    with signing_keychain(signing.get("keychain")):
+        run(*args, path, stdout=subprocess.DEVNULL)
 
 
 def build_installer(output: Path, signing: dict, release: bool, target: str, version: str) -> Path:

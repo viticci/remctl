@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -34,8 +37,52 @@ def private_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
+@contextmanager
+def signing_lock():
+    """Serialize search-list access across checkouts and signing directories."""
+    directory = Path.home() / "Library/Caches/RemCTL"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(directory / "signing.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("Signing lock must be an owner-only regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def signing_keychain(keychain: str | None):
+    """Expose an isolated identity to codesign, then restore the search list."""
+    if not keychain:
+        yield
+        return
+    with signing_lock():
+        command = ("/usr/bin/security", "list-keychains", "-d", "user")
+        original = shlex.split(run(*command).decode())
+        if keychain in original:
+            yield
+            return
+        # --keychain restricts identity selection, but codesign still needs the
+        # identity's keychain in the search list to resolve its certificate.
+        try:
+            run(*command, "-s", *original, keychain)
+            yield
+        finally:
+            run(*command, "-s", *original)
+
+
 def identity(directory: Path) -> dict[str, str]:
     """Create once, then fail closed if any part of the identity is lost."""
+    # Identity creation also observes the search list and must not race signing
+    # or another build creating the same identity for the first time.
+    with signing_lock():
+        return _identity(directory)
+
+
+def _identity(directory: Path) -> dict[str, str]:
     directory = directory.expanduser().absolute()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     info = directory.lstat()

@@ -54,7 +54,7 @@ xcode-select --install      # once, if you don't have the Command Line Tools
 
 This one command downloads a pinned, checksum-verified Python, compiles the host and helpers, signs them, and installs the result. Build output goes in `.build/`; `--build-output DIRECTORY` picks another folder.
 
-The first build creates a signing certificate without contacting Apple. It lives in `~/Library/Application Support/RemCTL Signing`, in its own keychain with owner-only files, and RemCTL doesn't add it to your normal keychain list. **Keep this folder.** macOS ties your permissions to the certificate, so every future build must use the same one. If you lose it, you'll need to grant permissions again. Uninstalling RemCTL leaves it alone.
+The first build creates a signing certificate without contacting Apple. It lives in `~/Library/Application Support/RemCTL Signing`, in its own keychain with owner-only files. RemCTL temporarily adds it to your keychain search list while signing, then restores the original list, including if signing fails. Concurrent RemCTL builds serialize this step with a per-user lock. **Keep this folder.** macOS ties your permissions to the certificate, so every future build must use the same one. If you lose it, you'll need to grant permissions again. Uninstalling RemCTL leaves it alone.
 
 A few options for special cases:
 
