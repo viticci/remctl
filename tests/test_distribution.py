@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,47 @@ class RuntimeArchiveTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS signing")
 class LocalSigningTests(unittest.TestCase):
+    def test_concurrent_signers_wait_before_reading_the_search_list(self):
+        before = local_signing.run("/usr/bin/security", "list-keychains", "-d", "user")
+        with tempfile.TemporaryDirectory(prefix="rctl-concurrent-") as temporary:
+            root = Path(temporary).resolve()
+            identities = []
+            try:
+                identities = [local_signing.identity(root / "first")]
+                identities.append(local_signing.identity(root / "second"))
+                # Cover both a shared identity and independent signing directories.
+                for identity in identities:
+                    with self.subTest(keychain=identity["keychain"]):
+                        child = None
+                        try:
+                            with local_signing.signing_keychain(identities[0]["keychain"]):
+                                child = subprocess.Popen(
+                                    [sys.executable, "-c", """
+import sys
+sys.path.insert(0, sys.argv[1])
+import local_signing
+print('ready', flush=True)
+with local_signing.signing_keychain(sys.argv[2]):
+    print('entered', flush=True)
+""", str(ROOT / "scripts"), identity["keychain"]],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                )
+                                self.assertTrue(select.select([child.stdout], [], [], 10)[0])
+                                self.assertEqual(child.stdout.readline(), b"ready\n")
+                                self.assertFalse(select.select([child.stdout], [], [], 0.25)[0],
+                                                 "Concurrent signer entered before the first restored the list")
+                            stdout, stderr = child.communicate(timeout=10)
+                            self.assertEqual(child.returncode, 0, stderr.decode())
+                            self.assertEqual(stdout, b"entered\n")
+                            self.assertEqual(before, local_signing.run("/usr/bin/security", "list-keychains", "-d", "user"))
+                        finally:
+                            if child is not None and child.poll() is None:
+                                child.kill()
+                                child.communicate()
+            finally:
+                for identity in identities:
+                    local_signing.run("/usr/bin/security", "delete-keychain", identity["keychain"])
+
     def test_identity_survives_rebuild_and_rejects_a_different_key(self):
         before = local_signing.run("/usr/bin/security", "list-keychains", "-d", "user")
         with tempfile.TemporaryDirectory(prefix="rctl-sign-") as temporary:
@@ -96,7 +138,11 @@ class LocalSigningTests(unittest.TestCase):
                     shutil.copyfile("/usr/bin/false" if name == "rebuilt" else "/usr/bin/true", binary)
                     binary.chmod(0o755)
                     distribution.sign(binary, identity, False, executable=True)
+                    self.assertEqual(before, local_signing.run("/usr/bin/security", "list-keychains", "-d", "user"))
                     binaries.append(binary)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    distribution.sign(root / "missing-binary", first, False, executable=True)
+                self.assertEqual(before, local_signing.run("/usr/bin/security", "list-keychains", "-d", "user"))
                 requirement = '=certificate leaf = H"' + first["identity"].lower() + '"'
                 for binary in binaries[:2]:
                     subprocess.run(["codesign", "--verify", "--strict", "-R", requirement, str(binary)], check=True, capture_output=True)
