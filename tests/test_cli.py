@@ -10075,6 +10075,293 @@ class CliTests(unittest.TestCase):
         self.assertIn("different lists require --smart-list", stderr.getvalue())
         private_call.assert_not_called()
 
+    def _hierarchy_move_args(self, reminder_id, **overrides):
+        values = dict(
+            id=reminder_id,
+            before=None,
+            after=None,
+            first=False,
+            last=False,
+            parent=None,
+            top_level=False,
+            smart_list=None,
+            smart_list_id=None,
+            private=True,
+            private_metadata=False,
+            json=True,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def _run_hierarchy_move(self, args, reminders, siblings_by_parent, ordering, *, expect_exit=False, verified=True,
+                            sections_by_member=None, sections=()):
+        """Run cmd_reminder_move against fake rows. siblings_by_parent maps a parent pk (None = top level) to {uuid: pk}."""
+        def siblings(_db, list_pk, parent_pk=None):
+            return dict(siblings_by_parent.get(parent_pk, {}))
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.remctl, "require_private_metadata"))
+            stack.enter_context(mock.patch.object(self.remctl, "open_db", return_value=object()))
+            stack.enter_context(mock.patch.object(self.remctl, "q_reminder", side_effect=lambda _db, pk: reminders.get(pk)))
+            stack.enter_context(mock.patch.object(self.remctl, "q_sibling_identifiers", side_effect=siblings))
+            stack.enter_context(mock.patch.object(self.remctl, "q_list_reminder_order", return_value=list(ordering)))
+            stack.enter_context(mock.patch.object(self.remctl, "q_list_ckid", return_value="LIST"))
+            stack.enter_context(mock.patch.object(
+                self.remctl, "q_reminder_section_ckid",
+                side_effect=lambda _db, _list, member: (sections_by_member or {}).get(member),
+            ))
+            stack.enter_context(mock.patch.object(self.remctl, "q_sections", return_value=list(sections)))
+            private_call = stack.enter_context(
+                mock.patch.object(self.remctl, "private_call", return_value={"status": "updated"})
+            )
+            wait = stack.enter_context(mock.patch.object(self.remctl, "_wait_for_order", return_value=verified))
+            stdout = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stderr = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            if expect_exit:
+                with self.assertRaises(SystemExit):
+                    self.remctl.cmd_reminder_move(args)
+            else:
+                self.remctl.cmd_reminder_move(args)
+        return private_call, wait, stdout.getvalue(), stderr.getvalue()
+
+    def _hierarchy_rows(self):
+        def row(uuid, title, parent=None, list_pk=12):
+            return {"ZCKIDENTIFIER": uuid, "ZLIST": list_pk, "ZTITLE": title, "list_name": "Inbox", "ZPARENTREMINDER": parent}
+        return {
+            100: row("PARENT", "Plan retreat"),
+            101: row("MOVING", "Book the bus"),
+            102: row("OTHER", "Call venue"),
+            201: row("SUB-A", "Pick a date", parent=100),
+            202: row("SUB-B", "Send invites", parent=100),
+        }
+
+    def test_reminder_move_parent_nests_after_last_subtask_by_default(self):
+        reminders = self._hierarchy_rows()
+        private_call, wait, stdout, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=100),
+            reminders,
+            {100: {"SUB-A": 201, "SUB-B": 202}, 101: {}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"],
+        )
+
+        private_call.assert_called_once_with({
+            "action": "move_reminder_in_hierarchy",
+            "id": "MOVING",
+            "listId": "LIST",
+            "parentId": "PARENT",
+            "position": "after",
+            "anchorId": "SUB-B",
+        })
+        self.assertEqual(wait.call_args.args[1], (100, ["sub-a", "sub-b", "moving"]))
+        result = json.loads(stdout)
+        self.assertEqual(result["hierarchy"], "nested")
+        self.assertEqual(result["parentId"], 100)
+        self.assertEqual(result["anchorId"], 202)
+
+    def test_reminder_move_parent_with_position_places_among_subtasks(self):
+        reminders = self._hierarchy_rows()
+        private_call, wait, _, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=100, before=202),
+            reminders,
+            {100: {"SUB-A": 201, "SUB-B": 202}, 101: {}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING"],
+        )
+
+        request = private_call.call_args.args[0]
+        self.assertEqual((request["position"], request["anchorId"]), ("before", "SUB-B"))
+        self.assertEqual(wait.call_args.args[1], (100, ["sub-a", "moving", "sub-b"]))
+
+    def test_reminder_move_parent_without_subtasks_appends(self):
+        reminders = self._hierarchy_rows()
+        private_call, wait, _, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=102, first=True),
+            reminders,
+            {102: {}, 101: {}},
+            ["PARENT", "MOVING", "OTHER"],
+        )
+
+        request = private_call.call_args.args[0]
+        self.assertEqual(request["position"], "append")
+        self.assertNotIn("anchorId", request)
+        self.assertEqual(wait.call_args.args[1], (102, ["moving"]))
+
+    def test_reminder_move_subtask_reorders_within_its_parent(self):
+        # A plain --before on a subtask must stay under the parent, not move to the top level.
+        reminders = self._hierarchy_rows()
+        private_call, wait, stdout, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(202, before=201),
+            reminders,
+            {100: {"SUB-A": 201, "SUB-B": 202}},
+            ["PARENT", "SUB-A", "SUB-B"],
+        )
+
+        private_call.assert_called_once_with({
+            "action": "move_reminder_in_hierarchy",
+            "id": "SUB-B",
+            "listId": "LIST",
+            "parentId": "PARENT",
+            "position": "before",
+            "anchorId": "SUB-A",
+        })
+        self.assertEqual(wait.call_args.args[1], (100, ["sub-b", "sub-a"]))
+        self.assertEqual(json.loads(stdout)["hierarchy"], "reordered")
+
+    def test_reminder_move_top_level_places_subtask_after_its_parent(self):
+        reminders = self._hierarchy_rows()
+        private_call, wait, stdout, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(201, top_level=True),
+            reminders,
+            {None: {"PARENT": 100, "MOVING": 101, "OTHER": 102}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"],
+        )
+
+        private_call.assert_called_once_with({
+            "action": "move_reminder_in_hierarchy",
+            "id": "SUB-A",
+            "listId": "LIST",
+            "parentId": None,
+            "position": "after",
+            "anchorId": "PARENT",
+        })
+        self.assertEqual(wait.call_args.args[1], (None, ["parent", "sub-a", "moving", "other"]))
+        result = json.loads(stdout)
+        self.assertEqual(result["hierarchy"], "unnested")
+        self.assertIsNone(result["parentId"])
+
+    def test_reminder_move_top_level_joins_the_anchor_section(self):
+        reminders = self._hierarchy_rows()
+        private_call, _, stdout, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(201, top_level=True),
+            reminders,
+            {None: {"PARENT": 100, "MOVING": 101, "OTHER": 102}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"],
+            sections_by_member={"PARENT": "SECTION"},
+            sections=[{"ZCKIDENTIFIER": "SECTION", "ZDISPLAYNAME": "Retreat"}],
+        )
+
+        self.assertEqual(private_call.call_count, 2)
+        self.assertEqual(
+            private_call.call_args_list[1].args[0],
+            {"action": "assign_section", "id": "SUB-A", "sectionId": "SECTION"},
+        )
+        self.assertEqual(json.loads(stdout)["section"], "Retreat")
+
+    def test_reminder_move_first_or_last_leaves_sections_alone(self):
+        reminders = self._hierarchy_rows()
+        private_call, _, stdout, _ = self._run_hierarchy_move(
+            self._hierarchy_move_args(201, top_level=True, last=True),
+            reminders,
+            {None: {"PARENT": 100, "MOVING": 101, "OTHER": 102}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"],
+            sections_by_member={"OTHER": "SECTION"},
+            sections=[{"ZCKIDENTIFIER": "SECTION", "ZDISPLAYNAME": "Retreat"}],
+        )
+
+        private_call.assert_called_once()
+        self.assertNotIn("section", json.loads(stdout))
+
+    def test_reminder_move_hierarchy_rejections_do_not_write(self):
+        reminders = self._hierarchy_rows()
+        reminders[103] = {"ZCKIDENTIFIER": "ELSEWHERE", "ZLIST": 99, "ZTITLE": "Other list",
+                          "list_name": "Work", "ZPARENTREMINDER": None}
+        cases = [
+            (self._hierarchy_move_args(101, parent=201), {}, "is itself a subtask"),
+            (self._hierarchy_move_args(101, parent=103), {}, "Move #101 there first"),
+            (self._hierarchy_move_args(100, parent=102), {100: {"SUB-A": 201}}, "has its own subtasks"),
+            (self._hierarchy_move_args(101, parent=100, after=102), {100: {"SUB-A": 201}, 101: {}}, "is not a subtask of #100"),
+            (self._hierarchy_move_args(101, parent=101), {}, "cannot be its own parent"),
+            (self._hierarchy_move_args(101, top_level=True), {}, "already a top-level reminder"),
+            (self._hierarchy_move_args(101, parent=100, smart_list="Focus"), {}, "not a smart list"),
+            (self._hierarchy_move_args(101, before=201), {}, "Pass --parent 100"),
+        ]
+        for args, siblings, message in cases:
+            with self.subTest(message=message):
+                private_call, _, _, stderr = self._run_hierarchy_move(
+                    args, reminders, siblings, ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"], expect_exit=True
+                )
+                self.assertIn(message, stderr)
+                private_call.assert_not_called()
+
+    def test_reminder_move_hierarchy_reports_unverified_move(self):
+        reminders = self._hierarchy_rows()
+        private_call, _, stdout, stderr = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=100),
+            reminders,
+            {100: {"SUB-A": 201, "SUB-B": 202}, 101: {}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING"],
+            expect_exit=True,
+            verified=False,
+        )
+
+        private_call.assert_called_once()
+        self.assertIn("could not be verified", stderr)
+        self.assertEqual(stdout, "")
+
+    def test_reminder_move_hierarchy_refuses_siblings_missing_from_ordering(self):
+        # A sibling without a recorded position would make "last" and verification meaningless.
+        reminders = self._hierarchy_rows()
+        private_call, _, _, stderr = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=100),
+            reminders,
+            {100: {"SUB-A": 201, "SUB-B": 202}, 101: {}},
+            ["PARENT", "SUB-A", "MOVING"],
+            expect_exit=True,
+        )
+
+        self.assertIn("has not recorded a position for 1 reminder(s)", stderr)
+        private_call.assert_not_called()
+
+    def test_reminder_move_top_level_needs_its_former_parent(self):
+        reminders = self._hierarchy_rows()
+        del reminders[100]
+        private_call, _, _, stderr = self._run_hierarchy_move(
+            self._hierarchy_move_args(201, top_level=True),
+            reminders,
+            {None: {"MOVING": 101, "OTHER": 102}},
+            ["SUB-A", "MOVING", "OTHER"],
+            expect_exit=True,
+        )
+
+        self.assertIn("former parent #100 not found", stderr)
+        private_call.assert_not_called()
+
+    def test_hierarchy_verification_reads_fresh_sibling_membership(self):
+        rows = {101: {"ZPARENTREMINDER": 100}}
+        fresh = {"SUB-A": 201, "MOVING": 101, "SUB-B": 202}
+        with (
+            mock.patch.object(self.remctl, "q_reminder", side_effect=lambda _db, pk: rows.get(pk)),
+            mock.patch.object(self.remctl, "q_sibling_identifiers", return_value=fresh),
+            mock.patch.object(self.remctl, "q_list_reminder_order", return_value=["PARENT", "SUB-A", "MOVING"]),
+        ):
+            # SUB-B is a live sibling the ordering record lacks, so the state can never match.
+            parent, order = self.remctl._hierarchy_state(object(), 101, 12, 100)
+        self.assertEqual(parent, 100)
+        self.assertEqual(order, ["sub-a", "moving", "<unrecorded>"])
+
+    def test_subtask_queries_follow_reminders_display_order(self):
+        db = self._due_window_db()
+        try:
+            db.execute("ALTER TABLE ZREMCDBASELIST ADD COLUMN ZREMINDERIDSMERGEABLEORDERING_V2_JSON TEXT")
+            db.execute(
+                "UPDATE ZREMCDBASELIST SET ZREMINDERIDSMERGEABLEORDERING_V2_JSON = ? WHERE Z_PK = 1",
+                (json.dumps(["CK-10", "CK-13", "CK-11", "CK-12", "CK-20"]),),
+            )
+            for pk, parent in [(10, None), (11, 10), (12, 10), (13, 10), (20, None)]:
+                self._insert_lookup_reminder(db, pk, f"Reminder {pk}")
+                db.execute("UPDATE ZREMCDREMINDER SET ZPARENTREMINDER = ? WHERE Z_PK = ?", (parent, pk))
+            self.remctl._REMINDER_COLUMN_CACHE.clear()
+
+            subtasks = self.remctl.q_subtasks_for_parent(db, 10)
+            siblings = self.remctl.q_sibling_identifiers(db, 1, 10)
+            top_level = self.remctl.q_sibling_identifiers(db, 1)
+        finally:
+            db.close()
+            self.remctl._REMINDER_COLUMN_CACHE.clear()
+
+        self.assertEqual([row["Z_PK"] for row in subtasks], [13, 11, 12])
+        self.assertEqual(siblings, {"CK-11": 11, "CK-12": 12, "CK-13": 13})
+        self.assertEqual(top_level, {"CK-10": 10, "CK-20": 20})
+
     def test_require_private_metadata_accepts_protocol_version_two(self):
         self._default_protocol_probe.stop()
         self.remctl._private_protocol_probe = None
