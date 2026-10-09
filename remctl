@@ -2121,6 +2121,9 @@ def q_reminders(
         if manual_order and list_pk is not None
         else []
     )
+    if parent_pk is not None and not identifier_order:
+        # Subtasks share their parent's list, whose ordering record holds their display order.
+        identifier_order = q_list_reminder_order(db, q_reminder_list_pk(db, parent_pk))
     c, params = [LIVE_REMINDER_SQL], []
     if not completed: c.append("r.ZCOMPLETED = 0")
     if list_pk is not None: c.append("r.ZLIST = ?"); params.append(list_pk)
@@ -2239,6 +2242,26 @@ def q_subtask_count(db, pk):
 def q_subtasks_for_parent(db, pk, limit=500):
     return q_reminders(db, parent_pk=pk, completed=True, limit=limit)
 
+
+def q_reminder_list_pk(db, pk):
+    try:
+        row = db.execute("SELECT ZLIST FROM ZREMCDREMINDER WHERE Z_PK = ?", (pk,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def q_sibling_identifiers(db, list_pk, parent_pk=None):
+    """Map stable identifier to Z_PK for live reminders sharing a parent, or the top level, in a list."""
+    level = "r.ZPARENTREMINDER = ?" if parent_pk is not None else "(r.ZPARENTREMINDER IS NULL OR r.ZPARENTREMINDER = 0)"
+    params = [list_pk] + ([parent_pk] if parent_pk is not None else [])
+    rows = db.execute(
+        "SELECT r.Z_PK, r.ZCKIDENTIFIER FROM ZREMCDREMINDER r LEFT JOIN ZREMCDBASELIST l ON r.ZLIST = l.Z_PK "
+        f"WHERE {LIVE_REMINDER_SQL} AND r.ZLIST = ? AND {level}",
+        params,
+    ).fetchall()
+    return {row[1]: row[0] for row in rows if row[1]}
+
 def q_sections(db, list_pk=None):
     if list_pk:
         return db.execute(
@@ -2261,6 +2284,32 @@ def section_name_exists(db, list_pk, name, *, excluding_ckid=None):
         if (row["ZDISPLAYNAME"] or "").casefold() == needle:
             return True
     return False
+
+
+def q_reminder_section_ckid(db, list_pk, reminder_ckid):
+    """Stable identifier of the live section a reminder belongs to, or None."""
+    try:
+        row = db.execute(
+            "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
+            (list_pk,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        data = json.loads(row[0])
+        live = {
+            (section["ZCKIDENTIFIER"] or "").casefold(): section["ZCKIDENTIFIER"]
+            for section in q_sections(db, list_pk)
+        }
+    except (sqlite3.Error, json.JSONDecodeError, TypeError):
+        return None
+    member = (reminder_ckid or "").casefold()
+    for membership in (data.get("memberships") or []) if isinstance(data, dict) else []:
+        if membership.get("isObsolete") or (membership.get("memberID") or "").casefold() != member:
+            continue
+        section = live.get((membership.get("groupID") or "").casefold())
+        if section:
+            return section
+    return None
 
 
 def q_section_memberships(db, list_pk):
@@ -10338,6 +10387,9 @@ def reminder_move_relation(a):
         choices.append(("first", None))
     if getattr(a, "last", False):
         choices.append(("last", None))
+    if not choices and (getattr(a, "parent", None) is not None or getattr(a, "top_level", False)):
+        # The hierarchy move picks its default position.
+        return None, None
     if len(choices) != 1:
         print("Error: pass exactly one of --before, --after, --first, or --last.", file=sys.stderr)
         sys.exit(1)
@@ -10438,6 +10490,188 @@ def _smart_list_move_request(db, a, reminder, relation, anchor):
     }
 
 
+def _parent_pk(row):
+    return _row_get(row, "ZPARENTREMINDER") or None
+
+
+def _hierarchy_state(db, reminder_pk, list_pk, parent_pk):
+    """(parent pk, casefolded sibling order) for verifying a hierarchy move.
+
+    Membership is read fresh, so a sibling missing from the ordering record fails verification.
+    """
+    row = q_reminder(db, reminder_pk)
+    members = {identifier.casefold() for identifier in q_sibling_identifiers(db, list_pk, parent_pk)}
+    order = [
+        identifier.casefold() for identifier in q_list_reminder_order(db, list_pk)
+        if identifier.casefold() in members
+    ]
+    if set(order) != members:
+        order.append("<unrecorded>")
+    return (_parent_pk(row) if row else "missing", order)
+
+
+def _reminder_move_in_hierarchy(db, a, reminder, relation, anchor_id, anchor, target_parent_pk):
+    """Nest a reminder under a parent, reorder it among subtasks, or return it to the top level."""
+    def die(message):
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    list_pk = reminder["ZLIST"]
+    current_parent_pk = _parent_pk(reminder)
+    parent = None
+    if target_parent_pk is not None:
+        if target_parent_pk == a.id:
+            die("a reminder cannot be its own parent.")
+        parent = q_reminder(db, target_parent_pk)
+        if not parent or not parent["ZCKIDENTIFIER"]:
+            die(f"parent #{target_parent_pk} not found or has no stable identifier.")
+        if _parent_pk(parent) is not None:
+            die(f"#{target_parent_pk} is itself a subtask. Reminders allows one level of subtasks.")
+        if parent["ZLIST"] != list_pk:
+            die(
+                f"#{target_parent_pk} is in list {parent['list_name']!r}. Move #{a.id} there first: "
+                f"remctl edit {a.id} -l {shlex.quote(parent['list_name'] or '')}"
+            )
+        if current_parent_pk != target_parent_pk and q_sibling_identifiers(db, list_pk, a.id):
+            die(f"#{a.id} has its own subtasks. Reminders allows one level of subtasks.")
+    elif current_parent_pk is None and relation is None:
+        die(f"#{a.id} is already a top-level reminder. Pass --before, --after, --first, or --last to reorder it.")
+
+    if relation is None:
+        # Like outdenting in Reminders, a reminder leaving its parent lands right after it.
+        if target_parent_pk is None:
+            relation, anchor_id = "after", current_parent_pk
+            anchor = q_reminder(db, anchor_id)
+            if not anchor or not anchor["ZCKIDENTIFIER"]:
+                die(f"former parent #{anchor_id} not found. Pass --before, --after, --first, or --last.")
+        else:
+            relation = "last"
+
+    siblings = q_sibling_identifiers(db, list_pk, target_parent_pk)
+    moving_uuid = reminder["ZCKIDENTIFIER"]
+    if anchor is not None:
+        if anchor["ZLIST"] != list_pk or anchor["ZCKIDENTIFIER"] not in siblings:
+            where = f"a subtask of #{target_parent_pk}" if target_parent_pk is not None else f"a top-level reminder in {reminder['list_name']!r}"
+            die(f"anchor #{anchor_id} is not {where}.")
+    ordering = q_list_reminder_order(db, list_pk)
+    if not ordering:
+        die("this list has no readable ReminderKit ordering data.")
+    # Positions are only meaningful when the ordering record holds every sibling.
+    recorded = {identifier.casefold() for identifier in ordering}
+    unrecorded = [
+        pk for identifier, pk in siblings.items()
+        if identifier.casefold() != moving_uuid.casefold() and identifier.casefold() not in recorded
+    ]
+    if unrecorded:
+        die(
+            f"Reminders has not recorded a position for {len(unrecorded)} reminder(s) at this level yet. "
+            "Open the list in Reminders.app, then retry."
+        )
+    folded = {identifier.casefold() for identifier in siblings}
+    current_order = [
+        identifier for identifier in ordering
+        if identifier.casefold() in folded and identifier.casefold() != moving_uuid.casefold()
+    ]
+    if relation in {"first", "last"}:
+        if current_order:
+            anchor_uuid = current_order[0] if relation == "first" else current_order[-1]
+            position = "before" if relation == "first" else "after"
+        else:
+            anchor_uuid, position = None, "append"
+    else:
+        position = relation
+        anchor_uuid = next(
+            (identifier for identifier in current_order
+             if identifier.casefold() == anchor["ZCKIDENTIFIER"].casefold()),
+            None,
+        )
+        if anchor_uuid is None:
+            die("the anchor has no persisted position in this list.")
+    if position == "append":
+        expected_order = [moving_uuid]
+    else:
+        expected_order = reorder_identifier_list(current_order, moving_uuid, position, anchor_uuid)
+    expected_order = [identifier.casefold() for identifier in expected_order]
+
+    parent_uuid = parent["ZCKIDENTIFIER"] if parent is not None else None
+    request = {
+        "action": "move_reminder_in_hierarchy",
+        "id": moving_uuid,
+        "listId": q_list_ckid(db, list_pk),
+        "parentId": parent_uuid,
+        "position": position,
+    }
+    if anchor_uuid is not None:
+        request["anchorId"] = anchor_uuid
+    if not request["listId"]:
+        die("target list has no stable identifier.")
+
+    result = private_call(request)
+    helper_reported_error = not result or result.get("status") != "updated"
+    verified = _wait_for_order(
+        lambda: _read_fresh_db_value(lambda current_db: _hierarchy_state(current_db, a.id, list_pk, target_parent_pk)),
+        (target_parent_pk, expected_order),
+    )
+    if helper_reported_error and not verified:
+        message = result.get("message") if isinstance(result, dict) else "private helper failed"
+        die(message or "private helper failed")
+    if not verified:
+        die("ReminderKit reported success, but the new subtask structure could not be verified.")
+
+    if target_parent_pk is None:
+        hierarchy = "unnested" if current_parent_pk is not None else "reordered"
+    else:
+        hierarchy = "reordered" if current_parent_pk == target_parent_pk else "nested"
+    sibling_pks = {identifier.casefold(): pk for identifier, pk in siblings.items()}
+    anchor_pk = sibling_pks.get(anchor_uuid.casefold()) if anchor_uuid is not None else None
+    payload = {
+        "status": "updated",
+        "id": a.id,
+        "title": reminder["ZTITLE"],
+        "hierarchy": hierarchy,
+        "parentId": target_parent_pk,
+        "position": relation,
+        "list": reminder["list_name"],
+        "verified": True,
+    }
+    if parent is not None:
+        payload["parentTitle"] = parent["ZTITLE"]
+    if anchor_pk is not None:
+        payload["anchorId"] = anchor_pk
+    if helper_reported_error:
+        payload["verifiedAfterHelperError"] = True
+    if target_parent_pk is None and relation in {"before", "after"}:
+        # Placed next to a top-level reminder, it joins that reminder's section, as a drop does in Reminders.
+        section_ckid = q_reminder_section_ckid(db, list_pk, anchor_uuid)
+        if section_ckid and section_ckid != q_reminder_section_ckid(db, list_pk, moving_uuid):
+            section_result = private_call({"action": "assign_section", "id": moving_uuid, "sectionId": section_ckid})
+            joined = _wait_for_order(
+                lambda: _read_fresh_db_value(lambda current_db: q_reminder_section_ckid(current_db, list_pk, moving_uuid)),
+                section_ckid,
+            )
+            section_name = next(
+                (row["ZDISPLAYNAME"] for row in q_sections(db, list_pk) if row["ZCKIDENTIFIER"] == section_ckid),
+                None,
+            )
+            if joined:
+                payload["section"] = section_name
+            else:
+                message = section_result.get("message") if isinstance(section_result, dict) else None
+                payload["warnings"] = [f"section_not_set: the move is verified, but #{a.id} did not join section {section_name!r}"
+                                       + (f" ({message})" if message else "")]
+    if a.json:
+        print(json.dumps(payload, ensure_ascii=False))
+        return
+    for warning in payload.get("warnings", []):
+        print(f"Warning: {warning}", file=sys.stderr)
+    if target_parent_pk is None:
+        where = "to the top level"
+    else:
+        where = f"under #{target_parent_pk} {safe_display(parent['ZTITLE'])}"
+    anchor_text = f" ({position} #{anchor_pk})" if anchor_pk is not None else ""
+    print(f"Moved #{a.id} {where}{anchor_text} in list {reminder['list_name']!r}.")
+
+
 def cmd_reminder_move(a):
     require_private_metadata(a)
     relation, anchor_id = reminder_move_relation(a)
@@ -10452,6 +10686,23 @@ def cmd_reminder_move(a):
         sys.exit(1)
 
     smart_targeted = getattr(a, "smart_list", None) or getattr(a, "smart_list_id", None) is not None
+    parent_id = getattr(a, "parent", None)
+    to_top_level = getattr(a, "top_level", False)
+    if smart_targeted and (parent_id is not None or to_top_level):
+        print("Error: --parent and --top-level work within a list, not a smart list.", file=sys.stderr)
+        sys.exit(1)
+    if not smart_targeted and (parent_id is not None or to_top_level or _parent_pk(reminder) is not None):
+        target_parent_pk = parent_id if parent_id is not None else (None if to_top_level else _parent_pk(reminder))
+        _reminder_move_in_hierarchy(db, a, reminder, relation, anchor_id, anchor, target_parent_pk)
+        return
+    if not smart_targeted and anchor is not None and _parent_pk(anchor) is not None:
+        print(
+            f"Error: anchor #{anchor_id} is a subtask. Pass --parent {_parent_pk(anchor)} to place "
+            f"#{a.id} among its subtasks.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     smart_ref = None
     expected_order = None
     if smart_targeted:
@@ -11845,7 +12096,7 @@ _remctl() {
         'done:Complete reminders'
         'undone:Uncomplete reminders'
         'edit:Edit a reminder'
-        'reminder-move:Reorder a reminder in a list or custom smart list'
+        'reminder-move:Reorder a reminder, or nest it under another, in a list or custom smart list'
         'delete:Delete reminders'
         'deleted:Show Recently Deleted'
         'restore:Recover a deleted reminder'
@@ -12112,6 +12363,8 @@ _remctl() {
                 '(--before --first --last)--after[Place after reminder ID]:id:' \
                 '(--before --after --last)--first[Place first in the current ordering]' \
                 '(--before --after --first)--last[Place last in the current ordering]' \
+                '(--top-level)--parent[Make it a subtask of reminder ID]:id:' \
+                '(--parent)--top-level[Make a subtask a top-level reminder]' \
                 '(--smart-list-id)--smart-list[Target custom smart list]:smart-list:' \
                 '(--smart-list)--smart-list-id[Target custom smart list by numeric ID]:id:' \
                 '--private[Use private ReminderKit ordering]' \
@@ -12362,7 +12615,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "reminder-move" ]; then
-        COMPREPLY=( $(compgen -W "--before --after --first --last --smart-list --smart-list-id --private --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--before --after --first --last --parent --top-level --smart-list --smart-list-id --private --json" -- "$cur") )
         return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
@@ -12499,7 +12752,7 @@ complete -c remctl -n "__fish_use_subcommand" -a add -d "Add a reminder"
 complete -c remctl -n "__fish_use_subcommand" -a done -d "Complete reminders"
 complete -c remctl -n "__fish_use_subcommand" -a undone -d "Uncomplete reminders"
 complete -c remctl -n "__fish_use_subcommand" -a edit -d "Edit a reminder"
-complete -c remctl -n "__fish_use_subcommand" -a reminder-move -d "Reorder a reminder in a list or custom smart list"
+complete -c remctl -n "__fish_use_subcommand" -a reminder-move -d "Reorder a reminder, or nest it under another, in a list or custom smart list"
 complete -c remctl -n "__fish_use_subcommand" -a delete -d "Delete reminders"
 complete -c remctl -n "__fish_use_subcommand" -a search -d "Search reminders"
 complete -c remctl -n "__fish_use_subcommand" -a today -d "Due today + overdue"
@@ -12566,6 +12819,8 @@ complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l before -d "
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l after -d "Place after reminder ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l first -d "Place first in the current ordering"
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l last -d "Place last in the current ordering"
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l parent -d "Make it a subtask of reminder ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l top-level -d "Make a subtask a top-level reminder"
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l smart-list -d "Target custom smart list" -r
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l smart-list-id -d "Target custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from reminder-move" -l private -d "Use private ReminderKit ordering"
@@ -14654,26 +14909,37 @@ def build_parser():
 
     c = sub.add_parser(
         "reminder-move",
-        help="Reorder a reminder in a list or custom smart list",
+        help="Reorder a reminder, or nest it under another, in a list or custom smart list",
         description=(
             "Reorder a reminder through unsupported private ReminderKit APIs. "
             "Without --smart-list, both reminders must share a base list. "
-            "Use --smart-list for cross-list ordering in an unsectioned custom smart list."
+            "Use --smart-list for cross-list ordering in an unsectioned custom smart list. "
+            "--parent makes the reminder a subtask of another top-level reminder in the same list, "
+            "and --top-level makes a subtask a reminder of its own. Both keep the reminder's ID. "
+            "A subtask moved with --before, --after, --first, or --last stays with its parent."
         ),
         epilog=(
             "Examples:\n"
             "  remctl reminder-move 23880 --before 23881 --private\n"
             "  remctl reminder-move 23880 --after 23881 --smart-list 'Focus' --private\n"
-            "  remctl reminder-move 23880 --first --smart-list 'Focus' --private --json"
+            "  remctl reminder-move 23880 --first --smart-list 'Focus' --private --json\n"
+            "  remctl reminder-move 23882 --parent 23880 --private\n"
+            "  remctl reminder-move 23882 --parent 23880 --after 23883 --private\n"
+            "  remctl reminder-move 23882 --top-level --private --json"
         ),
         formatter_class=HelpFormatter,
     )
     c.add_argument("id", type=int, help="Reminder numeric ID")
-    position = c.add_mutually_exclusive_group(required=True)
+    position = c.add_mutually_exclusive_group()
     position.add_argument("--before", type=int, metavar="ID", help="Place immediately before reminder ID")
     position.add_argument("--after", type=int, metavar="ID", help="Place immediately after reminder ID")
     position.add_argument("--first", action="store_true", help="Place first in the current ordering")
     position.add_argument("--last", action="store_true", help="Place last in the current ordering")
+    hierarchy = c.add_mutually_exclusive_group()
+    hierarchy.add_argument("--parent", type=int, metavar="ID",
+                           help="Make it a subtask of reminder ID; placed last unless a position is given")
+    hierarchy.add_argument("--top-level", action="store_true",
+                           help="Make a subtask a top-level reminder; placed after its parent unless a position is given")
     smart_target = c.add_mutually_exclusive_group()
     smart_target.add_argument("--smart-list", help="Custom smart list containing the reminder")
     smart_target.add_argument("--smart-list-id", type=int, help="Custom smart list numeric ID")
