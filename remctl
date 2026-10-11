@@ -6410,7 +6410,8 @@ def capability_host_start_fix(status):
         import shlex
         path = agent["path"]
         fix = ("The signed host is installed, but its LaunchAgent is not loaded. Run "
-               f"`launchctl bootstrap gui/{os.getuid()} {shlex.quote(path)}`, then `remctl doctor --for-agent`.")
+               f"`launchctl bootstrap gui/{os.getuid()} {shlex.quote(path)} && "
+               f"launchctl kickstart gui/{os.getuid()}/{remctl_broker.LAUNCH_AGENT_LABEL}`, then `remctl doctor --for-agent`.")
         if Path(path).parent != Path.home() / "Library/LaunchAgents":
             fix += " This directory is not loaded at login; rerun the updated installer with the original PREFIX to migrate it."
         return fix

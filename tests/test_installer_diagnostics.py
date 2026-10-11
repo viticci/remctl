@@ -49,6 +49,8 @@ class InstallerDiagnosticTests(unittest.TestCase):
                   'launchAgent':{'installed':True,'loaded':False,'contractValid':True,'path':path}}
         fix = cli.capability_host_start_fix(status)
         self.assertIn(f'launchctl bootstrap gui/{os.getuid()}',fix)
+        self.assertIn(f'launchctl kickstart gui/{os.getuid()}/{remctl_broker.LAUNCH_AGENT_LABEL}',fix)
+        self.assertLess(fix.index('launchctl bootstrap'),fix.index('launchctl kickstart'))
         self.assertIn(path,fix)
         self.assertIn('not loaded at login',fix)
         self.assertNotIn('onboard',fix)
