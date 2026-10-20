@@ -9093,6 +9093,59 @@ class CliTests(unittest.TestCase):
         self.assertEqual(alarms[2]["location"]["title"], "Apple Park")
         self.assertEqual(alarms[2]["location"]["proximity"], "arriving")
 
+    def test_entity_numbers_come_from_primary_key_table(self):
+        # macOS 15.7 inserts REMCDAccount at 15, shifting REMCDAlarm to 16 and
+        # every later entity by one.
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME TEXT)")
+        conn.executemany(
+            "INSERT INTO Z_PRIMARYKEY VALUES (?, ?)",
+            [(15, "REMCDAccount"), (16, "REMCDAlarm"), (22, "REMCDAssignment"),
+             (35, "REMCDRecurrenceRule"), (37, "REMCDSharee")],
+        )
+        conn.execute(
+            "CREATE TABLE ZREMCDOBJECT ("
+            "Z_PK INTEGER, Z_ENT INTEGER, ZREMINDER INTEGER, ZTRIGGER INTEGER, "
+            "ZMARKEDFORDELETION INTEGER, ZTIMEINTERVAL REAL, ZDATECOMPONENTSDATA BLOB, "
+            "ZTITLE TEXT, ZLATITUDE REAL, ZLONGITUDE REAL, ZRADIUS REAL, "
+            "ZADDRESS TEXT, ZPROXIMITY INTEGER, ZCKIDENTIFIER TEXT, ZDISPLAYNAME TEXT, "
+            "ZFIRSTNAME TEXT, ZLASTNAME TEXT, ZADDRESS1 TEXT, ZSTATUS INTEGER, "
+            "ZACCESSLEVEL INTEGER, ZLIST INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO ZREMCDOBJECT (Z_PK, Z_ENT, ZREMINDER, ZTRIGGER, ZMARKEDFORDELETION, "
+            "ZTIMEINTERVAL, ZLIST) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, 15, 42, None, 0, None, None),
+                (2, 16, 42, 3, 0, None, None),
+                (3, 20, None, None, 0, -900, None),
+                (4, 36, None, None, 0, None, 7),
+                (5, 37, None, None, 0, None, 7),
+            ],
+        )
+
+        alarms = self.remctl.q_alarms(conn, 42)
+        sharees = self.remctl.q_sharees(conn, 7)
+        recurrence_sql = self.remctl.recurrence_cols(conn)
+        conn.close()
+
+        self.assertEqual([row["alarm_id"] for row in alarms], [2])
+        self.assertEqual(alarms[0]["time_interval"], -900)
+        self.assertEqual([row["Z_PK"] for row in sharees], [5])
+        self.assertIn("+rr.Z_ENT = 35 ", recurrence_sql)
+        self.assertNotIn("+rr.Z_ENT = 34 ", recurrence_sql)
+
+    def test_entity_numbers_fall_back_without_primary_key_table(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            self.assertEqual(self.remctl.core_data_entity(conn, self.remctl.ALARM_ENTITY), 15)
+            self.assertEqual(self.remctl.core_data_entity(conn, self.remctl.ASSIGNMENT_ENTITY), 21)
+            self.assertEqual(self.remctl.core_data_entity(conn, self.remctl.RECURRENCE_RULE_ENTITY), 34)
+            self.assertEqual(self.remctl.core_data_entity(conn, self.remctl.SHAREE_ENTITY), 36)
+        finally:
+            conn.close()
+
     def test_cmd_info_json_hydrates_subtask_attachments_and_alarms(self):
         db = sqlite3.connect(":memory:")
         db.row_factory = sqlite3.Row
