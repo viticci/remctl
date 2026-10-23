@@ -199,7 +199,7 @@ To install under `~/.local` instead, set `PREFIX` on every install and upgrade:
 PREFIX="$HOME/.local" ./install.sh --from-source --bootstrap
 ```
 
-A custom prefix moves the CLI, app, and socket. The LaunchAgent stays in `~/Library/LaunchAgents`, because that's where macOS looks at login. For finer control, `REMCTL_BIN_DIR`, `REMCTL_APP_DIR`, and `REMCTL_LAUNCH_AGENT_DIR` override each location; use the same overrides for every upgrade. The Codex plugin expects the default `~/bin/remctl`; see [the plugin guide](desktop-plugin.md#custom-install-locations) if you change it.
+A custom prefix moves the CLI, app, and socket. The LaunchAgent stays in `~/Library/LaunchAgents`, because that's where macOS looks at login. For finer control, `REMCTL_BIN_DIR`, `REMCTL_APP_DIR`, and `REMCTL_LAUNCH_AGENT_DIR` override each location; use the same overrides for every upgrade. The Codex and Claude Code plugins find `remctl` in `~/bin` or `~/.local/bin`; see [the plugin guide](desktop-plugin.md#custom-install-locations) for other locations.
 
 Don't copy files by hand. That skips the signed host, the protected Python, the background service, and the socket.
 

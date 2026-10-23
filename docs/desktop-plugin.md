@@ -57,7 +57,7 @@ Codex can keep running the old version in an open workspace or conversation. Clo
 
 ## Custom install locations
 
-The plugin starts `~/bin/remctl mcp`. If you installed RemCTL somewhere else, register a checkout instead of the app, and change the path in `plugins/remctl/mcp.json` in that checkout. Don't edit the copy inside the app; that breaks its signature. Keep your change when you pull updates.
+The plugin starts `remctl mcp` from the first of `$REMCTL_BIN_DIR/remctl`, `~/bin/remctl`, and `~/.local/bin/remctl` that exists, then from `PATH`. Both default layouts work without changes. Apps opened from the Dock don't see your shell's `PATH` or `REMCTL_BIN_DIR`, so for any other location, register a checkout instead of the app and change the path in `plugins/remctl/mcp.json` in that checkout. Don't edit the copy inside the app; that breaks its signature. Keep your change when you pull updates.
 
 ## Remove
 

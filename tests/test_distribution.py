@@ -23,19 +23,64 @@ import local_signing
 
 
 class PluginLauncherTests(unittest.TestCase):
+    LAUNCHERS = ("plugins/remctl/mcp.json", "plugins/claude-code/.mcp.json")
+
+    def launcher(self, relative):
+        return json.loads((ROOT / relative).read_text())["mcpServers"]["remctl"]
+
+    def run_launcher(self, config, home, *, path="/usr/bin:/bin", extra=None):
+        env = {"HOME": str(home), "PATH": path, **(extra or {})}
+        return subprocess.run([config["command"], *config["args"]], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def fake_cli(self, path, name):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'#!/bin/sh\nprintf "{name} %s\\n" "$@"\n')
+        path.chmod(0o755)
+
     def test_discoverable_launcher_uses_installed_cli_without_external_python(self):
-        config = json.loads((ROOT / "plugins/remctl/mcp.json").read_text())["mcpServers"]["remctl"]
-        # Agent Plugins rejects absolute commands before starting the MCP server.
-        self.assertRegex(config["command"], r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-        with tempfile.TemporaryDirectory(prefix="remctl home ") as directory:
-            cli = Path(directory) / "bin/remctl"
-            cli.parent.mkdir()
-            cli.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
-            cli.chmod(0o755)
-            result = subprocess.run([config["command"], *config["args"]],
-                                    env={"HOME": directory, "PATH": "/usr/bin:/bin"},
-                                    capture_output=True, text=True, check=True)
-            self.assertEqual(result.stdout, "mcp\n")
+        for relative in self.LAUNCHERS:
+            config = self.launcher(relative)
+            # Agent Plugins rejects absolute commands before starting the MCP server.
+            self.assertRegex(config["command"], r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+            # Claude Code expands ${VAR} in .mcp.json itself; leave every variable to sh.
+            self.assertNotIn("${", json.dumps(config["args"]))
+            with self.subTest(launcher=relative), tempfile.TemporaryDirectory(prefix="remctl home ") as directory:
+                self.fake_cli(Path(directory) / "bin/remctl", "home-bin")
+                result = self.run_launcher(config, directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "home-bin mcp\n")
+
+    def test_launcher_finds_a_local_bin_install(self):
+        # install.sh with REMCTL_BIN_DIR=~/.local/bin, the other common layout.
+        for relative in self.LAUNCHERS:
+            with self.subTest(launcher=relative), tempfile.TemporaryDirectory(prefix="remctl home ") as directory:
+                self.fake_cli(Path(directory) / ".local/bin/remctl", "local-bin")
+                result = self.run_launcher(self.launcher(relative), directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "local-bin mcp\n")
+
+    def test_launcher_prefers_remctl_bin_dir_then_path(self):
+        for relative in self.LAUNCHERS:
+            config = self.launcher(relative)
+            with self.subTest(launcher=relative), tempfile.TemporaryDirectory(prefix="remctl home ") as directory:
+                home = Path(directory)
+                self.fake_cli(home / "bin/remctl", "home-bin")
+                self.fake_cli(home / "custom dir/remctl", "custom")
+                result = self.run_launcher(config, home, extra={"REMCTL_BIN_DIR": str(home / "custom dir")})
+                self.assertEqual(result.stdout, "custom mcp\n")
+                (home / "bin/remctl").unlink()
+                self.fake_cli(home / "elsewhere/remctl", "on-path")
+                result = self.run_launcher(config, home, path=f"{home / 'elsewhere'}:/usr/bin:/bin")
+                self.assertEqual(result.stdout, "on-path mcp\n")
+
+    def test_launcher_explains_a_missing_install(self):
+        for relative in self.LAUNCHERS:
+            with self.subTest(launcher=relative), tempfile.TemporaryDirectory(prefix="remctl home ") as directory:
+                result = self.run_launcher(self.launcher(relative), directory)
+                self.assertEqual(result.returncode, 127)
+                self.assertIn("install.sh", result.stderr)
+                self.assertEqual(result.stdout, "")
 
 
 class RuntimeArchiveTests(unittest.TestCase):

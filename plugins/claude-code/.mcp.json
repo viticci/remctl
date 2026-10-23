@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "remctl": {
-      "command": "${HOME}/bin/remctl",
+      "command": "sh",
       "args": [
-        "mcp"
+        "-c",
+        "for cli in \"$REMCTL_BIN_DIR/remctl\" \"$HOME/bin/remctl\" \"$HOME/.local/bin/remctl\"; do [ -f \"$cli\" ] && [ -x \"$cli\" ] && exec \"$cli\" mcp; done; cli=\"$(command -v remctl)\" && exec \"$cli\" mcp; echo \"RemCTL is not installed in ~/bin or ~/.local/bin and not on PATH; run ./install.sh\" >&2; exit 127"
       ],
       "env": {
         "REMCTL_PLUGIN_BUILD": "e3687400c8af5cd4"
