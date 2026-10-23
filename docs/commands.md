@@ -204,7 +204,7 @@ remctl delete 23880 23881 --force --json
 
 `edit --json` reports `status: "updated"`, the numeric `id`, and the title. With no changed fields, it returns `status: "unchanged"` and `code: "nothing_to_update"`.
 
-Without `--private`, `edit ID --url URL` appends the URL to existing notes. If `--notes` is also supplied, it replaces the notes before the URL is appended. `--notes ""` clears the notes.
+Without `--private`, `edit ID --url URL` appends the URL to existing notes, unless the notes already contain that exact URL as a separate word, so a repeated edit does not add it twice. If `--notes` is also supplied, it replaces the notes before the URL is appended. `--notes ""` clears the notes.
 
 Rescheduling: when every alarm is an absolute alarm at the old due time, `edit -d` moves all copies to the new time, so the time shown in Reminders follows the due date. A date-only target removes those alarms instead of moving them to midnight. An explicit `--alarm` takes precedence. `edit -d clear` removes matching alarms. Other alarm configurations are left alone.
 

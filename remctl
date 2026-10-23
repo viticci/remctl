@@ -10196,8 +10196,10 @@ def cmd_edit(a):
     if getattr(a, "url", None) and not wants_private:
         if notes_body is None:
             notes_body = _row_get(r, "ZNOTES")
-        # Idempotent: a URL already in the notes (an earlier, maybe repeated call) is not appended again.
-        if not (notes_body and a.url in notes_body):
+        # Idempotent: a URL already in the notes as its own word (an earlier,
+        # maybe repeated call) is not appended again. A longer URL that merely
+        # starts with it does not count.
+        if not (notes_body and a.url in notes_body.split()):
             notes_body = (notes_body + "\n\n" + a.url) if notes_body else a.url
 
     # Auto double-tap: if Reminders' displayed due date already equals the

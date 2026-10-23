@@ -7443,6 +7443,8 @@ class CliTests(unittest.TestCase):
             ("", "Old notes", "https://example.com"),
             # A repeated call does not append the same URL again.
             (None, "Existing notes\n\nhttps://example.com", "Existing notes\n\nhttps://example.com"),
+            # A longer URL that starts with it is a different link.
+            (None, "See https://example.com/page", "See https://example.com/page\n\nhttps://example.com"),
         ]
         for bridge in (True, False):
             for supplied, existing, expected in cases:

@@ -192,7 +192,7 @@ Notes:
 
 Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`, which is true only for `resolve_location`).
 
-Errors use the two channels the specification defines. A malformed request or an unknown tool is a JSON-RPC error (`-32602`). A tool that ran but failed returns `isError: true` with `structuredContent.error`. When RemCTL emitted a structured error on stderr, for example `invalid_due_date` or `confirmation_required`, that object is passed through so the model can correct the call.
+Errors use the two channels the specification defines. A malformed request or an unknown tool is a JSON-RPC error (`-32602`). A tool that ran but failed returns `isError: true` with `structuredContent.error`. When RemCTL emitted a structured error on stderr, for example `invalid_due_date` or `confirmation_required`, that object is passed through so the model can correct the call. A write tool that times out returns `timeout` with `outcome: "unknown"`, because the change may already be saved: read the reminder before trying again.
 
 Two prompts are included: `daily_review` and `plan_week`.
 
