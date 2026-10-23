@@ -2999,8 +2999,8 @@ def _error_response(exc: BaseException) -> dict[str, Any]:
     return response
 
 
-def _process_parent_and_uid(pid: int) -> tuple[int, int] | None:
-    """Return a live process's parent pid and uid, or None when it cannot be read."""
+def _process_info(pid: int) -> tuple[int, int, tuple[int, int]] | None:
+    """Return a live process's parent pid, uid, and start time, or None."""
 
     try:
         library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -3009,42 +3009,84 @@ def _process_parent_and_uid(pid: int) -> tuple[int, int] | None:
             ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
         ]
         proc_pidinfo.restype = ctypes.c_int
-        # PROC_PIDT_SHORTBSDINFO: struct proc_bsdshortinfo, 64 bytes.
-        buffer = ctypes.create_string_buffer(64)
-        loaded = proc_pidinfo(pid, 13, 0, buffer, ctypes.sizeof(buffer))
+        # PROC_PIDTBSDINFO: struct proc_bsdinfo, 136 bytes.
+        buffer = ctypes.create_string_buffer(136)
+        loaded = proc_pidinfo(pid, 3, 0, buffer, ctypes.sizeof(buffer))
     except (AttributeError, OSError):
         return None
     if loaded != ctypes.sizeof(buffer):
         return None
-    parent = struct.unpack_from("=I", buffer.raw, 4)[0]
-    uid = struct.unpack_from("=I", buffer.raw, 36)[0]
-    return parent, uid
+    parent, uid = struct.unpack_from("=II", buffer.raw, 16)
+    started = struct.unpack_from("=QQ", buffer.raw, 120)
+    return parent, uid, started
 
 
-def _is_orphaned_broker(pid: int) -> bool:
-    """True only for this user's RemCTL Python after launchd adopted it.
+def _process_arguments(pid: int) -> list[str] | None:
+    """Read a process's argv through sysctl KERN_PROCARGS2, or None."""
+
+    try:
+        sysctl = ctypes.CDLL(None, use_errno=True).sysctl
+        sysctl.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+    except (AttributeError, OSError):
+        return None
+    raw = buffer.raw[: size.value]
+    if len(raw) < 4 or b"\0" not in raw[4:]:
+        return None
+    # Layout: argc, the executable path, NUL padding, then argv and environment.
+    argc = struct.unpack_from("=i", raw)[0]
+    arguments = raw[raw.index(b"\0", 4):].lstrip(b"\0").split(b"\0")[:argc]
+    return [os.fsdecode(argument) for argument in arguments]
+
+
+def _orphaned_broker_identity(pid: int, socket_path: Path) -> tuple[int, int] | None:
+    """Return the start time of this user's orphaned broker for socket_path.
 
     A broker's parent is always its native host, so a parent of 1 means the
-    host died without stopping it.
+    host died without stopping it. The start time pins that exact process, so
+    a later check cannot match a different process that reused its pid.
     """
 
-    if pid <= 1 or pid == os.getpid() or _process_parent_and_uid(pid) != (1, os.getuid()):
-        return False
+    if pid <= 1 or pid == os.getpid():
+        return None
+    info = _process_info(pid)
+    if info is None or info[:2] != (1, os.getuid()):
+        return None
     try:
         executable = _process_executable_path(pid)
+        own_executable = _process_executable_path(os.getpid())
     except _ServerError:
-        return False
-    return (
-        executable == Path(sys.executable).resolve()
-        or executable.is_relative_to(PROTECTED_PYTHON_ROOT)
-    )
+        return None
+    if executable != own_executable and not executable.is_relative_to(PROTECTED_PYTHON_ROOT):
+        return None
+    # The host always launches the broker as `... service --socket <path>`.
+    arguments = _process_arguments(pid)
+    if (
+        arguments is None
+        or arguments[-3:-1] != ["service", "--socket"]
+        or Path(arguments[-1]).expanduser().absolute() != socket_path
+        or _process_info(pid) != info
+    ):
+        return None
+    return info[2]
 
 
-def _stop_orphaned_broker(probe: socket.socket) -> bool:
+def _stop_orphaned_broker(probe: socket.socket, socket_path: Path) -> bool:
     """Stop the process answering on the socket if it is an orphaned broker.
 
     Returns True once that process is gone. Anything not positively identified
-    by _is_orphaned_broker is left alone.
+    by _orphaned_broker_identity is left alone, and every signal first checks
+    that the pid still names the process identified at the start.
     """
 
     if sys.platform != "darwin":
@@ -3053,10 +3095,11 @@ def _stop_orphaned_broker(probe: socket.socket) -> bool:
         pid = probe.getsockopt(0, getattr(socket, "LOCAL_PEERPID", 2))
     except OSError:
         return False
-    if not _is_orphaned_broker(pid):
+    identity = _orphaned_broker_identity(pid, socket_path)
+    if identity is None:
         return False
     for signum, wait in ((signal.SIGTERM, ORPHANED_BROKER_STOP_SECONDS), (signal.SIGKILL, 1.0)):
-        if not _is_orphaned_broker(pid):
+        if _orphaned_broker_identity(pid, socket_path) != identity:
             return True
         try:
             os.kill(pid, signum)
@@ -3064,20 +3107,20 @@ def _stop_orphaned_broker(probe: socket.socket) -> bool:
             return True
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if not _is_orphaned_broker(pid):
+            if _orphaned_broker_identity(pid, socket_path) != identity:
                 return True
             time.sleep(0.05)
     return False
 
 
-def _stop_when_parent_exits() -> None:
-    """Stop serving as soon as the native host exits, however it died.
+def _stop_when_parent_exits(parent: int) -> None:
+    """Stop serving as soon as the native host `parent` exits, however it died.
 
     The host forwards SIGTERM and SIGINT, but a crash or SIGKILL sends nothing,
-    and an orphaned broker would keep the socket from every later host.
+    and an orphaned broker would keep the socket from every later host. Pass
+    the pid recorded when serving began: if the host has already gone, this
+    stops at once instead of watching launchd.
     """
-
-    parent = os.getppid()
 
     def watch() -> None:
         try:
@@ -3148,7 +3191,7 @@ def _prepare_socket(path: Path) -> socket.socket:
             path.unlink()
             break
         else:
-            if released_by is None and _stop_orphaned_broker(probe):
+            if released_by is None and _stop_orphaned_broker(probe, path):
                 released_by = time.monotonic() + 1.0
                 continue
             if released_by is not None and time.monotonic() < released_by:
@@ -3172,8 +3215,9 @@ def _prepare_socket(path: Path) -> socket.socket:
 
 
 def serve(*, broker_socket: Path) -> None:
+    host_pid = os.getppid()
     runtime = _hosted_runtime_from_environment()
-    if os.getppid() <= 1:
+    if host_pid <= 1:
         raise _ServerError("Capability Host parent is unavailable", code="host_runtime_invalid")
     listener = _prepare_socket(broker_socket)
     previous_handlers = {
@@ -3193,7 +3237,7 @@ def serve(*, broker_socket: Path) -> None:
 
     for signum in previous_handlers:
         signal.signal(signum, stop_service)
-    _stop_when_parent_exits()
+    _stop_when_parent_exits(host_pid)
 
     def handle_connection(connection: socket.socket) -> None:
         descriptors: list[int] = []
