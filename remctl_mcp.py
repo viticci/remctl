@@ -1490,52 +1490,104 @@ def tool_result_from_command(tool: Tool, result: CommandResult, *, budget: bool 
             structured = dict(structured)
             structured["stderr"] = _tail("\n".join(warnings), 4000)
     if budget:
-        structured = _within_budget(structured)
+        cut = _within_budget(structured)
+        if cut is None:
+            return _error_result({"code": "result_too_large", "message": (
+                f"{tool.name} succeeded, but its result is larger than {RESULT_BYTE_LIMIT} bytes and could not be "
+                "cut to fit. Narrow the request.")})
+        structured = cut
     text = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
     return {"content": [{"type": "text", "text": text}], "structuredContent": structured, "isError": False}
 
 
-# MCP clients cut large tool results silently (show --completed was 82 kB, export 634 kB). Above this size the
-# largest list keeps its head as valid JSON and resultBudget says what was cut.
+# MCP clients cut large tool results silently (show --completed was 82 kB, export 634 kB). Above this size
+# _within_budget cuts the result until it fits, as valid JSON, and resultBudget says what was cut.
 RESULT_BYTE_LIMIT = 48_000
+CUT_TEXT_MARKER = "… [truncated]"
 
 
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def _within_budget(structured: Any) -> Any:
-    """Cut the largest top-level list so the result fits RESULT_BYTE_LIMIT.
+def _containers(value: Any, path: str = ""):
+    """Yield (parent, key, path) for every list and string below value."""
+    pairs = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+    for key, child in pairs:
+        child_path = f"{path}[{key}]" if isinstance(value, list) else f"{path}.{key}" if path else key
+        if isinstance(child, (list, str)):
+            yield value, key, child_path
+        yield from _containers(child, child_path)
 
-    A page (search, recently_deleted) gets count, hasMore, and nextOffset for
-    the rows it kept, so following nextOffset skips nothing. At least one row
-    is kept, so paging always advances even when one row alone is too large.
+
+def _within_budget(structured: Any) -> Any:
+    """Cut a result until it fits RESULT_BYTE_LIMIT, or return None if it cannot fit.
+
+    The rows of a page lose their tail first, then the list with the most entries
+    (rows rather than the groups holding them), until every list is down to one
+    entry; then the longest strings (usually notes) are shortened and end with
+    CUT_TEXT_MARKER. resultBudget.cuts names every list and string that was cut.
+    A page (search, recently_deleted) whose rows were cut gets count, hasMore, and
+    nextOffset for the rows it kept, so following nextOffset skips nothing. One row
+    is always kept, so paging always advances.
     """
     if not isinstance(structured, dict) or _json_size(structured) <= RESULT_BYTE_LIMIT:
         return structured
-    lists = [(key, value) for key, value in structured.items() if isinstance(value, list) and value]
-    if not lists:
-        return structured
-    key, items = max(lists, key=lambda pair: _json_size(pair[1]))
-    paged = key == "items" and "nextOffset" in structured and isinstance(structured.get("offset"), int)
-    low, high = 1, len(items)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if _json_size({**structured, key: items[:middle]}) <= RESULT_BYTE_LIMIT - 1_500:
-            low = middle
+    total = _json_size(structured)
+    work = json.loads(json.dumps(structured, ensure_ascii=False))
+    paged = isinstance(work.get("items"), list) and "nextOffset" in work and isinstance(work.get("offset"), int)
+    cuts: dict[str, dict[str, Any]] = {}
+
+    def result() -> dict[str, Any]:
+        out = {**work, "truncated": True}
+        if paged and "items" in cuts:
+            kept = len(work["items"])
+            out.update(count=kept, hasMore=True, nextOffset=structured["offset"] + kept)
+            hint = "Only the first rows of this page fit in one answer. Call again with offset set to nextOffset for the rest."
         else:
-            high = middle - 1
-    cut = {**structured, key: items[:low], "truncated": True}
-    if paged:
-        cut.update(count=low, hasMore=True, nextOffset=structured["offset"] + low)
-        hint = "Only the first rows of this page fit in one answer. Call again with offset set to nextOffset for the rest."
-    else:
-        hint = ("Only the first items fit in one answer; the rest is not shown. Do not present this as complete. "
-                "Narrow the request, for example with search, which pages with limit and offset.")
-    cut["resultBudget"] = {
-        "totalBytes": _json_size(structured), "list": key, "totalItems": len(items), "returnedItems": low, "hint": hint,
-    }
-    return cut
+            hint = ("Part of this result is not shown; resultBudget.cuts says what. Do not present it as complete. "
+                    "Narrow the request, for example with search, which pages with limit and offset.")
+        if any("totalChars" in cut for cut in cuts.values()):
+            hint += f" Text ending in {CUT_TEXT_MARKER!r} was shortened."
+        out["resultBudget"] = {"totalBytes": total, "cuts": list(cuts.values()), "hint": hint}
+        return out
+
+    def fits() -> bool:
+        return _json_size(result()) <= RESULT_BYTE_LIMIT
+
+    while not fits():
+        found = list(_containers(work))
+        lists = [entry for entry in found if isinstance(entry[0][entry[1]], list) and len(entry[0][entry[1]]) > 1]
+        if lists:
+            # Page rows first, since nextOffset recovers them; then the list with the most entries.
+            parent, key, path = max(lists, key=lambda entry: (
+                paged and entry[2] == "items", len(entry[0][entry[1]]), _json_size(entry[0][entry[1]])))
+            items = parent[key]
+            cut = cuts.setdefault(path, {"path": path, "totalItems": len(items)})
+            parent[key] = items[:1]
+            if fits():  # keep as many entries as fit
+                low, high = 1, len(items) - 1
+                while low < high:
+                    parent[key] = items[:(middle := (low + high + 1) // 2)]
+                    low, high = (middle, high) if fits() else (low, middle - 1)
+                parent[key] = items[:low]
+            else:  # other lists must shrink too: halve this one and look again
+                parent[key] = items[:len(items) // 2]
+            cut["returnedItems"] = len(parent[key])
+            continue
+        strings = [entry for entry in found if isinstance(entry[0][entry[1]], str)]
+        if not strings:
+            return None
+        parent, key, path = max(strings, key=lambda entry: len(entry[0][entry[1]]))
+        text = parent[key]
+        if len(text) < 500:
+            return None  # nothing sensible left to shorten
+        excess = _json_size(result()) - RESULT_BYTE_LIMIT + _json_size(CUT_TEXT_MARKER) + 100
+        keep = max(0, len(text) - math.ceil(excess * len(text) / _json_size(text)))
+        cut = cuts.setdefault(path, {"path": path, "totalChars": len(text)})
+        parent[key] = text[:keep] + CUT_TEXT_MARKER
+        cut["returnedChars"] = keep
+    return result()
 
 
 def _error_result(error: dict[str, Any]) -> dict[str, Any]:

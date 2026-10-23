@@ -88,7 +88,7 @@ Upgrades keep the install's signing route: `git pull && ./install.sh --from-sour
 - Do not pass `--private` for recurrence, alarms, priority, notes, or ordinary list moves; those are EventKit features. Use `--private` only for the metadata in [Private metadata](#private-metadata), or when the user asks for it.
 - Do not use `--via-eventkit` unless the task explicitly accepts limited data. It returns `eventKitId` values that no numeric-id command accepts, and no sections, tags, or private fields.
 - `search` matches titles, notes, and saved rich links of active reminders, ignoring case and accents; add `--completed` to include completed ones. The MCP tool always returns a page: while `hasMore` is true, call again with `offset` set to `nextOffset`. Scope it with `list` or `list_id`.
-- An MCP result over 48 kB is cut and marked `truncated: true`, with `resultBudget` saying how many rows were returned. Never present a truncated result as complete; follow `nextOffset` on a page, or narrow the request.
+- An MCP result over 48 kB is cut and marked `truncated: true`, with `resultBudget.cuts` saying which lists and texts were cut. Never present a truncated result as complete; follow `nextOffset` on a page, or narrow the request.
 - `done`, `undone`, and `delete` (MCP `reminder_ids`) take up to 50 ids. Read `succeeded`, `failed`, and `uncertain`. Never retry an `uncertain` id without `get_reminder` first: completing a repeating reminder advances it one occurrence each time.
 - JSON preserves raw Reminders text. Human output strips control characters and adds marks (`⚑`, `!!!`, `🔗`, `🌄`) that are never in JSON.
 - Never read or write the Reminders SQLite database yourself.
