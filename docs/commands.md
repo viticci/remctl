@@ -246,9 +246,15 @@ remctl reminder-move 23880 --first --private
 remctl reminder-move 23880 --last --private --json
 remctl reminder-move 23880 --before 23881 --smart-list "Focus" --private
 remctl reminder-move 23880 --last --smart-list-id 170 --private
+remctl reminder-move 23882 --parent 23880 --private
+remctl reminder-move 23882 --parent 23880 --after 23883 --private
+remctl reminder-move 23883 --first --private
+remctl reminder-move 23882 --top-level --private --json
 ```
 
 `reminder-move` changes the display position without changing the list. It is a private write and requires `--private`. Without a smart-list target, the reminder and the anchor must be in the same list. With `--smart-list` or `--smart-list-id`, RemCTL reorders an unsectioned custom smart list, whose reminders may come from different lists. Sectioned smart lists are refused. The command reads the order back and reports `verified: true`; `show <list> --json` shows the new order.
+
+`--parent ID` makes an existing reminder a subtask of another reminder, as indenting does in Reminders. The reminder keeps its ID, notes, dates, and other details. It goes last among the parent's subtasks unless `--before`, `--after`, or `--first` places it; those anchors must be subtasks of the same parent. `--top-level` turns a subtask back into an ordinary reminder, placed right after its former parent unless a position is given. Placed before or after a top-level reminder, including that default, it also joins that reminder's section, so it shows where it was put; `--first` and `--last` leave sections alone. A subtask moved with only a position stays with its parent and is reordered among its siblings. Reminders allows one level of subtasks, so the parent must be a top-level reminder in the same list, and a reminder with subtasks of its own cannot be nested. `--parent` and `--top-level` don't combine with a smart-list target. Success reports `hierarchy` (`nested`, `unnested`, or `reordered`) and `parentId`. `subtasks ID` lists subtasks in the order Reminders shows them.
 
 ## Lists
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- `reminder-move --parent ID` makes an existing reminder a subtask of another, as indenting does in Reminders, and `--top-level` turns a subtask back into an ordinary reminder. The reminder keeps its ID, notes, dates, and other details; nothing is cloned or deleted. Add `--before`, `--after`, `--first`, or `--last` to place it among the parent's subtasks, or among top-level reminders. A reminder placed next to a top-level reminder joins that reminder's section. RemCTL reads back the parent and the position before reporting success. The Codex plugin's Reminder Move tool takes `parent` and `top_level`, and MCP clients reach the new options through `run`.
+
+### Fixes
+
+- Moving a subtask with `reminder-move --before`, `--after`, `--first`, or `--last` reorders it under its parent. It used to move the subtask out of its parent to the top level and then report that the order could not be verified.
+- Subtasks added with `add --subtask` or `edit --subtask` appear in Reminders in the order given, after any existing subtasks. ReminderKit puts each new subtask first, so several subtasks used to appear in reverse.
+- `subtasks`, `info`, and the workspace list subtasks in the order Reminders shows them, instead of the order they were stored in.
+- Moving a parent with subtasks to another list (`edit -l`, which clones and deletes) keeps its subtasks in their order instead of reversing them.
+
 ## 2.3.1 — 2026-10-04
 
 ### Fixes

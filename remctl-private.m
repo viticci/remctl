@@ -118,6 +118,17 @@
 - (id)subtaskContext;
 - (id)urgentAlarmContext;
 - (void)addAlarm:(id)alarm;
+- (void)removeFromParentReminder;
+@end
+
+@interface REMReminderSubtaskContextChangeItem : NSObject
+- (void)addReminderChangeItem:(id)changeItem;
+- (void)insertReminderChangeItem:(id)changeItem beforeReminderChangeItem:(id)siblingChangeItem;
+- (void)insertReminderChangeItem:(id)changeItem afterReminderChangeItem:(id)siblingChangeItem;
+@end
+
+@interface REMReminderSubtaskContext : NSObject
+- (NSArray *)fetchRemindersWithError:(NSError **)error;
 @end
 
 @interface REMReminderAssignmentContextChangeItem : NSObject
@@ -156,6 +167,8 @@
 @interface REMReminder : NSObject
 - (id)list;
 - (id)remObjectID;
+- (BOOL)isSubtask;
+- (id)subtaskContext;
 @end
 
 @interface REMListChangeItem : NSObject
@@ -172,6 +185,7 @@
 - (void)setParentSubContainerID:(id)objectID;
 - (void)insertReminderChangeItem:(id)changeItem beforeReminderChangeItem:(id)siblingChangeItem;
 - (void)insertReminderChangeItem:(id)changeItem afterReminderChangeItem:(id)siblingChangeItem;
+- (void)addReminderChangeItem:(id)changeItem;
 - (void)removeFromParentWithAccountChangeItem:(id)accountChangeItem;
 @end
 
@@ -460,6 +474,39 @@ static NSArray<NSString *> *stringArray(id value, NSString *field) {
 
 static NSURL *reminderURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDReminder/%@", ckIdentifier]];
+}
+
+static NSString *objectUUIDString(id objectID) {
+    if (!objectID || ![objectID respondsToSelector:@selector(uuid)]) return @"";
+    return [[objectID uuid] UUIDString] ?: @"";
+}
+
+// Live subtasks of a reminder, keyed by uppercase UUID. Returns nil when ReminderKit cannot list them.
+static NSDictionary<NSString *, id> *subtasksByUUID(id reminder) {
+    if (![reminder respondsToSelector:@selector(subtaskContext)]) return nil;
+    id context = [reminder subtaskContext];
+    if (![context respondsToSelector:@selector(fetchRemindersWithError:)]) return nil;
+    NSError *error = nil;
+    NSArray *subtasks = [context fetchRemindersWithError:&error];
+    if (!subtasks) return nil;
+    NSMutableDictionary *result = [NSMutableDictionary dictionaryWithCapacity:subtasks.count];
+    for (id subtask in subtasks) {
+        NSString *uuid = objectUUIDString([subtask remObjectID]);
+        if (uuid.length) result[uuid.uppercaseString] = subtask;
+    }
+    return result;
+}
+
+// The last of these subtasks in Reminders display order, or nil when none is in the list ordering.
+static id lastSubtaskInDisplayOrder(id reminder, NSDictionary<NSString *, id> *subtasks) {
+    if (subtasks.count == 0) return nil;
+    REMList *list = [reminder list];
+    if (![list respondsToSelector:@selector(reminderIDsOrdering)]) return nil;
+    for (id candidateObjectID in [[[list reminderIDsOrdering] array] reverseObjectEnumerator]) {
+        id subtask = subtasks[objectUUIDString(candidateObjectID).uppercaseString];
+        if (subtask) return subtask;
+    }
+    return nil;
 }
 
 static NSArray *reminderObjectIDsFromStrings(NSArray<NSString *> *identifiers, NSString *field) {
@@ -933,6 +980,7 @@ int main(void) {
             @"apply_template",
             @"delete_template",
             @"move_reminder_in_list",
+            @"move_reminder_in_hierarchy",
             @"set_smart_list_manual_order",
         ]];
         if (![action isKindOfClass:[NSString class]] || ![allowedActions containsObject:action]) {
@@ -1814,6 +1862,10 @@ int main(void) {
                     fail(@"Cloned parent reminder does not support subtasks");
                 }
 
+                // Copies land first like new subtasks, so chain each after the previous one
+                // to keep childIds' display order.
+                BOOL canOrderCopies = [subtaskContext respondsToSelector:@selector(insertReminderChangeItem:afterReminderChangeItem:)];
+                REMReminderChangeItem *previousCopy = nil;
                 for (NSString *childID in childIDs) {
                     id childObjectID = [REMObjectID objectIDWithURL:reminderURL(childID)];
                     if (!childObjectID) {
@@ -1827,6 +1879,14 @@ int main(void) {
                     if (!copiedChild) {
                         fail([NSString stringWithFormat:@"Could not clone child reminder: %@", childID]);
                     }
+                    if (previousCopy && canOrderCopies) {
+                        @try {
+                            [subtaskContext insertReminderChangeItem:copiedChild afterReminderChangeItem:previousCopy];
+                        } @catch (NSException *exception) {
+                            failException(@"ReminderKit subtask ordering failed", exception);
+                        }
+                    }
+                    previousCopy = copiedChild;
                     id childObjectIDOut = [copiedChild remObjectID];
                     NSString *childUUID = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(uuid)] ? [[childObjectIDOut uuid] UUIDString] : @"";
                     NSString *childURL = childObjectIDOut && [childObjectIDOut respondsToSelector:@selector(urlRepresentation)] ? [[childObjectIDOut urlRepresentation] absoluteString] : @"";
@@ -1963,6 +2023,169 @@ int main(void) {
                 @"listId": listID,
                 @"position": position,
                 @"anchorId": effectiveAnchorID ?: @"",
+                @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION),
+            });
+            return 0;
+        }
+
+        if ([action isEqualToString:@"move_reminder_in_hierarchy"]) {
+            // Nest a reminder under a parent, reorder it among that parent's subtasks,
+            // or return it to the top level. The reminder keeps its ID throughout.
+            NSString *listID = cmd[@"listId"];
+            id parentValue = cmd[@"parentId"];
+            NSString *position = cmd[@"position"];
+            NSString *anchorID = cmd[@"anchorId"];
+            if (![listID isKindOfClass:[NSString class]] || listID.length == 0) {
+                fail(@"listId is required");
+            }
+            NSString *parentID = nil;
+            if ([parentValue isKindOfClass:[NSString class]] && [(NSString *)parentValue length] > 0) {
+                parentID = parentValue;
+            } else if (parentValue && parentValue != [NSNull null]) {
+                fail(@"parentId must be a reminder ID, or null for the top level");
+            }
+            NSSet<NSString *> *positions = [NSSet setWithArray:@[@"before", @"after", @"append"]];
+            if (![position isKindOfClass:[NSString class]] || ![positions containsObject:position]) {
+                fail(@"position must be before, after, or append");
+            }
+            BOOL anchored = ![position isEqualToString:@"append"];
+            if (anchored) {
+                if (![anchorID isKindOfClass:[NSString class]] || anchorID.length == 0) {
+                    fail(@"anchorId is required for before or after positioning");
+                }
+                if ([anchorID caseInsensitiveCompare:reminderID] == NSOrderedSame) {
+                    fail(@"A reminder cannot be positioned relative to itself");
+                }
+            }
+
+            REMList *list = [reminder list];
+            if ([objectUUIDString([list remObjectID]) caseInsensitiveCompare:listID] != NSOrderedSame) {
+                fail(@"Reminder is not in the requested list");
+            }
+            if (![reminder respondsToSelector:@selector(isSubtask)]) {
+                fail(@"ReminderKit subtask state is unavailable on this macOS version");
+            }
+
+            id parent = nil;
+            NSDictionary<NSString *, id> *siblings = nil;
+            if (parentID) {
+                if ([parentID caseInsensitiveCompare:reminderID] == NSOrderedSame) {
+                    fail(@"A reminder cannot be its own parent");
+                }
+                id parentObjectID = [REMObjectID objectIDWithURL:reminderURL(parentID)];
+                if (!parentObjectID) {
+                    fail(@"Could not build ReminderKit parent object ID");
+                }
+                parent = [store fetchReminderWithObjectID:parentObjectID error:&error];
+                if (!parent) {
+                    fail(error.localizedDescription ?: @"Parent reminder not found");
+                }
+                if ([objectUUIDString([[parent list] remObjectID]) caseInsensitiveCompare:listID] != NSOrderedSame) {
+                    fail(@"Parent reminder is not in the requested list");
+                }
+                if ([parent isSubtask]) {
+                    fail(@"The parent must be a top-level reminder; Reminders allows one level of subtasks");
+                }
+                // A subtask cannot have subtasks, and ReminderKit gives it no subtask context to ask.
+                if (![reminder isSubtask]) {
+                    NSDictionary<NSString *, id> *ownSubtasks = subtasksByUUID(reminder);
+                    if (!ownSubtasks) {
+                        fail(@"ReminderKit could not list this reminder's subtasks on this macOS version");
+                    }
+                    if (ownSubtasks.count > 0) {
+                        fail(@"A reminder with its own subtasks cannot become a subtask");
+                    }
+                }
+                siblings = subtasksByUUID(parent);
+                if (!siblings) {
+                    fail(@"ReminderKit could not list the parent's subtasks on this macOS version");
+                }
+            }
+
+            id anchor = nil;
+            if (anchored) {
+                id anchorObjectID = [REMObjectID objectIDWithURL:reminderURL(anchorID)];
+                if (!anchorObjectID) {
+                    fail(@"Could not build ReminderKit anchor object ID");
+                }
+                anchor = [store fetchReminderWithObjectID:anchorObjectID error:&error];
+                if (!anchor) {
+                    fail(error.localizedDescription ?: @"Anchor reminder not found");
+                }
+                if (parentID) {
+                    if (!siblings[anchorID.uppercaseString]) {
+                        fail(@"The anchor is not a subtask of the requested parent");
+                    }
+                } else {
+                    if ([objectUUIDString([[anchor list] remObjectID]) caseInsensitiveCompare:listID] != NSOrderedSame) {
+                        fail(@"Reminder and anchor are not in the same list");
+                    }
+                    if ([anchor isSubtask]) {
+                        fail(@"The anchor must be a top-level reminder");
+                    }
+                }
+            }
+
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            REMReminderChangeItem *movingChange = [save updateReminder:reminder];
+            REMReminderChangeItem *anchorChange = anchor ? [save updateReminder:anchor] : nil;
+            if (!movingChange || (anchor && !anchorChange)) {
+                fail(@"Could not create ReminderKit change items");
+            }
+            @try {
+                if (parentID) {
+                    REMReminderChangeItem *parentChange = [save updateReminder:parent];
+                    id subtaskContext = parentChange ? [parentChange subtaskContext] : nil;
+                    if (!subtaskContext
+                        || ![subtaskContext respondsToSelector:@selector(addReminderChangeItem:)]
+                        || ![subtaskContext respondsToSelector:@selector(insertReminderChangeItem:afterReminderChangeItem:)]
+                        || ![subtaskContext respondsToSelector:@selector(insertReminderChangeItem:beforeReminderChangeItem:)]) {
+                        fail(@"ReminderKit subtask ordering is unavailable on this macOS version");
+                    }
+                    if ([position isEqualToString:@"before"]) {
+                        [subtaskContext insertReminderChangeItem:movingChange beforeReminderChangeItem:anchorChange];
+                    } else if ([position isEqualToString:@"after"]) {
+                        [subtaskContext insertReminderChangeItem:movingChange afterReminderChangeItem:anchorChange];
+                    } else {
+                        [subtaskContext addReminderChangeItem:movingChange];
+                    }
+                } else {
+                    REMListChangeItem *listChange = [save updateList:list];
+                    if (!listChange
+                        || ![listChange respondsToSelector:@selector(addReminderChangeItem:)]
+                        || ![listChange respondsToSelector:@selector(insertReminderChangeItem:afterReminderChangeItem:)]
+                        || ![listChange respondsToSelector:@selector(insertReminderChangeItem:beforeReminderChangeItem:)]) {
+                        fail(@"ReminderKit list ordering is unavailable on this macOS version");
+                    }
+                    if ([reminder isSubtask]) {
+                        if (![movingChange respondsToSelector:@selector(removeFromParentReminder)]) {
+                            fail(@"ReminderKit cannot remove a subtask from its parent on this macOS version");
+                        }
+                        [movingChange removeFromParentReminder];
+                    }
+                    if ([position isEqualToString:@"before"]) {
+                        [listChange insertReminderChangeItem:movingChange beforeReminderChangeItem:anchorChange];
+                    } else if ([position isEqualToString:@"after"]) {
+                        [listChange insertReminderChangeItem:movingChange afterReminderChangeItem:anchorChange];
+                    } else {
+                        [listChange addReminderChangeItem:movingChange];
+                    }
+                }
+            } @catch (NSException *exception) {
+                failException(@"ReminderKit hierarchy move failed", exception);
+            }
+            error = nil;
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit hierarchy move save failed");
+            }
+            output(@{
+                @"status": @"updated",
+                @"action": action,
+                @"id": reminderID,
+                @"listId": listID,
+                @"parentId": parentID ?: [NSNull null],
+                @"position": position,
+                @"anchorId": anchorID ?: @"",
                 @"protocolVersion": @(REMCTL_PRIVATE_PROTOCOL_VERSION),
             });
             return 0;
@@ -2125,15 +2348,42 @@ int main(void) {
             }
             NSMutableArray *subtaskURLs = [NSMutableArray array];
             NSMutableArray *subtaskDetails = [NSMutableArray array];
+            // ReminderKit puts each new subtask first. Chain them after the current last
+            // subtask so they appear after existing ones, in the order given.
+            // subtaskPlacement reports where the batch went: "afterExisting", "first" (the
+            // parent had none), "unconfirmed" (existing subtasks whose order could not be read;
+            // the batch keeps its order but starts first), or "unordered" (no ordering API).
+            BOOL canOrderSubtasks = [subtaskContext respondsToSelector:@selector(insertReminderChangeItem:afterReminderChangeItem:)];
+            id previousSubtask = nil;
+            NSString *placement = canOrderSubtasks ? @"first" : @"unordered";
+            if (canOrderSubtasks) {
+                NSDictionary<NSString *, id> *existingSubtasks = subtasksByUUID(reminder);
+                if (!existingSubtasks) {
+                    placement = @"unconfirmed";
+                } else if (existingSubtasks.count > 0) {
+                    id lastExistingSubtask = lastSubtaskInDisplayOrder(reminder, existingSubtasks);
+                    if (lastExistingSubtask) {
+                        previousSubtask = [save updateReminder:lastExistingSubtask];
+                        placement = @"afterExisting";
+                    } else {
+                        placement = @"unconfirmed";
+                    }
+                }
+            }
+            details[@"subtaskPlacement"] = placement;
             for (NSDictionary *subtaskSpec in subtaskSpecs) {
                 NSString *title = subtaskSpec[@"title"];
                 id subtask = nil;
                 @try {
                     subtask = [save addReminderWithTitle:title toReminderSubtaskContextChangeItem:subtaskContext];
+                    if (subtask && previousSubtask && canOrderSubtasks) {
+                        [subtaskContext insertReminderChangeItem:subtask afterReminderChangeItem:previousSubtask];
+                    }
                 } @catch (NSException *exception) {
                     failException(@"ReminderKit subtask creation failed", exception);
                 }
                 if (!subtask) fail([NSString stringWithFormat:@"Could not create subtask: %@", title]);
+                previousSubtask = subtask;
                 id subtaskID = [subtask remObjectID];
                 NSString *subtaskURL = subtaskID ? ([[subtaskID urlRepresentation] absoluteString] ?: @"") : @"";
                 NSString *subtaskIdentifier = subtaskID && [subtaskID respondsToSelector:@selector(uuid)] ? [[subtaskID uuid] UUIDString] : @"";

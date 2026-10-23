@@ -177,11 +177,15 @@ remctl reminder-move 23880 --before 23881 --private
 remctl reminder-move 23880 --first --private
 remctl reminder-move 23880 --after 23881 --smart-list "Focus" --private
 remctl reminder-move 23880 --last --smart-list-id 170 --private --json
+remctl reminder-move 23882 --parent 23880 --private
+remctl reminder-move 23882 --top-level --private
 ```
 
 Ordinary-list moves use ReminderKit's list ordering changes and require both relative reminders to share a base list. Unsectioned custom-smart-list moves update the existing `REMManualOrdering` object through `REMSmartListChangeItem`; they do not mutate the local SQLite row. Cross-list anchors are supported only when targeting a custom smart list.
 
 RemCTL intentionally refuses built-in smart lists, sectioned custom smart lists, missing manual-order records, and anchors without a persisted position. A custom smart list with no manual-order record must be manually reordered once in Reminders.app before RemCTL can preserve and update that ordering safely. Every successful command verifies the resulting identifier order from the local Reminders store before reporting success.
+
+Subtask moves (`--parent`, `--top-level`, and any move of a subtask) go through `move_reminder_in_hierarchy`. Nesting and reordering among subtasks call `REMReminderSubtaskContextChangeItem` `addReminderChangeItem:` or `insertReminderChangeItem:before/afterReminderChangeItem:` on the parent's subtask context; returning a subtask to the top level calls `REMReminderChangeItem.removeFromParentReminder` and inserts it through the list's ordering. These are the same objects Reminders uses to indent and outdent, so the reminder keeps its identifier and fields; nothing is cloned. The helper refuses a parent that is a subtask, a parent or anchor in another list, an anchor that isn't a sibling, and a reminder that has subtasks of its own. The CLI then verifies the reminder's parent and its position among its siblings in the list ordering record, which holds subtasks in display order. `add --subtask` and `edit --subtask` chain new subtasks after the parent's last subtask so they appear in the order given.
 
 ## Smart lists
 

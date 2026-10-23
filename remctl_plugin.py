@@ -1570,6 +1570,14 @@ ADVANCED = {'manage_groups': {'title': 'Groups',
                                                                              'ordering'},
                                                     'last': {'type': 'boolean',
                                                              'description': 'Place last in the current ordering'},
+                                                    'parent': {'type': 'integer',
+                                                               'description': 'Make it a subtask of reminder ID; '
+                                                                              'placed last unless a position is '
+                                                                              'given'},
+                                                    'top_level': {'type': 'boolean',
+                                                                  'description': 'Make a subtask a top-level '
+                                                                                 'reminder; placed after its parent '
+                                                                                 'unless a position is given'},
                                                     'smart_list': {'type': 'string',
                                                                    'description': 'Custom smart list containing '
                                                                                   'the reminder',
@@ -1590,6 +1598,11 @@ ADVANCED = {'manage_groups': {'title': 'Groups',
                                      'after': {'position': 0, 'boolean': False, 'array': False, 'flag': '--after'},
                                      'first': {'position': 0, 'boolean': True, 'array': False, 'flag': '--first'},
                                      'last': {'position': 0, 'boolean': True, 'array': False, 'flag': '--last'},
+                                     'parent': {'position': 0, 'boolean': False, 'array': False, 'flag': '--parent'},
+                                     'top_level': {'position': 0,
+                                                   'boolean': True,
+                                                   'array': False,
+                                                   'flag': '--top-level'},
                                      'smart_list': {'position': 0,
                                                     'boolean': False,
                                                     'array': False,
