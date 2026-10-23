@@ -46,6 +46,7 @@ remctl edit 23880 --private --remove-tag stale
 remctl edit 23880 --private --clear-tags
 remctl edit 23880 --private --section "Research"
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
+remctl edit 23880 --private --smart-list "Flagged Tasks" --section "Next Up"
 remctl edit 23880 --private --new-section "Inbox Zero"
 remctl sharees Shopping --json
 remctl edit 23880 --private --assign Alex --json
@@ -84,7 +85,7 @@ Early Reminders are stored by Reminders as private `REMDueDateDeltaAlert` metada
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
 
-If the target list has no section with that name or ID, `add` and `edit` look in custom smart lists. Exactly one matching smart-list section is assigned through `REMSmartListChangeItem.sectionsContextChangeItem`; more than one fails before writing and prints the stable IDs. Sections in the target list always take precedence, the section commands never fall back, and built-in smart lists are ignored. The helper action needs protocol 4. RemCTL does not check whether the reminder matches the smart list's filter, and it does not read smart-list section membership back, so check the assignment in Reminders.
+With `--smart-list NAME` or `--smart-list-id ID`, `--section` and `--section-id` name a section of that custom smart list instead. Without it they never look outside the target list. RemCTL resolves the section before writing anything, fails on a duplicate name with the stable IDs, and refuses built-in smart lists. The write goes through `REMSmartListChangeItem.sectionsContextChangeItem` (helper action `assign_smart_list_section`, protocol 4). Smart lists store their own memberships in `ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA` on the smart list's row, the column lists use, so RemCTL reads the membership back and reports `verified: true`. It does not check whether the reminder matches the smart list's filter.
 
 `-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other. Tag reads and rewrites ignore soft-deleted tag links, so a recently-deleted tag is no longer returned and `--remove-tag` cannot resurrect it.
 
@@ -211,7 +212,7 @@ remctl smart-list-edit "Priority or Today" --private --priority high --color red
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-`smart-lists` is read-only. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads.
+`smart-lists` is read-only. It reads `REMCDSmartList` rows from `ZREMCDBASELIST`, including built-in smart lists, and decodes known `ZFILTERDATA` payloads. Custom smart lists include their `sections` (`ZREMCDBASESECTION` rows with `ZSMARTLIST`), each with the `id` that `--smart-list-id ID --section-id` takes.
 
 `smart-list-create` writes through `REMSaveRequest.addCustomSmartListWithName` and saves through ReminderKit. It requires `--private`, requires an active iCloud (CloudKit) Reminders account and fails with `No active iCloud Reminders account found` when none is available, verifies that the active account supports custom smart lists, rejects duplicate exact custom names, and accepts private appearance flags plus the filters that appear in Reminders.app through this write path: Any Tag, selected tags via the include/exclude tag payload, date any/today/on/before/after/range, time of day, priority single, No Priority, or Priority: Any, flagged, vehicle connected, specific location, one included list, and top-level all/any matching across those families. Known zero-filter writes are rejected before saving: legacy short selected-tag JSON, untagged, no-date, relative date, no-time, vehicle disconnected, list exclusions, and more than one included list. It explicitly sets the private account ownership and supported-version metadata Reminders.app expects; without those fields, the row can survive but the edit UI can show zero filters. It does not write SQLite.
 
@@ -289,7 +290,7 @@ After a write, verify the result through MCP, or through the CLI when testing it
 | --- | --- |
 | Reminder fields, tags, links, images, subtasks, assignment, alarms | `get_reminder` / `info ID --json` |
 | List appearance and pins | `lists` / `lists --json` |
-| Smart-list appearance, filters, and pins | `run` with `smart-lists --json` |
+| Smart-list appearance, filters, pins, and section ids | `run` with `smart-lists --json` |
 | Groups | `run` with `group-info GROUP --json` |
 | Groceries sections and list order | `show_list` / `show LIST --json` |
 | Templates | `run` with `template-info NAME --json`; after applying, read the new list |

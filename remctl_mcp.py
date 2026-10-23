@@ -416,8 +416,8 @@ BATCH_MAX_IDS = 50
 # Reminders-only metadata. RemCTL writes it through ReminderKit only when the
 # caller opts in with `private: true`, the typed form of the CLI's --private.
 PRIVATE_FIELDS = (
-    "section", "section_id", "new_section", "subtasks", "assign", "unassign", "early_reminder", "urgent",
-    "location_title", "location_address", "latitude", "longitude", "radius", "proximity",
+    "section", "section_id", "new_section", "smart_list", "smart_list_id", "subtasks", "assign", "unassign",
+    "early_reminder", "urgent", "location_title", "location_address", "latitude", "longitude", "radius", "proximity",
     "set_tags", "remove_tags", "clear_tags", "grocery",
 )
 LIST_PRIVATE_FIELDS = ("symbol", "emoji", "groceries", "grocery_locale", "group", "group_id")
@@ -461,6 +461,8 @@ def _private_metadata_argv(args: dict[str, Any], *, extra_private: tuple[str, ..
     argv += _option(args, "section", "--section")
     argv += _option(args, "section_id", "--section-id")
     argv += _option(args, "new_section", "--new-section")
+    argv += _option(args, "smart_list", "--smart-list")
+    argv += _option(args, "smart_list_id", "--smart-list-id")
     argv += _repeated(args.get("subtasks"), "--subtask")
     argv += _option(args, "assign", "--assign")
     argv += _flag(args, "unassign", "--unassign")
@@ -673,6 +675,20 @@ REMINDER_METADATA_PARAMS = (
     Param("section_id", "string", "Section id from get_list, for lists with duplicate section names (private).", max_length=512),
     Param("new_section", "string", "Create this section in the target list and file the reminder there (private).", max_length=512),
     Param(
+        "smart_list",
+        "string",
+        "Custom smart list whose own section section or section_id names, instead of the list's (private). "
+        "run with smart-lists --json lists each custom smart list's sections and ids.",
+        max_length=512,
+    ),
+    Param(
+        "smart_list_id",
+        "integer",
+        "Numeric custom smart-list id from smart-lists, instead of smart_list (private).",
+        minimum=INTEGER_ID_RANGE[0],
+        maximum=INTEGER_ID_RANGE[1],
+    ),
+    Param(
         "subtasks",
         "array",
         "Subtasks to add (private). Each item is a title, or a JSON object string with title, notes, due, "
@@ -699,6 +715,7 @@ REMINDER_METADATA_PARAMS = (
 METADATA_EXCLUSIVE = (
     ("list", "list_id"),
     ("section", "section_id", "new_section"),
+    ("smart_list", "smart_list_id", "new_section"),
     ("location_address", "latitude"),
     ("location_address", "longitude"),
 )
@@ -738,9 +755,9 @@ SEARCH_OUTPUT_SCHEMA = {
 
 UPDATE_FIELDS = (
     "title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url", "flagged",
-    "tags", "set_tags", "remove_tags", "clear_tags", "section", "section_id", "new_section", "subtasks",
-    "assign", "unassign", "early_reminder", "urgent", "location_address", "latitude", "longitude",
-    "location_title", "radius", "proximity", "grocery",
+    "tags", "set_tags", "remove_tags", "clear_tags", "section", "section_id", "new_section", "smart_list",
+    "smart_list_id", "subtasks", "assign", "unassign", "early_reminder", "urgent", "location_address", "latitude",
+    "longitude", "location_title", "radius", "proximity", "grocery",
 )
 
 TOOLS: tuple[Tool, ...] = (

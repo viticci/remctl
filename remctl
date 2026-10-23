@@ -2299,8 +2299,11 @@ def section_name_exists(db, list_pk, name, *, excluding_ckid=None):
     return False
 
 
-def q_reminder_section_ckid(db, list_pk, reminder_ckid):
-    """Stable identifier of the live section a reminder belongs to, or None."""
+def q_reminder_section_ckid(db, list_pk, reminder_ckid, *, smart_list=False):
+    """Stable identifier of the live section a reminder belongs to, or None.
+
+    With smart_list, list_pk is a custom smart list's Z_PK: its row stores its own section memberships.
+    """
     try:
         row = db.execute(
             "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
@@ -2311,7 +2314,7 @@ def q_reminder_section_ckid(db, list_pk, reminder_ckid):
         data = json.loads(row[0])
         live = {
             (section["ZCKIDENTIFIER"] or "").casefold(): section["ZCKIDENTIFIER"]
-            for section in q_sections(db, list_pk)
+            for section in (q_smart_list_sections(db, list_pk) if smart_list else q_sections(db, list_pk))
         }
     except (sqlite3.Error, json.JSONDecodeError, TypeError):
         return None
@@ -4753,6 +4756,17 @@ def is_web_url(value):
 def validate_private_args(a):
     validate_tag_replacement_args(a)
 
+    if smart_list_section_targeted(a):
+        if not getattr(a, "section", None) and not getattr(a, "section_id", None):
+            print("Error: --smart-list and --smart-list-id need --section or --section-id.", file=sys.stderr)
+            sys.exit(1)
+        if getattr(a, "section", None) and getattr(a, "section_id", None):
+            print("Error: pass either --section or --section-id, not both.", file=sys.stderr)
+            sys.exit(1)
+        if getattr(a, "new_section", None):
+            print("Error: --new-section creates a section in the reminder's list; it cannot be combined with --smart-list.", file=sys.stderr)
+            sys.exit(1)
+
     if getattr(a, "assign", None) and getattr(a, "unassign", False):
         print("Error: pass either --assign or --unassign, not both.", file=sys.stderr)
         sys.exit(1)
@@ -5681,67 +5695,80 @@ def resolve_section_ckid(db, list_pk, section_name=None, section_id=None):
     return matches[0]["ZCKIDENTIFIER"]
 
 
-def _list_has_section(db, list_pk, section_name=None, section_id=None):
+def smart_list_section_targeted(a):
+    return bool(getattr(a, "smart_list", None)) or getattr(a, "smart_list_id", None) is not None
+
+
+def resolve_smart_list_section_or_die(db, a):
+    """Resolve --section/--section-id among the sections of the custom smart list named by --smart-list."""
+    section_name = getattr(a, "section", None)
+    section_id = normalize_section_id(getattr(a, "section_id", None))
+    smart_ref = resolve_smart_list_or_die(db, name=getattr(a, "smart_list", None), smart_list_id=getattr(a, "smart_list_id", None))
+    if smart_ref["kind"] != "custom" or not smart_ref.get("objectUUID"):
+        print(f"Error: {smart_ref['title']!r} is a built-in smart list; only custom smart lists have sections.", file=sys.stderr)
+        sys.exit(1)
+    sections = [row for row in q_smart_list_sections(db, smart_ref["id"]) if row["ZCKIDENTIFIER"]]
     if section_id:
-        return db.execute(
-            "SELECT 1 FROM ZREMCDBASESECTION "
-            "WHERE ZLIST = ? AND ZMARKEDFORDELETION = 0 AND lower(ZCKIDENTIFIER) = lower(?)",
-            (list_pk, section_id),
-        ).fetchone() is not None
-    return any((s["ZDISPLAYNAME"] or "").lower() == section_name.lower() for s in q_sections(db, list_pk))
-
-
-def _custom_smart_list_section_matches(db, section_name=None, section_id=None):
-    matches = []
-    for smart_list in q_smart_lists(db):
-        if smart_list["ZSMARTLISTTYPE"] != CUSTOM_SMART_LIST_TYPE or not smart_list["ZCKIDENTIFIER"]:
-            continue
-        for section in q_smart_list_sections(db, smart_list["Z_PK"]):
-            if not section["ZCKIDENTIFIER"]:
-                continue
-            if section_id:
-                found = section["ZCKIDENTIFIER"].lower() == section_id.lower()
-            else:
-                found = (section["ZDISPLAYNAME"] or "").lower() == section_name.lower()
-            if found:
-                matches.append((smart_list, section))
-    return matches
-
-
-def resolve_section_assignment(db, list_pk, section_name=None, section_id=None):
-    """Resolve --section/--section-id for a reminder write.
-
-    Sections in the reminder's list always win and use resolve_section_ckid unchanged.
-    Only when that list has no match does a uniquely named custom smart-list section apply.
-    """
-    section_id = normalize_section_id(section_id)
-    if (
-        not list_pk
-        or bool(section_name) == bool(section_id)
-        or _list_has_section(db, list_pk, section_name, section_id)
-    ):
-        return {"sectionId": resolve_section_ckid(db, list_pk, section_name, section_id)}
-    matches = _custom_smart_list_section_matches(db, section_name, section_id)
-    if len(matches) > 1:
-        options = ", ".join(
-            f"{section['ZCKIDENTIFIER']} (smart list {smart_list_display_name(smart_list)!r})"
-            for smart_list, section in matches
-        )
+        matches = [row for row in sections if row["ZCKIDENTIFIER"].lower() == section_id.lower()]
+    else:
+        matches = [row for row in sections if (row["ZDISPLAYNAME"] or "").lower() == section_name.lower()]
+    if len(matches) != 1:
+        options = ", ".join(f"{row['ZDISPLAYNAME']!r} ({row['ZCKIDENTIFIER']})" for row in (matches or sections))
+        if matches:
+            problem, hint = f"multiple sections named {section_name!r}", "Use --section-id with one of"
+        else:
+            problem, hint = f"section not found: {section_id or section_name}", "Its sections are"
         print(
-            f"Error: multiple custom smart-list sections named {section_name!r}. "
-            f"Use --section-id with one of: {options}",
+            f"Error: {problem} in smart list {smart_ref['title']!r}. {hint}: {options or 'none'}",
             file=sys.stderr,
         )
         sys.exit(1)
-    if not matches:
-        return {"sectionId": resolve_section_ckid(db, list_pk, section_name, section_id)}
-    smart_list, section = matches[0]
-    return {"sectionId": section["ZCKIDENTIFIER"], "smartListId": smart_list["ZCKIDENTIFIER"]}
+    return {
+        "sectionId": matches[0]["ZCKIDENTIFIER"],
+        "section": matches[0]["ZDISPLAYNAME"],
+        "smartListId": smart_ref["objectUUID"],
+        "smartListPk": smart_ref["id"],
+        "smartList": smart_ref["title"],
+    }
 
 
-def require_section_assignment_helper(target):
-    if target.get("smartListId"):
-        require_private_helper(minimum_protocol=SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION)
+def resolve_section_target(db, list_pk, a):
+    """Where --section/--section-id points: a section of the reminder's list, or of the custom smart list
+    named by --smart-list/--smart-list-id. Exits before any write when it does not resolve or needs a newer helper."""
+    if smart_list_section_targeted(a):
+        target = resolve_smart_list_section_or_die(db, a)
+        require_private_helper(
+            json_mode=getattr(a, "json", False),
+            minimum_protocol=SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION,
+        )
+        return target
+    return {"sectionId": resolve_section_ckid(db, list_pk, getattr(a, "section", None), getattr(a, "section_id", None))}
+
+
+def assign_smart_list_section(reminder_ckid, target, partial_context=None):
+    """Write a smart-list section membership, then confirm it from the smart list's own membership record."""
+    result = private_action({
+        "action": "assign_smart_list_section",
+        "id": reminder_ckid,
+        "sectionId": target["sectionId"],
+        "smartListId": target["smartListId"],
+    }, partial_context=partial_context)
+    verified = _wait_for_order(
+        lambda: _read_fresh_db_value(
+            lambda db: q_reminder_section_ckid(db, target["smartListPk"], reminder_ckid, smart_list=True)
+        ),
+        target["sectionId"],
+    )
+    if not verified:
+        message = (
+            f"ReminderKit reported success, but the reminder is not in section {target['section']!r} "
+            f"of smart list {target['smartList']!r}."
+        )
+        if partial_context is not None:
+            fail_private_add_partial(partial_context, "assign_smart_list_section", message)
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+    return {**result, "smartList": target["smartList"], "section": target["section"], "verified": True}
 
 
 def private_changes_from_args(a):
@@ -5755,6 +5782,7 @@ def private_changes_from_args(a):
         getattr(a, "section", None),
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
+        smart_list_section_targeted(a),
         getattr(a, "subtask", None),
         getattr(a, "image", None),
         getattr(a, "flag", False),
@@ -5779,6 +5807,7 @@ def private_only_changes_from_args(a):
         getattr(a, "section", None),
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
+        smart_list_section_targeted(a),
         getattr(a, "subtask", None),
         getattr(a, "image", None),
         getattr(a, "flagged", None) is not None,
@@ -5912,12 +5941,7 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids, partial_co
 
 def validate_private_add_ready(a, db, list_pk):
     if getattr(a, "section", None) or getattr(a, "section_id", None):
-        require_section_assignment_helper(resolve_section_assignment(
-            db,
-            list_pk,
-            section_name=getattr(a, "section", None),
-            section_id=getattr(a, "section_id", None),
-        ))
+        resolve_section_target(db, list_pk, a)
     if getattr(a, "assign", None):
         if list_pk is None:
             print("Error: --assign requires a target shared list via -l/--list or --list-id.", file=sys.stderr)
@@ -5963,17 +5987,15 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
     if getattr(a, "section", None) or getattr(a, "section_id", None):
         if db is None:
             db = open_db()
-        target = resolve_section_assignment(
-            db,
-            list_pk,
-            section_name=getattr(a, "section", None),
-            section_id=getattr(a, "section_id", None),
-        )
-        require_section_assignment_helper(target)
-        payload = {"action": "assign_section", "id": reminder_ckid, "sectionId": target["sectionId"]}
+        target = resolve_section_target(db, list_pk, a)
         if target.get("smartListId"):
-            payload.update(action="assign_smart_list_section", smartListId=target["smartListId"])
-        results.append(private_action(payload, partial_context=partial_context))
+            results.append(assign_smart_list_section(reminder_ckid, target, partial_context=partial_context))
+        else:
+            results.append(private_action({
+                "action": "assign_section",
+                "id": reminder_ckid,
+                "sectionId": target["sectionId"],
+            }, partial_context=partial_context))
 
     if getattr(a, "new_section", None):
         if db is None:
@@ -7816,6 +7838,14 @@ def cmd_smart_lists(a):
     db = open_db()
     rows = q_smart_lists(db)
     payload = [smart_list_to_dict(row) for row in rows]
+    for item in payload:
+        if item["kind"] == "custom":
+            # The ids --section-id takes together with --smart-list-id.
+            item["sections"] = [
+                {"id": section["ZCKIDENTIFIER"], "name": section["ZDISPLAYNAME"]}
+                for section in q_smart_list_sections(db, item["id"])
+                if section["ZCKIDENTIFIER"]
+            ]
     if a.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
@@ -7835,6 +7865,8 @@ def cmd_smart_lists(a):
         pin_info = C.dim(" [pinned]") if item.get("pinned") else ""
         print(f"  {safe_display(item['name'])} {id_details}{pin_info}")
         print(f"    {smart_type} · filter bytes: {length} · {desc}")
+        for section in item.get("sections", []):
+            print(f"    - {safe_display(section['name'])} {C.dim('(' + section['id'] + ')')}")
     print(f"\n{len(payload)} smart list{'s' if len(payload) != 1 else ''}")
 
 
@@ -10167,6 +10199,9 @@ def cmd_edit(a):
         validate_private_args(a)
         if getattr(a, "grocery", False):
             require_grocery_list_target(db, target_list_pk)
+        if getattr(a, "section", None) or getattr(a, "section_id", None):
+            # Resolve before the bridge write so a bad section changes nothing.
+            resolve_section_target(db, target_list_pk, a)
         if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
             print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
             sys.exit(1)
@@ -12388,6 +12423,8 @@ _remctl() {
                 '--section[Assign to existing section]:section:' \
                 '--section-id[Assign to section by stable ID]:section-id:' \
                 '--new-section[Create and assign to new section]:section:' \
+                '(--smart-list-id)--smart-list[Resolve --section in this custom smart list]:smart-list:' \
+                '(--smart-list)--smart-list-id[Resolve --section in this custom smart list by numeric ID]:id:' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--assign[Assign to shared-list user]:sharee:' \
@@ -12426,6 +12463,8 @@ _remctl() {
                 '--section[Assign to existing section]:section:' \
                 '--section-id[Assign to section by stable ID]:section-id:' \
                 '--new-section[Create and assign to new section]:section:' \
+                '(--smart-list-id)--smart-list[Resolve --section in this custom smart list]:smart-list:' \
+                '(--smart-list)--smart-list-id[Resolve --section in this custom smart list by numeric ID]:id:' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--assign[Assign to shared-list user]:sharee:' \
@@ -12708,13 +12747,13 @@ BASH_COMPLETION = '''_remctl() {
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --smart-list --smart-list-id --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "done" ]; then
         COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --smart-list --smart-list-id --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "reminder-move" ]; then
         COMPREPLY=( $(compgen -W "--before --after --first --last --parent --top-level --smart-list --smart-list-id --private --json" -- "$cur") )
@@ -13063,6 +13102,8 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsup
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign to section by stable ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list -d "Resolve --section in this custom smart list" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l image -d "Add private image attachment" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l assign -d "Assign to shared-list user" -r
@@ -13078,6 +13119,8 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l private -d "Use unsu
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l section-id -d "Assign to section by stable ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list -d "Resolve --section in this custom smart list" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask title or JSON object" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l image -d "Add private image attachment" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l assign -d "Assign to shared-list user" -r
@@ -14895,6 +14938,11 @@ def build_parser():
     c.add_argument("--section", help="Private metadata: assign to an existing section in the target list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
     c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
+    smart_section = c.add_mutually_exclusive_group()
+    smart_section.add_argument("--smart-list", metavar="NAME",
+                               help="Private metadata: resolve --section/--section-id in this custom smart list instead")
+    smart_section.add_argument("--smart-list-id", type=int, metavar="ID",
+                               help="Private metadata: like --smart-list, by numeric ID from smart-lists")
     c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
     c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
     c.add_argument("--assign", metavar="USER", help="Private metadata: assign in a shared list to a sharee by unique name, email/phone, numeric sharee ID, object UUID, or me")
@@ -14964,6 +15012,8 @@ def build_parser():
             "  remctl edit 23880 --private --url https://example.com -t remctl\n"
             "  remctl edit 23880 --private --section Research --subtask \"Follow up\"\n"
             "  remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8\n"
+            "  remctl smart-lists\n"
+            "  remctl edit 23880 --private --smart-list \"Flagged Tasks\" --section \"Next Up\"\n"
             "  remctl sharees Shopping --json\n"
             "  remctl edit 23880 --private --assign Alex\n"
             "  remctl edit 23880 --private --assign alex@example.com\n"
@@ -15003,6 +15053,11 @@ def build_parser():
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
     c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list and assign this reminder")
+    smart_section = c.add_mutually_exclusive_group()
+    smart_section.add_argument("--smart-list", metavar="NAME",
+                               help="Private metadata: resolve --section/--section-id in this custom smart list instead")
+    smart_section.add_argument("--smart-list-id", type=int, metavar="ID",
+                               help="Private metadata: like --smart-list, by numeric ID from smart-lists")
     c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
     c.add_argument("--image", action="append", help="Private metadata: add an image attachment path (repeatable)")
     c.add_argument("--assign", metavar="USER", help="Private metadata: assign in a shared list to a sharee by unique name, email/phone, numeric sharee ID, object UUID, or me")

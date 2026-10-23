@@ -319,11 +319,13 @@ remctl section-delete "Reading" -l Projects --private --force
 remctl add "Paper" -l Projects --private --section Research
 remctl add "Paper" -l Projects --private --new-section Reading
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
+remctl edit 23880 --private --smart-list "Flagged Tasks" --section "Next Up"
+remctl edit 23880 --private --smart-list-id 170 --section-id 5C1E0A44-2D7B-4F0E-9B61-0F2B7E0D9A11
 ```
 
 Section commands are private writes. Create and rename refuse duplicate names in the same list. `--section` resolves by name; if a list has two sections with the same name, RemCTL uses the one that is not empty when exactly one qualifies, otherwise ask for `--section-id`. Verify with `sections --json` or `show <list> --json`.
 
-When `add` or `edit` names a section that is not in the reminder's list, RemCTL looks for a section with that name in custom smart lists and assigns the reminder there if exactly one matches. RemCTL does not read smart-list section membership, so check that assignment in Reminders.
+Custom smart lists have sections of their own, separate from the sections of the lists their reminders come from. `--smart-list NAME` or `--smart-list-id ID` makes `--section` or `--section-id` name a section of that smart list instead of the reminder's list; without it they always mean the reminder's list. `smart-lists` shows each custom smart list's sections and their ids. A name that two sections of the smart list share fails before writing and prints both ids. RemCTL reads the membership back from the smart list and reports `verified: true`. It does not check that the reminder matches the smart list's filter: if it doesn't, Reminders won't show it there. Needs helper protocol 4; `--new-section` can't be combined with `--smart-list`.
 
 ## List groups
 
@@ -361,7 +363,7 @@ remctl smart-list-edit --smart-list-id 170 --private --filter-json @filter.json
 remctl smart-list-delete "Flagged Review" --private --force
 ```
 
-`smart-lists` is read-only. It reports built-in and custom smart lists with numeric id, `objectUUID`, type, `pinned`, `pinnedDate`, and a decoded filter summary. A filter RemCTL cannot decode becomes an `error` field instead of failing the command.
+`smart-lists` is read-only. It reports built-in and custom smart lists with numeric id, `objectUUID`, type, `pinned`, `pinnedDate`, and a decoded filter summary. Custom smart lists also list `sections`, each with the `id` that `--smart-list-id ID --section-id` takes. A filter RemCTL cannot decode becomes an `error` field instead of failing the command.
 
 The write commands are private. They support the filters that Reminders reliably shows after this write path:
 
@@ -441,7 +443,7 @@ remctl location-lookup "Piazza Navona, Rome" --json
 | --- | --- | --- |
 | Rich link | `--url` | Public `http` or `https` host only; loopback, `.local`, and private addresses are rejected. Additive. |
 | Synced tags | `-t/--tags` (add), `--set-tags` (replace), `--clear-tags`, `--remove-tag` (repeatable) | The replace and remove options cannot be combined with each other or with `-t`. |
-| Section | `--section`, `--section-id`, `--new-section` | See [Sections](#sections). |
+| Section | `--section`, `--section-id`, `--new-section`, `--smart-list`, `--smart-list-id` | See [Sections](#sections). |
 | Assignment | `--assign`, `--unassign` | Shared lists only. |
 | Subtasks | `--subtask TITLE` or `--subtask '{json}'` | JSON accepts `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields. Additive. |
 | Images | `--image PATH` (repeatable) | Additive. Other file types are rejected because Reminders does not show them. |

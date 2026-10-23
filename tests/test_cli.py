@@ -8059,6 +8059,7 @@ class CliTests(unittest.TestCase):
                 return_value={"id": 9, "title": "Projects", "requested": "Projects", "method": "exact"},
             ),
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "resolve_section_target") as resolve_section_target,
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(
                 self.remctl,
@@ -8074,6 +8075,7 @@ class CliTests(unittest.TestCase):
         ):
             self.remctl.cmd_edit(args)
 
+        resolve_section_target.assert_called_once_with(mock.ANY, 9, args)
         apply_private_changes.assert_called_once_with(
             reminder["ZCKIDENTIFIER"],
             args,
@@ -9869,7 +9871,7 @@ class CliTests(unittest.TestCase):
     def _smart_list_section_db(self):
         db = self._list_db(["Projects"])
         for column in ("ZSMARTLISTTYPE TEXT", "ZFILTERDATA BLOB", "ZMINIMUMSUPPORTEDAPPVERSION INTEGER",
-                       "ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER"):
+                       "ZEFFECTIVEMINIMUMSUPPORTEDAPPVERSION INTEGER", "ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA BLOB"):
             db.execute(f"ALTER TABLE ZREMCDBASELIST ADD COLUMN {column}")
         db.execute("ALTER TABLE ZREMCDBASESECTION ADD COLUMN ZSMARTLIST INTEGER")
         db.executemany(
@@ -9883,33 +9885,52 @@ class CliTests(unittest.TestCase):
         db.executemany(
             "INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
             "VALUES (?, ?, ?, ?, 0)",
-            [(20, "Next", 2, "FOCUS-NEXT"), (21, "Later", 3, "TODAY-LATER")],
+            [(20, "Next", 2, "FOCUS-NEXT"), (21, "Later", 2, "FOCUS-LATER")],
         )
+        # Projects has its own "Next"; only --smart-list may pick Focus's.
+        self._insert_section(db, 10, "Next", "SECTION-1")
         return db
 
-    def _apply_section(self, db, protocol=4, **section):
+    def _set_smart_list_membership(self, db, member, group):
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 2",
+            (json.dumps({"memberships": [{"memberID": member, "groupID": group, "isObsolete": False}]}),),
+        )
+
+    def _apply_section(self, db, protocol=4, written_membership="FOCUS-NEXT", **section):
+        """Run apply_private_changes; a smart-list write records written_membership for the readback."""
         args = self._private_edit_args(**section)
+
+        def write(payload, partial_context=None):
+            if payload["action"] == "assign_smart_list_section" and written_membership:
+                self._set_smart_list_membership(db, payload["id"], written_membership)
+            return {"status": "updated"}
+
+        result = None
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
             mock.patch.object(
                 self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": protocol}
             ),
-            mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}) as private_action,
+            mock.patch.object(self.remctl, "private_action", side_effect=write) as private_action,
+            mock.patch.object(self.remctl, "_read_fresh_db_value", side_effect=lambda reader: reader(db)),
+            mock.patch.object(self.remctl.time, "sleep"),
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
             try:
-                self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+                result = self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
             except SystemExit:
                 pass
-        return private_action, stderr.getvalue()
+        return private_action, stderr.getvalue(), result
 
-    def test_section_falls_back_to_unique_custom_smart_list_section(self):
+    def test_smart_list_targets_its_own_section_by_name_or_id_and_verifies(self):
         db = self._smart_list_section_db()
         try:
-            by_name, _ = self._apply_section(db, section="next")
-            by_id, _ = self._apply_section(
-                db, section_id="x-apple-reminderkit://REMCDSmartListSection/FOCUS-NEXT"
+            by_name, _, result = self._apply_section(db, smart_list="Focus", section="next")
+            by_id, _, _ = self._apply_section(
+                db, smart_list_id=2, section_id="x-apple-reminderkit://REMCDSmartListSection/FOCUS-NEXT"
             )
+            in_list, _, _ = self._apply_section(db, section="Next")
         finally:
             db.close()
 
@@ -9921,64 +9942,112 @@ class CliTests(unittest.TestCase):
         }
         by_name.assert_called_once_with(expected, partial_context=None)
         by_id.assert_called_once_with(expected, partial_context=None)
+        self.assertEqual(result, [{"status": "updated", "smartList": "Focus", "section": "Next", "verified": True}])
+        # Without --smart-list, --section means the reminder's own list, whatever smart lists contain.
+        in_list.assert_called_once_with(
+            {"action": "assign_section", "id": "REM-1", "sectionId": "SECTION-1"}, partial_context=None
+        )
 
-    def test_section_in_reminder_list_wins_over_smart_list_section(self):
-        db = self._smart_list_section_db()
-        self._insert_section(db, 10, "Next", "SECTION-1")
-        try:
-            private_action, _ = self._apply_section(db, protocol=2, section="Next")
-        finally:
-            db.close()
-
-        private_action.assert_called_once_with({
-            "action": "assign_section",
-            "id": "REM-1",
-            "sectionId": "SECTION-1",
-        }, partial_context=None)
-
-    def test_smart_list_section_fallback_refuses_ambiguous_builtin_and_old_helper(self):
+    def test_smart_list_section_refusals_happen_before_writing(self):
         db = self._smart_list_section_db()
         try:
-            private_action, err = self._apply_section(db, protocol=3, section="Next")
-            private_action.assert_not_called()
-            self.assertIn("protocol 3 < required 4", err)
-
-            private_action, err = self._apply_section(db, section="Later")
+            # A smart-list section name never stands in for a missing list section.
+            private_action, err, _ = self._apply_section(db, section="Later")
             private_action.assert_not_called()
             self.assertIn("section not found in target list: Later", err)
 
-            db.execute(
-                "INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME, ZCKIDENTIFIER, ZMARKEDFORDELETION, Z_ENT, ZSMARTLISTTYPE) "
-                "VALUES (4, 'Review', 'SMART-REVIEW', 0, 4, ?)",
-                (self.remctl.CUSTOM_SMART_LIST_TYPE,),
-            )
+            private_action, err, _ = self._apply_section(db, protocol=3, smart_list="Focus", section="Next")
+            private_action.assert_not_called()
+            self.assertIn("protocol 3 < required 4", err)
+
+            private_action, err, _ = self._apply_section(db, smart_list="Today", section="Next")
+            private_action.assert_not_called()
+            self.assertIn("only custom smart lists have sections", err)
+
+            private_action, err, _ = self._apply_section(db, smart_list="Focus", section="Someday")
+            private_action.assert_not_called()
+            self.assertIn("'Next' (FOCUS-NEXT), 'Later' (FOCUS-LATER)", err)
+
             db.execute(
                 "INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
-                "VALUES (22, 'Next', 4, 'REVIEW-NEXT', 0)"
+                "VALUES (22, 'Next', 2, 'FOCUS-NEXT-2', 0)"
             )
-            private_action, err = self._apply_section(db, section="Next")
+            private_action, err, _ = self._apply_section(db, smart_list="Focus", section="Next")
             private_action.assert_not_called()
-            self.assertIn("--section-id", err)
-            self.assertIn("FOCUS-NEXT", err)
-            self.assertIn("REVIEW-NEXT", err)
+            self.assertIn("Use --section-id with one of: 'Next' (FOCUS-NEXT), 'Next' (FOCUS-NEXT-2)", err)
         finally:
             db.close()
 
-    def test_section_commands_and_canonical_schema_do_not_use_smart_list_sections(self):
+    def test_smart_list_section_write_that_does_not_read_back_fails(self):
         db = self._smart_list_section_db()
-        canonical = self._list_db(["Projects"])
         try:
-            with contextlib.redirect_stderr(io.StringIO()) as stderr:
-                with self.assertRaises(SystemExit):
-                    self.remctl.resolve_section_ckid(db, 1, section_name="Next")
-            self.assertIn("section not found in target list: Next", stderr.getvalue())
-
-            private_action, err = self._apply_section(canonical, section="Next")
-            private_action.assert_not_called()
-            self.assertIn("section not found in target list: Next", err)
+            private_action, err, result = self._apply_section(
+                db, written_membership="FOCUS-LATER", smart_list="Focus", section="Next"
+            )
         finally:
             db.close()
-            canonical.close()
+
+        private_action.assert_called_once()
+        self.assertIsNone(result)
+        self.assertIn("not in section 'Next' of smart list 'Focus'", err)
+
+    def test_smart_list_flag_needs_an_existing_section_flag(self):
+        for overrides, message in (
+            ({"smart_list": "Focus"}, "need --section or --section-id"),
+            ({"smart_list": "Focus", "section": "Next", "section_id": "FOCUS-NEXT"}, "not both"),
+            ({"smart_list_id": 2, "section": "Next", "new_section": "Later"}, "cannot be combined with --smart-list"),
+        ):
+            with self.subTest(overrides=overrides), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    self.remctl.validate_private_args(self._private_edit_args(**overrides))
+                self.assertIn(message, stderr.getvalue())
+
+    def test_edit_resolves_smart_list_section_before_the_bridge_write(self):
+        db = self._smart_list_section_db()
+        args = self.remctl.build_parser()[0].parse_args(
+            ["edit", "42", "--title", "Renamed", "--private", "--smart-list", "Focus", "--section", "Someday"]
+        )
+        try:
+            with (
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(self.remctl, "q_reminder", return_value={**self._FAKE_REMINDER, "ZLIST": 1}),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(
+                    self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 4}
+                ),
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+                mock.patch.object(self.remctl, "private_call") as private_call,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                with self.assertRaises(SystemExit):
+                    self.remctl.cmd_edit(args)
+        finally:
+            db.close()
+
+        bridge_call_result.assert_not_called()
+        private_call.assert_not_called()
+        self.assertIn("section not found: Someday in smart list 'Focus'", stderr.getvalue())
+
+    def test_smart_lists_shows_custom_sections_with_ids(self):
+        db = self._smart_list_section_db()
+        try:
+            with mock.patch.object(self.remctl, "open_db", return_value=db):
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.remctl.cmd_smart_lists(SimpleNamespace(json=True))
+                with contextlib.redirect_stdout(io.StringIO()) as human:
+                    self.remctl.cmd_smart_lists(SimpleNamespace(json=False))
+        finally:
+            db.close()
+
+        by_name = {item["name"]: item for item in json.loads(stdout.getvalue())}
+        self.assertEqual(by_name["Focus"]["sections"], [
+            {"id": "FOCUS-NEXT", "name": "Next"},
+            {"id": "FOCUS-LATER", "name": "Later"},
+        ])
+        self.assertNotIn("sections", by_name["Today"])
+        self.assertIn("- Next", human.getvalue())
+        self.assertIn("FOCUS-LATER", human.getvalue())
 
     def test_apply_private_changes_new_section_passes_empty_existing_section_ids(self):
         db = self._list_db(["Projects"])
