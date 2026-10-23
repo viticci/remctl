@@ -2252,10 +2252,14 @@ def q_sections(db, list_pk=None):
             "SELECT Z_PK, ZDISPLAYNAME, ZLIST, ZCKIDENTIFIER FROM ZREMCDBASESECTION "
             "WHERE ZMARKEDFORDELETION = 0 AND ZLIST = ? ORDER BY Z_PK", (list_pk,)
         ).fetchall()
+    # Only sections of a live list. Deleting a list can leave its sections
+    # behind with no list at all; Reminders hides them, and so does RemCTL.
+    # Smart-list and template sections have no ZLIST and are read through
+    # their own commands.
     return db.execute(
         "SELECT s.Z_PK, s.ZDISPLAYNAME, s.ZLIST, s.ZCKIDENTIFIER, l.ZNAME as list_name FROM ZREMCDBASESECTION s "
-        "LEFT JOIN ZREMCDBASELIST l ON s.ZLIST = l.Z_PK "
-        "WHERE s.ZMARKEDFORDELETION = 0 ORDER BY l.ZNAME, s.Z_PK"
+        "JOIN ZREMCDBASELIST l ON s.ZLIST = l.Z_PK "
+        "WHERE s.ZMARKEDFORDELETION = 0 AND l.ZMARKEDFORDELETION = 0 ORDER BY l.ZNAME, s.Z_PK"
     ).fetchall()
 
 

@@ -9987,6 +9987,41 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual([section["ZDISPLAYNAME"] for section in sections], ["Current"])
 
+    def test_sections_skip_orphans_and_sections_of_deleted_lists(self):
+        # A deleted list can leave sections with no list; Reminders hides them,
+        # and `sections` used to group them under "?".
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("CREATE TABLE ZREMCDBASELIST (Z_PK INTEGER PRIMARY KEY, ZNAME TEXT, ZMARKEDFORDELETION INTEGER DEFAULT 0)")
+            db.execute(
+                "CREATE TABLE ZREMCDBASESECTION ("
+                "Z_PK INTEGER PRIMARY KEY, ZDISPLAYNAME TEXT, ZLIST INTEGER, ZSMARTLIST INTEGER, ZTEMPLATE INTEGER, "
+                "ZCKIDENTIFIER TEXT, ZMARKEDFORDELETION INTEGER)"
+            )
+            db.executemany("INSERT INTO ZREMCDBASELIST VALUES (?, ?, ?)", [(1, "Groceries", 0), (2, "Old", 1)])
+            db.executemany(
+                "INSERT INTO ZREMCDBASESECTION VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (10, "Produce", 1, None, None, "A", 0),
+                    (11, "Gone", 1, None, None, "B", 1),
+                    (12, "Of a deleted list", 2, None, None, "C", 0),
+                    (13, "Orphan", None, None, None, "D", 0),
+                    (14, "Dangling", 99, None, None, "E", 0),
+                    (15, "Smart", None, 7, None, "F", 0),
+                    (16, "Template", None, None, 3, "G", 0),
+                ],
+            )
+            rows = self.remctl.q_sections(db)
+            self.assertEqual([(row["list_name"], row["ZDISPLAYNAME"]) for row in rows], [("Groceries", "Produce")])
+            self.assertEqual([row["ZDISPLAYNAME"] for row in self.remctl.q_sections(db, 1)], ["Produce"])
+            out = io.StringIO()
+            with mock.patch.object(self.remctl, "open_db", return_value=db), contextlib.redirect_stdout(out):
+                self.remctl.cmd_sections(SimpleNamespace(json=True))
+            self.assertEqual(json.loads(out.getvalue()), {"Groceries": ["Produce"]})
+        finally:
+            db.close()
+
     def test_reminder_move_in_custom_smart_list_sends_manual_order(self):
         args = SimpleNamespace(
             id=101,
