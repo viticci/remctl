@@ -11,6 +11,7 @@ import array
 import base64
 import concurrent.futures
 import ctypes
+import hashlib
 import importlib
 import importlib.machinery
 import importlib.util
@@ -94,10 +95,17 @@ PERMISSION_STATUS_INITIAL_WAIT_SECONDS = 0.25
 PERMISSION_STATUS_HYDRATION_SECONDS = 20.0
 PERMISSION_STATUS_FAILURE_BACKOFF_SECONDS = 10.0
 NATIVE_PERMISSION_QUEUE_TIMEOUT_SECONDS = 2.0
+CODESIGN_PATH = "/usr/bin/codesign"
+SIGNATURE_CHECK_TIMEOUT_SECONDS = 15.0
+# How long a passed bundle verification is reused while the bundle is unchanged.
+SIGNATURE_CACHE_TTL_SECONDS = 600.0
+SIGNATURE_LOCK_WAIT_SECONDS = 2 * SIGNATURE_CHECK_TIMEOUT_SECONDS + 5.0
 _CDHASH_PATTERN = re.compile(r"(?m)^CDHash=([0-9a-fA-F]{40})$")
 _NATIVE_ERROR_CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 
 _DISPATCH_LOCK = threading.Lock()
+_SIGNATURE_LOCK = threading.Lock()
+_SIGNATURE_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _NATIVE_PERMISSION_LOCK = threading.Lock()
 _NATIVE_PERMISSION_CHANNEL_FAILED = threading.Event()
 _PERMISSION_STATUS_LOCK = threading.Lock()
@@ -1241,29 +1249,122 @@ def _hosted_runtime_from_environment() -> HostedRuntime:
     )
 
 
-def _verify_sealed_bundle(runtime: HostedRuntime) -> None:
+def _bundle_fingerprint(app: Path) -> str | None:
+    """Hash every entry's identity in the signed bundle without reading contents.
+
+    Any write, replacement, chmod, rename, addition, or removal inside the
+    bundle changes an entry's inode, size, mtime, or ctime (ctime cannot be set
+    from user space), so an unchanged fingerprint means codesign would see the
+    same bytes it last verified. None means the walk failed: verify in full.
+    """
+
+    digest = hashlib.sha256()
+    root = os.fspath(app)
+
+    def add(path: str, details: os.stat_result) -> None:
+        digest.update(
+            os.fsencode(path)
+            + b"\0"
+            + struct.pack(
+                "=QQQQqq",
+                details.st_dev & 0xFFFFFFFFFFFFFFFF,
+                details.st_ino & 0xFFFFFFFFFFFFFFFF,
+                details.st_mode,
+                details.st_size,
+                details.st_mtime_ns,
+                details.st_ctime_ns,
+            )
+        )
+
+    try:
+        add(root, os.lstat(root))
+        pending = [root]
+        while pending:
+            with os.scandir(pending.pop()) as listing:
+                entries = sorted(listing, key=lambda item: item.name)
+            for item in entries:
+                add(item.path, item.stat(follow_symlinks=False))
+                if item.is_dir(follow_symlinks=False):
+                    pending.append(item.path)
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+def _signature_cache_valid(key: tuple[str, str], fingerprint: str | None) -> bool:
+    if fingerprint is None:
+        return False
+    cached = _SIGNATURE_CACHE.get(key)
+    return (
+        cached is not None
+        and cached[1] == fingerprint
+        and 0 <= time.monotonic() - cached[0] < SIGNATURE_CACHE_TTL_SECONDS
+    )
+
+
+def _run_codesign_verification(runtime: HostedRuntime) -> None:
     try:
         verified = subprocess.run(
-            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(runtime.app)],
+            [CODESIGN_PATH, "--verify", "--deep", "--strict", str(runtime.app)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=15,
+            timeout=SIGNATURE_CHECK_TIMEOUT_SECONDS,
             check=False,
         )
         described = subprocess.run(
-            ["/usr/bin/codesign", "-dvvv", str(runtime.app)],
+            [CODESIGN_PATH, "-dvvv", str(runtime.app)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=15,
+            timeout=SIGNATURE_CHECK_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        # Slow is not invalid: nothing ran, and the caller may retry.
+        raise _ServerError(
+            "signed host verification timed out; nothing ran, retry the request",
+            code="host_signature_check_timeout",
+        ) from exc
+    except OSError as exc:
         raise _ServerError("could not verify signed host", code="host_signature_invalid") from exc
     match = _CDHASH_PATTERN.search(described.stderr.decode("utf-8", errors="replace"))
     if verified.returncode != 0 or described.returncode != 0 or match is None:
         raise _ServerError("signed host verification failed", code="host_signature_invalid")
     if match.group(1).lower() != runtime.cdhash:
         raise _ServerError("running host CDHash changed", code="host_signature_invalid")
+
+
+def _verify_sealed_bundle(runtime: HostedRuntime) -> None:
+    """Verify the signed bundle, reusing a recent pass while nothing in it changed.
+
+    A pass is remembered in this process only, per app path and running CDHash,
+    for SIGNATURE_CACHE_TTL_SECONDS and only while the bundle fingerprint stays
+    the same. One verification runs at a time; concurrent requests wait for it
+    and reuse its result instead of starting their own codesign processes.
+    """
+
+    key = (str(runtime.app), runtime.cdhash)
+    if _signature_cache_valid(key, _bundle_fingerprint(runtime.app)):
+        return
+    if not _SIGNATURE_LOCK.acquire(timeout=SIGNATURE_LOCK_WAIT_SECONDS):
+        raise _ServerError(
+            "signed host verification is busy; nothing ran, retry the request",
+            code="host_signature_check_timeout",
+        )
+    try:
+        before = _bundle_fingerprint(runtime.app)
+        if _signature_cache_valid(key, before):
+            return
+        _SIGNATURE_CACHE.pop(key, None)
+        _run_codesign_verification(runtime)
+        if before is not None and _bundle_fingerprint(runtime.app) == before:
+            _SIGNATURE_CACHE[key] = (time.monotonic(), before)
+    finally:
+        _SIGNATURE_LOCK.release()
+
+
+def _reset_signature_cache() -> None:
+    with _SIGNATURE_LOCK:
+        _SIGNATURE_CACHE.clear()
 
 
 def _process_executable_path(pid: int) -> Path:

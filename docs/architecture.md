@@ -55,7 +55,7 @@ The client parses the command line first. Seven commands run in the client becau
 
 A hosted call sends the argument list, file descriptors for input files, and terminal state to the host over the socket. The socket directory is mode 0700 and the socket is mode 0600, owned by the user. There is no network listener and no token; the operating system checks the peer's user id. Confirmation prompts, signals, and cancellation cross the boundary, so `remctl delete` on a terminal still asks first.
 
-The host verifies its own signature and runtime before running anything. It executes the CLI from an archive sealed into the app binary, with the bridge, the private helper, the store path, and scratch paths fixed by the installed generation. Caller-side helper overrides are ignored on the hosted route.
+The host verifies its own signature and runtime before running anything. A full `codesign --verify --deep --strict` runs at most once every ten minutes per app path and running CDHash, and only while every file and folder in the bundle keeps the inode, size, mode, and modification and change times it had when that check passed; any change inside the bundle verifies again before the next request. The result lives only in the host's memory, one check runs at a time, and a check that takes too long fails with the retryable `host_signature_check_timeout` instead of `host_signature_invalid`. It executes the CLI from an archive sealed into the app binary, with the bridge, the private helper, the store path, and scratch paths fixed by the installed generation. Caller-side helper overrides are ignored on the hosted route.
 
 ## The Capability Host
 
