@@ -71,6 +71,7 @@ VERSION = "2.3.1"
 PRIVATE_PROTOCOL_VERSION = 2
 RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION = 4
+HIERARCHY_PRIVATE_PROTOCOL_VERSION = 4
 _private_protocol_probe = None
 
 MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
@@ -10618,6 +10619,7 @@ def _reminder_move_in_hierarchy(db, a, reminder, relation, anchor_id, anchor, ta
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
 
+    require_private_helper(json_mode=a.json, minimum_protocol=HIERARCHY_PRIVATE_PROTOCOL_VERSION)
     list_pk = reminder["ZLIST"]
     current_parent_pk = _parent_pk(reminder)
     parent = None

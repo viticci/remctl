@@ -10416,13 +10416,17 @@ class CliTests(unittest.TestCase):
         return SimpleNamespace(**values)
 
     def _run_hierarchy_move(self, args, reminders, siblings_by_parent, ordering, *, expect_exit=False, verified=True,
-                            sections_by_member=None, sections=()):
+                            sections_by_member=None, sections=(), protocol=4):
         """Run cmd_reminder_move against fake rows. siblings_by_parent maps a parent pk (None = top level) to {uuid: pk}."""
         def siblings(_db, list_pk, parent_pk=None):
             return dict(siblings_by_parent.get(parent_pk, {}))
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(self.remctl, "require_private_metadata"))
+            stack.enter_context(mock.patch.object(self.remctl, "private_available", return_value=True))
+            stack.enter_context(mock.patch.object(
+                self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": protocol}
+            ))
             stack.enter_context(mock.patch.object(self.remctl, "open_db", return_value=object()))
             stack.enter_context(mock.patch.object(self.remctl, "q_reminder", side_effect=lambda _db, pk: reminders.get(pk)))
             stack.enter_context(mock.patch.object(self.remctl, "q_sibling_identifiers", side_effect=siblings))
@@ -10479,6 +10483,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["hierarchy"], "nested")
         self.assertEqual(result["parentId"], 100)
         self.assertEqual(result["anchorId"], 202)
+
+    def test_reminder_move_hierarchy_refuses_helper_before_protocol_4(self):
+        private_call, _, _, stderr = self._run_hierarchy_move(
+            self._hierarchy_move_args(101, parent=100),
+            self._hierarchy_rows(),
+            {100: {"SUB-A": 201, "SUB-B": 202}, 101: {}},
+            ["PARENT", "SUB-A", "SUB-B", "MOVING", "OTHER"],
+            expect_exit=True,
+            protocol=3,
+        )
+
+        private_call.assert_not_called()
+        self.assertIn("protocol 3 < required 4", stderr)
 
     def test_reminder_move_parent_with_position_places_among_subtasks(self):
         reminders = self._hierarchy_rows()

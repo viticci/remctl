@@ -267,6 +267,8 @@ clang -fobjc-arc -O -F/System/Library/PrivateFrameworks \
   -o /tmp/remctl-private remctl-private.m
 ```
 
+The helper reports protocol 4. Most private writes need 2, `deleted` and `restore` need 3, and two actions need 4: `move_reminder_in_hierarchy` (`reminder-move --parent`, `--top-level`, and reordering a subtask) and `assign_smart_list_section` (custom smart-list sections). RemCTL checks the version before the first write on those paths and refuses an older helper with `private_helper_outdated`, so nothing is half-applied. The Capability Host accepts helpers that report 2, 3, or 4.
+
 For normal hosted `auto` execution, `remctl doctor --for-agent --json` reports private-helper readiness under `capabilityHost.privateProtocol.compatible`; use it with `capabilityHost.fullReady`. The direct `private_helper` check and path apply only to explicit direct diagnostics. An incompatible hosted protocol or outdated direct helper blocks `--private` writes while normal non-private commands can keep working. After every RemCTL update, reinstall the same way you installed so the helper matches the CLI.
 
 Override the helper path for testing:
