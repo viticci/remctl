@@ -24,7 +24,7 @@ RemCTL Capability Host.app            signed, persistent, started by a LaunchAge
        ├─ reads the Reminders SQLite database
        ├─ remctl-bridge (Swift)       EventKit writes, address lookup
        ├─ remctl-private (ObjC)       ReminderKit writes, --private only
-       └─ AppleScript                 flags
+       └─ AppleScript                 flag fallback
 
 remctl-permissions (Swift)            the Full Disk Access helper window
 ```
@@ -92,8 +92,8 @@ Attachments: each attachment row stores a filename, a UTI, pixel dimensions, and
 ## Writes
 
 1. **EventKit through `remctl-bridge`.** The normal path for create, edit, list moves, complete, delete, recurrence, alarms, location alarms, notes URLs, and list management. The client validates input first; the bridge validates again and returns structured errors so the client can tell a permission denial from a move rejection.
-2. **AppleScript.** Sets flags for `flag`, `unflag`, and ordinary `add --flag`; EventKit has no flag property. Private flag writes use ReminderKit. Also a fallback for a few operations after a recovery check that prevents duplicates. A failed flag write returns an error.
-3. **ReminderKit through `remctl-private`.** Used only with `--private`, plus one automatic case: when EventKit rejects a pure list move (parents with subtasks, shared-list boundaries), RemCTL clones the reminder into the destination with ReminderKit, verifies the clone and its subtasks, and deletes the original. It is not used for permission errors, timeouts, or moves combined with other edits.
+2. **AppleScript.** Sets flags for `flag`, `unflag`, and ordinary `add --flag` when the private helper is unavailable or its flag write fails; EventKit has no flag property. Also a fallback for a few operations after a recovery check that prevents duplicates. A failed flag write returns an error.
+3. **ReminderKit through `remctl-private`.** Used only with `--private`, plus two automatic cases. Flag writes from `flag`, `unflag`, and `add --flag` try ReminderKit first, because it works without launching Reminders.app and setting a flag is idempotent. Second, when EventKit rejects a pure list move (parents with subtasks, shared-list boundaries), RemCTL clones the reminder into the destination with ReminderKit, verifies the clone and its subtasks, and deletes the original. The clone is not used for permission errors, timeouts, or moves combined with other edits.
 
 `remctl-private` reads one bounded JSON request on stdin, performs one of a fixed set of actions, and saves through the Reminders stack. It never runs a shell, never accepts arbitrary selectors, and never writes the database. It answers a `protocol_version` handshake (currently 4). The client needs 2, 3 for `deleted` and `restore`, and 4 for assigning a custom smart-list section, and refuses an older helper. Paths that once failed silently now return explicit errors, and the account lookup accepts only CloudKit accounts.
 
@@ -141,7 +141,7 @@ Installed HTTP endpoints read the current token file for each request. Token rot
 
 **Due dates and alarms.** `dueDate` comes from `ZDUEDATE`; `displayDate` from `ZDISPLAYDATEDATE` when present. Reminders.app lists and labels a reminder at `ZDISPLAYDATEDATE`, which follows an absolute alarm set to another time than the due date, so `today`, `overdue`, `upcoming`, and `stats` bucket by it and fall back to `ZDUEDATE`. Date-only input creates all-day reminders through date components. On `edit -d`, absolute alarms equal to the old due time move with it; `edit -d clear` removes them. Reminders can store the same alarm more than once, one acknowledged copy for each device that handled the notification. Both rules act only when every alarm matches, however many copies there are. Alarms are `ZREMCDOBJECT` rows (`REMCDAlarm`) with triggers; relative, absolute, and location triggers serialize under `alarms`. Writing a location alarm replaces the previous one.
 
-**Flags, urgent, Early Reminders.** Flags come from `ZFLAGGED`; non-private flag writes use AppleScript addressed by reminder id so lists inside groups work; `remctl-bridge` refuses flag payloads. Urgent comes from `ZISURGENTSTATEENABLEDFORCURRENTUSER` and is written only with `--private`. Early Reminders live in `ZREMCDDUEDATEDELTAALERT` with a JSON mirror on the reminder (`dueDateDeltaUnit` 0 and `dueDateDeltaCount` -15 is "15 minutes before") and are written through `REMReminderChangeItem.dueDateDeltaAlertContext`, replacing existing alerts first.
+**Flags, urgent, Early Reminders.** Flags come from `ZFLAGGED`; flag writes use ReminderKit's flagged context when the helper is available, otherwise AppleScript addressed by reminder id so lists inside groups work; `remctl-bridge` refuses flag payloads. Urgent comes from `ZISURGENTSTATEENABLEDFORCURRENTUSER` and is written only with `--private`. Early Reminders live in `ZREMCDDUEDATEDELTAALERT` with a JSON mirror on the reminder (`dueDateDeltaUnit` 0 and `dueDateDeltaCount` -15 is "15 minutes before") and are written through `REMReminderChangeItem.dueDateDeltaAlertContext`, replacing existing alerts first.
 
 **Shared-list assignment** resolves the sharee from local `REMCDSharee` rows and writes through ReminderKit's assignment context with the current user as originator.
 

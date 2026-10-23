@@ -428,7 +428,8 @@ def _requested(args: dict[str, Any], key: str) -> bool:
     if value is None or value == []:
         return False
     if value is False:
-        return key == "urgent"  # urgent: false clears the urgent state; other false flags ask for nothing
+        # urgent and flagged: false clear the state; other false flags ask for nothing.
+        return key in ("urgent", "flagged")
     return True
 
 
@@ -507,9 +508,12 @@ def _argv_update_reminder(args):
     argv += _option(args, "recurrence", "--recurrence")
     argv += _option(args, "alarm", "--alarm")
     argv += _option(args, "url", "--url")
-    # edit only adds synced tags, so tags join the private fields here.
+    # edit only adds synced tags, so tags join the private fields here, and
+    # edit sets the flag only through ReminderKit.
     argv += _option(args, "tags", "--tags")
-    argv += _private_metadata_argv(args, extra_private=("tags",))
+    argv += _private_metadata_argv(args, extra_private=("tags", "flagged"))
+    if args.get("flagged") is not None:
+        argv.append("--flagged" if args["flagged"] else "--no-flagged")
     argv.append("--json")
     return argv
 
@@ -733,7 +737,7 @@ SEARCH_OUTPUT_SCHEMA = {
 }
 
 UPDATE_FIELDS = (
-    "title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url",
+    "title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url", "flagged",
     "tags", "set_tags", "remove_tags", "clear_tags", "section", "section_id", "new_section", "subtasks",
     "assign", "unassign", "early_reminder", "urgent", "location_address", "latitude", "longitude",
     "location_title", "radius", "proximity", "grocery",
@@ -849,7 +853,8 @@ TOOLS: tuple[Tool, ...] = (
             Param("alarm", "string", ALARM_HELP, max_length=64),
             Param("url", "string", "URL. A synced rich link with private: true; otherwise appended to the notes.", max_length=2048),
             Param("tags", "string", TAGS_HELP, max_length=512, coerce=_coerce_tag_list),
-            Param("flagged", "boolean", "Flag the reminder after creating it.", default=False),
+            Param("flagged", "boolean", "Flag the reminder after creating it, through ReminderKit without opening Reminders "
+                  "when the private helper is available, otherwise through AppleScript.", default=False),
             PRIVATE_OPT_IN,
             *REMINDER_METADATA_PARAMS,
         ),
@@ -862,7 +867,7 @@ TOOLS: tuple[Tool, ...] = (
         "Update Reminder",
         "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. A list move can return a new "
         "id plus oldId: use the new id afterwards. Set private to true for synced tags, rich links, sections, subtasks, "
-        "assignment, Early Reminders, urgent state, and location alarms.",
+        "assignment, Early Reminders, urgent state, the flag, and location alarms.",
         (
             REMINDER_ID,
             Param("title", "string", "Replacement title.", max_length=1024),
@@ -879,6 +884,7 @@ TOOLS: tuple[Tool, ...] = (
             Param("remove_tags", "array", "Synced tags to remove (private).", items_type="string", max_items=20),
             Param("clear_tags", "boolean", "Remove every synced tag (private).", default=False),
             Param("unassign", "boolean", "Clear the shared-list assignment (private).", default=False),
+            Param("flagged", "boolean", "Set (true) or clear (false) the flag through ReminderKit (private). set_flagged needs no opt-in."),
             PRIVATE_OPT_IN,
             *REMINDER_METADATA_PARAMS,
         ),
@@ -904,7 +910,8 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "set_flagged",
         "Set Flag",
-        "Flag or unflag a reminder through Reminders automation inside the signed host.",
+        "Flag or unflag a reminder. Uses ReminderKit, which does not open Reminders, when the private helper is "
+        "available; otherwise Reminders automation (AppleScript), which opens Reminders.",
         (
             REMINDER_ID,
             Param("flagged", "boolean", "true flags the reminder; false removes the flag.", required=True),

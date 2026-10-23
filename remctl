@@ -6817,7 +6817,7 @@ def applescript_access_check_for_onboarding():
         "automation",
         "warn",
         message,
-        "Direct mode is self-managed. Rerun `remctl onboard` in the deliberate direct caller and approve Automation access. `flag`/`unflag` require it and have no EventKit fallback.",
+        "Direct mode is self-managed. Rerun `remctl onboard` in the deliberate direct caller and approve Automation access. `flag`/`unflag` fall back to it when the private helper is unavailable; EventKit has no flag API.",
     )
 
 
@@ -7168,6 +7168,23 @@ def osa_set_flagged_result(reminder_ckid, *, flagged=True, timeout=120):
         return True, ""
     detail = (r.stderr or "").strip()
     return False, detail or f"osascript exited {r.returncode} with no error output"
+
+
+def set_flag_state(reminder_ckid, *, flagged):
+    """Set the real flagged state for flag, unflag, and add --flag.
+
+    ReminderKit first when the private helper is ready, because it works
+    without Reminders.app; AppleScript, which launches the app, only when the
+    helper is unavailable or its write fails. Setting a flag is idempotent, so
+    the fallback cannot double-apply anything. Returns (ok, error_text).
+    """
+    if reminder_ckid and private_available():
+        probe = _probe_private_protocol_version()
+        if probe.get("ok") and probe.get("version", 0) >= PRIVATE_PROTOCOL_VERSION:
+            result = private_call({"action": "set_flagged", "id": reminder_ckid, "flagged": bool(flagged)})
+            if result.get("status") == "updated":
+                return True, ""
+    return osa_set_flagged_result(reminder_ckid, flagged=flagged)
 
 def esc(s):
     """Escape a string for AppleScript double-quoted literals.
@@ -9525,7 +9542,7 @@ def cmd_add(a):
                     created_row = None
             flag_error = None
             if a.flag and not wants_private:
-                flag_ok, flag_err = osa_set_flagged_result(result.get("id", ""), flagged=True)
+                flag_ok, flag_err = set_flag_state(result.get("id", ""), flagged=True)
                 if not flag_ok:
                     flag_error = flag_err
                     print(
@@ -11431,13 +11448,11 @@ def cmd_flag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # AppleScript-only: EventKit has no public "flagged" API, so the bridge
-    # can never set the real ZFLAGGED column. The reminder is addressed at
-    # application level because group-nested lists are invisible to
-    # `tell list "<name>"` (see osa_set_flagged_result).
+    # ReminderKit or AppleScript (see set_flag_state): EventKit has no public
+    # "flagged" API, so the bridge can never set the real ZFLAGGED column.
     if not r["ZCKIDENTIFIER"]:
         _refuse_unsafe_title_fallback(r, "flag it", "The reminder has no stable identifier")
-    ok, err = osa_set_flagged_result(r["ZCKIDENTIFIER"], flagged=True)
+    ok, err = set_flag_state(r["ZCKIDENTIFIER"], flagged=True)
     if ok:
         if a.json:
             print(json.dumps({"status": "flagged", "id": a.id, "title": r["ZTITLE"]}))
@@ -11453,10 +11468,10 @@ def cmd_unflag(a):
         print(f"Error: #{a.id} not found", file=sys.stderr)
         sys.exit(1)
 
-    # AppleScript-only (see cmd_flag).
+    # ReminderKit or AppleScript (see cmd_flag).
     if not r["ZCKIDENTIFIER"]:
         _refuse_unsafe_title_fallback(r, "unflag it", "The reminder has no stable identifier")
-    ok, err = osa_set_flagged_result(r["ZCKIDENTIFIER"], flagged=False)
+    ok, err = set_flag_state(r["ZCKIDENTIFIER"], flagged=False)
     if ok:
         if a.json:
             print(json.dumps({"status": "unflagged", "id": a.id, "title": r["ZTITLE"]}))
@@ -13461,7 +13476,7 @@ def gather_doctor_checks(capability_host=None):
                 "authorized": None,
                 "unverified": (
                     "macOS cannot report Automation access until Reminders has run once. "
-                    "Only flag and unflag need it; reads and writes are unaffected."
+                    "Only flag and unflag need it, and only when the private helper is unavailable; reads and writes are unaffected."
                 ),
                 "blocked": "Run `remctl onboard` to request Automation access for the signed host.",
             }[automation_state],
@@ -14862,7 +14877,7 @@ def build_parser():
     c.add_argument("--list-id", type=int, help="Create in a list by stable numeric ID")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders")
     c.add_argument("-p", "--priority", help="high, medium, low")
-    c.add_argument("-f", "--flag", action="store_true", help="Set the real flagged state by AppleScript inside the signed host (ReminderKit with --private)")
+    c.add_argument("-f", "--flag", action="store_true", help="Set the real flagged state through ReminderKit, or AppleScript when the private helper is unavailable")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
     c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
@@ -15174,18 +15189,20 @@ def build_parser():
     # --- New commands ---
     c = sub.add_parser(
         "flag",
-        help="Flag by AppleScript inside the signed host; needs host Automation access",
+        help="Flag a reminder through ReminderKit, or AppleScript when the private helper is unavailable",
         description=(
-            "Set the real Reminders flagged state through AppleScript inside the signed host. "
-            "The host needs Automation access to control Reminders; EventKit has no flagged API."
+            "Set the real Reminders flagged state through the private ReminderKit helper, which does not open "
+            "Reminders.app. When the helper is unavailable or its write fails, fall back to AppleScript inside the "
+            "signed host, which needs Automation access and opens Reminders.app; EventKit has no flagged API."
         ),
     ); c.add_argument("id", type=int); js(c)
     c = sub.add_parser(
         "unflag",
-        help="Unflag by AppleScript inside the signed host; needs host Automation access",
+        help="Unflag a reminder through ReminderKit, or AppleScript when the private helper is unavailable",
         description=(
-            "Clear the real Reminders flagged state through AppleScript inside the signed host. "
-            "The host needs Automation access to control Reminders; EventKit has no flagged API."
+            "Clear the real Reminders flagged state through the private ReminderKit helper, which does not open "
+            "Reminders.app. When the helper is unavailable or its write fails, fall back to AppleScript inside the "
+            "signed host, which needs Automation access and opens Reminders.app; EventKit has no flagged API."
         ),
     ); c.add_argument("id", type=int); js(c)
 

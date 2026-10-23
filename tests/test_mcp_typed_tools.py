@@ -130,6 +130,7 @@ class PrivateOptInTests(unittest.TestCase):
             ("create_reminder", {"title": "x", "urgent": False}),
             ("update_reminder", {"reminder_id": 1, "tags": "work"}),
             ("update_reminder", {"reminder_id": 1, "clear_tags": True}),
+            ("update_reminder", {"reminder_id": 1, "flagged": False}),
             ("create_list", {"name": "Food", "groceries": True}),
             ("update_list", {"list": "Work", "emoji": "💼"}),
         ):
@@ -158,6 +159,9 @@ class PrivateOptInTests(unittest.TestCase):
             "latitude": 37.3349, "longitude": -122.009,
         })
         self.assertEqual((edit.id, edit.set_tags, edit.remove_tag, edit.unassign), (7, "a", ["-old"], True))
+        # flagged alone is a whole update, and false clears the flag through ReminderKit.
+        for value in (True, False):
+            self.assertIs(parsed("update_reminder", {"reminder_id": 7, "private": True, "flagged": value}).flagged, value)
         self.assertEqual((edit.latitude, edit.longitude), (37.3349, -122.009))
 
     def test_location_extras_need_a_location(self):

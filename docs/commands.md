@@ -135,7 +135,7 @@ Options: `-l/--list`, `--list-id`, `-n/--notes`, `-d/--due`, `-p/--priority high
 
 Without `--private`, `--url` is appended to the notes and `-t/--tags` adds `#hashtags` to the title. With `--private` they become a synced rich link and synced tags.
 
-`-f/--flag` sets the flag through Reminders automation after the reminder is created. If that step fails, the reminder still exists; the command prints a warning and `--json` adds `"warnings": ["flag_not_set: …"]`.
+`-f/--flag` sets the flag after the reminder is created, the same way `flag` does (see [Flags](#flags)). If that step fails, the reminder still exists; the command prints a warning and `--json` adds `"warnings": ["flag_not_set: …"]`.
 
 With `--json`, `add` prints `{"status": "created", "id": "<uuid>", "numericId": 32308, "title": "…"}`. Use `numericId` for follow-up commands. `resolvedList` appears when the list name was matched loosely.
 
@@ -231,11 +231,11 @@ Every destructive command (`delete`, `list-delete`, `section-delete`, `group-del
 
 ### Flags
 
-`flag` and `unflag` write the real flag through Reminders automation (AppleScript), without changing priority. Reminders nested in groups work.
+`flag` and `unflag` write the real flag without changing priority. They use the private ReminderKit helper, which does not open Reminders.app, and fall back to Reminders automation (AppleScript), which opens it, only when the helper is unavailable or its write fails. Reminders nested in groups work.
 
 - Success under `--json`: `{"status": "flagged", "id": 23880, "title": "…"}` or `"unflagged"`.
-- Failure: exit 1 and, under `--json`, `{"status": "error", "code": "applescript_flag_failed", "id": 23880, "message": "…"}` on stderr. The flag is unchanged. Usual causes: the host lacks Automation access (error -1743), or Reminders did not respond within 120 seconds.
-- `edit ID --private --flagged` and `--no-flagged` write the same state through ReminderKit without automation.
+- Failure: exit 1 and, under `--json`, `{"status": "error", "code": "applescript_flag_failed", "id": 23880, "message": "…"}` on stderr. The flag is unchanged. This means the AppleScript fallback failed too. Usual causes: the host lacks Automation access (error -1743), or Reminders did not respond within 120 seconds.
+- `edit ID --private --flagged` and `--no-flagged` write the same state through ReminderKit only, with no fallback.
 
 ## Reminder ordering
 

@@ -4667,6 +4667,7 @@ class CliTests(unittest.TestCase):
                     return_value={"id": 1, "title": "Work", "requested": "Work", "method": "exact"},
                 ),
                 mock.patch.object(self.remctl, "osa_set_flagged_result", return_value=(True, "")) as flag_try,
+                mock.patch.object(self.remctl, "private_available", return_value=False),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.remctl.cmd_add(args)
@@ -4728,6 +4729,7 @@ class CliTests(unittest.TestCase):
                 "osa_set_flagged_result",
                 return_value=(False, "Not authorized to send Apple events to Reminders. (-1743)"),
             ),
+            mock.patch.object(self.remctl, "private_available", return_value=False),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
             contextlib.redirect_stderr(io.StringIO()) as stderr,
         ):
@@ -4788,6 +4790,7 @@ class CliTests(unittest.TestCase):
                 "osa_set_flagged_result",
                 return_value=(False, "Not authorized to send Apple events to Reminders. (-1743)"),
             ),
+            mock.patch.object(self.remctl, "private_available", return_value=False),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
             contextlib.redirect_stderr(io.StringIO()),
         ):
@@ -6800,6 +6803,7 @@ class CliTests(unittest.TestCase):
             mock.patch.object(
                 self.remctl, "osa_set_flagged_result", return_value=set_result
             ) as set_flag,
+            mock.patch.object(self.remctl, "private_available", return_value=False),
             mock.patch.object(self.remctl, "bridge_available", return_value=True),
             mock.patch.object(self.remctl, "bridge_call") as bridge_call,
             contextlib.redirect_stdout(out),
@@ -6858,6 +6862,29 @@ class CliTests(unittest.TestCase):
         payload = json.loads(result.stderr)
         self.assertEqual(payload["code"], "applescript_flag_failed")
         self.assertIn("timed out", payload["message"])
+
+    def test_flag_writes_use_reminderkit_and_fall_back_to_applescript(self):
+        # ReminderKit sets the flag without launching Reminders.app; AppleScript
+        # runs only when the helper is unavailable or its write fails.
+        cases = [
+            ("helper ready", True, {"status": "updated"}, False),
+            ("helper write fails", True, {"status": "error", "message": "not found"}, True),
+            ("helper missing", False, None, True),
+        ]
+        for label, available, private_result, expect_applescript in cases:
+            with self.subTest(label):
+                with (
+                    mock.patch.object(self.remctl, "private_available", return_value=available),
+                    mock.patch.object(self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 3}),
+                    mock.patch.object(self.remctl, "private_call", return_value=private_result) as private_call,
+                    mock.patch.object(self.remctl, "osa_set_flagged_result", return_value=(True, "")) as osa,
+                ):
+                    self.assertEqual(self.remctl.set_flag_state("ABC-123", flagged=False), (True, ""))
+                if available:
+                    private_call.assert_called_once_with({"action": "set_flagged", "id": "ABC-123", "flagged": False})
+                else:
+                    private_call.assert_not_called()
+                self.assertEqual(osa.called, expect_applescript)
 
     def test_osa_set_flagged_result_addresses_reminder_at_app_level(self):
         # `tell list "<name>"` cannot see lists nested inside groups (-1728);
