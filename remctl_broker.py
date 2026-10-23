@@ -80,6 +80,7 @@ SIGNAL_CONTROL_MAX_BYTES = 256
 SIGNAL_CONTROL_PARTIAL_TIMEOUT_SECONDS = 0.5
 SIGNAL_CONTROL_GRACE_SECONDS = 2.0
 CLIENT_SIGNAL_WAIT_SECONDS = 5.0
+HOST_START_WAIT_SECONDS = 10.0
 MAX_CLIENT_WORKERS = 16
 MAX_ANCILLARY_FDS = 256
 SUPPORTED_PRIVATE_PROTOCOL_VERSIONS = (2, 3)
@@ -510,6 +511,32 @@ def _recv_request(connection: socket.socket) -> tuple[dict[str, Any], list[int]]
         raise
 
 
+def _start_pended_host(metadata: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """Start a loaded but idle host; launchd may pend RunAtLoad/KeepAlive spawns indefinitely."""
+
+    if metadata.get("exists") or metadata.get("error"):
+        return metadata
+    agent = _launch_agent_status()
+    if not (agent["loaded"] and agent["contractValid"]):
+        return metadata
+    try:
+        subprocess.run(
+            ["/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return metadata
+    deadline = time.monotonic() + min(timeout, HOST_START_WAIT_SECONDS)
+    while True:
+        metadata = _socket_metadata(socket_path())
+        if metadata.get("exists") or time.monotonic() >= deadline:
+            return metadata
+        time.sleep(0.1)
+
+
 def _request(
     payload: dict[str, Any],
     *,
@@ -517,7 +544,7 @@ def _request(
     descriptors: list[int] | None = None,
     forwarded_signals: list[int] | None = None,
 ) -> dict[str, Any]:
-    metadata = _socket_metadata(socket_path())
+    metadata = _start_pended_host(_socket_metadata(socket_path()), timeout=timeout)
     if metadata.get("secure") is not True:
         if metadata.get("exists"):
             raise HostUnhealthy(metadata.get("error") or "Capability Host socket is unsafe")
@@ -1045,6 +1072,8 @@ def status(*, timeout: float = 10) -> dict[str, Any]:
     """Return a total local/remote diagnostic without raising."""
 
     result = _base_status()
+    if not result["socket"].get("exists"):
+        result["socket"] = _start_pended_host(result["socket"], timeout=timeout)
     if result["socket"].get("secure") is not True:
         result["error"] = result["socket"].get("error") or "Capability Host is not running"
         return result

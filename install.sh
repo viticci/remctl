@@ -393,9 +393,13 @@ stop_job() {
 bootstrap_job() {
     local plist="$1"
     for _ in {1..10}; do
-        if job_loaded; then return 0; fi
-        if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then return 0; fi
-        job_loaded && return 0
+        if job_loaded || launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 || job_loaded; then
+            # launchd may pend a freshly bootstrapped RunAtLoad job as a
+            # "speculative" spawn indefinitely. Without -k this starts it now
+            # and leaves an already running host alone.
+            launchctl kickstart "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
+            return 0
+        fi
         sleep 0.2
     done
     return 1

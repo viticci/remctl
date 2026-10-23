@@ -322,6 +322,37 @@ class CapabilityPlannerTests(unittest.TestCase):
                 agent_path.unlink()
                 self.assertEqual(remctl_broker.socket_path(), default_socket)
 
+    def test_missing_socket_kickstarts_loaded_host_that_launchd_pended(self):
+        missing = {"exists": False, "secure": False, "error": None}
+        ready = {"exists": True, "secure": True, "error": None}
+        agent = {"loaded": True, "contractValid": True}
+        with (
+            mock.patch.object(remctl_broker, "_launch_agent_status", return_value=agent),
+            mock.patch.object(remctl_broker, "_socket_metadata", side_effect=[missing, ready]),
+            mock.patch.object(remctl_broker.subprocess, "run") as run,
+            mock.patch.object(remctl_broker.time, "sleep"),
+        ):
+            self.assertEqual(remctl_broker._start_pended_host(missing, timeout=5), ready)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{remctl_broker.LAUNCH_AGENT_LABEL}"],
+        )
+
+    def test_host_start_leaves_unsafe_sockets_and_foreign_agents_alone(self):
+        missing = {"exists": False, "secure": False, "error": None}
+        cases = [
+            ({"exists": True, "secure": False, "error": "unsafe"}, {"loaded": True, "contractValid": True}),
+            ({"exists": False, "secure": False, "error": "unsafe parent"}, {"loaded": True, "contractValid": True}),
+            (missing, {"loaded": False, "contractValid": True}),
+            (missing, {"loaded": True, "contractValid": False}),
+        ]
+        for metadata, agent in cases:
+            with self.subTest(metadata=metadata, agent=agent), (
+                mock.patch.object(remctl_broker, "_launch_agent_status", return_value=agent)
+            ), mock.patch.object(remctl_broker.subprocess, "run") as run:
+                self.assertIs(remctl_broker._start_pended_host(metadata, timeout=5), metadata)
+                run.assert_not_called()
+
     def test_real_parser_planner_and_server_binding_cover_all_file_surfaces(self):
         parser = remctl_broker._load_real_parser()
         with tempfile.TemporaryDirectory() as temp_value:
