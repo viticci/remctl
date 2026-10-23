@@ -910,6 +910,11 @@ if [[ "$CAPABILITY_SIMULATION" != "1" ]]; then
     socket_owned || fail "A capability-host socket exists but is not an exact current-user 0600 socket in its canonical 0700 directory; refusing to stop or overwrite anything."
     SERVICE_QUIESCED=1
     stop_job || fail "The previous capability host did not stop; nothing was published."
+    # A host that crashed under RemCTL 2.3 or earlier could leave its broker
+    # listening. The new broker code stops it only if it can identify it.
+    # Its Python may differ from this install's, so pass the one the old host recorded.
+    OLD_HOST_PYTHON="$(cat "$APP_PATH/Contents/Resources/remctl-capability-python-path" 2>/dev/null || true)"
+    "$CAPABILITY_PYTHON" -B -I -S -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import remctl_broker; remctl_broker.stop_orphaned_broker_at(Path(sys.argv[2]), sys.argv[3] or None)' "$BIN_STAGE" "$SOCKET_PATH" "$OLD_HOST_PYTHON" >/dev/null 2>&1 || true
     safe_remove_socket || fail "Refusing to remove a foreign or unsafe capability-host socket."
 fi
 

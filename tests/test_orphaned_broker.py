@@ -106,6 +106,34 @@ class OrphanedBrokerTests(unittest.TestCase):
         remctl_broker._prepare_socket(self.socket_path).close()
         self.assertTrue(_wait_until(lambda: not _alive(orphan)))
 
+    def test_installer_stops_an_orphaned_broker(self):
+        # install.sh calls this after stopping the old host, before removing the socket.
+        orphan = self.start_listener("orphan")
+        self.assertTrue(remctl_broker.stop_orphaned_broker_at(self.socket_path))
+        self.assertTrue(_wait_until(lambda: not _alive(orphan)))
+        self.assertFalse(remctl_broker.stop_orphaned_broker_at(self.socket_path.parent / "missing.sock"))
+
+    def test_installer_accepts_the_old_hosts_python(self):
+        # The upgrade runs another Python than the orphan; only the one the old
+        # host recorded, passed by install.sh, identifies it.
+        orphan = self.start_listener("orphan")
+        executable_path = remctl_broker._process_executable_path
+
+        def elsewhere_for_self(pid):
+            return Path("/Elsewhere/Python/bin/python3.13") if pid == os.getpid() else executable_path(pid)
+
+        with mock.patch.object(remctl_broker, "_process_executable_path", side_effect=elsewhere_for_self):
+            self.assertFalse(remctl_broker.stop_orphaned_broker_at(self.socket_path))
+            self.assertTrue(_alive(orphan))
+            self.assertFalse(remctl_broker.stop_orphaned_broker_at(self.socket_path, "/usr/bin/python3"))
+            self.assertTrue(remctl_broker.stop_orphaned_broker_at(self.socket_path, sys.executable))
+        self.assertTrue(_wait_until(lambda: not _alive(orphan)))
+
+    def test_installer_leaves_a_live_broker_running(self):
+        child = self.start_listener("child")
+        self.assertFalse(remctl_broker.stop_orphaned_broker_at(self.socket_path))
+        self.assertTrue(_alive(child))
+
     def test_live_broker_is_left_running(self):
         child = self.start_listener("child")
         with self.assertRaises(remctl_broker._ServerError) as raised:

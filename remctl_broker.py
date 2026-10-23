@@ -3049,12 +3049,15 @@ def _process_arguments(pid: int) -> list[str] | None:
     return [os.fsdecode(argument) for argument in arguments]
 
 
-def _orphaned_broker_identity(pid: int, socket_path: Path) -> tuple[int, int] | None:
+def _orphaned_broker_identity(
+    pid: int, socket_path: Path, python_root: Path | None = None
+) -> tuple[int, int] | None:
     """Return the start time of this user's orphaned broker for socket_path.
 
     A broker's parent is always its native host, so a parent of 1 means the
     host died without stopping it. The start time pins that exact process, so
     a later check cannot match a different process that reused its pid.
+    python_root also accepts the Python install an older host recorded.
     """
 
     if pid <= 1 or pid == os.getpid():
@@ -3067,7 +3070,11 @@ def _orphaned_broker_identity(pid: int, socket_path: Path) -> tuple[int, int] | 
         own_executable = _process_executable_path(os.getpid())
     except _ServerError:
         return None
-    if executable != own_executable and not executable.is_relative_to(PROTECTED_PYTHON_ROOT):
+    if not (
+        executable == own_executable
+        or executable.is_relative_to(PROTECTED_PYTHON_ROOT)
+        or (python_root is not None and executable.is_relative_to(python_root))
+    ):
         return None
     # The host always launches the broker as exactly
     # `<python> -I -S /dev/fd/<archive> service --socket <path>`.
@@ -3085,7 +3092,7 @@ def _orphaned_broker_identity(pid: int, socket_path: Path) -> tuple[int, int] | 
     return info[2]
 
 
-def _stop_orphaned_broker(probe: socket.socket, socket_path: Path) -> bool:
+def _stop_orphaned_broker(probe: socket.socket, socket_path: Path, python_root: Path | None = None) -> bool:
     """Stop the process answering on the socket if it is an orphaned broker.
 
     Returns True once that process is gone. Anything not positively identified
@@ -3099,11 +3106,11 @@ def _stop_orphaned_broker(probe: socket.socket, socket_path: Path) -> bool:
         pid = probe.getsockopt(0, getattr(socket, "LOCAL_PEERPID", 2))
     except OSError:
         return False
-    identity = _orphaned_broker_identity(pid, socket_path)
+    identity = _orphaned_broker_identity(pid, socket_path, python_root)
     if identity is None:
         return False
     for signum, wait in ((signal.SIGTERM, ORPHANED_BROKER_STOP_SECONDS), (signal.SIGKILL, 1.0)):
-        if _orphaned_broker_identity(pid, socket_path) != identity:
+        if _orphaned_broker_identity(pid, socket_path, python_root) != identity:
             return True
         try:
             os.kill(pid, signum)
@@ -3111,10 +3118,36 @@ def _stop_orphaned_broker(probe: socket.socket, socket_path: Path) -> bool:
             return True
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if _orphaned_broker_identity(pid, socket_path) != identity:
+            if _orphaned_broker_identity(pid, socket_path, python_root) != identity:
                 return True
             time.sleep(0.05)
     return False
+
+
+def stop_orphaned_broker_at(socket_path: Path, old_python: str | None = None) -> bool:
+    """Stop an orphaned broker still listening on socket_path; True once it is gone.
+
+    The installer calls this after stopping the old host, so an upgrade can
+    replace a broker that a crashed host (RemCTL 2.3 and earlier) left behind.
+    old_python is the interpreter the old host recorded; the broker may run
+    from anywhere in that Python install (a framework re-executes as Python.app).
+    """
+
+    python_root = None
+    if old_python and Path(old_python).is_absolute():
+        root = Path(old_python).resolve().parent.parent
+        # A shallow root such as /usr would accept far more than one Python install.
+        python_root = root if len(root.parts) >= 4 else None
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.25)
+        probe.connect(str(socket_path))
+        return _stop_orphaned_broker(probe, socket_path, python_root)
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 def _stop_when_parent_exits(parent: int) -> None:
