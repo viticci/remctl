@@ -37,7 +37,7 @@ From a checkout, this does the same thing:
 ./install.sh --bootstrap
 ```
 
-The installer downloads the disk image for your Mac. Before it installs anything, it checks the app's full signature, confirms it was signed with the MacStories Developer ID, and asks Gatekeeper to accept it. If any of that fails, it stops. It never falls back to an unsigned build.
+The installer downloads the disk image for your Mac and copies the app into a private temporary folder; every later step uses only that copy. Before it installs anything, it checks the copy's full signature, confirms it was signed with the MacStories Developer ID, and asks Gatekeeper to accept it. If any of that fails, it stops. It never falls back to an unsigned build.
 
 To install an app you already downloaded:
 

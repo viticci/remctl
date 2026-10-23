@@ -256,6 +256,25 @@ class LocalSigningTests(unittest.TestCase):
         self.assertEqual(before, self.search_list())
 
 
+class PrebuiltCopyTests(unittest.TestCase):
+    def test_prebuilt_app_is_verified_from_a_private_copy_that_is_removed(self):
+        # sudo may not reach an app on a user-mounted disk image, so the
+        # installer checks and runs a copy. An unsigned app stops at the check.
+        with tempfile.TemporaryDirectory(prefix="rd-", dir="/private/tmp") as temporary:
+            root = Path(temporary)
+            app = root / "mounted" / distribution.APP_NAME
+            (app / "Contents/MacOS").mkdir(parents=True)
+            (root / "tmp").mkdir()
+            env = dict(os.environ, PREFIX=str(root / "prefix"), TMPDIR=str(root / "tmp"),
+                       REMCTL_LAUNCH_AGENT_DIR=str(root / "prefix/agents"), REMCTL_SKIP_LAUNCHSERVICES="1")
+            result = subprocess.run([str(ROOT / "install.sh"), "--prebuilt", str(app), "--dry-run"],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid app signature", result.stderr)
+            self.assertIn("/remctl-prebuilt.", result.stderr)
+            self.assertEqual(list((root / "tmp").iterdir()), [])
+
+
 @unittest.skipUnless(os.environ.get("REMCTL_TEST_DISTRIBUTION_APP"), "set REMCTL_TEST_DISTRIBUTION_APP to a built app")
 class PrebuiltInstallTests(unittest.TestCase):
     def setUp(self):

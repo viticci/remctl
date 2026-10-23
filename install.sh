@@ -123,9 +123,16 @@ fi
 if [[ -z "$PREBUILT_APP" && "$SKIP_LAUNCHSERVICES" != "1" && -z "${REMCTL_CAPABILITY_PYTHON:-}" ]]; then
     exec "$SCRIPT_DIR/scripts/download_release.sh" "${ORIGINAL_ARGS[@]}"
 fi
+PREBUILT_COPY=""
 if [[ -n "$PREBUILT_APP" ]]; then
     PREBUILT_APP="$(cd "$PREBUILT_APP" && pwd -P)"
     [[ "$(basename "$PREBUILT_APP")" == "$APP_NAME" ]] || fail "Unexpected app name."
+    # Verify and run only a private copy. sudo may not see an app on a disk
+    # image the user mounted (macOS 27.2), and a copy can't change after its checks.
+    PREBUILT_COPY="$(mktemp -d "${TMPDIR:-/tmp}/remctl-prebuilt.XXXXXX")"
+    trap 'rm -rf -- "$PREBUILT_COPY"' EXIT
+    /usr/bin/ditto "$PREBUILT_APP" "$PREBUILT_COPY/$APP_NAME" || fail "Could not copy $PREBUILT_APP."
+    PREBUILT_APP="$PREBUILT_COPY/$APP_NAME"
     /usr/bin/codesign --verify --deep --strict -R '=identifier "net.macstories.remctl.capability-host"' "$PREBUILT_APP" || fail "Invalid app signature."
     if [[ "$ALLOW_LOCAL_BUILD" != "1" ]]; then
         /usr/bin/codesign --verify --strict -R '=identifier "net.macstories.remctl.capability-host" and anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "4W35M4UN6R"' "$PREBUILT_APP" || fail "The download is not signed with RemCTL's Developer ID."
@@ -529,6 +536,7 @@ cleanup() {
     if [[ "$RECOVERY_FAILED" != "1" ]]; then
         rm -rf -- "$BIN_STAGE" "$APP_STAGE" "$AGENT_STAGE" "$BUILD_STAGE"
     fi
+    [[ -z "$PREBUILT_COPY" ]] || rm -rf -- "$PREBUILT_COPY"
     exit "$result"
 }
 trap cleanup EXIT INT TERM
