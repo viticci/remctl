@@ -10046,6 +10046,25 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_undated_conflicts_keep_the_live_section_for_display_only(self):
+        # An undated obsolete entry beside a dated live one: display keeps "Later",
+        # while write verification refuses to guess.
+        db = self._smart_list_section_db()
+        self._insert_section(db, 11, "Later", "SECTION-2")
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 1",
+            (json.dumps({"memberships": [
+                {"memberID": "REM-1", "groupID": "SECTION-1", "isObsolete": True},
+                {"memberID": "REM-1", "groupID": "SECTION-2", "isObsolete": False, "modifiedOn": 200},
+            ]}),),
+        )
+        try:
+            self.assertEqual(self.remctl.q_section_memberships(db, 1), {"REM-1": "Later"})
+            self.assertEqual(self.remctl.q_section_member_counts(db, 1), {"SECTION-2": 1})
+            self.assertIsNone(self.remctl.q_reminder_section_ckid(db, 1, "rem-1"))
+        finally:
+            db.close()
+
     def test_smart_list_flag_needs_an_existing_section_flag(self):
         for overrides, message in (
             ({"smart_list": "Focus"}, "need --section or --section-id"),

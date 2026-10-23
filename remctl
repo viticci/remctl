@@ -2299,12 +2299,13 @@ def section_name_exists(db, list_pk, name, *, excluding_ckid=None):
     return False
 
 
-def effective_section_memberships(data):
+def effective_section_memberships(data, *, strict=False):
     """Map each memberID in REMMemberships JSON to the section groupID it is effectively in, or None.
 
     ReminderKit keeps one membership per member and, when two disagree, its default merge keeps the
-    newest modifiedOn; a newest obsolete entry means "no section". Disagreements that dates cannot
-    order map to None so no reader guesses from array order.
+    newest modifiedOn; a newest obsolete entry means "no section". When dates cannot order a
+    disagreement, strict callers (write verification) get None rather than a guess; display keeps
+    the last live entry, as RemCTL always has.
     """
     by_member = {}
     for membership in (data.get("memberships") or []) if isinstance(data, dict) else []:
@@ -2318,18 +2319,24 @@ def effective_section_memberships(data):
     def agree(entries):
         return len({(group(entry) or "").casefold() for entry in entries}) == 1
 
+    def undecided(entries):
+        if strict:
+            return None
+        return next((group(entry) for entry in reversed(entries) if group(entry)), None)
+
     resolved = {}
     for entries in by_member.values():
         member_id = entries[0]["memberID"]
         if not agree(entries):
             dates = [entry.get("modifiedOn") for entry in entries]
             if not all(isinstance(date, (int, float)) and not isinstance(date, bool) for date in dates):
-                resolved[member_id] = None
+                resolved[member_id] = undecided(entries)
                 continue
-            entries = [entry for entry, date in zip(entries, dates) if date == max(dates)]
-            if not agree(entries):
-                resolved[member_id] = None
+            newest = [entry for entry, date in zip(entries, dates) if date == max(dates)]
+            if not agree(newest):
+                resolved[member_id] = undecided(newest)
                 continue
+            entries = newest
         resolved[member_id] = group(entries[-1])
     return resolved
 
@@ -2353,7 +2360,7 @@ def q_reminder_section_ckid(db, list_pk, reminder_ckid, *, smart_list=False):
     With smart_list, list_pk is a custom smart list's Z_PK: its row stores its own section memberships.
     """
     try:
-        memberships = effective_section_memberships(_section_memberships_data(db, list_pk))
+        memberships = effective_section_memberships(_section_memberships_data(db, list_pk), strict=True)
         live = {
             (section["ZCKIDENTIFIER"] or "").casefold(): section["ZCKIDENTIFIER"]
             for section in (q_smart_list_sections(db, list_pk) if smart_list else q_sections(db, list_pk))
