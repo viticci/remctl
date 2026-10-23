@@ -4566,6 +4566,42 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["id"], "RECOVERED-ID")
         self.assertEqual(payload["numericId"], 99)
 
+    def test_cmd_add_flags_a_reminder_recovered_after_a_bridge_error(self):
+        db = self._due_window_db()
+        db.execute("DELETE FROM ZREMCDBASELIST")
+        db.execute("INSERT INTO ZREMCDBASELIST (Z_PK, ZNAME) VALUES (1, 'Work')")
+        self._insert_lookup_reminder(db, 99, "Dup test", list_pk=1, ckid="RECOVERED-ID")
+        args = SimpleNamespace(
+            title="Dup test", list="Work", list_id=None, notes=None, due=None, priority=None, flag=True,
+            tags=None, url=None, recurrence=None, alarm=None, private=False, private_metadata=False,
+            grocery=False, section=None, section_id=None, new_section=None, subtask=None, image=None,
+            json=True, flagged=None, urgent=None, early_reminder=None, location_title=None, latitude=None,
+            longitude=None, radius=100, proximity="arriving", address=None,
+        )
+        bridge_result = self._bridge_result({"status": "error", "message": "Save failed"}, returncode=1)
+        try:
+            with (
+                mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                mock.patch.object(self.remctl, "bridge_call_result", return_value=bridge_result),
+                mock.patch.object(self.remctl, "open_db", return_value=db),
+                mock.patch.object(
+                    self.remctl,
+                    "resolve_list_or_die",
+                    return_value={"id": 1, "title": "Work", "requested": "Work", "method": "exact"},
+                ),
+                mock.patch.object(self.remctl, "set_flag_state", return_value=(False, "flag write failed")) as flag,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.remctl.cmd_add(args)
+        finally:
+            db.close()
+
+        flag.assert_called_once_with("RECOVERED-ID", flagged=True)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["id"], "RECOVERED-ID")
+        self.assertEqual(payload["warnings"], ["flag_not_set: flag write failed"])
+
     def test_cmd_add_falls_back_to_applescript_when_reminder_absent_after_generic_bridge_error(self):
         db = self._due_window_db()
         args = SimpleNamespace(
@@ -4736,7 +4772,7 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_add(args)
 
         self.assertIn("Created:", stdout.getvalue())
-        self.assertIn("failed to set the flag via AppleScript", stderr.getvalue())
+        self.assertIn("failed to set the flag", stderr.getvalue())
         self.assertIn("-1743", stderr.getvalue())
 
     def test_cmd_add_flag_applescript_failure_surfaces_warning_in_json(self):

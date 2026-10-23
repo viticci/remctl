@@ -7186,6 +7186,17 @@ def set_flag_state(reminder_ckid, *, flagged):
                 return True, ""
     return osa_set_flagged_result(reminder_ckid, flagged=flagged)
 
+def flag_new_reminder(reminder_ckid):
+    """Flag a reminder add just created. Returns None, or the error for a warning.
+
+    The reminder already exists, so a failed flag is a warning, not a failure.
+    """
+    ok, error = set_flag_state(reminder_ckid, flagged=True)
+    if ok:
+        return None
+    print(f"Warning: created the reminder but failed to set the flag: {error}", file=sys.stderr)
+    return error
+
 def esc(s):
     """Escape a string for AppleScript double-quoted literals.
     Covers backslash, double-quote, and every kind of control/line-break
@@ -9540,16 +9551,7 @@ def cmd_add(a):
                     created_row = q_reminder_by_identifier(db, result.get("id", ""))
                 except RemindersDBUnavailable:
                     created_row = None
-            flag_error = None
-            if a.flag and not wants_private:
-                flag_ok, flag_err = set_flag_state(result.get("id", ""), flagged=True)
-                if not flag_ok:
-                    flag_error = flag_err
-                    print(
-                        "Warning: created the reminder but failed to set the flag via AppleScript: "
-                        f"{flag_err}",
-                        file=sys.stderr,
-                    )
+            flag_error = flag_new_reminder(result.get("id", "")) if a.flag and not wants_private else None
             if a.json:
                 payload = {"status": "created", "id": result.get("id", ""), "title": title}
                 if list_resolution and list_resolution.get("method") != "exact":
@@ -9593,6 +9595,7 @@ def cmd_add(a):
     if recovered_row:
         result = {"id": recovered_row["ZCKIDENTIFIER"] or "", "status": "created"}
         created_row = recovered_row
+        flag_error = flag_new_reminder(result["id"]) if a.flag else None
         if a.json:
             payload = {"status": "created", "id": result.get("id", ""), "title": title}
             if list_resolution and list_resolution.get("method") != "exact":
@@ -9604,6 +9607,8 @@ def cmd_add(a):
                 }
             if created_row:
                 payload["numericId"] = created_row["Z_PK"]
+            if flag_error is not None:
+                payload["warnings"] = [f"flag_not_set: {flag_error}"]
             print(json.dumps(payload))
         else:
             print(f"Created: {safe_display(title)}")
