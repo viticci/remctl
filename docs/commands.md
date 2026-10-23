@@ -533,7 +533,7 @@ REMCTL_CAPABILITY_HOST=force remctl stats --json    # prove the host route works
 REMCTL_CAPABILITY_HOST=direct remctl stats --json   # bypass the host (diagnostics only)
 ```
 
-`onboard` is described in [installation.md](installation.md#onboarding). `doctor --for-agent --json` reports `access.direct` and `access.effective`; `access.effective.ready` plus `capabilityHost.fullReady` is the readiness gate. `capabilityHost.privateProtocol.compatible` reports whether the sealed private helper matches the CLI; if not, reinstall the same way you installed (`./install.sh --from-source`, or the latest release). `doctor` also warns when the zsh completion directory is not on `fpath`.
+`onboard` is described in [installation.md](installation.md#onboarding). `doctor --for-agent --json` reports `access.direct` and `access.effective`; `access.effective.ready` plus `capabilityHost.fullReady` is the readiness gate. When the host is ready, the `store_dir` and `database` checks are ok even for a caller without Full Disk Access; that caller's own result is in each check's `direct` field and in `access.direct`. `capabilityHost.privateProtocol.compatible` reports whether the sealed private helper matches the CLI; if not, reinstall the same way you installed (`./install.sh --from-source`, or the latest release). `doctor` also warns when the zsh completion directory is not on `fpath`.
 
 The `mcp` commands are documented in [mcp.md](mcp.md). `workspace` is an internal command the [Codex plugin](desktop-plugin.md) uses to read snapshots; you don't need to run it.
 
