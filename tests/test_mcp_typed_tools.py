@@ -210,6 +210,14 @@ class ResultTests(unittest.TestCase):
         result = call(server, "search", {"query": "x", "limit": 1})
         self.assertEqual(result["structuredContent"], page)
 
+    def test_write_timeout_is_an_unknown_outcome(self):
+        server, _ = make_server(FakeExecutor(timed_out=True))
+        result = call(server, "create_reminder", {"title": "x"})
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["error"]["outcome"], "unknown")
+        result = call(server, "search", {"query": "x"})
+        self.assertNotIn("outcome", result["structuredContent"]["error"])
+
     def test_readback_keeps_tags_assignment_subtasks_dates_and_alarms(self):
         record = {
             "id": 77, "title": "Launch", "list": "Projects", "dueDate": "2026-10-01T09:00:00",

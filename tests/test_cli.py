@@ -7388,6 +7388,8 @@ class CliTests(unittest.TestCase):
             (None, None, "https://example.com"),
             ("Replacement", "Old notes", "Replacement\n\nhttps://example.com"),
             ("", "Old notes", "https://example.com"),
+            # A repeated call does not append the same URL again.
+            (None, "Existing notes\n\nhttps://example.com", "Existing notes\n\nhttps://example.com"),
         ]
         for bridge in (True, False):
             for supplied, existing, expected in cases:

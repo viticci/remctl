@@ -1434,7 +1434,11 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
     if result.cancelled:
         return _error_result({"code": "cancelled", "message": f"{tool.name} was cancelled."})
     if result.timed_out:
-        return _error_result({"code": "timeout", "message": f"{tool.name} timed out after {int(tool.timeout)} seconds."})
+        error = {"code": "timeout", "message": f"{tool.name} timed out after {int(tool.timeout)} seconds."}
+        if not tool.read_only:
+            # The change may already be saved in Reminders: never retry blindly.
+            error.update(outcome="unknown", hint="The write may have been applied before the timeout. Read the reminder (search / get_reminder) before trying again.")
+        return _error_result(error)
     if result.returncode is None:
         return _error_result({"code": "spawn_failed", "message": result.stderr.strip() or "RemCTL could not start."})
     if result.returncode != 0:
