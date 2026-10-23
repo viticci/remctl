@@ -84,6 +84,8 @@ Early Reminders are stored by Reminders as private `REMDueDateDeltaAlert` metada
 
 `--section` resolves by name inside the target list. If duplicate section names exist, RemCTL automatically uses the only non-empty matching section when there is exactly one. If the duplicate remains ambiguous, the command fails before writing and prints the available stable IDs; pass one with `--section-id`.
 
+If the target list has no section with that name or ID, `add` and `edit` look in custom smart lists. Exactly one matching smart-list section is assigned through `REMSmartListChangeItem.sectionsContextChangeItem`; more than one fails before writing and prints the stable IDs. Sections in the target list always take precedence, the section commands never fall back, and built-in smart lists are ignored. The helper action needs protocol 4. RemCTL does not check whether the reminder matches the smart list's filter, and it does not read smart-list section membership back, so check the assignment in Reminders.
+
 `-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other. Tag reads and rewrites ignore soft-deleted tag links, so a recently-deleted tag is no longer returned and `--remove-tag` cannot resurrect it.
 
 ## Sections
