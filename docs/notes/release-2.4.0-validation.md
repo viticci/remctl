@@ -97,6 +97,6 @@ Testing ran on Apple silicon with macOS 27.0. The macOS 27.2 disk-image `sudo` f
 
 ## Publication
 
-Published on October 23, 2026 from commit `b854bb6`, tagged `v2.4.0`. The [public release](https://github.com/viticci/remctl/releases/tag/v2.4.0) is the latest release, not a draft or prerelease. Both public assets were downloaded without authentication; the disk image's bytes, GitHub asset digest, and SHA-256 match the verified build, the `latest` download URL serves it, and its stapled ticket and Gatekeeper assessment pass.
+First published on October 23, 2026 from commit `b854bb6`. The same day, the refreshed release was republished from commit `e21975f`: the `v2.4.0` tag moved there, and the assets were replaced. The [public release](https://github.com/viticci/remctl/releases/tag/v2.4.0) is the latest release, not a draft or prerelease. Both public assets were downloaded without authentication; the refreshed disk image's bytes, GitHub asset digest, and SHA-256 match the verified build, the `latest` download URL serves it, and its stapled ticket and Gatekeeper assessment pass.
 
 GitHub marks all eleven pull requests as merged by `viticci`, each with a thank-you comment that describes any changes made on top. Issues #65, #66, #67, and #75 were closed as completed by `viticci` with comments explaining the released behavior. Issues #17 and #48 and pull request #24 remain open by decision.
