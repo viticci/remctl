@@ -5957,17 +5957,22 @@ def apply_private_grocery_categorization(db, list_pk, reminder_ckids, partial_co
 
 
 def validate_private_add_ready(a, db, list_pk):
+    """Check private add inputs before the reminder exists; returns the resolved section target, if any."""
+    section_target = None
     if getattr(a, "section", None) or getattr(a, "section_id", None):
-        resolve_section_target(db, list_pk, a)
+        section_target = resolve_section_target(db, list_pk, a)
     if getattr(a, "assign", None):
         if list_pk is None:
             print("Error: --assign requires a target shared list via -l/--list or --list-id.", file=sys.stderr)
             sys.exit(1)
         resolve_sharee_or_die(db, list_pk, a.assign)
         resolve_assignment_originator_or_die(db, list_pk)
+    return section_target
 
 
-def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_context=None):
+def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_context=None, section_target=None):
+    """Apply private metadata writes. section_target is the preflight resolve_section_target result:
+    passing it keeps the write on the section that was validated, even if a sync renames sections."""
     require_private_metadata(a)
     validate_tag_replacement_args(a)
     results = []
@@ -6002,9 +6007,11 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
         }, partial_context=partial_context))
 
     if getattr(a, "section", None) or getattr(a, "section_id", None):
-        if db is None:
-            db = open_db()
-        target = resolve_section_target(db, list_pk, a)
+        target = section_target
+        if target is None:
+            if db is None:
+                db = open_db()
+            target = resolve_section_target(db, list_pk, a)
         if target.get("smartListId"):
             results.append(assign_smart_list_section(reminder_ckid, target, partial_context=partial_context))
         else:
@@ -9536,10 +9543,11 @@ def cmd_add(a):
             sys.exit(1)
         require_grocery_list_target(db, target_list_pk)
 
+    section_target = None
     if wants_private:
         if db is None:
             db = open_db()
-        validate_private_add_ready(a, db, target_list_pk)
+        section_target = validate_private_add_ready(a, db, target_list_pk)
         # Last check before the reminder exists: a failed lookup creates nothing.
         resolve_location_address_or_die(a)
 
@@ -9593,6 +9601,7 @@ def cmd_add(a):
                     db=db,
                     list_pk=target_list_pk,
                     partial_context=partial_context,
+                    section_target=section_target,
                 )
             else:
                 try:
@@ -10211,14 +10220,15 @@ def cmd_edit(a):
         target_list_name = target_list_ref["title"]
         target_list_pk = target_list_ref["id"]
     wants_private = private_metadata_enabled(a) and private_changes_from_args(a)
+    section_target = None
     if wants_private:
         require_private_metadata(a)
         validate_private_args(a)
         if getattr(a, "grocery", False):
             require_grocery_list_target(db, target_list_pk)
         if getattr(a, "section", None) or getattr(a, "section_id", None):
-            # Resolve before the bridge write so a bad section changes nothing.
-            resolve_section_target(db, target_list_pk, a)
+            # Resolve before the bridge write so a bad section changes nothing, and write to this one.
+            section_target = resolve_section_target(db, target_list_pk, a)
         if subtask_specs_need_bridge(parse_subtask_specs(getattr(a, "subtask", None))) and not bridge_available():
             print("Error: rich private subtasks require remctl-bridge for notes, due dates, priority, recurrence, or alarms.", file=sys.stderr)
             sys.exit(1)
@@ -10395,6 +10405,7 @@ def cmd_edit(a):
                     a,
                     db=db,
                     list_pk=target_list_pk,
+                    section_target=section_target,
                 ) if wants_private else []
                 if a.json:
                     payload = {"status": "updated", "id": a.id, "title": resulting_title}
@@ -10435,6 +10446,7 @@ def cmd_edit(a):
                 a,
                 db=db,
                 list_pk=target_list_pk,
+                section_target=section_target,
             )
             if a.json:
                 print(json.dumps({

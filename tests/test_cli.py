@@ -4228,6 +4228,7 @@ class CliTests(unittest.TestCase):
             db=fake_db,
             list_pk=7,
             partial_context=mock.ANY,
+            section_target=None,
         )
         self.assertEqual(json.loads(stdout.getvalue())["private"][0]["status"], "updated")
 
@@ -8081,6 +8082,7 @@ class CliTests(unittest.TestCase):
             args,
             db=mock.ANY,
             list_pk=9,
+            section_target=resolve_section_target.return_value,
         )
 
     def test_cmd_edit_rejects_list_name_and_list_id_together_before_bridge(self):
@@ -10081,6 +10083,59 @@ class CliTests(unittest.TestCase):
         bridge_call_result.assert_not_called()
         private_call.assert_not_called()
         self.assertIn("section not found: Someday in smart list 'Focus'", stderr.getvalue())
+
+    def test_edit_writes_the_section_it_validated_even_if_sections_are_renamed_meanwhile(self):
+        def renamed_during_bridge_write(db, renamed_pk, owner, owner_pk, new_id):
+            def bridge_write(payload):
+                # A sync renames the validated section and gives its old name to another one.
+                db.execute("UPDATE ZREMCDBASESECTION SET ZDISPLAYNAME = 'Renamed' WHERE Z_PK = ?", (renamed_pk,))
+                db.execute(
+                    f"INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, {owner}, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+                    "VALUES (30, 'Next', ?, ?, 0)",
+                    (owner_pk, new_id),
+                )
+                return {"returncode": 0, "payload": {"status": "updated", "id": "REM-1"}}
+            return bridge_write
+
+        for flags, renamed_pk, owner, owner_pk, expected in (
+            (["--smart-list", "Focus"], 20, "ZSMARTLIST", 2, "FOCUS-NEXT"),
+            ([], 10, "ZLIST", 1, "SECTION-1"),
+        ):
+            db = self._smart_list_section_db()
+            args = self.remctl.build_parser()[0].parse_args(
+                ["edit", "42", "--title", "Renamed", "--private", *flags, "--section", "Next", "--json"]
+            )
+
+            def write(payload, partial_context=None):
+                if payload["action"] == "assign_smart_list_section":
+                    self._set_smart_list_membership(db, payload["id"], payload["sectionId"])
+                return {"status": "updated"}
+
+            try:
+                with (
+                    self.subTest(flags=flags),
+                    mock.patch.object(self.remctl, "open_db", return_value=db),
+                    mock.patch.object(
+                        self.remctl, "q_reminder", return_value={**self._FAKE_REMINDER, "ZLIST": 1, "ZCKIDENTIFIER": "REM-1"}
+                    ),
+                    mock.patch.object(self.remctl, "private_available", return_value=True),
+                    mock.patch.object(
+                        self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 4}
+                    ),
+                    mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                    mock.patch.object(
+                        self.remctl, "bridge_call_result",
+                        side_effect=renamed_during_bridge_write(db, renamed_pk, owner, owner_pk, "OTHER-NEXT"),
+                    ),
+                    mock.patch.object(self.remctl, "private_action", side_effect=write) as private_action,
+                    mock.patch.object(self.remctl, "_read_fresh_db_value", side_effect=lambda reader: reader(db)),
+                    mock.patch.object(self.remctl.time, "sleep"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.remctl.cmd_edit(args)
+                    self.assertEqual(private_action.call_args.args[0]["sectionId"], expected)
+            finally:
+                db.close()
 
     def test_smart_lists_shows_custom_sections_with_ids(self):
         db = self._smart_list_section_db()
