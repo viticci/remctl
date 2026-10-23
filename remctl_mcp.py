@@ -1428,8 +1428,12 @@ def _structured_error_from_stderr(stderr: str) -> dict[str, Any] | None:
     return None
 
 
-def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any]:
-    """Map one CLI run to a CallToolResult (without era-specific fields)."""
+def tool_result_from_command(tool: Tool, result: CommandResult, *, budget: bool = True) -> dict[str, Any]:
+    """Map one CLI run to a CallToolResult (without era-specific fields).
+
+    With budget, a successful result larger than RESULT_BYTE_LIMIT is cut to
+    fit (see _within_budget). Errors are never cut.
+    """
 
     if result.cancelled:
         return _error_result({"code": "cancelled", "message": f"{tool.name} was cancelled."})
@@ -1478,7 +1482,8 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
         if isinstance(structured, dict) and "stderr" not in structured:
             structured = dict(structured)
             structured["stderr"] = _tail("\n".join(warnings), 4000)
-    structured = _within_budget(structured)
+    if budget:
+        structured = _within_budget(structured)
     text = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
     return {"content": [{"type": "text", "text": text}], "structuredContent": structured, "isError": False}
 
@@ -1493,24 +1498,37 @@ def _json_size(value: Any) -> int:
 
 
 def _within_budget(structured: Any) -> Any:
+    """Cut the largest top-level list so the result fits RESULT_BYTE_LIMIT.
+
+    A page (search, recently_deleted) gets count, hasMore, and nextOffset for
+    the rows it kept, so following nextOffset skips nothing. At least one row
+    is kept, so paging always advances even when one row alone is too large.
+    """
     if not isinstance(structured, dict) or _json_size(structured) <= RESULT_BYTE_LIMIT:
         return structured
     lists = [(key, value) for key, value in structured.items() if isinstance(value, list) and value]
     if not lists:
         return structured
     key, items = max(lists, key=lambda pair: _json_size(pair[1]))
-    low, high = 0, len(items)
+    paged = key == "items" and "nextOffset" in structured and isinstance(structured.get("offset"), int)
+    low, high = 1, len(items)
     while low < high:
         middle = (low + high + 1) // 2
         if _json_size({**structured, key: items[:middle]}) <= RESULT_BYTE_LIMIT - 1_500:
             low = middle
         else:
             high = middle - 1
-    return {**structured, key: items[:low], "truncated": True, "resultBudget": {
-        "totalBytes": _json_size(structured), "list": key, "totalItems": len(items), "returnedItems": low,
-        "hint": "Result larger than one tool answer: only the first items are shown, the rest is not lost. Do not "
-                "present this as complete; narrow the request (one list, search with paging via limit/offset).",
-    }}
+    cut = {**structured, key: items[:low], "truncated": True}
+    if paged:
+        cut.update(count=low, hasMore=True, nextOffset=structured["offset"] + low)
+        hint = "Only the first rows of this page fit in one answer. Call again with offset set to nextOffset for the rest."
+    else:
+        hint = ("Only the first items fit in one answer; the rest is not shown. Do not present this as complete. "
+                "Narrow the request, for example with search, which pages with limit and offset.")
+    cut["resultBudget"] = {
+        "totalBytes": _json_size(structured), "list": key, "totalItems": len(items), "returnedItems": low, "hint": hint,
+    }
+    return cut
 
 
 def _error_result(error: dict[str, Any]) -> dict[str, Any]:

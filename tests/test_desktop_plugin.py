@@ -139,6 +139,14 @@ class DesktopPluginTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),b"%PDF")
             self.assertEqual(path.stat().st_mode&0o777,0o600)
 
+    def test_export_keeps_every_row_of_a_large_workspace_page(self):
+        # The MCP result budget applies to model-facing tools, not to workspace pages.
+        items=[{"id":i,"title":"Item %d"%i,"notes":"x"*200} for i in range(500)]
+        self.executor.stdout=json.dumps({"items":items,"snapshot":"one","nextOffset":None})
+        with patch.object(Path,"home",return_value=Path(self.temp.name)):
+            result=self.call("export_remctl_file",{"format":"json"})
+            self.assertEqual(len(json.loads(Path(result["structuredContent"]["path"]).read_text())),500)
+
     def test_smart_filter_exclusions_relative_ranges_and_empty_values(self):
         from remctl_smart_lists import summarize_smart_list_filter
         item={"tags":["demo","design"],"priority":"high","dueDate":"2026-10-02T09:00:00","allDay":False,"listUUID":"demo-list"}

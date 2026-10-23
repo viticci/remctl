@@ -164,7 +164,9 @@ class Plugin:
         from remctl_mcp import Tool, tool_result_from_command
         command = self.server.config.executor.run(key, argv, timeout=120, stdin_text=stdin)
         synthetic = Tool("workspace", "Reminders", "", (), lambda _: [], "generic", read_only=True)
-        return tool_result_from_command(synthetic, command)
+        # Workspace snapshots are bounded and paged by the workspace itself;
+        # cutting one would break its paging and the export built on it.
+        return tool_result_from_command(synthetic, command, budget=False)
 
     def query(self, args, key):
         # Artwork belongs to the app-only catalog. Keep model-visible reminder
