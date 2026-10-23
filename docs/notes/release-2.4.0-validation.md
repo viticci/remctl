@@ -85,3 +85,9 @@ Installing the download requires the normal administrator authorization for its 
 ## Coverage limits
 
 Testing ran on Apple silicon with macOS 27.0. The macOS 27.2 disk-image `sudo` fix, #62 on Intel, the Full Disk Access helper with a locally signed installed host (#67), and the launchd pended-spawn path (#64) are covered by unit tests, not live reproduction. The macOS 15 entity numbers (#74) were checked through the `Z_PRIMARYKEY` lookup on macOS 27 and with fixtures, not on a macOS 15 Mac. A physical iPhone and fresh native Codex and Claude Code agent conversations weren't tested; the plugins were exercised through their cached launchers.
+
+## Publication
+
+Published on October 23, 2026 from commit `b854bb6`, tagged `v2.4.0`. The [public release](https://github.com/viticci/remctl/releases/tag/v2.4.0) is the latest release, not a draft or prerelease. Both public assets were downloaded without authentication; the disk image's bytes, GitHub asset digest, and SHA-256 match the verified build, the `latest` download URL serves it, and its stapled ticket and Gatekeeper assessment pass.
+
+GitHub marks all eleven pull requests as merged by `viticci`, each with a thank-you comment that describes any changes made on top. Issues #65, #66, #67, and #75 were closed as completed by `viticci` with comments explaining the released behavior. Issues #17 and #48 and pull request #24 remain open by decision.
