@@ -677,8 +677,8 @@ REMINDER_METADATA_PARAMS = (
     Param(
         "smart_list",
         "string",
-        "Custom smart list whose own section section or section_id names, instead of the list's (private). "
-        "run with smart-lists --json lists each custom smart list's sections and ids.",
+        "Custom smart list name: section or section_id then names one of this smart list's own sections, "
+        "not the reminder list's (private). run with smart-lists --json lists each custom smart list's sections and ids.",
         max_length=512,
     ),
     Param(

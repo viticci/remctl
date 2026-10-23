@@ -10,7 +10,7 @@ RemCTL 2.4.0 brings subtask nesting and Smart List sections, and fixes every ope
 **Fixes**
 
 - macOS 15: alarms, repeat rules, assignments, and sharees are read correctly again. Thanks to @NSExceptional ([#74](https://github.com/viticci/remctl/pull/74)).
-- A crashed Capability Host no longer leaves an orphaned broker that blocks every new host. Thanks to @tkaufmann ([#66](https://github.com/viticci/remctl/issues/66)).
+- A crashed Capability Host no longer leaves an orphaned broker that blocks every new host, and upgrading clears one left by an older version. Thanks to @tkaufmann ([#66](https://github.com/viticci/remctl/issues/66)).
 - The guided Full Disk Access helper accepts hosts built from source with RemCTL's local certificate. Thanks to @marcodegra5 ([#67](https://github.com/viticci/remctl/issues/67)).
 - Flagging no longer launches Reminders.app when the private helper is available. Thanks to @mymatejackson ([#65](https://github.com/viticci/remctl/issues/65)).
 - Subtasks keep their order when created, moved, listed, or moved to another list ([#63](https://github.com/viticci/remctl/pull/63)).

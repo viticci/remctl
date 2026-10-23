@@ -160,11 +160,13 @@ Open 'Reminders' in the Codex sidebar, or ask Codex to open your Reminders works
 
 ## Private metadata
 
-Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, manual ordering, list icons, Groceries lists, list groups, custom smart lists, and templates. RemCTL writes them only when you pass `--private`:
+Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, manual ordering and subtask nesting, list icons, Groceries lists, list groups, custom smart lists and their sections, and templates. RemCTL writes them only when you pass `--private`:
 
 ```bash
 remctl add "Research" -l Projects --private --url https://example.com -t remctl --section Research
 remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
+remctl reminder-move 23882 --parent 23880 --private     # make an existing reminder a subtask
+remctl edit 23882 --private --smart-list "Priority or Today" --section "Next Up"
 ```
 
 These writes use Apple's private ReminderKit framework, never the database directly. Apple can change these APIs in any macOS release. [Private metadata](docs/private-metadata.md) lists what works and how to verify it.

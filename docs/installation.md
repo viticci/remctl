@@ -104,9 +104,15 @@ remctl doctor
 
 Only Full Disk Access needs a restart. Reminders and Automation take effect right away.
 
+The helper accepts the notarized download and a host you built with `./install.sh --from-source`, which is signed with the local certificate the installer keeps. It refuses an ad-hoc or unsigned host. In that case, add the app by hand with the steps above, then restart the host.
+
 ### Automation right after a restart
 
-A host that just started may report Automation as `targetNotRunning` or `unknown` until it can check with the Reminders app. `doctor` waits up to three seconds, then reports a state it still can't read as a warning, not a failure: reads and writes work in the meantime, and the host clears it on its own. Reminders doesn't need to stay open. A refused grant is still a failure.
+A host that just started may report Automation as `targetNotRunning` or `unknown` until it can check with the Reminders app. `doctor` waits up to three seconds, then reports a state it still can't read as a warning, not a failure: reads and writes work in the meantime, and the host clears it on its own. Reminders doesn't need to stay open. A refused grant is still a failure. Flagging (`flag`, `unflag`, `add --flag`) writes through ReminderKit first, without opening Reminders, and uses Automation only when the private helper is unavailable or its write fails. A few other writes still fall back to Automation in rare cases.
+
+### The host keeps restarting
+
+Before 2.4.0, a Capability Host that crashed could leave its background broker running. Every new host then found the socket in use, quit with "already running", and launchd restarted it in a loop: reads kept working, but `doctor` reported the private protocol as unavailable. From 2.4.0, the broker stops with its host, and a starting host stops a leftover broker it can identify, then takes over. The 2.4.0 installer does the same before it replaces the old host, so upgrading clears a broker left by an older version.
 
 ### Reading without Full Disk Access
 

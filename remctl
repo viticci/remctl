@@ -258,6 +258,7 @@ def show_splash():
     print(C.dim("    lists       All lists                    smart-lists Inspect smart lists"))
     print(C.dim("    templates   Saved templates              template-info Inspect template"))
     print(C.dim("    sections    Inspect sections             section-*   Manage sections"))
+    print(C.dim("    subtasks    Subtasks in order            reminder-move Reorder or nest"))
     print()
     print(C.dim("  Protected commands use the signed RemCTL Capability Host."))
     print(C.dim("  First setup: remctl onboard   Diagnose or repair: remctl doctor --for-agent"))
@@ -12261,7 +12262,7 @@ _remctl() {
         'group-create:Create a Reminders list group'
         'group-edit:Rename a group or add/remove child lists'
         'group-delete:Delete a Reminders list group'
-        'smart-lists:Inspect Reminders smart lists'
+        'smart-lists:Inspect smart lists and their sections'
         'templates:Inspect saved Reminders templates'
         'template-info:Show a saved Reminders template'
         'show:Show reminders in a list'
@@ -12921,7 +12922,7 @@ complete -c remctl -n "__fish_use_subcommand" -a group-info -d "Show details for
 complete -c remctl -n "__fish_use_subcommand" -a group-create -d "Create a Reminders list group"
 complete -c remctl -n "__fish_use_subcommand" -a group-edit -d "Rename a group or add/remove child lists"
 complete -c remctl -n "__fish_use_subcommand" -a group-delete -d "Delete a Reminders list group"
-complete -c remctl -n "__fish_use_subcommand" -a smart-lists -d "Inspect Reminders smart lists"
+complete -c remctl -n "__fish_use_subcommand" -a smart-lists -d "Inspect smart lists and their sections"
 complete -c remctl -n "__fish_use_subcommand" -a templates -d "Inspect saved Reminders templates"
 complete -c remctl -n "__fish_use_subcommand" -a template-info -d "Show a saved Reminders template"
 complete -c remctl -n "__fish_use_subcommand" -a show -d "Show reminders in a list"
@@ -14887,7 +14888,21 @@ def build_parser():
     c.add_argument("--force", action="store_true", help="Required for --json/non-interactive use; skip confirmation")
     js(c)
 
-    c = sub.add_parser("smart-lists", help="Inspect Reminders smart lists"); js(c)
+    c = sub.add_parser(
+        "smart-lists",
+        help="Inspect smart lists and their sections",
+        description=(
+            "Show built-in and custom smart lists with their ids, pins, and decoded filters. Custom smart lists "
+            "also list their own sections with ids, for add and edit with --private --smart-list or --smart-list-id."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  remctl smart-lists --json\n"
+            "  remctl edit 23880 --private --smart-list \"Flagged Tasks\" --section \"Next Up\"\n"
+            "  remctl edit 23880 --private --smart-list-id 170 --section-id 5C1E0A44-2D7B-4F0E-9B61-0F2B7E0D9A11"
+        ),
+        formatter_class=HelpFormatter,
+    ); js(c)
 
     c = sub.add_parser("templates", help="Inspect saved Reminders templates"); js(c)
 
@@ -15206,7 +15221,7 @@ def build_parser():
 
     c = sub.add_parser("tags", help="List all hashtag labels"); js(c)
 
-    c = sub.add_parser("subtasks", help="Show subtasks of a reminder")
+    c = sub.add_parser("subtasks", help="Show subtasks of a reminder in Reminders' order")
     c.add_argument("id", type=int); vb(c); js(c); img(c)
 
     c = sub.add_parser("info", help="Full detail view"); c.add_argument("id", type=int); js(c); img(c)
