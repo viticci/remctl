@@ -1478,8 +1478,39 @@ def tool_result_from_command(tool: Tool, result: CommandResult) -> dict[str, Any
         if isinstance(structured, dict) and "stderr" not in structured:
             structured = dict(structured)
             structured["stderr"] = _tail("\n".join(warnings), 4000)
+    structured = _within_budget(structured)
     text = json.dumps(structured, ensure_ascii=False, separators=(",", ":"))
     return {"content": [{"type": "text", "text": text}], "structuredContent": structured, "isError": False}
+
+
+# MCP clients cut large tool results silently (show --completed was 82 kB, export 634 kB). Above this size the
+# largest list keeps its head as valid JSON and resultBudget says what was cut.
+RESULT_BYTE_LIMIT = 48_000
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _within_budget(structured: Any) -> Any:
+    if not isinstance(structured, dict) or _json_size(structured) <= RESULT_BYTE_LIMIT:
+        return structured
+    lists = [(key, value) for key, value in structured.items() if isinstance(value, list) and value]
+    if not lists:
+        return structured
+    key, items = max(lists, key=lambda pair: _json_size(pair[1]))
+    low, high = 0, len(items)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _json_size({**structured, key: items[:middle]}) <= RESULT_BYTE_LIMIT - 1_500:
+            low = middle
+        else:
+            high = middle - 1
+    return {**structured, key: items[:low], "truncated": True, "resultBudget": {
+        "totalBytes": _json_size(structured), "list": key, "totalItems": len(items), "returnedItems": low,
+        "hint": "Result larger than one tool answer: only the first items are shown, the rest is not lost. Do not "
+                "present this as complete; narrow the request (one list, search with paging via limit/offset).",
+    }}
 
 
 def _error_result(error: dict[str, Any]) -> dict[str, Any]:
