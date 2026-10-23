@@ -37,7 +37,12 @@ from remctl_runtime import (
     upcoming_window,
 )
 from remctl_serialization import (
+    ALARM_ENTITY,
+    ASSIGNMENT_ENTITY,
     DUE_DATE_DELTA_UNITS,
+    RECURRENCE_RULE_ENTITY,
+    SHAREE_ENTITY,
+    core_data_entity,
     due_date_delta_alerts_from_row,
     preload_attachments,
     preload_extras,
@@ -1996,17 +2001,19 @@ def template_to_dict(row, db=None, *, include_items=False):
     return payload
 
 
-_RECURRENCE_COLS = """
-    (SELECT rr.ZFREQUENCY FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_frequency,
-    (SELECT rr.ZINTERVAL FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_interval,
-    (SELECT rr.ZOCCURRENCECOUNT FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_count,
-    (SELECT rr.ZENDDATE FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_end_date,
-    (SELECT rr.ZDAYSOFTHEWEEK FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_week,
-    (SELECT rr.ZDAYSOFTHEMONTH FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_month,
-    (SELECT rr.ZMONTHSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_months_of_year,
-    (SELECT rr.ZDAYSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_year,
-    (SELECT rr.ZWEEKSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_weeks_of_year,
-    (SELECT rr.ZSETPOSITIONS FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = 34 ORDER BY rr.Z_PK LIMIT 1) AS recurrence_set_positions"""
+def recurrence_cols(db):
+    ent = core_data_entity(db, RECURRENCE_RULE_ENTITY)
+    return f"""
+    (SELECT rr.ZFREQUENCY FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_frequency,
+    (SELECT rr.ZINTERVAL FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_interval,
+    (SELECT rr.ZOCCURRENCECOUNT FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_count,
+    (SELECT rr.ZENDDATE FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_end_date,
+    (SELECT rr.ZDAYSOFTHEWEEK FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_week,
+    (SELECT rr.ZDAYSOFTHEMONTH FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_month,
+    (SELECT rr.ZMONTHSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_months_of_year,
+    (SELECT rr.ZDAYSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_days_of_year,
+    (SELECT rr.ZWEEKSOFTHEYEAR FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_weeks_of_year,
+    (SELECT rr.ZSETPOSITIONS FROM ZREMCDOBJECT rr WHERE rr.ZREMINDER4 = r.Z_PK AND +rr.ZMARKEDFORDELETION = 0 AND +rr.Z_ENT = {ent} ORDER BY rr.Z_PK LIMIT 1) AS recurrence_set_positions"""
 
 _REMINDER_COLUMN_CACHE = {}
 
@@ -2071,7 +2078,7 @@ def rem_cols(db):
     {due_expr()} AS ZDUEDATE, {display_due_expr(db)} AS ZDISPLAYDATEDATE,
     r.ZALLDAY, r.ZCOMPLETIONDATE, r.ZCREATIONDATE,
     r.ZPARENTREMINDER, r.ZLIST, r.ZICSURL, r.ZCKIDENTIFIER, l.ZNAME as list_name,
-    {_RECURRENCE_COLS}{time_zone_column(db)}"""
+    {recurrence_cols(db)}{time_zone_column(db)}"""
 
 def sort_reminder_rows_by_identifier_order(rows, identifier_order):
     """Return reminder rows in ReminderKit's persisted display order.
@@ -2435,9 +2442,9 @@ def q_sharees(db, list_pk):
     return db.execute(
         "SELECT Z_PK, ZCKIDENTIFIER, ZDISPLAYNAME, ZFIRSTNAME, ZLASTNAME, ZADDRESS1, "
         "ZSTATUS, ZACCESSLEVEL FROM ZREMCDOBJECT "
-        "WHERE +Z_ENT = 36 AND +ZMARKEDFORDELETION = 0 AND ZLIST = ? "
+        "WHERE +Z_ENT = ? AND +ZMARKEDFORDELETION = 0 AND ZLIST = ? "
         "ORDER BY Z_PK",
-        (list_pk,),
+        (core_data_entity(db, SHAREE_ENTITY), list_pk),
     ).fetchall()
 
 
@@ -2455,9 +2462,9 @@ def q_assignment(db, reminder_pk):
             "FROM ZREMCDOBJECT a "
             "LEFT JOIN ZREMCDOBJECT assignee ON a.ZASSIGNEE = assignee.Z_PK "
             "LEFT JOIN ZREMCDOBJECT originator ON a.ZORIGINATOR = originator.Z_PK "
-            "WHERE +a.Z_ENT = 21 AND +a.ZMARKEDFORDELETION = 0 AND a.ZREMINDER1 = ? "
+            "WHERE +a.Z_ENT = ? AND +a.ZMARKEDFORDELETION = 0 AND a.ZREMINDER1 = ? "
             "ORDER BY a.ZASSIGNEDDATE DESC, a.Z_PK DESC LIMIT 1",
-            (reminder_pk,),
+            (core_data_entity(db, ASSIGNMENT_ENTITY), reminder_pk),
         ).fetchone()
     except (AttributeError, sqlite3.OperationalError):
         return None
@@ -2534,10 +2541,10 @@ def q_alarms(db, pk):
         "t.ZADDRESS AS address, t.ZPROXIMITY AS proximity "
         "FROM ZREMCDOBJECT a "
         "LEFT JOIN ZREMCDOBJECT t ON a.ZTRIGGER = t.Z_PK "
-        "WHERE a.ZREMINDER = ? AND +a.Z_ENT = 15 AND +a.ZMARKEDFORDELETION = 0 "
+        "WHERE a.ZREMINDER = ? AND +a.Z_ENT = ? AND +a.ZMARKEDFORDELETION = 0 "
         "AND (t.Z_PK IS NULL OR t.ZMARKEDFORDELETION = 0) "
         "ORDER BY a.Z_PK",
-        (pk,),
+        (pk, core_data_entity(db, ALARM_ENTITY)),
     ).fetchall()
 
 def q_rich_links(db, pk):

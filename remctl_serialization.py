@@ -25,6 +25,26 @@ DUE_DATE_DELTA_UNITS = {
     4: ("month", "months"),
 }
 
+# Core Data numbers entities alphabetically per model version, so a macOS update
+# that adds an entity shifts every Z_ENT after it (REMCDAlarm is 15 on some
+# systems and 16 on others). These are fallbacks; core_data_entity() reads the
+# store's Z_PRIMARYKEY table.
+ALARM_ENTITY = ("REMCDAlarm", 15)
+ASSIGNMENT_ENTITY = ("REMCDAssignment", 21)
+RECURRENCE_RULE_ENTITY = ("REMCDRecurrenceRule", 34)
+SHAREE_ENTITY = ("REMCDSharee", 36)
+
+
+def core_data_entity(db, entity):
+    # Deliberately uncached: Z_PRIMARYKEY is tiny, and sqlite3.Connection can't be
+    # weak-referenced, so an id(db)-keyed cache could alias a reused connection id.
+    name, fallback = entity
+    try:
+        row = db.execute("SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = ?", (name,)).fetchone()
+    except Exception:
+        return fallback
+    return int(row[0]) if row and row[0] is not None else fallback
+
 
 def _row_has(row, key):
     keys = getattr(row, "keys", None)
@@ -335,9 +355,9 @@ def timed_due_raw(row, db=None):
         # extra work. Ignore deleted alarms and triggers, as q_alarms does.
         if db is not None and time_zone is not _MISSING and db.execute(
             "SELECT 1 FROM ZREMCDOBJECT a JOIN ZREMCDOBJECT t ON a.ZTRIGGER = t.Z_PK "
-            "WHERE a.ZREMINDER = ? AND +a.Z_ENT = 15 AND +a.ZMARKEDFORDELETION = 0 "
+            "WHERE a.ZREMINDER = ? AND +a.Z_ENT = ? AND +a.ZMARKEDFORDELETION = 0 "
             "AND t.ZMARKEDFORDELETION = 0 AND t.ZDATECOMPONENTSDATA IS NOT NULL LIMIT 1",
-            (_row_get(row, "Z_PK"),),
+            (_row_get(row, "Z_PK"), core_data_entity(db, ALARM_ENTITY)),
         ).fetchone():
             return raw
         return floating
