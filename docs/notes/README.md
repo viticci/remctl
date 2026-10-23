@@ -15,6 +15,7 @@ These are dated engineering records: audits, reviews, and the evidence behind ea
 | [2.1.0 validation](release-2.1.0-validation.md) | The Claude Code plugin, the completed-search fix (#54), and plugin-aware installs |
 | [2.2.0 validation](release-2.2.0-validation.md) | No Priority, performance and date fixes, notarized download, and installed acceptance |
 | [2.2.1 validation](release-2.2.1-validation.md) | The three contributor fixes, verified 1.7.1 upgrades, notarized download, and installed acceptance |
+| [2.4.0 validation](release-2.4.0-validation.md) | Subtask nesting, Smart List sections, eleven merged contributor PRs, issue fixes, notarized download, and live acceptance across every MCP surface |
 | [October 2 audit](audit-2026-10-02.md) | Smart-list and statistics performance, date consistency, safe recurring completion, installer packaging, and cross-client checks |
 | [PR fixes and 1.7.1 upgrades](pr-fixes-2026-10-02.md) | Archived colors, plugin tabs, renamed iCloud accounts, and the reproduced legacy upgrade bug |
 | [Distribution validation](distribution-validation-2026-09-30.md) | The notarized download, free builds, signing, and permission continuity |
