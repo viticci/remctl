@@ -211,7 +211,7 @@ class SignatureDefaultsTests(unittest.TestCase):
     def test_production_uses_the_system_codesign_and_a_bounded_cache(self):
         # An absolute path: a codesign earlier on PATH must never verify the host.
         self.assertEqual(remctl_broker.CODESIGN_PATH, "/usr/bin/codesign")
-        self.assertLessEqual(remctl_broker.SIGNATURE_CACHE_TTL_SECONDS, 600)
+        self.assertLessEqual(remctl_broker.SIGNATURE_CACHE_TTL_SECONDS, 60)
 
 
 if __name__ == "__main__":

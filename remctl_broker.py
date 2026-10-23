@@ -100,7 +100,8 @@ NATIVE_PERMISSION_QUEUE_TIMEOUT_SECONDS = 2.0
 CODESIGN_PATH = "/usr/bin/codesign"
 SIGNATURE_CHECK_TIMEOUT_SECONDS = 15.0
 # How long a passed bundle verification is reused while the bundle is unchanged.
-SIGNATURE_CACHE_TTL_SECONDS = 600.0
+# It also bounds changes a stat fingerprint might miss, such as unflushed mmap writes.
+SIGNATURE_CACHE_TTL_SECONDS = 60.0
 SIGNATURE_LOCK_WAIT_SECONDS = 2 * SIGNATURE_CHECK_TIMEOUT_SECONDS + 5.0
 _CDHASH_PATTERN = re.compile(r"(?m)^CDHash=([0-9a-fA-F]{40})$")
 _NATIVE_ERROR_CODE_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
