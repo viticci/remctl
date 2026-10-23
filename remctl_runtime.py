@@ -88,6 +88,33 @@ HOSTED_COMMANDS = frozenset(
         "workspace",
     }
 )
+_CORE_COMMANDS = LOCAL_COMMANDS | HOSTED_COMMANDS
+# Commands an optional extension (such as remctl_accounts) adds to the parser.
+EXTENSION_COMMANDS: frozenset[str] = frozenset()
+
+
+def register_extension_commands(*, local=(), hosted=()) -> None:
+    """Classify commands an optional extension adds to the CLI parser.
+
+    The Capability Host requires every parser command to be classified exactly
+    once, so an extension that adds commands must declare them here. Core
+    commands can never be reclassified, and repeating the same registration
+    is a no-op.
+    """
+
+    global LOCAL_COMMANDS, HOSTED_COMMANDS, EXTENSION_COMMANDS
+    local, hosted = frozenset(local), frozenset(hosted)
+    if local & hosted:
+        raise ValueError(f"extension commands classified twice: {sorted(local & hosted)!r}")
+    if (local | hosted) & _CORE_COMMANDS:
+        raise ValueError(
+            f"extensions cannot reclassify core commands: {sorted((local | hosted) & _CORE_COMMANDS)!r}"
+        )
+    if (local & HOSTED_COMMANDS) or (hosted & LOCAL_COMMANDS):
+        raise ValueError("extension command classification conflicts with an earlier registration")
+    LOCAL_COMMANDS = LOCAL_COMMANDS | local
+    HOSTED_COMMANDS = HOSTED_COMMANDS | hosted
+    EXTENSION_COMMANDS = EXTENSION_COMMANDS | local | hosted
 
 
 def env_bool(name: str, default: bool = False) -> bool:
