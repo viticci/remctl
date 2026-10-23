@@ -12,9 +12,13 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import signal
 import stat
 import subprocess
 import tempfile
+
+# The user keychain search list. Tests point this at a fake `security`.
+SEARCH_LIST = ("/usr/bin/security", "list-keychains", "-d", "user")
 
 
 def run(*args: str) -> bytes:
@@ -53,25 +57,39 @@ def signing_lock():
         os.close(descriptor)
 
 
+def _raise_on_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 @contextmanager
 def signing_keychain(keychain: str | None):
-    """Expose an isolated identity to codesign, then restore the search list."""
+    """Expose an isolated identity to codesign, then restore the search list.
+
+    SIGTERM and SIGHUP raise like SIGINT so the restore still runs, and the
+    restore itself runs with those signals blocked.
+    """
     if not keychain:
         yield
         return
     with signing_lock():
-        command = ("/usr/bin/security", "list-keychains", "-d", "user")
-        original = shlex.split(run(*command).decode())
+        original = shlex.split(run(*SEARCH_LIST).decode())
         if keychain in original:
             yield
             return
+        handlers = {signum: signal.signal(signum, _raise_on_signal) for signum in (signal.SIGTERM, signal.SIGHUP)}
         # --keychain restricts identity selection, but codesign still needs the
         # identity's keychain in the search list to resolve its certificate.
         try:
-            run(*command, "-s", *original, keychain)
+            run(*SEARCH_LIST, "-s", *original, keychain)
             yield
         finally:
-            run(*command, "-s", *original)
+            masked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+            try:
+                run(*SEARCH_LIST, "-s", *original)
+            finally:
+                for signum, handler in handlers.items():
+                    signal.signal(signum, handler)
+                signal.pthread_sigmask(signal.SIG_SETMASK, masked)
 
 
 def identity(directory: Path) -> dict[str, str]:
