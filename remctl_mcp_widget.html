@@ -175,6 +175,7 @@ tr.rw-inputrow td { background: var(--panel); padding: 0; }
 .rw-idchip { font-family: var(--mono); font-size: 11px; color: var(--text3); }
 .rw-warning { display: flex; gap: 9px; padding: 9px 10px; border-radius: 8px; background: var(--warn-tint); color: var(--warn); font-size: 12px; }
 .rw-warning ul { padding-left: 16px; }
+.rw-partial { padding: 0 16px 10px; }
 
 /* lists table */
 .rw-color { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
@@ -821,11 +822,25 @@ const RemCTLWidget = (() => {
       if (isObject(value) && value.ok === false) status = 'failed'; else if (isObject(value) && value.warnings > 0) status = 'warning';
     } else body = renderSummary(p, value);
 
+    // The server cut an oversized result to fit (see _within_budget): never label it as complete.
+    const partial = p.status !== 'failed' && isObject(value) && value.truncated === true;
+    if (partial && status === 'success') status = 'warning';
     shell.dataset.status = status;
-    const header = el('div', 'rw-header', el('div', 'rw-title-group', el('span', 'rw-tool', p.toolTitle),
-      el('span', 'rw-chip', status === 'failed' ? 'Failed' : status === 'warning' ? 'Completed with warnings' : 'Success')));
+    const chip = status === 'failed' ? 'Failed' : partial ? 'Partial results' : status === 'warning' ? 'Completed with warnings' : 'Success';
+    const header = el('div', 'rw-header', el('div', 'rw-title-group', el('span', 'rw-tool', p.toolTitle), el('span', 'rw-chip', chip)));
     if (count != null) header.append(el('span', 'rw-count', count + (count === 1 ? ' item' : ' items')));
-    shell.append(header, body);
+    shell.append(header);
+    if (partial) {
+      const budget = isObject(value.resultBudget) ? value.resultBudget : {};
+      const rowsCut = Array.isArray(budget.cuts) ? budget.cuts.find(c => isObject(c) && c.path === 'items') : null;
+      let text = rowsCut && Number.isInteger(rowsCut.totalItems) ? 'Showing ' + (items ? items.length : 0) + ' of ' + rowsCut.totalItems + '. ' : '';
+      text += safeText(budget.hint, 500) || 'This result was too large to show in full.';
+      if (Number.isInteger(value.nextOffset)) text += ' Next offset: ' + value.nextOffset + '.';
+      const warn = el('div', 'rw-warning'); const wi = el('div'); wi.append(I.alert());
+      warn.append(wi, el('div', null, text));
+      shell.append(el('div', 'rw-partial', warn));
+    }
+    shell.append(body);
     if (p.onRunAgain) {
       const footer = el('div', 'rw-footer');
       const again = el('button', 'rw-footbtn', 'Run again'); again.type = 'button';
