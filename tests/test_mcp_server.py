@@ -1159,8 +1159,30 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertNotIn("No Claude Code", out.getvalue())
         install.assert_not_called()
 
+    def test_detect_clients_outside_path_like_the_http_launch_agent(self):
+        # The HTTP MCP LaunchAgent runs with PATH=/usr/local/bin:/usr/bin:/bin,
+        # so its doctor used to list fewer installed apps than a Terminal doctor.
+        with tempfile.TemporaryDirectory() as tmp:
+            local_bin = Path(tmp) / ".local/bin"
+            local_bin.mkdir(parents=True)
+            for name in ("claude", "codex"):
+                (local_bin / name).write_text("#!/bin/sh\n")
+                (local_bin / name).chmod(0o755)
+            (local_bin / "not-executable").write_text("")
+            with mock.patch.object(remctl_mcp.shutil, "which", return_value=None), \
+                 mock.patch.object(remctl_mcp, "CLIENT_CLI_DIRS", (Path(tmp) / "missing", local_bin)):
+                clients = {client["id"]: client for client in remctl_mcp.detect_clients()}
+                self.assertIsNone(remctl_mcp.find_client_cli("not-executable"))
+            self.assertTrue(clients["claude-code"]["installed"])
+            self.assertEqual(clients["claude-code"]["detail"], str(local_bin / "claude"))
+            self.assertTrue(clients["codex"]["cliInstalled"])
+            with mock.patch.object(remctl_mcp.shutil, "which", side_effect=lambda name: f"/on/path/{name}"), \
+                 mock.patch.object(remctl_mcp, "CLIENT_CLI_DIRS", (local_bin,)):
+                self.assertEqual(remctl_mcp.find_client_cli("claude"), "/on/path/claude")
+
     def test_detect_codex_desktop_without_command_and_offer_plugin_setup(self):
         with mock.patch.object(remctl_mcp.shutil, "which", return_value=None), \
+             mock.patch.object(remctl_mcp, "CLIENT_CLI_DIRS", ()), \
              mock.patch.object(Path, "is_dir", side_effect=lambda: True):
             client = next(c for c in remctl_mcp.detect_clients() if c["id"] == "codex")
         self.assertTrue(client["installed"])
@@ -1187,7 +1209,8 @@ class CliIntegrationTests(unittest.TestCase):
             with mock.patch.object(remctl_mcp, "CLAUDE_CODE_CONFIG", missing / "claude.json"), \
                  mock.patch.object(remctl_mcp, "CODEX_CONFIG", missing / "config.toml"), \
                  mock.patch.object(remctl_mcp, "CLAUDE_DESKTOP_CONFIG", missing / "desktop.json"), \
-                 mock.patch.object(remctl_mcp.shutil, "which", return_value=None):
+                 mock.patch.object(remctl_mcp.shutil, "which", return_value=None), \
+                 mock.patch.object(remctl_mcp, "CLIENT_CLI_DIRS", ()):
                 out = io.StringIO()
                 with mock.patch.object(sys, "stdout", out):
                     self.remctl.cmd_mcp(SimpleNamespace(mcp_action="status", json=True))

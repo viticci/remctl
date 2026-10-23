@@ -13035,35 +13035,38 @@ def gather_doctor_checks(capability_host=None):
         None if py_ok else "Install Python 3.10 or newer.",
     )
 
+    # Direct access matters only when nothing else reads the store. With the
+    # signed Capability Host ready, a caller without Full Disk Access, such as
+    # the HTTP MCP LaunchAgent, is fine: report ok and keep the direct result
+    # in "direct" so `access.direct` stays accurate.
     store_exists = STORE_DIR.exists()
-    add(
-        "store_dir",
-        "ok" if store_exists else ("warn" if host_store_ready else "fail"),
-        str(STORE_DIR),
-        (
-            None
-            if store_exists
-            else (
-                "Direct access is unavailable in this caller; the signed Capability Host "
-                "can read the store."
-                if host_store_ready
-                else "Set REMCTL_STORE_DIR if your Reminders store lives elsewhere."
-            )
-        ),
-    )
+    if store_exists or not host_store_ready:
+        add(
+            "store_dir",
+            "ok" if store_exists else "fail",
+            str(STORE_DIR),
+            None if store_exists else "Set REMCTL_STORE_DIR if your Reminders store lives elsewhere.",
+        )
+    else:
+        add("store_dir", "ok", f"{STORE_DIR} (read through the signed Capability Host)")
+    checks[-1]["direct"] = store_exists
 
     db_access_error = reminders_store_access_error()
     db_path = find_main_db_path()
-    if db_access_error:
+    if host_store_ready and (db_access_error or not db_path):
         add(
             "database",
-            "warn" if host_store_ready else "fail",
+            "ok",
+            "Read through the signed RemCTL Capability Host; this process has no direct access.",
+        )
+        checks[-1]["directError"] = db_access_error or "No Reminders database found"
+    elif db_access_error:
+        add(
+            "database",
+            "fail",
             db_access_error,
             (
-                "Direct caller access is blocked, but effective database access is available "
-                "through the signed RemCTL Capability Host."
-                if host_store_ready
-                else full_disk_access_fix_text(
+                full_disk_access_fix_text(
                     rerun_command="remctl doctor --for-agent",
                     mention_onboard=True,
                     host_status=host_status,
@@ -13073,29 +13076,26 @@ def gather_doctor_checks(capability_host=None):
     else:
         add(
             "database",
-            "ok" if db_path else ("warn" if host_store_ready else "fail"),
+            "ok" if db_path else "fail",
             str(db_path) if db_path else "No Reminders database found",
-            (
-                None
-                if db_path
-                else (
-                    "Direct caller access is unavailable, but effective database access is "
-                    "available through the signed RemCTL Capability Host."
-                    if host_store_ready
-                    else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard."
-                )
-            ),
+            None if db_path else "Enable iCloud Reminders and open Reminders.app once, or run remctl onboard.",
         )
     direct_database_ready = not db_access_error and bool(db_path)
+    checks[-1]["direct"] = direct_database_ready
 
     cli_path = current_cli_path()
     cli_on_path = shutil.which(CLI_NAME) is not None
+    # PATH matters only for a person typing `remctl`. MCP servers, LaunchAgents,
+    # and agents start the CLI by absolute path, so an ok check carries no fix.
+    path_hint_useful = not cli_on_path and sys.stdin.isatty() and sys.stdout.isatty()
     add(
         "cli",
         "ok" if cli_path.exists() else "fail",
-        str(cli_path),
-        None if cli_on_path else f"Add {cli_path.parent} to PATH.",
+        str(cli_path) + ("" if cli_on_path else " (not on this process's PATH)"),
+        f"Add {cli_path.parent} to PATH." if path_hint_useful or not cli_path.exists() else None,
     )
+    if path_hint_useful and cli_path.exists():
+        checks[-1]["status"] = "warn"
 
     bridge_path = current_bridge_path()
     bridge_ok = bridge_path.exists() and os.access(bridge_path, os.X_OK)
@@ -13370,7 +13370,11 @@ def cmd_doctor(a):
             "requestedMode": capability_host_requested_mode(),
             "direct": {
                 "ready": next(
-                    (check["status"] == "ok" for check in checks if check["name"] == "database"),
+                    (
+                        check.get("direct", check["status"] == "ok")
+                        for check in checks
+                        if check["name"] == "database"
+                    ),
                     False,
                 ),
             },

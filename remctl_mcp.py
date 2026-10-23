@@ -2071,9 +2071,33 @@ def _run(argv: list[str], *, timeout: float = 60.0, runner: Callable[..., Any] |
     return run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
 
 
+# Where the Claude Code and Codex installers put their commands. GUI apps and
+# LaunchAgents, such as the HTTP MCP service, start with a PATH that lacks them,
+# and detection should not depend on who asks.
+CLIENT_CLI_DIRS: tuple[Path, ...] = (
+    Path.home() / ".local/bin",
+    Path.home() / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+)
+
+
+def find_client_cli(name: str) -> str | None:
+    """A client's command on PATH, else in its installer's usual folder."""
+
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in CLIENT_CLI_DIRS:
+        candidate = directory / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def detect_clients() -> list[dict[str, Any]]:
-    claude = shutil.which("claude")
-    codex = shutil.which("codex")
+    claude = find_client_cli("claude")
+    codex = find_client_cli("codex")
     codex_app = next(
         (path for path in (Path("/Applications/Codex.app"), Path.home() / "Applications" / "Codex.app") if path.is_dir()),
         None,

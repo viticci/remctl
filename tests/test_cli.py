@@ -5820,6 +5820,59 @@ class CliTests(unittest.TestCase):
         self.assertEqual(by_name["effective_access"]["status"], "ok")
         self.assertEqual([check["name"] for check in checks if check["status"] == "fail"], [])
 
+    def test_doctor_agrees_across_callers_when_the_host_reads_the_store(self):
+        # The HTTP MCP LaunchAgent has no Full Disk Access and a minimal PATH.
+        # With the host ready, that must not show up as warnings or as an
+        # "Add ... to PATH" fix on an ok check.
+        status = self._warming_host_status(reminders="authorized", automation="authorized")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "Stores"
+
+            def doctor(*, tty, host=status):
+                with (
+                    mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+                    mock.patch.object(self.remctl, "STORE_DIR", missing),
+                    mock.patch.object(self.remctl, "reminders_store_access_error", return_value=None),
+                    mock.patch.object(self.remctl.shutil, "which", return_value=None),
+                    mock.patch.object(self.remctl.sys.stdin, "isatty", return_value=tty),
+                    mock.patch.object(self.remctl.sys.stdout, "isatty", return_value=tty),
+                    mock.patch.object(self.remctl, "mcp_overview", return_value={"clients": [], "tailscale": {}}),
+                ):
+                    return {check["name"]: check for check in self.remctl.gather_doctor_checks(host)}
+
+            agent = doctor(tty=False)
+            self.assertEqual((agent["store_dir"]["status"], agent["store_dir"]["direct"]), ("ok", False))
+            self.assertEqual(agent["database"]["status"], "ok")
+            self.assertFalse(agent["database"]["direct"])
+            self.assertIn("No Reminders database", agent["database"]["directError"])
+            self.assertNotIn("Full Disk Access", agent["database"]["detail"])
+            self.assertEqual(agent["cli"]["status"], "ok")
+            self.assertIsNone(agent["cli"]["fix"])
+            for check in agent.values():
+                if check["status"] == "ok":
+                    self.assertIsNone(check["fix"], check["name"])
+
+            person = doctor(tty=True)
+            self.assertEqual(person["cli"]["status"], "warn")
+            self.assertIn("to PATH", person["cli"]["fix"])
+
+            not_ready = doctor(tty=False, host=self._absent_host_status)
+            self.assertEqual(not_ready["database"]["status"], "fail")
+            self.assertEqual(not_ready["store_dir"]["status"], "fail")
+
+        payload_checks = [agent["store_dir"], agent["database"], agent["cli"],
+                          {"name": "effective_access", "status": "ok", "detail": "route=capabilityHost; ready=yes", "fix": None}]
+        with (
+            mock.patch.object(self.remctl, "capability_host_status_settled", return_value=status),
+            mock.patch.object(self.remctl, "capability_host_requested_mode", return_value="auto"),
+            mock.patch.object(self.remctl, "gather_doctor_checks", return_value=payload_checks),
+            mock.patch.object(self.remctl, "doctor_execution_context", return_value={"effective_context": "unknown"}),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.remctl.cmd_doctor(SimpleNamespace(json=True, for_agent=True))
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["access"]["direct"]["ready"])
+
     def test_gather_doctor_checks_warns_when_reminders_is_not_running(self):
         # macOS answers targetNotRunning when it cannot reach Reminders, which
         # says nothing about whether Automation was granted.
