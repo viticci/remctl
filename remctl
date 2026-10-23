@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v2.3.1
+"""remctl — Power-user Reminders CLI v2.4.0
 
 Normal installed commands run through the signed RemCTL Capability Host, which
 owns database, Reminders, and Automation access. The client supports Python
@@ -67,7 +67,7 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 PRIVATE_PROTOCOL_VERSION = 2
 RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION = 4

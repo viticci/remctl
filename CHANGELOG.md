@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.4.0 — 2026-10-23
+
+### New
+
+- Make an existing reminder a subtask, turn a subtask back into an ordinary reminder, or reorder subtasks. The reminder keeps its ID, notes, dates, and other details: `reminder-move ID --parent PARENT_ID --private`, optionally with `--before`, `--after`, `--first`, or `--last`, and `reminder-move ID --top-level --private`. Thanks to @danielstengler-ai ([#63](https://github.com/viticci/remctl/pull/63)).
+- Put a reminder in a section of a custom Smart List: `edit ID --private --smart-list "Flagged Tasks" --section "Next Up"`, or `--smart-list-id` with `--section-id` when names repeat. `smart-lists` shows each custom Smart List's sections with their IDs, and RemCTL reads the change back before reporting success. MCP `create_reminder` and `update_reminder` take `smart_list` and `smart_list_id`. Thanks to @davidgliu ([#61](https://github.com/viticci/remctl/pull/61)) and @marcodegra5 ([#75](https://github.com/viticci/remctl/issues/75)).
+- MCP `update_reminder` accepts `flagged` with `private: true`.
+
+### Fixes
+
+- On macOS 15, alarms, repeat rules, assignments, and sharees were missing from every read, and changing a due date could leave Reminders showing the old time. Reminders numbers its record types differently across macOS versions, and RemCTL had those numbers hard-coded. It now reads them from the database. Thanks to @NSExceptional ([#74](https://github.com/viticci/remctl/pull/74)).
+- A Capability Host that crashed could leave its background broker running. Every new host then quit with "already running", and launchd restarted it forever. The broker now exits with its host, and a starting host stops a leftover broker it can positively identify, then takes over. Thanks to @tkaufmann ([#66](https://github.com/viticci/remctl/issues/66)).
+- The guided Full Disk Access helper accepts a host built from source with RemCTL's local signing certificate. When it can't accept a host, it gives working manual steps instead of repeating the same command. Thanks to @marcodegra5 ([#67](https://github.com/viticci/remctl/issues/67)).
+- `flag`, `unflag`, `add --flag`, and the MCP flag tools use ReminderKit when the private helper is available, so they no longer launch Reminders.app. AppleScript remains the fallback. Thanks to @mymatejackson ([#65](https://github.com/viticci/remctl/issues/65)).
+- Subtasks keep their order. Several `--subtask` options create subtasks in the order given, after any existing ones. `reminder-move` on a subtask reorders it under its parent instead of pulling it out. `subtasks`, `info`, and the workspace list subtasks in Reminders' order. Moving a parent to another list keeps its subtasks in order. Thanks to @danielstengler-ai ([#63](https://github.com/viticci/remctl/pull/63)).
+- `edit` checks the target section before it writes anything, so a missing section no longer leaves a half-applied edit. Section membership uses the newest entry when Reminders stores more than one.
+- MCP tool results stay under 48 kB, which is what clients accept. Larger results are trimmed, and `truncated` plus `resultBudget` say what was cut and how to get the rest. Paging stays correct, and the widget shows a Partial results notice. Workspace pages are never trimmed. Thanks to @davidmaxschmidt ([#72](https://github.com/viticci/remctl/pull/72)).
+- A write tool that times out reports `outcome: "unknown"`, so agents check before retrying instead of creating duplicates. `edit --url` no longer adds a URL to the notes when the same URL is already there. Thanks to @davidmaxschmidt ([#73](https://github.com/viticci/remctl/pull/73)).
+- `doctor` gives the same verdict in Terminal and in MCP services that read through the Capability Host, and finds Claude Code and Codex installed in `~/.local/bin`. Thanks to @davidmaxschmidt ([#71](https://github.com/viticci/remctl/pull/71)).
+- `sections` and `stats` skip sections left behind by deleted lists. Thanks to @davidmaxschmidt ([#70](https://github.com/viticci/remctl/pull/70)).
+- The Codex and Claude Code plugins find RemCTL in `$REMCTL_BIN_DIR`, `~/bin`, `~/.local/bin`, or on PATH. Thanks to @davidmaxschmidt ([#69](https://github.com/viticci/remctl/pull/69)).
+- Requests no longer fail with `host_signature_invalid` when many arrive at once. A passed signature check is reused for up to a minute while nothing in the app changes, and a slow check reports `host_signature_check_timeout`, which is safe to retry. Thanks to @davidmaxschmidt ([#68](https://github.com/viticci/remctl/pull/68)).
+- The installer and clients start the Capability Host when launchd holds back its launch, instead of timing out and rolling back. Thanks to @evaneus ([#64](https://github.com/viticci/remctl/pull/64)).
+- Source builds find the local signing certificate on Macs where `codesign` ignores an explicit keychain. Thanks to @tashmurra ([#62](https://github.com/viticci/remctl/pull/62)).
+- The installer copies the app out of the downloaded disk image before the administrator step, which failed on macOS 27.2.
+- `add --flag` flags the reminder even when RemCTL recovers it after a bridge error.
+
 ## 2.3.1 — 2026-10-04
 
 ### Fixes

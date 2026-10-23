@@ -1,7 +1,7 @@
 {
   "name": "remctl",
   "displayName": "RemCTL",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "description": "Apple Reminders in Claude Code: RemCTL's tools, plus today's tasks above the prompt in your lists' colors.",
   "author": { "name": "Federico Viticci", "url": "https://macstories.net" },
   "homepage": "https://github.com/viticci/remctl#use-it-in-claude-code",
