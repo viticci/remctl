@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stands in for remctl-bridge in tests, so no test can write to real Reminders
+# through EventKit. Mock the bridge call instead.
+echo '{"status": "error", "code": "test_stub", "message": "remctl-bridge is stubbed in tests; mock the call."}'
+exit 1

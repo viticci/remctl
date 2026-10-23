@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stands in for remctl-private in tests, so no test can reach the installed
+# helper and write to real Reminders. It answers the protocol handshake and
+# refuses every other action.
+if grep -q '"protocol_version"'; then
+    echo '{"status": "ok", "protocolVersion": 4}'
+    exit 0
+fi
+echo '{"status": "error", "code": "test_stub", "message": "remctl-private is stubbed in tests; mock the call."}'
+exit 1
