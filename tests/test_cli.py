@@ -9892,9 +9892,11 @@ class CliTests(unittest.TestCase):
         return db
 
     def _set_smart_list_membership(self, db, member, group):
+        """Record one membership, or a list of raw membership entries when group is a list."""
+        memberships = group if isinstance(group, list) else [{"memberID": member, "groupID": group, "isObsolete": False}]
         db.execute(
             "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 2",
-            (json.dumps({"memberships": [{"memberID": member, "groupID": group, "isObsolete": False}]}),),
+            (json.dumps({"memberships": memberships}),),
         )
 
     def _apply_section(self, db, protocol=4, written_membership="FOCUS-NEXT", **section):
@@ -9990,6 +9992,57 @@ class CliTests(unittest.TestCase):
         private_action.assert_called_once()
         self.assertIsNone(result)
         self.assertIn("not in section 'Next' of smart list 'Focus'", err)
+
+    def test_smart_list_section_readback_uses_the_newest_conflicting_membership(self):
+        def entry(group, modified_on=None, obsolete=False):
+            membership = {"memberID": "REM-1", "groupID": group, "isObsolete": obsolete}
+            if modified_on is not None:
+                membership["modifiedOn"] = modified_on
+            return membership
+
+        stale, fresh = entry("FOCUS-LATER", 100), entry("FOCUS-NEXT", 200)
+        cases = (
+            ([stale, fresh], "Next", True),
+            ([fresh, stale], "Next", True),
+            ([stale, fresh], "Later", False),
+            ([fresh, stale], "Later", False),
+            # A newer obsolete entry removes the reminder from the older section.
+            ([stale, entry("FOCUS-LATER", 300, obsolete=True)], "Later", False),
+            # Without dates nothing orders the conflict, so neither section verifies.
+            ([entry("FOCUS-LATER"), entry("FOCUS-NEXT")], "Next", False),
+            ([entry("FOCUS-NEXT"), entry("FOCUS-LATER")], "Next", False),
+        )
+        db = self._smart_list_section_db()
+        try:
+            for memberships, section, verified in cases:
+                with self.subTest(memberships=memberships, section=section):
+                    _, err, result = self._apply_section(
+                        db, written_membership=memberships, smart_list="Focus", section=section
+                    )
+                    if verified:
+                        self.assertEqual(result[0]["verified"], True)
+                    else:
+                        self.assertIsNone(result)
+                        self.assertIn(f"not in section {section!r}", err)
+        finally:
+            db.close()
+
+    def test_list_section_readers_share_the_newest_membership_rule(self):
+        db = self._smart_list_section_db()
+        self._insert_section(db, 11, "Later", "SECTION-2")
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 1",
+            (json.dumps({"memberships": [
+                {"memberID": "REM-1", "groupID": "SECTION-2", "isObsolete": False, "modifiedOn": 200},
+                {"memberID": "REM-1", "groupID": "SECTION-1", "isObsolete": False, "modifiedOn": 100},
+            ]}),),
+        )
+        try:
+            self.assertEqual(self.remctl.q_section_memberships(db, 1), {"REM-1": "Later"})
+            self.assertEqual(self.remctl.q_reminder_section_ckid(db, 1, "rem-1"), "SECTION-2")
+            self.assertEqual(self.remctl.q_section_member_counts(db, 1), {"SECTION-2": 1})
+        finally:
+            db.close()
 
     def test_smart_list_flag_needs_an_existing_section_flag(self):
         for overrides, message in (

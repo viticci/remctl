@@ -2299,44 +2299,75 @@ def section_name_exists(db, list_pk, name, *, excluding_ckid=None):
     return False
 
 
+def effective_section_memberships(data):
+    """Map each memberID in REMMemberships JSON to the section groupID it is effectively in, or None.
+
+    ReminderKit keeps one membership per member and, when two disagree, its default merge keeps the
+    newest modifiedOn; a newest obsolete entry means "no section". Disagreements that dates cannot
+    order map to None so no reader guesses from array order.
+    """
+    by_member = {}
+    for membership in (data.get("memberships") or []) if isinstance(data, dict) else []:
+        if isinstance(membership, dict) and isinstance(membership.get("memberID"), str) and membership["memberID"]:
+            by_member.setdefault(membership["memberID"].casefold(), []).append(membership)
+
+    def group(membership):
+        group_id = membership.get("groupID")
+        return group_id if isinstance(group_id, str) and group_id and not membership.get("isObsolete") else None
+
+    def agree(entries):
+        return len({(group(entry) or "").casefold() for entry in entries}) == 1
+
+    resolved = {}
+    for entries in by_member.values():
+        member_id = entries[0]["memberID"]
+        if not agree(entries):
+            dates = [entry.get("modifiedOn") for entry in entries]
+            if not all(isinstance(date, (int, float)) and not isinstance(date, bool) for date in dates):
+                resolved[member_id] = None
+                continue
+            entries = [entry for entry, date in zip(entries, dates) if date == max(dates)]
+            if not agree(entries):
+                resolved[member_id] = None
+                continue
+        resolved[member_id] = group(entries[-1])
+    return resolved
+
+
+def _section_memberships_data(db, list_pk):
+    row = db.execute(
+        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
+        (list_pk,)
+    ).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
 def q_reminder_section_ckid(db, list_pk, reminder_ckid, *, smart_list=False):
     """Stable identifier of the live section a reminder belongs to, or None.
 
     With smart_list, list_pk is a custom smart list's Z_PK: its row stores its own section memberships.
     """
     try:
-        row = db.execute(
-            "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
-            (list_pk,),
-        ).fetchone()
-        if not row or not row[0]:
-            return None
-        data = json.loads(row[0])
+        memberships = effective_section_memberships(_section_memberships_data(db, list_pk))
         live = {
             (section["ZCKIDENTIFIER"] or "").casefold(): section["ZCKIDENTIFIER"]
             for section in (q_smart_list_sections(db, list_pk) if smart_list else q_sections(db, list_pk))
         }
-    except (sqlite3.Error, json.JSONDecodeError, TypeError):
+    except sqlite3.Error:
         return None
     member = (reminder_ckid or "").casefold()
-    for membership in (data.get("memberships") or []) if isinstance(data, dict) else []:
-        if membership.get("isObsolete") or (membership.get("memberID") or "").casefold() != member:
-            continue
-        section = live.get((membership.get("groupID") or "").casefold())
-        if section:
-            return section
-    return None
+    group = next((group for member_id, group in memberships.items() if member_id.casefold() == member), None)
+    return live.get((group or "").casefold())
 
 
 def q_section_memberships(db, list_pk):
-    row = db.execute(
-        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
-        (list_pk,)
-    ).fetchone()
-    if not row or not row[0]: return {}
-    try:
-        data = json.loads(row[0])
-    except (json.JSONDecodeError, TypeError):
+    data = _section_memberships_data(db, list_pk)
+    if not data:
         return {}
     sections = db.execute(
         "SELECT ZCKIDENTIFIER, ZDISPLAYNAME FROM ZREMCDBASESECTION "
@@ -2344,9 +2375,9 @@ def q_section_memberships(db, list_pk):
     ).fetchall()
     g2n = {s["ZCKIDENTIFIER"]: s["ZDISPLAYNAME"] for s in sections}
     return {
-        m["memberID"]: g2n[m["groupID"]]
-        for m in data.get("memberships", [])
-        if m.get("groupID") in g2n and m.get("memberID") and not m.get("isObsolete")
+        member_id: g2n[group]
+        for member_id, group in effective_section_memberships(data).items()
+        if group in g2n
     }
 
 
@@ -2363,24 +2394,10 @@ def q_smart_list_sections(db, smart_list_pk):
 
 
 def q_section_member_counts(db, list_pk):
-    row = db.execute(
-        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?",
-        (list_pk,)
-    ).fetchone()
-    if not row or not row[0]:
-        return {}
-    try:
-        data = json.loads(row[0])
-    except (json.JSONDecodeError, TypeError):
-        return {}
     counts = {}
-    for membership in data.get("memberships", []):
-        if membership.get("isObsolete"):
-            continue
-        group_id = membership.get("groupID")
-        member_id = membership.get("memberID")
-        if group_id and member_id:
-            counts[group_id] = counts.get(group_id, 0) + 1
+    for group in effective_section_memberships(_section_memberships_data(db, list_pk)).values():
+        if group:
+            counts[group] = counts.get(group, 0) + 1
     return counts
 
 
