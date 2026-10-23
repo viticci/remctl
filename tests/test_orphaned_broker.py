@@ -20,8 +20,8 @@ import remctl_broker
 ROOT = Path(__file__).resolve().parents[1]
 
 LISTENER = """
-import os, socket, sys
-path, kind = sys.argv[1:3]
+import os, socket
+path, kind = os.environ["REMCTL_TEST_SOCKET"], os.environ["REMCTL_TEST_KIND"]
 if kind == "orphan" and os.fork():
     os._exit(0)
 server = socket.socket(socket.AF_UNIX)
@@ -60,12 +60,27 @@ class OrphanedBrokerTests(unittest.TestCase):
         self.socket_path.parent.chmod(0o700)
 
     def start_listener(self, kind, broker=True):
-        """Start a listener on the socket; an "orphan" is adopted by launchd."""
-        arguments = ["service", "--socket", str(self.socket_path)] if broker else []
+        """Start a listener on the socket; an "orphan" is adopted by launchd.
+
+        A broker is launched the way the host launches one, with its script on
+        an inherited descriptor. Otherwise the same listener runs through `-c`
+        with the broker's trailing arguments, which must not be enough.
+        """
+        script = self.socket_path.parent / "listener.py"
+        script.write_text(LISTENER)
+        descriptor = os.open(script, os.O_RDONLY)
+        self.addCleanup(os.close, descriptor)
+        service = ["service", "--socket", str(self.socket_path)]
+        if broker:
+            command = [sys.executable, "-I", "-S", f"/dev/fd/{descriptor}", *service]
+        else:
+            command = [sys.executable, "-c", LISTENER, *service]
         process = subprocess.Popen(
-            [sys.executable, "-c", LISTENER, str(self.socket_path), kind, *arguments],
+            command,
             stdout=subprocess.PIPE,
             text=True,
+            pass_fds=(descriptor,),
+            env={**os.environ, "REMCTL_TEST_SOCKET": str(self.socket_path), "REMCTL_TEST_KIND": kind},
         )
         pids = []
         self.addCleanup(self.stop, pids, process)
@@ -98,8 +113,8 @@ class OrphanedBrokerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "already_running")
         self.assertTrue(_alive(child))
 
-    def test_orphan_without_broker_arguments_is_left_running(self):
-        # Same interpreter and an orphan, but not a broker for this socket.
+    def test_orphan_without_broker_launch_shape_is_left_running(self):
+        # Same interpreter, socket, and trailing arguments, but not launched as a broker.
         orphan = self.start_listener("orphan", broker=False)
         with self.assertRaises(remctl_broker._ServerError) as raised:
             remctl_broker._prepare_socket(self.socket_path)

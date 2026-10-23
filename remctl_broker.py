@@ -3069,12 +3069,16 @@ def _orphaned_broker_identity(pid: int, socket_path: Path) -> tuple[int, int] | 
         return None
     if executable != own_executable and not executable.is_relative_to(PROTECTED_PYTHON_ROOT):
         return None
-    # The host always launches the broker as `... service --socket <path>`.
+    # The host always launches the broker as exactly
+    # `<python> -I -S /dev/fd/<archive> service --socket <path>`.
     arguments = _process_arguments(pid)
     if (
         arguments is None
-        or arguments[-3:-1] != ["service", "--socket"]
-        or Path(arguments[-1]).expanduser().absolute() != socket_path
+        or len(arguments) != 7
+        or arguments[1:3] != ["-I", "-S"]
+        or not arguments[3].startswith("/dev/fd/")
+        or arguments[4:6] != ["service", "--socket"]
+        or Path(arguments[6]).expanduser().absolute() != socket_path
         or _process_info(pid) != info
     ):
         return None
