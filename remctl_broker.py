@@ -82,6 +82,8 @@ SIGNAL_CONTROL_PARTIAL_TIMEOUT_SECONDS = 0.5
 SIGNAL_CONTROL_GRACE_SECONDS = 2.0
 CLIENT_SIGNAL_WAIT_SECONDS = 5.0
 HOST_START_WAIT_SECONDS = 10.0
+ORPHANED_BROKER_STOP_SECONDS = 3.0
+PROTECTED_PYTHON_ROOT = Path("/Library/RemCTL/Python")
 MAX_CLIENT_WORKERS = 16
 MAX_ANCILLARY_FDS = 256
 SUPPORTED_PRIVATE_PROTOCOL_VERSIONS = (2, 3, 4)
@@ -2996,6 +2998,103 @@ def _error_response(exc: BaseException) -> dict[str, Any]:
     return response
 
 
+def _process_parent_and_uid(pid: int) -> tuple[int, int] | None:
+    """Return a live process's parent pid and uid, or None when it cannot be read."""
+
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = library.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        # PROC_PIDT_SHORTBSDINFO: struct proc_bsdshortinfo, 64 bytes.
+        buffer = ctypes.create_string_buffer(64)
+        loaded = proc_pidinfo(pid, 13, 0, buffer, ctypes.sizeof(buffer))
+    except (AttributeError, OSError):
+        return None
+    if loaded != ctypes.sizeof(buffer):
+        return None
+    parent = struct.unpack_from("=I", buffer.raw, 4)[0]
+    uid = struct.unpack_from("=I", buffer.raw, 36)[0]
+    return parent, uid
+
+
+def _is_orphaned_broker(pid: int) -> bool:
+    """True only for this user's RemCTL Python after launchd adopted it.
+
+    A broker's parent is always its native host, so a parent of 1 means the
+    host died without stopping it.
+    """
+
+    if pid <= 1 or pid == os.getpid() or _process_parent_and_uid(pid) != (1, os.getuid()):
+        return False
+    try:
+        executable = _process_executable_path(pid)
+    except _ServerError:
+        return False
+    return (
+        executable == Path(sys.executable).resolve()
+        or executable.is_relative_to(PROTECTED_PYTHON_ROOT)
+    )
+
+
+def _stop_orphaned_broker(probe: socket.socket) -> bool:
+    """Stop the process answering on the socket if it is an orphaned broker.
+
+    Returns True once that process is gone. Anything not positively identified
+    by _is_orphaned_broker is left alone.
+    """
+
+    if sys.platform != "darwin":
+        return False
+    try:
+        pid = probe.getsockopt(0, getattr(socket, "LOCAL_PEERPID", 2))
+    except OSError:
+        return False
+    if not _is_orphaned_broker(pid):
+        return False
+    for signum, wait in ((signal.SIGTERM, ORPHANED_BROKER_STOP_SECONDS), (signal.SIGKILL, 1.0)):
+        if not _is_orphaned_broker(pid):
+            return True
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            return True
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if not _is_orphaned_broker(pid):
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def _stop_when_parent_exits() -> None:
+    """Stop serving as soon as the native host exits, however it died.
+
+    The host forwards SIGTERM and SIGINT, but a crash or SIGKILL sends nothing,
+    and an orphaned broker would keep the socket from every later host.
+    """
+
+    parent = os.getppid()
+
+    def watch() -> None:
+        try:
+            queue = select.kqueue()
+            queue.control(
+                [select.kevent(parent, select.KQ_FILTER_PROC, select.KQ_EV_ADD, select.KQ_NOTE_EXIT)],
+                0,
+            )
+        except ProcessLookupError:
+            pass
+        else:
+            if os.getppid() == parent:
+                queue.control(None, 1)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=watch, name="remctl-host-exit-watch", daemon=True).start()
+
+
 def _prepare_socket(path: Path) -> socket.socket:
     if sys.platform == "darwin" and len(os.fsencode(path)) > 103:
         raise _ServerError("socket path exceeds macOS limit", code="unsafe_socket")
@@ -3016,11 +3115,14 @@ def _prepare_socket(path: Path) -> socket.socket:
     if not stat.S_ISDIR(parent_details.st_mode) or parent_details.st_uid != os.getuid():
         raise _ServerError("socket parent has unsafe ownership", code="unsafe_socket")
     os.chmod(parent, 0o700)
-    try:
-        existing = path.lstat()
-    except FileNotFoundError:
-        existing = None
-    if existing is not None:
+    # After stopping an orphaned broker, probe again until its listener is
+    # released; an exiting process can still accept for a moment.
+    released_by: float | None = None
+    while True:
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            break
         if (
             not stat.S_ISSOCK(existing.st_mode)
             or existing.st_uid != os.getuid()
@@ -3032,7 +3134,10 @@ def _prepare_socket(path: Path) -> socket.socket:
             probe.settimeout(0.2)
             probe.connect(str(path))
         except OSError:
-            current = path.lstat()
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                break
             if (
                 not stat.S_ISSOCK(current.st_mode)
                 or current.st_uid != os.getuid()
@@ -3040,7 +3145,14 @@ def _prepare_socket(path: Path) -> socket.socket:
             ):
                 raise _ServerError("stale socket changed before cleanup", code="unsafe_socket")
             path.unlink()
+            break
         else:
+            if released_by is None and _stop_orphaned_broker(probe):
+                released_by = time.monotonic() + 1.0
+                continue
+            if released_by is not None and time.monotonic() < released_by:
+                time.sleep(0.05)
+                continue
             raise _ServerError("Capability Host is already running", code="already_running")
         finally:
             probe.close()
@@ -3060,6 +3172,8 @@ def _prepare_socket(path: Path) -> socket.socket:
 
 def serve(*, broker_socket: Path) -> None:
     runtime = _hosted_runtime_from_environment()
+    if os.getppid() <= 1:
+        raise _ServerError("Capability Host parent is unavailable", code="host_runtime_invalid")
     listener = _prepare_socket(broker_socket)
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
@@ -3078,6 +3192,7 @@ def serve(*, broker_socket: Path) -> None:
 
     for signum in previous_handlers:
         signal.signal(signum, stop_service)
+    _stop_when_parent_exits()
 
     def handle_connection(connection: socket.socket) -> None:
         descriptors: list[int] = []
