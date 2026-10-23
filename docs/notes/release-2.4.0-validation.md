@@ -23,15 +23,15 @@ The implicit Smart List fallback in #61 was replaced with explicit `--smart-list
 
 ## Regression and package checks
 
-- Protected Python 3.13 ran 954 tests: 948 passed and six optional distribution checks were skipped. Python 3.14 passed 184 MCP, desktop-plugin, event, and orphaned-broker tests, plus the result-budget tests.
+- Protected Python 3.13 ran 957 tests: 951 passed and six optional distribution checks were skipped. Python 3.14 passed 184 MCP, desktop-plugin, event, and orphaned-broker tests, plus the result-budget tests.
 - Against the Developer ID build, 15 prebuilt distribution checks passed. The one remaining check expects a local signature and doesn't apply to a Developer ID app. Against a locally signed build of the same source, all five applicable prebuilt installer checks passed, including the default refusal of a local signature. The user keychain search list was identical before and after local signing.
 - UI build, type checks, interaction contracts, and OpenAI extension schema checks passed. Claude Code strict plugin and marketplace validation passed, and its Today mod runner passed five tests.
-- The CLI, both app version fields, the UI package and lockfile, and both plugin manifests report 2.4.0. Both plugin launchers share build identifier `9ee5913f5632e45d`.
+- The CLI, both app version fields, the UI package and lockfile, and both plugin manifests report 2.4.0. Both plugin launchers share build identifier `cb1aa558e41e7a62`.
 - The packaged client code matches the release source, except for the CLI's four-line protected-interpreter wrapper.
 
 ## Installed and live acceptance
 
-This Mac was reinstalled from the release source with its existing Developer ID identity and protected Python runtime. A source build signs a new runtime, which needs an administrator password, so the installer was pointed at the existing runtime. Permission grants were preserved. Doctor reports 16 checks and zero failures. Its two warnings are Automation access, which macOS can't report until Reminders.app has run; only the AppleScript flag fallback needs it. The installed host's CDHash is `1c8c1f59e5d94c848e1882a36a724f7ed15e7953`. The installed-surface audit passes all 41 comparisons, including both refreshed plugin caches.
+This Mac was reinstalled from the release source with its existing Developer ID identity and protected Python runtime. A source build signs a new runtime, which needs an administrator password, so the installer was pointed at the existing runtime. Permission grants were preserved. Doctor reports 16 checks and zero failures. Its two warnings are Automation access, which macOS can't report until Reminders.app has run; only the AppleScript flag fallback needs it. The installed host's CDHash is `6bb646b84a2ed72f64c7dc60bd89447772e423a8`. The installed-surface audit passes all 41 comparisons, including both refreshed plugin caches.
 
 Live checks used disposable lists `RL Test 240` and `RL Test 240 B` and a disposable Smart List `RL Flagged 240`. Its two sections were created in Reminders.app through computer use.
 
@@ -74,13 +74,22 @@ Both Developer ID apps and the disk image were accepted by Apple, stapled, and v
 
 | Artifact | Verification value |
 | --- | --- |
-| App submission | `33e75528-32d9-47d7-bf6f-875e21c70316` — Accepted |
-| Disk image submission | `6a83a884-2bfe-4ed3-bf58-464d583a5039` — Accepted |
-| `RemCTL-arm64.dmg` SHA-256 | `c78dccc093a5fbe7fe3c6af5210e611346b48bf0177239b3964abb0353a3680f` |
+| App submission | `bfe7795d-bfb9-4185-b2f8-ce946688ddfb` — Accepted |
+| Disk image submission | `cb25515b-22a4-4731-930d-8db2074b4197` — Accepted |
+| `RemCTL-arm64.dmg` SHA-256 | `b24de4aedd1b2931715d39fd9b5b2f32951e9e653d86ecdd366c4013f541d580` |
 | Bundled Python | `3.13.15` |
-| Bundled protected runtime ID | `d56400ee81ac178912d0e158538f067d088db44a4e75b2b164bcfd88e4d3924a` |
+| Bundled protected runtime ID | `72170c31e2d6c16aa5e80a13d4dc786c6cedd82d0172938afcbab2be36fd065a` |
 
 Installing the download requires the normal administrator authorization for its new protected runtime. Existing permission grants are kept.
+
+## Release refresh
+
+The release was refreshed the same day, under the same version, to bring the help and documentation up to date and to fix an upgrade gap that the documentation review found.
+
+- `smart-lists --help`, its command summary, the `subtasks` summary, and the splash screen describe Smart List sections and subtask nesting. One MCP field description was reworded.
+- `SKILL.md` (the agent manual, which the personal `remctl` skills link to), the README, and the command, MCP, installation, and private-metadata guides cover ordered subtask creation and `subtaskPlacement`, verification of Smart List sections, write timeouts with `outcome: "unknown"`, `result_too_large`, when flagging falls back to Automation, and recovery from a host restart loop. A second model checked every added claim against the code over three review rounds.
+- The installer refused to remove a socket that still answered, so the users affected by #66 couldn't upgrade. It now asks the new broker code to stop an identifiable orphaned broker first. That accepts the Python the old host recorded, so an install that ran on another interpreter is covered too. Live test: the host was stopped, and a fake orphaned broker was planted on the real socket. It ran on the protected Python, with the host's exact launch command, and launchd had adopted it. The installer stopped it, published 2.4.0, and `doctor` reported zero failures with private protocol 4.
+- The refreshed artifact replaced the earlier one: the tag moved to the refreshed commit, and the release assets were replaced. Claude Code refreshes a plugin only when its version changes. An existing 2.4.0 Claude Code plugin keeps its earlier launcher file, which still runs the updated CLI. This Mac's cache was refreshed by reinstalling the plugin, and Codex picked up the new build through its normal update.
 
 ## Coverage limits
 
