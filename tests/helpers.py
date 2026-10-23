@@ -12,8 +12,9 @@ if str(ROOT) not in sys.path:
 
 # Without these, the CLI falls back to a built or installed helper and bridge,
 # which write to real Reminders. The stubs refuse writes; tests mock the calls.
-os.environ.setdefault("REMCTL_PRIVATE_PATH", str(ROOT / "tests" / "remctl-private-stub"))
-os.environ.setdefault("REMCTL_BRIDGE_PATH", str(ROOT / "tests" / "remctl-bridge-stub"))
+# Set unconditionally so an override inherited from the shell can't bypass them.
+os.environ["REMCTL_PRIVATE_PATH"] = str(ROOT / "tests" / "remctl-private-stub")
+os.environ["REMCTL_BRIDGE_PATH"] = str(ROOT / "tests" / "remctl-bridge-stub")
 
 
 def load_module(name: str, relative_path: str):
