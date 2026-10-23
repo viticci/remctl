@@ -12648,9 +12648,9 @@ class PermissionHelperTests(unittest.TestCase):
                            "--keychain", identity["keychain"], str(app)]
                 if requirement:
                     command[2:2] = ["-r=" + requirement]
+                # --keychain alone resolves the identity; the user search list stays untouched.
                 signed = subprocess.run(command, capture_output=True, text=True)
-                if signed.returncode:
-                    self.skipTest(f"codesign could not use the local identity: {signed.stderr}")
+                self.assertEqual(signed.returncode, 0, signed.stderr)
                 self.marker.write_text(f"{app}\n")
                 result = self._run_target(app)
                 if requirement is None:
