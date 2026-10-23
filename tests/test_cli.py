@@ -12624,6 +12624,41 @@ class PermissionHelperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 64)
         self.assertEqual(result.stdout, "")
         self.assertIn("stable signing identity", result.stderr)
+        # The refusal gives a manual route instead of the command that just failed.
+        self.assertIn("Privacy & Security > Full Disk Access", result.stderr)
+        self.assertIn(f"choose {self.valid_app}", result.stderr)
+        self.assertIn("launchctl kickstart -k", result.stderr)
+        self.assertNotIn("remctl permissions full-disk-access", result.stderr)
+
+    def test_preserved_local_certificate_passes_only_when_pinned(self):
+        # The certificate ./install.sh --from-source creates has no team identifier.
+        sys.path.insert(0, str(self.source.parent / "scripts"))
+        import local_signing
+        identity = local_signing.identity(self.root.resolve() / "local-signing")
+        self.addCleanup(local_signing.run, "/usr/bin/security", "delete-keychain", identity["keychain"])
+        self.identity_marker.write_text(identity["identity"] + "\n")
+        requirements = {
+            "pinned": None,
+            "unpinned": 'designated => identifier "net.macstories.remctl.capability-host"',
+        }
+        for name, requirement in requirements.items():
+            with self.subTest(requirement=name):
+                app = self._create_host_app(self.root / f"local-{name}", self.host_binary)
+                command = ["/usr/bin/codesign", "--force", "--deep", "--sign", identity["identity"],
+                           "--keychain", identity["keychain"], str(app)]
+                if requirement:
+                    command[2:2] = ["-r=" + requirement]
+                signed = subprocess.run(command, capture_output=True, text=True)
+                if signed.returncode:
+                    self.skipTest(f"codesign could not use the local identity: {signed.stderr}")
+                self.marker.write_text(f"{app}\n")
+                result = self._run_target(app)
+                if requirement is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "valid\n")
+                else:
+                    self.assertEqual(result.returncode, 64)
+                    self.assertIn("no stable signing identity", result.stderr)
 
     def test_matching_preserved_development_identity_passes_preflight(self):
         identities = subprocess.run(

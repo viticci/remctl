@@ -213,6 +213,10 @@ extension Data {
     }
 }
 
+/// Accept only an identity that a Full Disk Access grant keeps following across
+/// updates: the installer's preserved certificate, either under an Apple team
+/// or as a local certificate that the designated requirement pins exactly.
+/// Ad-hoc and unsigned code has no certificate and is refused.
 func signingIdentityError(for target: URL, expectedIdentifier: String) -> String? {
     guard let expectedCertificateHash = preservedSigningIdentity() else {
         return "the preserved signing identity is missing or unsafe"
@@ -234,20 +238,28 @@ func signingIdentityError(for target: URL, expectedIdentifier: String) -> String
           let values = information as NSDictionary?,
           let identifier = values[kSecCodeInfoIdentifier] as? String,
           identifier == expectedIdentifier,
-          let teamIdentifier = values[kSecCodeInfoTeamIdentifier] as? String,
-          !teamIdentifier.isEmpty,
-          teamIdentifier != "not set",
           let certificates = values[kSecCodeInfoCertificates] as? [SecCertificate],
           let leaf = certificates.first
     else { return "the target app has no stable signing identity" }
     var designatedRequirement: SecRequirement?
     guard SecCodeCopyDesignatedRequirement(staticCode, [], &designatedRequirement) == errSecSuccess,
-          designatedRequirement != nil
-    else { return "the target app has no designated requirement" }
+          let designatedRequirement,
+          SecStaticCodeCheckValidity(staticCode, [], designatedRequirement) == errSecSuccess
+    else { return "the target app does not satisfy its designated requirement" }
     let leafData = SecCertificateCopyData(leaf) as Data
     let leafHash = Data(Insecure.SHA1.hash(data: leafData))
     guard leafHash == expectedCertificateHash else {
         return "the target app does not match the preserved signing identity"
+    }
+    let teamIdentifier = values[kSecCodeInfoTeamIdentifier] as? String ?? ""
+    if teamIdentifier.isEmpty || teamIdentifier == "not set" {
+        let leafHex = leafHash.map { String(format: "%02x", $0) }.joined()
+        let pinned = "identifier \"\(expectedIdentifier)\" and certificate leaf = H\"\(leafHex)\""
+        var requirementText: CFString?
+        guard SecRequirementCopyString(designatedRequirement, [], &requirementText) == errSecSuccess,
+              let requirementText,
+              (requirementText as String).lowercased() == pinned.lowercased()
+        else { return "the target app has no stable signing identity" }
     }
     return nil
 }
@@ -664,7 +676,16 @@ guard options.targets.count == 1,
     exit(64)
 }
 if let validationError = capabilityHostTargetValidationError(target) {
-    let message = "Error: remctl-permissions refused the RemCTL Capability Host.app target because \(validationError). Run `remctl permissions full-disk-access` instead.\n"
+    // Name only the installed host, never the refused target, which may be any app.
+    let hostApp = installedCapabilityHostPath() ?? "RemCTL Capability Host.app"
+    let message = """
+    Error: remctl-permissions refused the RemCTL Capability Host.app target because \(validationError).
+    To grant access by hand, open System Settings > Privacy & Security > Full Disk Access, \
+    click +, choose \(hostApp), and turn it on. Then restart the host:
+      launchctl kickstart -k gui/\(getuid())/net.macstories.remctl.capability-host
+      remctl doctor
+
+    """
     FileHandle.standardError.write(Data(message.utf8))
     exit(64)
 }
