@@ -671,6 +671,7 @@ def list_select_columns(db):
     table_columns = table_column_names(db, "ZREMCDBASELIST")
     optional_columns = [
         "ZBADGEEMBLEM",
+        "ZSHARINGSTATUS",
         "ZCOLOR",
         "ZISGROUP",
         "ZPARENTLIST",
@@ -1059,6 +1060,8 @@ def list_to_dict(row):
         "isGroup": is_group,
         "isGroceries": False if is_group else is_groceries,
     }
+    if _row_has_key(row, "ZSHARINGSTATUS"):
+        item["sharingStatus"] = _row_value(row, "ZSHARINGSTATUS")
     object_uuid = _row_value(row, "ZCKIDENTIFIER")
     if object_uuid:
         item["objectUUID"] = object_uuid
@@ -1184,6 +1187,8 @@ def list_ref_payload(row, *, requested=None, method="exact"):
         "isGroup": is_group,
     }
     payload["isGroceries"] = False if is_group else is_groceries
+    if _row_has_key(row, "ZSHARINGSTATUS"):
+        payload["sharingStatus"] = _row_value(row, "ZSHARINGSTATUS")
     parent_id = list_parent_pk(row)
     if parent_id:
         payload["parentListId"] = parent_id
@@ -3879,7 +3884,14 @@ def bridge_failure_is_access_error(result):
 
 
 def bridge_failure_is_list_move_rejection(result):
+    payload = result.get("payload") if result else None
+    if isinstance(payload, dict) and payload.get("errorDomain") == "com.apple.reminderkit" and payload.get("errorCode") == -3002:
+        return True
     message = bridge_failure_message(result).lower()
+    # Older installed bridges only return localizedDescription. Keep the match
+    # tied to ReminderKit's domain and exact code, not an arbitrary -3002.
+    if re.search(r"com\.apple\.reminderkit (?:error|code[= ])\s*-3002(?!\d)", message):
+        return True
     if "update failed:" not in message and "save failed:" not in message:
         return False
     exclusions = [
@@ -5254,25 +5266,57 @@ def private_action(data, partial_context=None):
 
 def subtask_rows_for_parent_move(db, reminder):
     try:
-        parent_pk = reminder["Z_PK"]
-    except (KeyError, TypeError):
-        return []
-    try:
-        return list(q_subtasks_for_parent(db, parent_pk))
-    except (AttributeError, sqlite3.Error, TypeError, ValueError):
-        return []
+        return list(q_subtasks_for_parent(db, reminder["Z_PK"]))
+    except (KeyError, AttributeError, sqlite3.Error, TypeError, ValueError):
+        fail_list_move(
+            "list_move_source_unverified",
+            "Could not read the source reminder's subtasks. No move was attempted.",
+        )
 
 
-def wait_for_cloned_reminder_tree(reminder_ckid, target_list_pk, expected_subtasks, attempts=24, delay=0.25):
+def reminder_move_snapshot(db, row):
+    # Copies receive a new identity and creation date. User-visible content must
+    # already match before the source can be removed.
+    fields = (
+        "ZTITLE", "ZNOTES", "ZDUEDATE", "ZDISPLAYDATEDATE", "ZALLDAY", "ZTIMEZONE",
+        "ZCOMPLETED", "ZCOMPLETIONDATE", "ZPRIORITY", "ZFLAGGED",
+        "ZISURGENTSTATEENABLEDFORCURRENTUSER",
+    )
+    snapshot = {field: _row_get(row, field) for field in fields}
+    snapshot["urls"] = sorted(link["ZURL"] for link in q_rich_links(db, row["Z_PK"]))
+    return snapshot
+
+
+def wait_for_cloned_reminder_tree(reminder_ckid, target_list_pk, expected_parent, expected_children,
+                                 attempts=24, delay=0.25):
     for _ in range(attempts):
-        db = open_db()
-        row = q_reminder_by_identifier(db, reminder_ckid)
-        if row and row["ZLIST"] == target_list_pk:
-            subtasks = q_subtasks_for_parent(db, row["Z_PK"], limit=max(500, expected_subtasks + 5))
-            if len(subtasks) == expected_subtasks:
-                return row, subtasks
+        with contextlib.closing(open_db()) as db:
+            row = q_reminder_by_identifier(db, reminder_ckid)
+            if row and row["ZLIST"] == target_list_pk and reminder_move_snapshot(db, row) == expected_parent:
+                subtasks = q_subtasks_for_parent(db, row["Z_PK"], limit=max(500, len(expected_children) + 5))
+                actual_ids = {_row_get(child, "ZCKIDENTIFIER") for child in subtasks}
+                if len(subtasks) == len(expected_children) and actual_ids == set(expected_children) and all(
+                    child["ZLIST"] == target_list_pk and child["ZPARENTREMINDER"] == row["Z_PK"]
+                    and reminder_move_snapshot(db, child) == expected_children[child["ZCKIDENTIFIER"]]
+                    for child in subtasks
+                ):
+                    return row, subtasks
         time.sleep(delay)
     return None, []
+
+
+def fail_list_move(code, message, **details):
+    print(json.dumps({"status": "error", "code": code, "message": message, **details}), file=sys.stderr)
+    sys.exit(1)
+
+
+def fail_combined_list_move():
+    fail_list_move(
+        "list_move_requires_separate_edit",
+        "Move this reminder without other edits first, then edit the returned id. "
+        "Use move_to_list (reminders_move_to_list in Apple Core) with confirm: true, "
+        "or remctl edit ID --list-id LIST --json.",
+    )
 
 
 def delete_reminder_by_identifier_or_die(reminder):
@@ -5318,6 +5362,8 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
             file=sys.stderr,
         )
         sys.exit(1)
+    expected_parent = reminder_move_snapshot(db, reminder)
+    child_snapshots = {_row_get(child, "ZCKIDENTIFIER"): reminder_move_snapshot(db, child) for child in child_rows}
     result = private_call({
         "action": "clone_reminder_tree_to_list",
         "id": reminder_ckid,
@@ -5332,14 +5378,24 @@ def clone_reminder_tree_to_list_or_die(db, reminder, target_list_ref, child_rows
     if not new_ckid:
         print("Error: private helper cloned the reminder but did not return the new reminder identifier.", file=sys.stderr)
         sys.exit(1)
-    new_row, new_children = wait_for_cloned_reminder_tree(new_ckid, target_list_ref["id"], len(child_rows))
+    copied_children = result.get("children", [])
+    expected_children = {child.get("id"): child_snapshots.get(child.get("sourceId")) for child in copied_children}
+    if (new_ckid == reminder_ckid or len(expected_children) != len(child_snapshots)
+        or {child.get("sourceId") for child in copied_children} != set(child_snapshots)
+        or any(not identifier or identifier in child_snapshots or snapshot is None
+               for identifier, snapshot in expected_children.items())):
+        fail_list_move("list_move_copy_unverified", "The copied subtask identities could not be verified. The source was kept.",
+                       oldId=reminder["Z_PK"], newObjectUUID=new_ckid, originalDeleted=False)
+    new_row, new_children = wait_for_cloned_reminder_tree(
+        new_ckid, target_list_ref["id"], expected_parent, expected_children,
+    )
     if not new_row:
-        print(
-            "Error: cloned reminder tree was not visible in the target list with the expected subtask count. "
-            f"Original #{reminder['Z_PK']} was not deleted.",
-            file=sys.stderr,
+        fail_list_move(
+            "list_move_copy_unverified",
+            "The copied reminder's fields, URLs or subtasks did not match the source in the target list. "
+            "The source was kept. Inspect both copies before retrying.",
+            oldId=reminder["Z_PK"], newObjectUUID=new_ckid, originalDeleted=False,
         )
-        sys.exit(1)
     delete_result = delete_reminder_by_identifier_or_die(reminder)
     return {
         "status": "updated",
@@ -10331,14 +10387,9 @@ def cmd_edit(a):
     )
     if moving_to_different_list:
         child_rows_for_move = subtask_rows_for_parent_move(db, r)
-        if child_rows_for_move:
+        if child_rows_for_move or target_list_ref.get("sharingStatus") not in (None, 0):
             if has_other_changes_for_move:
-                print(
-                    "Error: moving a parent reminder with subtasks cannot currently be combined with other edits. "
-                    "Move it first, then edit the cloned reminder returned by remctl.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                fail_combined_list_move()
             move_result = clone_reminder_tree_to_list_or_die(db, r, target_list_ref, child_rows_for_move)
             emit_clone_delete_move_result(a, move_result, target_list_ref)
             return
@@ -10442,9 +10493,11 @@ def cmd_edit(a):
             if (
                 moving_to_different_list
                 and not child_rows_for_move
-                and not has_other_changes_for_move
                 and bridge_failure_allows_clone_delete_fallback(bridge_write_result)
             ):
+                if has_other_changes_for_move:
+                    warn_if_nudged_due_stranded(r, nudge_succeeded, dt, due_all_day)
+                    fail_combined_list_move()
                 move_result = clone_reminder_tree_to_list_or_die(db, r, target_list_ref, [])
                 emit_clone_delete_move_result(a, move_result, target_list_ref)
                 return
