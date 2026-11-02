@@ -71,3 +71,9 @@ Installing the download requires the normal administrator authorization for its 
 ## Coverage limits
 
 Testing ran on Apple silicon with macOS 27.0. The shared-list move was tested on a list Federico owns, not on one shared with him. The workspace height was measured in a browser, not in a portrait Codex window. App links were checked as chips in Reminders.app, but no chip was clicked open.
+
+## Publication
+
+Published on November 2, 2026 from commit `0883a59`, which the `v2.5.0` tag points to. The [public release](https://github.com/viticci/remctl/releases/tag/v2.5.0) is the latest release, not a draft or prerelease. Both assets were downloaded without authentication through the `latest` URL: the disk image's bytes, GitHub asset digest, and SHA-256 match the verified build, its stapled ticket validates, and a quarantined copy passes Gatekeeper. `scripts/download_release.sh --dry-run` also verified it.
+
+GitHub marks pull request #77 as merged by `viticci`, with a thank-you comment that describes the changes made on top. Issues #76 and #78 were closed as completed by `viticci` with comments explaining the released behavior.
