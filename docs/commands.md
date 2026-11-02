@@ -208,7 +208,7 @@ Without `--private`, `edit ID --url URL` appends the URL to existing notes, unle
 
 Rescheduling: when every alarm is an absolute alarm at the old due time, `edit -d` moves all copies to the new time, so the time shown in Reminders follows the due date. A date-only target removes those alarms instead of moving them to midnight. An explicit `--alarm` takes precedence. `edit -d clear` removes matching alarms. Other alarm configurations are left alone.
 
-Moving between lists: `edit -l` and `edit --list-id` use EventKit. Some moves are rejected by EventKit, for example a parent reminder with subtasks or a move across a shared-list boundary. For a pure move, RemCTL then clones the reminder into the destination through ReminderKit, verifies the clone and its subtask count, and deletes the original. The JSON then has `"method": "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved`. Continue with the new `id`. Move first; apply other edits afterwards.
+Moving between lists: `edit -l` and `edit --list-id` use EventKit and keep the id. Three kinds of move copy the reminder instead: a move into a shared list, a move of a parent reminder with subtasks, and a pure move that EventKit rejects with ReminderKit error `-3002` or another container rejection. RemCTL copies the reminder and its subtasks into the destination through ReminderKit, then deletes the original only after the copy's title, notes, due and display dates, time zone, completion, priority, flag, urgent state, rich links, and each subtask read back the same in the destination. The JSON then has `"method": "clone-delete"`, `oldId`, the new `id`, and `subtasksMoved`; continue with the new `id`. If the copy doesn't match, the command fails with `list_move_copy_unverified`, keeps the original, and reports `oldId` and the copy's `newObjectUUID`: inspect both before retrying. If the original's subtasks can't be read, it fails with `list_move_source_unverified` before writing anything. A copying move can't be combined with other edits and fails with `list_move_requires_separate_edit`: move first, then edit the new `id`. `lists --json` reports each list's `sharingStatus` (0 when the list isn't shared).
 
 `done --date WHEN` records a specific completion time, also on an already completed reminder. `WHEN` must be `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`. Recurring reminders reject `--date`; plain `done` advances the series.
 
@@ -441,7 +441,7 @@ remctl location-lookup "Piazza Navona, Rome" --json
 
 | Field | Options | Notes |
 | --- | --- | --- |
-| Rich link | `--url` | Public `http` or `https` host only; loopback, `.local`, and private addresses are rejected. Additive. |
+| Rich link | `--url` | A public `http` or `https` host, or an app link such as `obsidian://open?vault=Notes`; loopback, `.local`, private addresses, and `file:`, `javascript:`, `data:`, and file-server schemes are rejected. Additive. |
 | Synced tags | `-t/--tags` (add), `--set-tags` (replace), `--clear-tags`, `--remove-tag` (repeatable) | The replace and remove options cannot be combined with each other or with `-t`. |
 | Section | `--section`, `--section-id`, `--new-section`, `--smart-list`, `--smart-list-id` | See [Sections](#sections). |
 | Assignment | `--assign`, `--unassign` | Shared lists only. |
