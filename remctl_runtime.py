@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -217,6 +218,35 @@ def mask_secret(secret: str, visible_chars: int = 4) -> str:
     if len(secret) <= visible_chars * 2:
         return "*" * len(secret)
     return f"{secret[:visible_chars]}...{secret[-visible_chars:]}"
+
+
+# Rich links can open an app (obsidian://, things:) as well as a website. These
+# schemes read local files, run script, or reach file servers, so they stay out.
+# remctl-private.m keeps the same list in blockedLinkSchemes().
+BLOCKED_LINK_SCHEMES = frozenset({
+    "about", "afp", "blob", "data", "file", "ftp", "ftps", "javascript", "nfs",
+    "sftp", "smb", "ssh", "telnet", "vbscript", "vnc", "ws", "wss",
+})
+_URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+
+
+def rich_link_url_problem(url: str) -> str | None:
+    """Say why a URL can't become a rich link, or return None when it can.
+
+    Web links must reach a public host. Any other scheme is an app link, which
+    Reminders opens in that app, unless it is in BLOCKED_LINK_SCHEMES.
+    """
+    scheme, colon, rest = (url or "").partition(":")
+    if not colon or not rest or not _URL_SCHEME.fullmatch(scheme) or any(ch.isspace() or ord(ch) < 32 for ch in url):
+        return "needs a web URL (https://...) or an app link such as obsidian://open?vault=Notes."
+    scheme = scheme.lower()
+    if scheme in {"http", "https"}:
+        if not is_safe_remote_url(url):
+            return "must resolve to a public http or https host."
+        return None
+    if scheme in BLOCKED_LINK_SCHEMES:
+        return f"can't use {scheme}: links. Use a web URL or an app link such as obsidian://."
+    return None
 
 
 def is_safe_remote_url(url: str) -> bool:

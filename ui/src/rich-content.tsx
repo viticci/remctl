@@ -1,6 +1,6 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {ArrowUpRight, Globe} from 'lucide-react';
-import {app, RecordData as D, safeLink} from './bridge';
+import {AppWindow, ArrowUpRight, Globe} from 'lucide-react';
+import {app, isAppLink, linkScheme, RecordData as D, safeLink} from './bridge';
 import {notePresentation} from './reminder-helpers';
 
 // A small shared cache avoids downloading the same Apple preview after every refresh.
@@ -69,15 +69,17 @@ export function SavedLinkCard({link, title, run}: {link:D;title:string;run:(fn:(
     if (visible && link.resourceUri) loadPreview(link.resourceUri, link.revision || '').then(value => {if(live)setPreview(value);}).catch(() => {});
     return () => {live=false;};
   }, [visible, link.resourceUri, link.revision]);
-  let domain = '';try {domain=new URL(link.url).hostname.replace(/^www\./,'');}catch{}
-  if (!/^https?:\/\//i.test(link.url || '')) return null;
+  const appLink = isAppLink(link.url);
+  let domain = appLink ? linkScheme(link.url) : '';
+  if (!appLink) try {domain=new URL(link.url).hostname.replace(/^www\./,'');}catch{}
+  if (!appLink && !/^https?:\/\//i.test(link.url || '')) return null;
   const image = preview?.image, icon = preview?.icon;
   const src = (asset:D) => /^image\/(png|jpeg|gif|webp)$/.test(asset.mimeType) ? `data:${asset.mimeType};base64,${asset.data}` : undefined;
   return <div ref={ref} className="saved-link-wrap">
     <a className={'saved-link-card' + (image ? ' has-artwork' : '')} href={link.url} aria-label={`Open ${preview?.title || title || domain}`} onClick={e=>{e.preventDefault();e.stopPropagation();run(()=>safeLink(link.url));}}>
       {image && <div className="saved-link-artwork"><img src={src(image)} alt="" loading="lazy" onLoad={e=>{const image=e.currentTarget;image.classList.toggle("square-artwork",image.naturalWidth/image.naturalHeight >= .85 && image.naturalWidth/image.naturalHeight < 1.3);}}/></div>}
       <div className="saved-link-caption">
-        {icon ? <img className="saved-link-icon" src={src(icon)} alt=""/> : !image && <Globe size={23} className="saved-link-globe"/>}
+        {icon ? <img className="saved-link-icon" src={src(icon)} alt=""/> : !image && (appLink ? <AppWindow size={23} className="saved-link-globe"/> : <Globe size={23} className="saved-link-globe"/>)}
         <div><strong>{preview?.title || title || domain}</strong><span>{preview?.siteName || domain}</span></div><ArrowUpRight size={14}/>
       </div>
     </a>

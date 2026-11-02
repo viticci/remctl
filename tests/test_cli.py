@@ -5038,7 +5038,7 @@ class CliTests(unittest.TestCase):
                 self.remctl.parse_subtask_specs([
                     json.dumps({"title": "Child", "url": "file:///tmp/not-rich"})
                 ])
-        self.assertIn("http or https", stderr.getvalue())
+        self.assertIn("can't use file: links", stderr.getvalue())
 
     def _section_db(self):
         db = sqlite3.connect(":memory:")
@@ -5360,7 +5360,7 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.remctl.cmd_add(args)
         bridge_call.assert_not_called()
-        self.assertIn("http or https", stderr.getvalue())
+        self.assertIn("can't use file: links", stderr.getvalue())
 
     def test_cmd_add_private_rejects_local_rich_url_before_creation(self):
         args = SimpleNamespace(

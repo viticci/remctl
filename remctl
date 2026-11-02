@@ -29,8 +29,8 @@ from remctl_runtime import (
     LOCAL_COMMANDS,
     due_today_window,
     env_bool,
-    is_safe_remote_url,
     resolve_binary_path,
+    rich_link_url_problem,
     resolve_config_dir,
     resolve_store_dir,
     start_of_day,
@@ -4623,11 +4623,9 @@ def parse_subtask_specs(values):
 
         urls = normalize_string_list(spec.get("urls", spec.get("url")), "urls")
         for url in urls:
-            if not is_web_url(url):
-                print("Error: --private --subtask url requires an http or https URL.", file=sys.stderr)
-                sys.exit(1)
-            if not is_safe_remote_url(url):
-                print("Error: --private --subtask url must resolve to a public http or https host.", file=sys.stderr)
+            problem = rich_link_url_problem(url)
+            if problem:
+                print(f"Error: --private --subtask url {problem}", file=sys.stderr)
                 sys.exit(1)
         if urls:
             normalized["urls"] = urls
@@ -4783,13 +4781,6 @@ def apply_subtask_private_metadata(subtask_id, spec):
     return updates
 
 
-def is_web_url(value):
-    if not value:
-        return False
-    parsed = urlparse(value)
-    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
-
-
 def validate_private_args(a):
     validate_tag_replacement_args(a)
 
@@ -4809,11 +4800,9 @@ def validate_private_args(a):
         sys.exit(1)
 
     url = getattr(a, "url", None)
-    if url and not is_web_url(url):
-        print("Error: --private --url requires an http or https URL.", file=sys.stderr)
-        sys.exit(1)
-    if url and not is_safe_remote_url(url):
-        print("Error: --private --url must resolve to a public http or https host.", file=sys.stderr)
+    problem = rich_link_url_problem(url) if url else None
+    if problem:
+        print(f"Error: --private --url {problem}", file=sys.stderr)
         sys.exit(1)
 
     early_reminder = getattr(a, "early_reminder", None)
@@ -5313,9 +5302,9 @@ def fail_list_move(code, message, **details):
 def fail_combined_list_move():
     fail_list_move(
         "list_move_requires_separate_edit",
-        "Move this reminder without other edits first, then edit the returned id. "
-        "Use move_to_list (reminders_move_to_list in Apple Core) with confirm: true, "
-        "or remctl edit ID --list-id LIST --json.",
+        "This move copies the reminder into the other list, so it can't be combined with other changes. "
+        "Move it on its own first (remctl edit ID --list-id LIST --json, or update_reminder with only list or list_id), "
+        "then edit the id it returns.",
     )
 
 
@@ -12529,7 +12518,7 @@ _remctl() {
                 '--longitude[Location alarm longitude]:longitude:' \
                 '--radius[Location alarm radius meters]:radius:' \
                 '--proximity[Location alarm trigger]:proximity:(arriving leaving)' \
-                '--url[URL, web rich link with --private]:url:' \
+                '--url[URL, rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Tags, synced with --private]:tags:' \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
                 '--list-id[Target list by stable numeric ID]:id:' \
@@ -12574,7 +12563,7 @@ _remctl() {
                 '--title[New title]:title:' \
                 '(-l --list)'{-l,--list}'[Move to list; pure moves may return new id]:list:' \
                 '--list-id[Move to list by stable numeric ID; pure moves may return new id]:id:' \
-                '--url[URL, web rich link with --private]:url:' \
+                '--url[URL, rich link with --private]:url:' \
                 '(-t --tags)'{-t,--tags}'[Synced tags with --private]:tags:' \
                 '--set-tags[Replace all synced tags with --private]:tags:' \
                 '--clear-tags[Remove all synced tags with --private]' \
@@ -13202,7 +13191,7 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l grocery -d "Auto-cate
 complete -c remctl -n "__fish_seen_subcommand_from add" -l urgent -d "Set private urgent state"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l no-urgent -d "Clear private urgent state"
 complete -c remctl -n "__fish_seen_subcommand_from add" -l early-reminder -d "Set Early Reminder delta, e.g. 15m, 1h, clear" -r
-complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, web rich link with --private" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l url -d "URL, rich link with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -s t -l tags -d "Tags, synced with --private" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l list-id -d "Target list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l private -d "Use unsupported private ReminderKit metadata writes"
@@ -15013,7 +15002,7 @@ def build_parser():
             "  remctl add \"Launch assets\" -l Projects --private --subtask '{\"title\":\"Export PNG\",\"notes\":\"Use final crop\",\"due\":\"tomorrow\",\"url\":\"https://example.com\",\"tags\":[\"media\"]}'\n"
             "\n"
             "Without --private, --url is appended to notes and -t/--tags appends inline #hashtags to the title.\n"
-            "With --private, --url creates a synced web rich link and -t/--tags creates synced Reminders tags.\n"
+            "With --private, --url creates a synced rich link (a web URL or an app link such as obsidian://...) and -t/--tags creates synced Reminders tags.\n"
             "--assign USER requires a shared list and accepts a unique name, email/phone, numeric sharee ID, object UUID, or me.\n"
             "Use remctl sharees LIST --json before assignment when scripting or when names may collide.\n"
             "Date-only due inputs such as today, tomorrow, YYYY-MM-DD, +3d, +1m (~30 days), and next friday create all-day reminders.\n"
@@ -15033,7 +15022,7 @@ def build_parser():
     c.add_argument("-p", "--priority", help="high, medium, low")
     c.add_argument("-f", "--flag", action="store_true", help="Set the real flagged state through ReminderKit, or AppleScript when the private helper is unavailable")
     c.add_argument("-t", "--tags", help="Comma-separated tags; inline #hashtags normally, synced Reminders tags with --private")
-    c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
+    c.add_argument("--url", help="URL; appended to notes normally, synced rich link with --private (web URL or app link such as obsidian://)")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, or ISO datetime (bridge only)")
     c.add_argument("--private", action="store_true", help="Use unsupported private ReminderKit writes for URL/tags/sections/assignments/subtasks/images")
@@ -15129,9 +15118,9 @@ def build_parser():
             "  remctl edit 23880 --private --location-title \"Apple Park\" --latitude 37.3349 --longitude -122.0090 --radius 200\n"
             "  remctl edit 23880 --private --location-title Office --location-address \"1 Apple Park Way, Cupertino, CA\" --proximity leaving\n"
             "\n"
-            "Without --private, --url is appended to notes. Synced tags, web rich links, sections, shared-list assignments, subtasks, images, "
+            "Without --private, --url is appended to notes. Synced tags, rich links (web or app links such as obsidian://), sections, shared-list assignments, subtasks, images, "
             "real flag state, urgent state, and location alarms require --private. "
-            "A pure list move may return a new id plus oldId when RemCTL uses its verified clone-delete fallback across list/container boundaries. "
+            "A move into a shared list, a move of a parent with subtasks, or a move EventKit rejects copies the reminder, verifies the copy, deletes the original, and returns a new id plus oldId; such a move can't be combined with other edits. "
             "--assign USER accepts a unique name, email/phone, numeric sharee ID, object UUID, or me; use remctl sharees LIST --json before scripting. "
             "Location alarms are saved through the EventKit bridge as structured-location alarms; replaces any existing location alarm. "
             "--location-address is looked up first (remctl location-lookup shows the result); unless it is the only match, "
@@ -15140,11 +15129,11 @@ def build_parser():
         formatter_class=HelpFormatter,
     )
     c.add_argument("id", type=int); c.add_argument("--title")
-    c.add_argument("-l", "--list", help="Move to a list by name; pure moves can use verified clone-delete fallback and return a new id")
-    c.add_argument("--list-id", type=int, help="Move to a list by stable numeric ID; pure moves can use verified clone-delete fallback and return a new id")
+    c.add_argument("-l", "--list", help="Move to a list by name; shared-list and subtask-parent moves copy the reminder and return a new id")
+    c.add_argument("--list-id", type=int, help="Move to a list by stable numeric ID; shared-list and subtask-parent moves copy the reminder and return a new id")
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders, or clear")
     c.add_argument("-p", "--priority")
-    c.add_argument("--url", help="URL; appended to notes normally, synced web rich link attachment with --private")
+    c.add_argument("--url", help="URL; appended to notes normally, synced rich link with --private (web URL or app link such as obsidian://)")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, ISO datetime, or clear (bridge only)")
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")

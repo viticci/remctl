@@ -1,4 +1,4 @@
-"""Shared-list moves copy and verify before deleting, with explicit MCP confirmation."""
+"""Shared-list moves copy and verify the reminder before deleting the original."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import unittest
 from unittest import mock
 
 from helpers import load_module
-import remctl_mcp
 from test_mcp_server import FakeExecutor, make_server, modern_meta, request
 
 
@@ -140,7 +139,7 @@ class MoveRouteTests(unittest.TestCase):
                     bridge.assert_not_called()
                 error = json.loads(stderr.getvalue())
                 self.assertEqual(error["code"], "list_move_requires_separate_edit")
-                self.assertIn("reminders_move_to_list", error["message"])
+                self.assertIn("then edit the id it returns", error["message"])
                 self.assertNotIn("-3002", error["message"])
 
 
@@ -242,45 +241,19 @@ class CopyVerificationTests(unittest.TestCase):
 
 
 class MoveMCPTests(unittest.TestCase):
-    def test_move_requires_confirmation_and_is_destructive(self):
-        tool = remctl_mcp.TOOLS_BY_NAME["move_to_list"]
-        self.assertIn("confirm", tool.input_schema()["required"])
-        self.assertTrue(tool.annotations()["destructiveHint"])
-        self.assertFalse(tool.annotations()["readOnlyHint"])
-        self.assertFalse(tool.annotations()["idempotentHint"])
-        for confirmation in ({}, {"confirm": False}):
-            with self.subTest(confirmation=confirmation):
-                server, executor = make_server()
-                result = call(server, "move_to_list", {"reminder_id": 1, "list_id": 9, **confirmation})
-                self.assertTrue(result["isError"])
-                self.assertEqual(executor.calls, [])
-                self.assertIn("confirm", result["structuredContent"]["error"]["message"])
-
-    def test_confirmed_move_returns_new_identity(self):
+    def test_update_reminder_moves_and_reports_the_new_identity(self):
         moved = {"status": "updated", "id": 42, "oldId": 1, "method": "clone-delete", "originalDeleted": True}
         server, executor = make_server(FakeExecutor(stdout=json.dumps(moved)))
-        result = call(server, "move_to_list", {"reminder_id": 1, "list_id": 9, "confirm": True})
+        result = call(server, "update_reminder", {"reminder_id": 1, "list_id": 9})
         self.assertFalse(result["isError"])
         self.assertEqual(executor.calls[0]["argv"], ["edit", "1", "--list-id", "9", "--json"])
-        self.assertEqual(result["structuredContent"]["id"], 42)
-        self.assertEqual(result["structuredContent"]["oldId"], 1)
-
-    def test_update_with_list_is_redirected_before_execution(self):
-        for selector in ({"list": "Target"}, {"list_id": 9}):
-            with self.subTest(selector=selector):
-                server, executor = make_server()
-                result = call(server, "update_reminder", {"reminder_id": 1, "title": "Renamed", **selector})
-                self.assertTrue(result["isError"])
-                self.assertEqual(executor.calls, [])
-                error = result["structuredContent"]["error"]
-                self.assertEqual(error["code"], "move_required")
-                self.assertIn("reminders_move_to_list", error["message"])
+        self.assertEqual((result["structuredContent"]["id"], result["structuredContent"]["oldId"]), (42, 1))
 
     def test_copy_verification_error_survives_mcp_mapping(self):
         error = {"status": "error", "code": "list_move_copy_unverified", "message": "The source was kept.",
                  "oldId": 1, "newObjectUUID": "COPY", "originalDeleted": False}
         server, _ = make_server(FakeExecutor(stderr=json.dumps(error), returncode=1))
-        result = call(server, "move_to_list", {"reminder_id": 1, "list_id": 9, "confirm": True})
+        result = call(server, "update_reminder", {"reminder_id": 1, "list_id": 9})
         self.assertTrue(result["isError"])
         self.assertEqual(result["structuredContent"]["error"]["code"], "list_move_copy_unverified")
         self.assertFalse(result["structuredContent"]["error"]["originalDeleted"])

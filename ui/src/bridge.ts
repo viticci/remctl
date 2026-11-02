@@ -178,8 +178,22 @@ export async function discuss(
     _meta: { "openai/message": { target, send: true } },
   });
 }
+// Schemes that read local files, run script, or reach file servers. Keep in
+// sync with BLOCKED_LINK_SCHEMES in remctl_runtime.py.
+const BLOCKED_LINK_SCHEMES = new Set([
+  "about", "afp", "blob", "data", "file", "ftp", "ftps", "javascript", "nfs",
+  "sftp", "smb", "ssh", "telnet", "vbscript", "vnc", "ws", "wss",
+]);
+export function linkScheme(url: string) {
+  return /^([a-z][a-z0-9+.-]*):./i.exec(url || "")?.[1].toLowerCase() || "";
+}
+// An app link (obsidian://, things:, x-apple-reminderkit:) opens in its app.
+export function isAppLink(url: string) {
+  const scheme = linkScheme(url);
+  return !!scheme && scheme !== "http" && scheme !== "https" && !BLOCKED_LINK_SCHEMES.has(scheme);
+}
 export function safeLink(url: string) {
-  return /^(https?:|x-apple-reminderkit:|codex:)/i.test(url)
+  return /^https?:\/\/./i.test(url) || isAppLink(url)
     ? app.openLink({ url })
     : Promise.reject(new Error("Unsupported link"));
 }

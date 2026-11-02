@@ -247,10 +247,6 @@ class Tool:
 class ToolArgumentError(ValueError):
     """The arguments are well-formed JSON but not valid for the tool."""
 
-    def __init__(self, message: str, *, code: str = "invalid_argument"):
-        super().__init__(message)
-        self.code = code
-
 
 REMINDER_ID = Param(
     "reminder_id",
@@ -503,21 +499,11 @@ def _argv_create_reminder(args):
     return argv
 
 
-def _argv_move_to_list(args):
-    if args.get("confirm") is not True:
-        raise ToolArgumentError("Moving a reminder requires confirm: true.", code="confirmation_required")
-    return ["edit", str(args["reminder_id"]), *_option(args, "list", "--list"),
-            *_option(args, "list_id", "--list-id"), "--json"]
-
-
 def _argv_update_reminder(args):
-    if args.get("list") is not None or args.get("list_id") is not None:
-        raise ToolArgumentError(
-            "List changes require move_to_list (reminders_move_to_list in Apple Core) with confirm: true. "
-            "Move first, then apply other edits to the returned id.", code="move_required",
-        )
     argv = ["edit", str(args["reminder_id"])]
     argv += _option(args, "title", "--title")
+    argv += _option(args, "list", "--list")
+    argv += _option(args, "list_id", "--list-id")
     argv += _option(args, "notes", "--notes")
     argv += _option(args, "due", "--due")
     argv += _option(args, "priority", "--priority")
@@ -882,7 +868,7 @@ TOOLS: tuple[Tool, ...] = (
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP + " Also accepts an exported recurrence JSON object as a string.", max_length=4096),
             Param("alarm", "string", ALARM_HELP, max_length=64),
-            Param("url", "string", "URL. A synced rich link with private: true; otherwise appended to the notes.", max_length=2048),
+            Param("url", "string", "URL. With private: true, a synced rich link: a public web URL or an app link such as obsidian://...; otherwise appended to the notes.", max_length=2048),
             Param("tags", "string", TAGS_HELP, max_length=512, coerce=_coerce_tag_list),
             Param("flagged", "boolean", "Flag the reminder after creating it, through ReminderKit without opening Reminders "
                   "when the private helper is available, otherwise through AppleScript.", default=False),
@@ -896,8 +882,9 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "update_reminder",
         "Update Reminder",
-        "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. "
-        "For list changes use move_to_list first, then edit its returned id. Set private to true for synced tags, rich links, sections, subtasks, "
+        "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. Moving a reminder with "
+        "subtasks, or into a shared list, copies it and deletes the original: the result has a new id plus oldId, so use "
+        "the new id afterwards, and that move can't be combined with other changes. Set private to true for synced tags, rich links, sections, subtasks, "
         "assignment, Early Reminders, urgent state, the flag, and location alarms.",
         (
             REMINDER_ID,
@@ -909,7 +896,7 @@ TOOLS: tuple[Tool, ...] = (
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP + " Also accepts an exported recurrence JSON object as a string.", max_length=4096),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
-            Param("url", "string", "URL. A synced rich link with private: true (added, never replaced); otherwise appended to the notes.", max_length=2048),
+            Param("url", "string", "URL. With private: true, a synced rich link (added, never replaced): a public web URL or an app link such as obsidian://...; otherwise appended to the notes.", max_length=2048),
             Param("tags", "string", "Synced tags to add (private), as a list or comma-separated string.", max_length=512, coerce=_coerce_tag_list),
             Param("set_tags", "string", "Replace every synced tag with these (private).", max_length=512, coerce=_coerce_tag_list),
             Param("remove_tags", "array", "Synced tags to remove (private).", items_type="string", max_items=20),
@@ -921,18 +908,6 @@ TOOLS: tuple[Tool, ...] = (
         ),
         _argv_update_reminder, "change", read_only=False, idempotent=True, timeout=90,
         require_one_of=UPDATE_FIELDS, mutually_exclusive=(*METADATA_EXCLUSIVE, ("assign", "unassign")),
-        output_schema=OBJECT_OUTPUT_SCHEMA,
-    ),
-    Tool(
-        "move_to_list",
-        "Move Reminder to List",
-        "Move a reminder and its subtasks to another list. Shared targets and rejected in-place moves use a verified "
-        "copy before deleting the source. Requires confirm: true, because this can delete the source and make its "
-        "contents visible to shared-list participants. Returns id and oldId when the identity changes; use the new id.",
-        (REMINDER_ID, LIST_NAME, LIST_ID,
-         Param("confirm", "boolean", "Confirm moving this reminder and its subtasks.", required=True)),
-        _argv_move_to_list, "change", read_only=False, destructive=True, timeout=90,
-        require_one_of=("list", "list_id"), mutually_exclusive=(("list", "list_id"),),
         output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
@@ -1965,7 +1940,7 @@ class MCPServer:
                     "Split subtasks or tags across more than one call."
                 )
         except ToolArgumentError as exc:
-            result = _error_result({"code": exc.code, "message": str(exc)})
+            result = _error_result({"code": "invalid_argument", "message": str(exc)})
         else:
             stdin_text = arguments.get("stdin") if tool.accepts_stdin else None
             command = self.config.executor.run(request_id, argv, timeout=tool.timeout, stdin_text=stdin_text)

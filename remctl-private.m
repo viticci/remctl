@@ -674,6 +674,30 @@ static BOOL looksLikeWebURL(NSString *value) {
     return hostResolvesOnlyToPublicAddresses(url.host);
 }
 
+// Keep in sync with BLOCKED_LINK_SCHEMES in remctl_runtime.py.
+static NSSet<NSString *> *blockedLinkSchemes(void) {
+    return [NSSet setWithArray:@[
+        @"about", @"afp", @"blob", @"data", @"file", @"ftp", @"ftps", @"javascript", @"nfs",
+        @"sftp", @"smb", @"ssh", @"telnet", @"vbscript", @"vnc", @"ws", @"wss",
+    ]];
+}
+
+// A rich link is a public web URL or an app link such as obsidian://open?...,
+// which Reminders opens in that app.
+static BOOL looksLikeRichLinkURL(NSString *value) {
+    NSURL *url = [NSURL URLWithString:value];
+    NSString *scheme = [url.scheme lowercaseString];
+    // NSURL has no resourceSpecifier for a bare app link such as shortcuts://,
+    // so check the text after the colon, as remctl_runtime.py does.
+    if (!url || scheme.length == 0 || value.length <= scheme.length + 1) {
+        return NO;
+    }
+    if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
+        return looksLikeWebURL(value);
+    }
+    return ![blockedLinkSchemes() containsObject:scheme];
+}
+
 static NSData *decodedBase64Data(NSString *value, NSString *field) {
     if (![value isKindOfClass:[NSString class]] || value.length == 0) {
         fail([NSString stringWithFormat:@"%@ is required", field]);
@@ -2611,8 +2635,8 @@ int main(void) {
                 fail(@"ReminderKit attachment context unavailable");
             }
             for (NSString *urlString in urls) {
-                if (!looksLikeWebURL(urlString)) {
-                    fail([NSString stringWithFormat:@"Invalid web URL: %@", urlString]);
+                if (!looksLikeRichLinkURL(urlString)) {
+                    fail([NSString stringWithFormat:@"Invalid rich link URL: %@", urlString]);
                 }
                 NSURL *url = [NSURL URLWithString:urlString];
                 [attachmentContext addURLAttachmentWithURL:url];

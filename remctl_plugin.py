@@ -434,7 +434,9 @@ class Plugin:
             payload = response["structuredContent"]
             if match[2] == "attachment":
                 return {"contents": [{"uri": uri, **payload}]}
-            if match[2] == "link" and not payload.get("image") and self.read_state("settings.json", DEFAULTS).get("loadLinkPreviews", True):
+            # App links (obsidian://) have no web page to preview.
+            if (match[2] == "link" and not payload.get("image") and re.match(r"https?://", payload.get("url", ""), re.I)
+                    and self.read_state("settings.json", DEFAULTS).get("loadLinkPreviews", True)):
                 payload = self.enrich_link_preview(payload)
             return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(payload)}]}
         match = re.fullmatch(r"remctl://list/([A-Za-z0-9-]+)", uri)

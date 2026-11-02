@@ -240,7 +240,7 @@ class ResultTests(unittest.TestCase):
     def test_moved_reminder_reports_its_new_id(self):
         moved = {"status": "updated", "id": 90, "oldId": 77, "method": "clone-delete", "list": "Work"}
         server, _ = make_server(FakeExecutor(stdout=json.dumps(moved)))
-        structured = call(server, "move_to_list", {"reminder_id": 77, "list": "Work", "confirm": True})["structuredContent"]
+        structured = call(server, "update_reminder", {"reminder_id": 77, "list": "Work"})["structuredContent"]
         self.assertEqual((structured["id"], structured["oldId"]), (90, 77))
 
 

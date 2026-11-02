@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import socket
 import sys
 import shutil
@@ -109,6 +110,24 @@ class IssueCliFixTests(unittest.TestCase):
             self.assertFalse(remctl_runtime.is_safe_remote_url('https://example.com/'))
         self.assertFalse(remctl_runtime.is_safe_remote_url('https://example.com:invalid/'))
 
+    def test_rich_links_accept_app_links_and_refuse_local_or_script_schemes(self):
+        for url in ('obsidian://open?vault=MyVault&file=Notes%2FSome%20note', 'things:///show?id=today', 'mailto:hi@example.com', 'shortcuts://'):
+            self.assertIsNone(remctl_runtime.rich_link_url_problem(url), url)
+        for url in ('file:///etc/hosts', 'JavaScript:alert(1)', 'data:text/html,hi', 'smb://nas/share'):
+            self.assertIn("can't use", remctl_runtime.rich_link_url_problem(url), url)
+        for url in ('example.com/page', 'obsidian:', 'obsidian://open?file=a b', '1password://x'):
+            self.assertIn('needs a web URL', remctl_runtime.rich_link_url_problem(url), url)
+        with mock.patch('socket.getaddrinfo', return_value=[(None, None, None, None, ('10.0.0.1', 443))]):
+            self.assertIn('public http or https', remctl_runtime.rich_link_url_problem('https://intranet.example/'))
+
+    def test_native_and_python_rich_link_blocklists_match(self):
+        native = (Path(__file__).resolve().parents[1] / "remctl-private.m").read_text()
+        body = native[native.index('static NSSet<NSString *> *blockedLinkSchemes'):native.index('static BOOL looksLikeRichLinkURL')]
+        self.assertEqual(set(re.findall(r'@"([a-z]+)"', body)), remctl_runtime.BLOCKED_LINK_SCHEMES)
+        bridge = (Path(__file__).resolve().parents[1] / "ui/src/bridge.ts").read_text()
+        ui_body = bridge[bridge.index('const BLOCKED_LINK_SCHEMES'):bridge.index('export function linkScheme')]
+        self.assertEqual(set(re.findall(r'"([a-z]+)"', ui_body)), remctl_runtime.BLOCKED_LINK_SCHEMES)
+
     @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"), "requires macOS Swift")
     def test_eventkit_keeps_advanced_rule_fields(self):
         source = (Path(__file__).resolve().parents[1] / "remctl-bridge.swift").read_text()
@@ -163,6 +182,12 @@ static void fake_freeaddrinfo(struct addrinfo *value) {}
 int main(void) {
     @autoreleasepool {
         assert(looksLikeWebURL(@"https://example.com/"));
+        assert(looksLikeRichLinkURL(@"obsidian://open?vault=MyVault&file=Notes%2FSome%20note"));
+        assert(looksLikeRichLinkURL(@"things:///show?id=today"));
+        assert(looksLikeRichLinkURL(@"shortcuts://"));
+        for (NSString *url in @[@"file:///etc/hosts", @"JavaScript:alert(1)", @"smb://nas.local/share", @"obsidian:", @"https://198.18.0.1/"]) {
+            assert(!looksLikeRichLinkURL(url));
+        }
         for (NSString *url in @[@"https://198.18.0.1/", @"https://198.18.0.1./", @"https://0xc6120001./", @"http://localhost./", @"https://[::ffff:198.18.0.1]/", @"https://[::ffff:c612:1]/", @"https://[::ffff:127.0.0.1]/"]) {
             assert(!looksLikeWebURL(url));
         }
