@@ -867,7 +867,12 @@ case "update":
         try store.save(reminder, commit: true)
         output(["status": "updated", "id": reminder.calendarItemIdentifier])
     } catch {
-        fail("Update failed: \(error.localizedDescription)")
+        let saveError = error as NSError
+        output([
+            "status": "error", "message": "Update failed: \(error.localizedDescription)",
+            "errorDomain": saveError.domain, "errorCode": saveError.code,
+        ])
+        exit(1)
     }
 
 case "delete":

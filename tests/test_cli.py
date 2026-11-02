@@ -7654,7 +7654,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue().strip(), "Nothing to update.")
 
     def test_cmd_edit_moves_reminder_to_list_through_eventkit_bridge(self):
-        reminder = self._FAKE_REMINDER
+        reminder = {**self._FAKE_REMINDER, "Z_PK": 1}
         args = SimpleNamespace(
             id=1, json=True, title=None, list="Projects", list_id=None,
             notes=None, priority=None, due=None, url=None, recurrence=None,
@@ -7667,6 +7667,7 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_subtasks_for_parent", return_value=[]),
             mock.patch.object(
                 self.remctl,
                 "resolve_required_list_target_or_die",
@@ -7692,7 +7693,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["list"], "Projects")
 
     def test_cmd_edit_moves_by_list_id_and_reports_resolved_list(self):
-        reminder = self._FAKE_REMINDER
+        reminder = {**self._FAKE_REMINDER, "Z_PK": 1}
         args = SimpleNamespace(
             id=1, json=True, title=None, list=None, list_id=9,
             notes=None, priority=None, due=None, url=None, recurrence=None,
@@ -7705,6 +7706,7 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_subtasks_for_parent", return_value=[]),
             mock.patch.object(
                 self.remctl,
                 "resolve_required_list_target_or_die",
@@ -7813,7 +7815,7 @@ class CliTests(unittest.TestCase):
 
         clone_move.assert_not_called()
         bridge_call.assert_not_called()
-        self.assertIn("cannot currently be combined with other edits", stderr.getvalue())
+        self.assertEqual(json.loads(stderr.getvalue())["code"], "list_move_requires_separate_edit")
 
     def test_cmd_edit_clone_deletes_ordinary_list_move_after_container_rejection(self):
         reminder = dict(self._FAKE_REMINDER)
@@ -7948,7 +7950,7 @@ class CliTests(unittest.TestCase):
             self.remctl.cmd_edit(args)
 
         clone_move.assert_not_called()
-        self.assertIn("remctl-bridge failed while trying to edit the reminder", stderr.getvalue())
+        self.assertEqual(json.loads(stderr.getvalue())["code"], "list_move_requires_separate_edit")
 
     def test_cmd_edit_does_not_clone_ordinary_move_for_generic_bridge_error(self):
         reminder = dict(self._FAKE_REMINDER)
@@ -7995,9 +7997,10 @@ class CliTests(unittest.TestCase):
             "list_name": "Inbox",
         }
         target = {"id": 9, "title": "Projects", "objectUUID": "TARGET-LIST"}
-        new_row = {"Z_PK": 42, "ZLIST": 9, "ZCKIDENTIFIER": "NEW-REMINDER"}
+        new_row = {**reminder, "Z_PK": 42, "ZLIST": 9, "ZCKIDENTIFIER": "NEW-REMINDER"}
         with (
             mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "q_rich_links", return_value=[]),
             mock.patch.object(
                 self.remctl,
                 "private_call",
@@ -8017,8 +8020,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["id"], 42)
         self.assertEqual(result["oldId"], 1)
         self.assertEqual(result["subtasksMoved"], 0)
-        # The cloned row is read back before Reminders has filled in its title,
-        # so the move result falls back to the source reminder's title.
         self.assertEqual(result["title"], "Move me")
 
     def test_emit_clone_delete_move_result_json_echoes_title(self):
@@ -8041,7 +8042,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["title"], "Move me")
 
     def test_cmd_edit_resolves_private_section_against_destination_list(self):
-        reminder = self._FAKE_REMINDER
+        reminder = {**self._FAKE_REMINDER, "Z_PK": 1}
         args = SimpleNamespace(
             id=1, json=True, title=None, list="Projects", list_id=None,
             notes=None, priority=None, due=None, url=None, recurrence=None,
@@ -8054,6 +8055,7 @@ class CliTests(unittest.TestCase):
         with (
             mock.patch.object(self.remctl, "open_db", return_value=object()),
             mock.patch.object(self.remctl, "q_reminder", return_value=reminder),
+            mock.patch.object(self.remctl, "q_subtasks_for_parent", return_value=[]),
             mock.patch.object(
                 self.remctl,
                 "resolve_required_list_target_or_die",

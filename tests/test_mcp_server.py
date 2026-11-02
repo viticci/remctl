@@ -119,7 +119,8 @@ class CatalogTests(unittest.TestCase):
             (("get_reminder", (("reminder_id", 42),)), ["info", "42", "--json"]),
             (("create_reminder", (("title", "-Leading dash"), ("list", "Work"), ("due", "tomorrow 09:30"), ("priority", "high"), ("flagged", True))), ["add", "--list", "Work", "--due", "tomorrow 09:30", "--priority", "high", "--flag", "--json", "--", "-Leading dash"]),
             (("create_reminder", (("title", "Call Bo"), ("notes", "-> ask about Friday"))), ["add", "--notes=-> ask about Friday", "--json", "--", "Call Bo"]),
-            (("update_reminder", (("reminder_id", 7), ("due", "clear"), ("list_id", 9))), ["edit", "7", "--list-id", "9", "--due", "clear", "--json"]),
+            (("update_reminder", (("reminder_id", 7), ("due", "clear"))), ["edit", "7", "--due", "clear", "--json"]),
+            (("move_to_list", (("reminder_id", 7), ("list_id", 9), ("confirm", True))), ["edit", "7", "--list-id", "9", "--json"]),
             (("update_reminder", (("reminder_id", 7), ("title", "-Renamed"), ("alarm", "-15m"))), ["edit", "7", "--title=-Renamed", "--alarm=-15m", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", True), ("completion_date", "2026-09-01"))), ["done", "7", "--date", "2026-09-01", "--json"]),
             (("set_completion", (("reminder_id", 7), ("completed", False))), ["undone", "7", "--json"]),
@@ -154,6 +155,8 @@ class CatalogTests(unittest.TestCase):
                 sample = {"list": "Work"}
             if tool.name in {"set_completion", "delete_reminder"}:
                 sample["reminder_id"] = 5
+            if tool.name == "move_to_list":
+                sample["list"] = "Work"
             if tool.name == "restore_reminder":
                 sample.update(list="Work", private=True)
             if tool.name == "update_list":
