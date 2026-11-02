@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.5.0 — 2026-11-02
+
+### New
+
+- Rich links can open apps. `--private --url`, subtask `url`/`urls`, and MCP `url` accept app links such as `obsidian://open?vault=Notes&file=Plan`, which Reminders shows as a link and opens in that app. Web links still need a public `http` or `https` host. `file:`, `javascript:`, `data:`, and file-server schemes such as `smb:` stay refused. The Codex workspace shows app links and opens them through the host. Thanks to @rayshan ([#76](https://github.com/viticci/remctl/issues/76)).
+- `lists --json` reports each list's `sharingStatus`.
+
+### Fixes
+
+- Moving a reminder into a shared list failed with ReminderKit error `-3002`. RemCTL now copies it into the shared list with its subtasks and deletes the original only after the copy's fields, rich links, and subtasks read back the same. A move EventKit rejects with `-3002`, such as one out of a shared list, takes the same route. If the copy doesn't match, `list_move_copy_unverified` keeps the original. A copying move can't be combined with other edits and returns `list_move_requires_separate_edit`. Thanks to @oliverames ([#77](https://github.com/viticci/remctl/pull/77)).
+- The Codex workspace fills tall and portrait windows instead of stopping at 1,200 pixels and leaving empty space below the list. Thanks to @jrn4z6vmwj-a11y ([#78](https://github.com/viticci/remctl/issues/78)).
+
 ## 2.4.0 — 2026-10-23
 
 ### New

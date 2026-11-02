@@ -6,7 +6,7 @@ import {
 import { OpenAIExtensions } from "@openai/mcp-extensions/app";
 import contextIcon from "../../assets/remctl-context-icon.png";
 export const app = new App(
-  { name: "RemCTL", version: "2.2.1" },
+  { name: "RemCTL", version: "2.5.0" },
   {},
   { autoResize: true },
 );
