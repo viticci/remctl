@@ -128,7 +128,8 @@ a { color: var(--accent-ink); }
   --composer-space: max(84px, var(--host-safe-bottom, 0px));
   position: relative;
   display: flex;
-  height: 100vh; min-height: 620px; max-height: 1200px;
+  /* Fill whatever height the host gives the workspace, including tall portrait windows. */
+  height: 100vh; min-height: 620px;
   overflow: hidden;
   color: var(--text);
   /* The wash: the list's color in the top leading corner and, fainter, on the
