@@ -10,11 +10,8 @@ import argparse
 from collections.abc import Iterable
 from typing import Any
 
-from remctl_runtime import (
-    HOSTED_COMMANDS,
-    LOCAL_COMMANDS,
-    capability_host_command_scope,
-)
+import remctl_runtime
+from remctl_runtime import capability_host_command_scope
 
 
 PROTOCOL_VERSION = 2
@@ -69,6 +66,10 @@ def validate_command_scope(parser: argparse.ArgumentParser) -> dict[str, list[st
     """Require every real parser command to be classified exactly once."""
 
     parser_commands = _parser_commands(parser)
+    # Read the sets at call time: optional extensions register their commands
+    # with remctl_runtime.register_extension_commands() after import.
+    LOCAL_COMMANDS = remctl_runtime.LOCAL_COMMANDS
+    HOSTED_COMMANDS = remctl_runtime.HOSTED_COMMANDS
     overlap = LOCAL_COMMANDS & HOSTED_COMMANDS
     missing = parser_commands - LOCAL_COMMANDS - HOSTED_COMMANDS
     stale = (LOCAL_COMMANDS | HOSTED_COMMANDS) - parser_commands
