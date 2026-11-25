@@ -10,7 +10,7 @@
       ],
       "env": {
         "REMCTL_PLUGIN": "1",
-        "REMCTL_PLUGIN_BUILD": "3b649899f6b989ad"
+        "REMCTL_PLUGIN_BUILD": "e080a0a3ff93130f"
       }
     }
   }
