@@ -59,4 +59,4 @@ Testing ran on Apple silicon with macOS 27.2.1. No Claude or Claude Code session
 
 ## Publication
 
-Not published yet.
+Published on November 25, 2026. The `v2.6.0` tag points to commit `59ee361`, which adds the release notes, this validation, and one changelog sentence on top of the build commit `bdb2519`; the disk image was built from `bdb2519`. The [public release](https://github.com/viticci/remctl/releases/tag/v2.6.0) is the latest release, not a draft or prerelease. Both assets were downloaded without authentication through the `latest` URL: the disk image's bytes, GitHub's asset digest, and SHA-256 (`c8753a127044ef7230138fe8dab472ef3fd927d74fa7aac583c999b54b1bf6a1`) match the verified build, its stapled ticket validates, and a quarantined copy passes Gatekeeper as Notarized Developer ID. `scripts/download_release.sh --dry-run` also verified it.
