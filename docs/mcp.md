@@ -196,9 +196,21 @@ Notes:
 
 Every tool descriptor has `title`, `description`, an `inputSchema` with `additionalProperties: false`, an `outputSchema` where the shape is fixed, and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`, which is true only for `resolve_location`).
 
-Errors use the two channels the specification defines. A malformed request or an unknown tool is a JSON-RPC error (`-32602`). A tool that ran but failed returns `isError: true` with `structuredContent.error`. When RemCTL emitted a structured error on stderr, for example `invalid_due_date` or `confirmation_required`, that object is passed through so the model can correct the call. A write tool that times out returns `timeout` with `outcome: "unknown"`, because the change may already be saved: read the reminder before trying again.
+Errors use the two channels the specification defines. A malformed request or an unknown tool is a JSON-RPC error (`-32602`). A tool that ran but failed returns `isError: true` with `structuredContent.error`. When RemCTL emitted a structured error on stderr, for example `invalid_due_date` or `confirmation_required`, that object is passed through so the model can correct the call. A write tool that times out returns `timeout` with `outcome: "unknown"`, because the change may already be saved: read the reminder, or the list with `lists` or `get_list`, before trying again.
 
 Two prompts are included: `daily_review` and `plan_week`.
+
+## The skill
+
+The server also serves a skill, a guide that teaches an AI app how to use these tools well, through the [Skills extension](https://modelcontextprotocol.io/extensions/skills/overview) (`io.modelcontextprotocol/skills`). The server instructions are one paragraph. The skill covers what they can't: planning a day, quick capture, triaging overdue reminders, deleting and restoring safely, when `private: true` is needed, and what to do after an uncertain result.
+
+- There is one skill, `reminders`, made of one file: `skill://reminders/SKILL.md`, served as `text/markdown`.
+- `skills/list` and `skills/get` return its frontmatter plus the file's SHA-256 digest and size. `resources/read` returns the file. All three results carry `ttlMs` and `cacheScope: "public"`. An unknown skill URI is `-32602`.
+- Only 2026-07-28 clients see it. A legacy `initialize` session gets no Skills capability, and `skills/list` and `skills/get` answer `-32601`.
+- The file is not in `resources/list`. Plugin mode serves the same skill.
+- Claude Code lists it as `remctl:reminders` under `/skills`, in interactive sessions.
+
+The skill's text lives in `remctl_mcp.py` (`REMINDERS_SKILL_BODY`), so a release ships it with no extra file. It is separate from the Codex plugin's skills and from the repository's `SKILL.md`, which also covers the command line and setup.
 
 ## The widget
 
@@ -230,7 +242,7 @@ The server follows the [2026-07-28 versioning rules](https://modelcontextprotoco
 
 **Modern (2026-07-28).** Every request carries `_meta["io.modelcontextprotocol/protocolVersion"]` and `_meta["io.modelcontextprotocol/clientCapabilities"]`. `server/discover` returns the supported versions, capabilities, instructions, and server identity. Every result has `resultType: "complete"` and `_meta["io.modelcontextprotocol/serverInfo"]`. List and read results carry `ttlMs` and `cacheScope`. A request naming another version gets `UnsupportedProtocolVersionError` (`-32022`) with the supported list. A 2026-07-28 request missing one of the two required fields gets `-32602` with the same list. A modern `initialize` is refused with `-32601` and the supported versions.
 
-**Legacy (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05).** `initialize` echoes a requested version from that list, or answers `2025-11-25`. Results omit the modern fields. A missing resource is `-32002`, as those revisions expect. JSON-RPC batches are accepted.
+**Legacy (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05).** `initialize` echoes a requested version from that list, or answers `2025-11-25`. Results omit the modern fields, and the [skill](#the-skill) is not offered. A missing resource is `-32002`, as those revisions expect. JSON-RPC batches are accepted.
 
 **stdio.** One JSON-RPC message per line. Requests are served concurrently by a small worker pool, so a slow tool call never blocks `ping`. `notifications/cancelled` terminates the tool's subprocess. The process exits when stdin closes.
 

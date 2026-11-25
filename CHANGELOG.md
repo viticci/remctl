@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- The MCP server serves a `reminders` skill through the [Skills extension](https://modelcontextprotocol.io/extensions/skills/overview) (`io.modelcontextprotocol/skills`) to clients on MCP revision 2026-07-28. It teaches an AI app how to plan a day, capture quickly, triage overdue reminders, delete and restore safely, when `private: true` is needed, and what to check after an uncertain result. Claude Code shows it as `remctl:reminders`. Clients on older revisions see no change.
+
+### Fixes
+
+- When `create_list` or `update_list` times out, its hint now says to read the list back with `lists` or `get_list`. It used to point at `search` and `get_reminder`, which never show lists, so an AI app could create the list twice.
+
 ## 2.5.0 — 2026-11-02
 
 ### New

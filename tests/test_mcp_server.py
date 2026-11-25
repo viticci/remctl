@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import html.parser
 import io
 import json
@@ -366,6 +367,96 @@ class ModernProtocolTests(unittest.TestCase):
         unknown = request(server, "prompts/get", {"_meta": modern_meta(), "name": "nope"})
         self.assertEqual(unknown["error"]["code"], remctl_mcp.ERR_INVALID_PARAMS)
 
+    def test_skills_extension_serves_the_reminders_skill_in_both_modes(self):
+        uri = "skill://reminders/SKILL.md"
+        source = remctl_mcp.REMINDERS_SKILL_MD.encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            for plugin in ("0", "1"):
+                with self.subTest(plugin=plugin), mock.patch.dict(os.environ, {"REMCTL_PLUGIN": plugin, "REMCTL_CONFIG_DIR": tmp}):
+                    server, executor = make_server()
+                    capabilities = request(server, "server/discover", {"_meta": modern_meta()})["result"]["capabilities"]
+                    self.assertEqual(capabilities["extensions"][remctl_mcp.SKILLS_EXTENSION_ID], {})
+                    self.assertIn(remctl_mcp.UI_EXTENSION_ID, capabilities["extensions"])
+                    self.assertIn("resources", capabilities)
+
+                    listed = request(server, "skills/list", {"_meta": modern_meta()})["result"]
+                    self.assertEqual((listed["resultType"], listed["ttlMs"], listed["cacheScope"]), ("complete", remctl_mcp.LIST_TTL_MS, "public"))
+                    self.assertNotIn("nextCursor", listed)
+                    (entry,) = listed["skills"]
+                    self.assertEqual(entry["uri"], uri)
+                    self.assertEqual(entry["resources"], [{"uri": uri, "digest": "sha256:" + hashlib.sha256(source).hexdigest(), "size": len(source)}])
+                    got = request(server, "skills/get", {"_meta": modern_meta(), "uri": uri})["result"]
+                    self.assertEqual((got["skill"], got["cacheScope"]), (entry, "public"))
+
+                    read = request(server, "resources/read", {"_meta": modern_meta(), "uri": uri})["result"]
+                    self.assertEqual(read["contents"], [{"uri": uri, "mimeType": "text/markdown", "text": remctl_mcp.REMINDERS_SKILL_MD}])
+                    self.assertEqual((read["ttlMs"], read["cacheScope"]), (remctl_mcp.LIST_TTL_MS, "public"))
+                    self.assertEqual(executor.calls, [])
+
+        # The served file's frontmatter is the listed one, in plain YAML scalars a host can parse.
+        header, body = remctl_mcp.REMINDERS_SKILL_MD.removeprefix("---\n").split("\n---\n", 1)
+        self.assertEqual(dict(line.split(": ", 1) for line in header.splitlines()), entry["frontmatter"])
+        self.assertEqual(entry["frontmatter"]["name"], "reminders")
+        self.assertNotRegex(entry["frontmatter"]["description"], r": | #")
+        self.assertTrue(body.strip())
+
+    def test_unknown_skill_uris_are_invalid_params(self):
+        server, _ = make_server()
+        missing = request(server, "skills/get", {"_meta": modern_meta(), "uri": "skill://nope/SKILL.md"})
+        self.assertEqual(missing["error"]["code"], remctl_mcp.ERR_INVALID_PARAMS)
+        self.assertEqual(missing["error"]["data"], {"uri": "skill://nope/SKILL.md"})
+        self.assertEqual(request(server, "skills/get", {"_meta": modern_meta()})["error"]["code"], remctl_mcp.ERR_INVALID_PARAMS)
+        for uri in ("skill://nope/SKILL.md", "skill://reminders/references/nope.md"):
+            with self.subTest(uri=uri):
+                response = request(server, "resources/read", {"_meta": modern_meta(), "uri": uri})
+                self.assertEqual(response["error"]["code"], remctl_mcp.ERR_INVALID_PARAMS)
+
+    def test_skill_text_names_real_tools_and_their_arguments(self):
+        """Every name the skill puts in backticks is a real tool, a real argument, or a word RemCTL emits.
+
+        A tool name must be in TOOLS, never a plugin-only tool. An argument name (any tool's, or one
+        written `name: value`) belongs to the nearest tools named before it in the same sentence, or
+        after it when none come before, and every one of them must take it: tools named together, as
+        in "`a` or `b`", all must. With no tool in the sentence, some tool must take it. Any other word,
+        such as a result field or an error code, must start a string literal in RemCTL's source. This
+        checks names only: it can't tell a result field from an argument with the same name, and it
+        checks no values and nothing a tool returns.
+        """
+        schemas = {tool.name: set(tool.input_schema()["properties"]) for tool in remctl_mcp.TOOLS}
+        arguments = set().union(*schemas.values())
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REMCTL_PLUGIN": "1", "REMCTL_CONFIG_DIR": tmp}):
+            server, _ = make_server()
+            plugin_only = {tool["name"] for tool in request(server, "tools/list", {"_meta": modern_meta()})["result"]["tools"]} - set(schemas)
+        self.assertTrue(plugin_only)
+        source = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "remctl", *sorted(ROOT.glob("remctl_*.py"))))
+        problems = []
+        for line in remctl_mcp.REMINDERS_SKILL_BODY.splitlines():
+            for sentence in re.split(r"(?<=[.!?])\s+", line):
+                names = [(span.start(), match.group(1)) for span in re.finditer(r"`([^`]+)`", sentence)
+                         if (match := re.fullmatch(r"([a-z][A-Za-z0-9_]*)(?:: .+)?", span.group(1)))]
+                groups = []  # [start, end, tools] for tools named together
+                for at, name in names:
+                    if name not in schemas:
+                        continue
+                    if groups and re.fullmatch(r",? (?:or |and )?", sentence[groups[-1][1]:at]):
+                        groups[-1][1:] = [at + len(name) + 2, groups[-1][2] + [name]]
+                    else:
+                        groups.append([at, at + len(name) + 2, [name]])
+                for at, name in names:
+                    if name in schemas:
+                        continue
+                    if name in arguments:
+                        before = [tools for start, _, tools in groups if start < at]
+                        after = [tools for start, _, tools in groups if start > at]
+                        for owner in (before[-1] if before else after[0] if after else []):
+                            if name not in schemas[owner]:
+                                problems.append(f"{owner} has no argument {name}: {sentence}")
+                    elif name in plugin_only:
+                        problems.append(f"{name} is a plugin-only tool: {sentence}")
+                    elif not re.search(rf"[\"']{re.escape(name)}\b", source):
+                        problems.append(f"{name} is not a tool, an argument, or a word in RemCTL's source: {sentence}")
+        self.assertEqual(problems, [])
+
 
 class LegacyProtocolTests(unittest.TestCase):
     def test_initialize_negotiates_known_versions_and_falls_back_to_latest_legacy(self):
@@ -405,6 +496,17 @@ class LegacyProtocolTests(unittest.TestCase):
         meta = request(server, "tools/list", {})["result"]["tools"][0]["_meta"]
         self.assertEqual(meta["ui"]["resourceUri"], remctl_mcp.UI_RESOURCE_URI)
         self.assertEqual([r["uri"] for r in request(server, "resources/list", {})["result"]["resources"]], [remctl_mcp.UI_RESOURCE_URI])
+
+    def test_legacy_sessions_see_no_skills(self):
+        server, _ = make_server()
+        result = request(server, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {}})["result"]
+        self.assertNotIn(remctl_mcp.SKILLS_EXTENSION_ID, result["capabilities"]["extensions"])
+        for method in ("skills/list", "skills/get"):
+            with self.subTest(method=method):
+                response = request(server, method, {"uri": remctl_mcp.REMINDERS_SKILL_URI})
+                self.assertEqual(response["error"]["code"], remctl_mcp.ERR_METHOD_NOT_FOUND)
+        response = request(server, "resources/read", {"uri": remctl_mcp.REMINDERS_SKILL_URI})
+        self.assertEqual(response["error"]["code"], remctl_mcp.ERR_LEGACY_RESOURCE_NOT_FOUND)
 
     def test_legacy_resource_not_found_keeps_32002(self):
         server, _ = make_server()
@@ -1353,6 +1455,19 @@ class HTTPTransportTests(unittest.TestCase):
         discover = {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": modern_meta()}}
         status, _, payload = http_call(self.port, body=discover, headers={**self.MODERN_HEADERS, "Mcp-Method": "server/discover"})
         self.assertEqual(payload["result"]["supportedVersions"], [MODERN])
+
+    def test_skills_need_mcp_name_only_to_read_the_file(self):
+        uri = remctl_mcp.REMINDERS_SKILL_URI
+        for method, params in (("skills/list", {}), ("skills/get", {"uri": uri})):
+            with self.subTest(method=method):
+                body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {"_meta": modern_meta(), **params}}
+                status, _, payload = http_call(self.port, body=body, headers={**self.MODERN_HEADERS, "Mcp-Method": method})
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(payload["result"]["resultType"], "complete")
+        read = {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"_meta": modern_meta(), "uri": uri}}
+        status, _, payload = http_call(self.port, body=read, headers={**self.MODERN_HEADERS, "Mcp-Method": "resources/read", "Mcp-Name": uri})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["contents"][0]["text"], remctl_mcp.REMINDERS_SKILL_MD)
 
     def test_legacy_sessions_are_minted_validated_and_deletable(self):
         init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": APPS_CAPS, "clientInfo": {"name": "t", "version": "1"}}}

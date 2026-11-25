@@ -77,7 +77,7 @@ remctl mcp bundle --open                    # or install it as a one-click Claud
 remctl mcp status
 ```
 
-AI apps can read, create, edit, complete, and delete reminders and lists, search with paging, and restore reminders from Recently Deleted. Apps that support MCP Apps also get an interactive reminders widget. To use RemCTL from Claude Code, Codex, or Claude Desktop on another computer, `remctl mcp install --client tailscale` serves the same tools over your private Tailscale network.
+AI apps can read, create, edit, complete, and delete reminders and lists, search with paging, and restore reminders from Recently Deleted. Apps that support MCP Apps also get an interactive reminders widget, and apps on MCP revision 2026-07-28 get a `reminders` skill that teaches them how to use the tools. To use RemCTL from Claude Code, Codex, or Claude Desktop on another computer, `remctl mcp install --client tailscale` serves the same tools over your private Tailscale network.
 
 The [MCP guide](docs/mcp.md) has the full tool list and troubleshooting. There's also a guide for [Hermes Agent](docs/hermes.md).
 

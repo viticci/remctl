@@ -223,6 +223,8 @@ class ResultTests(unittest.TestCase):
         result = call(server, "create_reminder", {"title": "x"})
         self.assertTrue(result["isError"])
         self.assertEqual(result["structuredContent"]["error"]["outcome"], "unknown")
+        # search and get_reminder never show lists, so a list write points at lists / get_list.
+        self.assertIn("(lists / get_list)", call(server, "create_list", {"name": "x"})["structuredContent"]["error"]["hint"])
         result = call(server, "search", {"query": "x"})
         self.assertNotIn("outcome", result["structuredContent"]["error"])
 
