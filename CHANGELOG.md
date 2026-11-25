@@ -4,7 +4,7 @@
 
 ### New
 
-- The MCP server serves a `reminders` skill through the [Skills extension](https://modelcontextprotocol.io/extensions/skills/overview) (`io.modelcontextprotocol/skills`) to clients on MCP revision 2026-07-28. It teaches an AI app how to plan a day, capture quickly, triage overdue reminders, delete and restore safely, when `private: true` is needed, and what to check after an uncertain result. Claude Code shows it as `remctl:reminders`. Clients on older revisions see no change.
+- The MCP server serves a `reminders` skill through the [Skills extension](https://modelcontextprotocol.io/extensions/skills/overview) (`io.modelcontextprotocol/skills`) to clients on MCP revision 2026-07-28. It teaches an AI app how to plan a day, capture quickly, triage overdue reminders, delete and restore safely, when `private: true` is needed, and what to check after an uncertain result. Claude and Claude Code show it as `remctl:reminders` once Anthropic's skills over MCP beta is on for the account. Clients on older revisions see no change.
 
 ### Fixes
 
