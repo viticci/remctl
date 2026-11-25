@@ -153,7 +153,7 @@ bin_owned() {
     "$UNINSTALL_PYTHON" -B -I -S - "$bin_dir" <<'PY'
 import hashlib,json,os,stat,sys
 root=sys.argv[1]; manifest=os.path.join(root,".remctl-install-manifest.json")
-managed={"remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py","remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_workspace.html","remctl-list-symbols.json","remctl-list-artwork","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png",".remctl-capability-host-app",".remctl-capability-host-signing-identity","completions/_remctl","completions/_rctl","completions/_reminders","rctl","reminders"}
+managed={"remctl","remctl_runtime.py","remctl_images.py","remctl_serialization.py","remctl_smart_lists.py","remctl_broker.py","remctl_capability_policy.py","remctl_capabilities.py","remctl_mcp.py","remctl_events.py","remctl_workspace.py","remctl_plugin.py","remctl_accounts.py","remctl_workspace.html","remctl-list-symbols.json","remctl-list-artwork","remctl_mcp_widget.html","remctl-mcp-icon.png","remctl-mcp-icon-512.png","remctl-bridge","remctl-private","remctl-permissions","remctl-permissions-icon.png",".remctl-capability-host-app",".remctl-capability-host-signing-identity","completions/_remctl","completions/_rctl","completions/_reminders","rctl","reminders"}
 def present(): return {n for n in managed if os.path.lexists(os.path.join(root,n))}
 def match(name,item):
  p=os.path.join(root,name)
@@ -238,7 +238,7 @@ PY
 
 FILES=(
     remctl remctl_runtime.py remctl_images.py remctl_serialization.py remctl_smart_lists.py
-    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_workspace.html remctl-list-symbols.json remctl-list-artwork remctl_mcp_widget.html
+    remctl_broker.py remctl_capability_policy.py remctl_capabilities.py remctl_mcp.py remctl_events.py remctl_workspace.py remctl_plugin.py remctl_accounts.py remctl_workspace.html remctl-list-symbols.json remctl-list-artwork remctl_mcp_widget.html
     remctl-mcp-icon.png remctl-mcp-icon-512.png
     remctl-bridge remctl-private remctl-permissions remctl-permissions-icon.png
     .remctl-capability-host-app .remctl-capability-host-signing-identity
@@ -369,7 +369,7 @@ for bin_dir in "${BIN_DIRS[@]}"; do
         case "$name" in rctl|reminders|.remctl-install-manifest.json) continue ;; esac
         remove_file "$bin_dir/$name"
     done
-    for module in remctl_runtime remctl_images remctl_serialization remctl_smart_lists remctl_broker remctl_capability_policy remctl_capabilities remctl_mcp remctl_workspace remctl_plugin; do
+    for module in remctl_runtime remctl_images remctl_serialization remctl_smart_lists remctl_broker remctl_capability_policy remctl_capabilities remctl_mcp remctl_workspace remctl_plugin remctl_accounts; do
         for cache_path in "$bin_dir/__pycache__/${module}.cpython-"*.pyc; do
             [[ -e "$cache_path" || -L "$cache_path" ]] && remove_file "$cache_path"
         done
