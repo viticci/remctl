@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import plistlib
 from datetime import datetime, timezone
 
 
@@ -33,6 +34,33 @@ ALARM_ENTITY = ("REMCDAlarm", 15)
 ASSIGNMENT_ENTITY = ("REMCDAssignment", 21)
 RECURRENCE_RULE_ENTITY = ("REMCDRecurrenceRule", 34)
 SHAREE_ENTITY = ("REMCDSharee", 36)
+
+
+def decode_contact_handles(blob):
+    """Decode ZCONTACTHANDLES, the keyed archive behind "When Messaging a Person".
+
+    Returns {"phones": [...], "emails": [...]}, or None when the reminder has no
+    trigger or the archive isn't a REMContactRepresentation RemCTL can read.
+    """
+    if not blob:
+        return None
+    try:
+        archive = plistlib.loads(bytes(blob))
+        objects = archive["$objects"]
+        root = objects[archive["$top"]["root"].data]
+
+        def strings(key):
+            reference = root.get(key)
+            if not isinstance(reference, plistlib.UID):
+                return []
+            array = objects[reference.data]
+            values = [objects[item.data] for item in array.get("NS.objects", []) if isinstance(item, plistlib.UID)]
+            return [value for value in values if isinstance(value, str) and value]
+
+        handles = {"phones": strings("phones"), "emails": strings("emails")}
+    except (plistlib.InvalidFileException, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return handles if handles["phones"] or handles["emails"] else None
 
 
 def core_data_entity(db, entity):

@@ -10067,11 +10067,145 @@ class CliTests(unittest.TestCase):
         finally:
             db.close()
 
+    def _apply_board_change(self, db, **overrides):
+        """Run apply_private_changes with protocol 5; remove and create writes update the stored memberships."""
+        args = self._private_edit_args(**overrides)
+        memberships = {1: [], 2: []}
+
+        def write(payload, partial_context=None):
+            action = payload["action"]
+            if action in ("remove_from_section", "remove_from_smart_list_section"):
+                pk = 2 if action == "remove_from_smart_list_section" else 1
+                # Reminders' own "Move to Section > None" leaves an entry with no groupID.
+                memberships[pk].append({"memberID": payload["id"], "modifiedOn": 300})
+            if action == "add_smart_list_section_and_assign":
+                db.execute(
+                    "INSERT INTO ZREMCDBASESECTION (Z_PK, ZDISPLAYNAME, ZSMARTLIST, ZCKIDENTIFIER, ZMARKEDFORDELETION) "
+                    "VALUES (40, ?, 2, 'FOCUS-NEW', 0)", (payload["name"],),
+                )
+                memberships[2].append({"memberID": payload["id"], "groupID": "FOCUS-NEW", "isObsolete": False, "modifiedOn": 300})
+                result = {"status": "updated", "sectionId": "FOCUS-NEW"}
+            else:
+                result = {"status": "updated"}
+            for pk, entries in memberships.items():
+                if entries:
+                    current = json.loads(db.execute(
+                        "SELECT ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA FROM ZREMCDBASELIST WHERE Z_PK = ?", (pk,)
+                    ).fetchone()[0] or '{"memberships": []}')
+                    current["memberships"] += entries
+                    db.execute("UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = ?",
+                               (json.dumps(current), pk))
+                    entries.clear()
+            return result
+
+        result = None
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 5}),
+            mock.patch.object(self.remctl, "private_action", side_effect=write) as private_action,
+            mock.patch.object(self.remctl, "_read_fresh_db_value", side_effect=lambda reader: reader(db)),
+            mock.patch.object(self.remctl.time, "sleep"),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            try:
+                self.remctl.validate_private_args(args)
+                result = self.remctl.apply_private_changes("REM-1", args, db=db, list_pk=1)
+            except SystemExit:
+                pass
+        return private_action, stderr.getvalue(), result
+
+    def test_no_section_marks_the_current_membership_obsolete_and_reads_it_back(self):
+        # Issue #81: leaving a section, in the reminder's list or in a custom smart list.
+        db = self._smart_list_section_db()
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 1",
+            (json.dumps({"memberships": [{"memberID": "REM-1", "groupID": "SECTION-1", "isObsolete": False, "modifiedOn": 100}]}),),
+        )
+        self._set_smart_list_membership(db, "REM-1", [
+            {"memberID": "REM-1", "groupID": "FOCUS-NEXT", "isObsolete": False, "modifiedOn": 100}
+        ])
+        try:
+            in_list, _, list_result = self._apply_board_change(db, no_section=True)
+            in_smart, _, smart_result = self._apply_board_change(db, no_section=True, smart_list="Focus")
+            again, _, again_result = self._apply_board_change(db, no_section=True)
+            self.assertIsNone(self.remctl.q_reminder_section_ckid(db, 1, "REM-1"))
+            self.assertEqual(self.remctl.q_smart_list_section_entries(db), {})
+        finally:
+            db.close()
+
+        in_list.assert_called_once_with(
+            {"action": "remove_from_section", "id": "REM-1", "sectionId": "SECTION-1"}, partial_context=None
+        )
+        in_smart.assert_called_once_with(
+            {"action": "remove_from_smart_list_section", "smartListId": "SMART-FOCUS", "id": "REM-1", "sectionId": "FOCUS-NEXT"},
+            partial_context=None,
+        )
+        self.assertEqual(list_result[0]["verified"], True)
+        self.assertEqual(smart_result[0]["previousSectionId"], "FOCUS-NEXT")
+        again.assert_not_called()
+        self.assertEqual(again_result[0]["reason"], "not_in_section")
+
+    def test_new_section_in_a_smart_list_is_created_after_its_others_and_verified(self):
+        db = self._smart_list_section_db()
+        try:
+            private_action, _, result = self._apply_board_change(db, smart_list="Focus", new_section="Doing")
+            entries = self.remctl.q_smart_list_section_entries(db)
+        finally:
+            db.close()
+
+        private_action.assert_called_once_with({
+            "action": "add_smart_list_section_and_assign", "id": "REM-1", "name": "Doing",
+            "smartListId": "SMART-FOCUS", "existingSectionIds": ["FOCUS-NEXT", "FOCUS-LATER"],
+        }, partial_context=None)
+        self.assertEqual(result[0]["verified"], True)
+        self.assertEqual(entries, {"rem-1": [
+            {"smartListId": 2, "smartList": "Focus", "sectionId": "FOCUS-NEW", "section": "Doing"}
+        ]})
+
+    def test_set_url_and_clear_urls_replace_every_rich_link(self):
+        # Issue #79.
+        db = self._smart_list_section_db()
+        try:
+            replaced, _, _ = self._apply_board_change(db, set_url="obsidian://open?vault=V&file=New")
+            cleared, _, _ = self._apply_board_change(db, clear_urls=True)
+            refused, err, _ = self._apply_board_change(db, url="https://example.com", set_url="https://example.org")
+        finally:
+            db.close()
+        replaced.assert_called_once_with(
+            {"action": "set_url_attachments", "id": "REM-1", "urls": ["obsidian://open?vault=V&file=New"]}, partial_context=None
+        )
+        cleared.assert_called_once_with({"action": "set_url_attachments", "id": "REM-1", "urls": []}, partial_context=None)
+        refused.assert_not_called()
+        self.assertIn("can't be combined with --set-url", err)
+
+    def test_board_changes_need_protocol_5(self):
+        args = self._private_edit_args(clear_urls=True)
+        with (
+            mock.patch.object(self.remctl, "private_available", return_value=True),
+            mock.patch.object(self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 4}),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            self.remctl.validate_private_args(args)
+        self.assertIn("protocol 4 < required 5", stderr.getvalue())
+
+    def test_messaging_contact_takes_phones_and_emails_only(self):
+        # Issue #83.
+        self.assertEqual(
+            self.remctl.parse_messaging_contact(["+39 333 123 4567, sam@example.com", "SAM@example.com"]),
+            ({"phones": ["+39 333 123 4567"], "emails": ["sam@example.com"]}, None),
+        )
+        self.assertEqual(self.remctl.parse_messaging_contact(["Sam Rivera"]), (None, "Sam Rivera"))
+        with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
+            self.remctl.validate_private_args(self._private_edit_args(messaging_contact=["Sam Rivera"]))
+        self.assertIn("takes a phone number or an email address", stderr.getvalue())
+
     def test_smart_list_flag_needs_an_existing_section_flag(self):
         for overrides, message in (
-            ({"smart_list": "Focus"}, "need --section or --section-id"),
+            ({"smart_list": "Focus"}, "need --section, --section-id, --new-section, or --no-section"),
             ({"smart_list": "Focus", "section": "Next", "section_id": "FOCUS-NEXT"}, "not both"),
-            ({"smart_list_id": 2, "section": "Next", "new_section": "Later"}, "cannot be combined with --smart-list"),
+            ({"smart_list_id": 2, "section": "Next", "new_section": "Later"}, "not several"),
+            ({"section": "Next", "no_section": True}, "not several"),
         ):
             with self.subTest(overrides=overrides), contextlib.redirect_stderr(io.StringIO()) as stderr:
                 with self.assertRaises(SystemExit):

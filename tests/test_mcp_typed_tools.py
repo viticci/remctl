@@ -166,6 +166,21 @@ class PrivateOptInTests(unittest.TestCase):
 
         smart = parsed("update_reminder", {"reminder_id": 7, "private": True, "smart_list_id": 170, "section_id": "S-1"})
         self.assertEqual((smart.smart_list_id, smart.section_id), (170, "S-1"))
+
+        # Issues #79, #81, #82, #83: rich-link replacement, leaving a section, smart-list sections, messaging.
+        board = parsed("update_reminder", {
+            "reminder_id": 7, "private": True, "set_url": "obsidian://open?vault=V&file=New", "smart_list": "Board",
+            "no_section": True, "messaging_contact": ["+39 333 123 4567", "sam@example.com"],
+        })
+        self.assertEqual((board.set_url, board.smart_list, board.no_section, board.messaging_contact),
+                         ("obsidian://open?vault=V&file=New", "Board", True, ["+39 333 123 4567", "sam@example.com"]))
+        cleared = parsed("update_reminder", {"reminder_id": 7, "private": True, "clear_urls": True,
+                                             "clear_messaging_contact": True, "smart_list": "Board", "new_section": "Doing"})
+        self.assertEqual((cleared.clear_urls, cleared.clear_messaging_contact, cleared.new_section), (True, True, "Doing"))
+        for conflict in ({"url": "https://example.com", "set_url": "https://example.org"},
+                         {"section": "Next", "no_section": True}):
+            with self.assertRaises(remctl_mcp.ToolArgumentError):
+                argv_for("update_reminder", {"reminder_id": 7, "private": True, **conflict})
         self.assertEqual((edit.latitude, edit.longitude), (37.3349, -122.009))
 
     def test_location_extras_need_a_location(self):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remctl — Power-user Reminders CLI v2.6.0
+"""remctl — Power-user Reminders CLI v2.7.0
 
 Normal installed commands run through the signed RemCTL Capability Host, which
 owns database, Reminders, and Automation access. The client supports Python
@@ -43,6 +43,7 @@ from remctl_serialization import (
     RECURRENCE_RULE_ENTITY,
     SHAREE_ENTITY,
     core_data_entity,
+    decode_contact_handles,
     due_date_delta_alerts_from_row,
     preload_attachments,
     preload_extras,
@@ -67,11 +68,13 @@ try:
 except ImportError:
     _cal = None
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 PRIVATE_PROTOCOL_VERSION = 2
 RECOVERY_PRIVATE_PROTOCOL_VERSION = 3
 SMART_LIST_SECTION_PRIVATE_PROTOCOL_VERSION = 4
 HIERARCHY_PRIVATE_PROTOCOL_VERSION = 4
+# Rich-link replacement, leaving a section, smart-list section creation, and messaging contacts.
+BOARD_PRIVATE_PROTOCOL_VERSION = 5
 _private_protocol_probe = None
 
 MANUAL_SORT_HINT_ENTITY = "REMCDManualSortHint_v1"
@@ -2412,6 +2415,56 @@ def q_section_member_counts(db, list_pk):
         if group:
             counts[group] = counts.get(group, 0) + 1
     return counts
+
+
+def q_smart_list_section_entries(db):
+    """Map each reminder's CloudKit ID (casefolded) to the custom smart-list sections it is in.
+
+    Each custom smart list stores its own section memberships, apart from the reminder's list.
+    """
+    entries = {}
+    try:
+        smart_lists = db.execute(
+            "SELECT Z_PK, ZNAME FROM ZREMCDBASELIST WHERE ZMARKEDFORDELETION = 0 AND ZSMARTLISTTYPE = ? "
+            "ORDER BY COALESCE(ZNAME, ''), Z_PK",
+            (CUSTOM_SMART_LIST_TYPE,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return entries
+    for smart_list in smart_lists:
+        sections = {
+            row["ZCKIDENTIFIER"].casefold(): row
+            for row in q_smart_list_sections(db, smart_list["Z_PK"])
+            if row["ZCKIDENTIFIER"]
+        }
+        if not sections:
+            continue
+        memberships = effective_section_memberships(_section_memberships_data(db, smart_list["Z_PK"]))
+        for member_id, group in memberships.items():
+            section = sections.get((group or "").casefold())
+            if section:
+                entries.setdefault(member_id.casefold(), []).append({
+                    "smartListId": smart_list["Z_PK"],
+                    "smartList": smart_list["ZNAME"],
+                    "sectionId": section["ZCKIDENTIFIER"],
+                    "section": section["ZDISPLAYNAME"],
+                })
+    return entries
+
+
+def q_messaging_contact(db, pk):
+    """The reminder's When Messaging a Person trigger as {"phones": [...], "emails": [...]}, or None."""
+    if "ZCONTACTHANDLES" not in table_column_names(db, "ZREMCDREMINDER"):
+        return None
+    row = db.execute("SELECT ZCONTACTHANDLES FROM ZREMCDREMINDER WHERE Z_PK = ?", (pk,)).fetchone()
+    return decode_contact_handles(row["ZCONTACTHANDLES"]) if row else None
+
+
+def add_board_fields(db, payload, row, smart_sections):
+    """Add smartListSections and messagingContact, which info, subtasks, and export report."""
+    payload["smartListSections"] = smart_sections.get((_row_get(row, "ZCKIDENTIFIER") or "").casefold(), [])
+    payload["messagingContact"] = q_messaging_contact(db, row["Z_PK"])
+    return payload
 
 
 def decode_manual_sort_hint_blob(blob):
@@ -4781,19 +4834,77 @@ def apply_subtask_private_metadata(subtask_id, spec):
     return updates
 
 
+EMAIL_HANDLE_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+PHONE_HANDLE_RE = re.compile(r"^\+?[0-9 ()./-]+$")
+
+
+def parse_messaging_contact(values):
+    """Split --messaging-contact values into {"phones", "emails"}; returns (handles, rejected value)."""
+    phones, emails = [], []
+    for value in split_csv(",".join(values or [])):
+        if EMAIL_HANDLE_RE.match(value):
+            if value.casefold() not in {email.casefold() for email in emails}:
+                emails.append(value)
+        elif PHONE_HANDLE_RE.match(value) and sum(ch.isdigit() for ch in value) >= 3:
+            if value not in phones:
+                phones.append(value)
+        else:
+            return None, value
+    return {"phones": phones, "emails": emails}, None
+
+
+def board_private_args(a):
+    """Whether the edit needs protocol 5 of remctl-private."""
+    return any([
+        getattr(a, "set_url", None) is not None,
+        getattr(a, "clear_urls", False),
+        getattr(a, "no_section", False),
+        getattr(a, "messaging_contact", None),
+        getattr(a, "clear_messaging_contact", False),
+        getattr(a, "new_section", None) and smart_list_section_targeted(a),
+    ])
+
+
 def validate_private_args(a):
     validate_tag_replacement_args(a)
 
-    if smart_list_section_targeted(a):
-        if not getattr(a, "section", None) and not getattr(a, "section_id", None):
-            print("Error: --smart-list and --smart-list-id need --section or --section-id.", file=sys.stderr)
-            sys.exit(1)
-        if getattr(a, "section", None) and getattr(a, "section_id", None):
-            print("Error: pass either --section or --section-id, not both.", file=sys.stderr)
-            sys.exit(1)
-        if getattr(a, "new_section", None):
-            print("Error: --new-section creates a section in the reminder's list; it cannot be combined with --smart-list.", file=sys.stderr)
-            sys.exit(1)
+    def refuse(message):
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    section_choices = [
+        name for name, value in (
+            ("--section", getattr(a, "section", None)),
+            ("--section-id", getattr(a, "section_id", None)),
+            ("--new-section", getattr(a, "new_section", None)),
+            ("--no-section", getattr(a, "no_section", False)),
+        ) if value
+    ]
+    if smart_list_section_targeted(a) and not section_choices:
+        refuse("--smart-list and --smart-list-id need --section, --section-id, --new-section, or --no-section.")
+    if getattr(a, "section", None) and getattr(a, "section_id", None):
+        refuse("pass either --section or --section-id, not both.")
+    if len(section_choices) > 1 and (getattr(a, "no_section", False) or smart_list_section_targeted(a)):
+        refuse(f"pass one of {', '.join(section_choices)}, not several.")
+
+    if getattr(a, "url", None) and (getattr(a, "set_url", None) is not None or getattr(a, "clear_urls", False)):
+        refuse("--url adds a rich link; it can't be combined with --set-url or --clear-urls.")
+    set_url = getattr(a, "set_url", None)
+    problem = rich_link_url_problem(set_url) if set_url is not None else None
+    if problem:
+        refuse(f"--set-url {problem}")
+
+    if getattr(a, "messaging_contact", None):
+        if getattr(a, "clear_messaging_contact", False):
+            refuse("pass either --messaging-contact or --clear-messaging-contact, not both.")
+        handles, rejected = parse_messaging_contact(a.messaging_contact)
+        if handles is None:
+            refuse(f"--messaging-contact takes a phone number or an email address, not {rejected!r}.")
+        if not handles["phones"] and not handles["emails"]:
+            refuse("--messaging-contact needs a phone number or an email address.")
+
+    if board_private_args(a):
+        require_private_helper(json_mode=getattr(a, "json", False), minimum_protocol=BOARD_PRIVATE_PROTOCOL_VERSION)
 
     if getattr(a, "assign", None) and getattr(a, "unassign", False):
         print("Error: pass either --assign or --unassign, not both.", file=sys.stderr)
@@ -5769,14 +5880,20 @@ def smart_list_section_targeted(a):
     return bool(getattr(a, "smart_list", None)) or getattr(a, "smart_list_id", None) is not None
 
 
-def resolve_smart_list_section_or_die(db, a):
-    """Resolve --section/--section-id among the sections of the custom smart list named by --smart-list."""
-    section_name = getattr(a, "section", None)
-    section_id = normalize_section_id(getattr(a, "section_id", None))
+def resolve_custom_smart_list_or_die(db, a):
+    """The custom smart list named by --smart-list or --smart-list-id; built-in ones have no sections."""
     smart_ref = resolve_smart_list_or_die(db, name=getattr(a, "smart_list", None), smart_list_id=getattr(a, "smart_list_id", None))
     if smart_ref["kind"] != "custom" or not smart_ref.get("objectUUID"):
         print(f"Error: {smart_ref['title']!r} is a built-in smart list; only custom smart lists have sections.", file=sys.stderr)
         sys.exit(1)
+    return smart_ref
+
+
+def resolve_smart_list_section_or_die(db, a):
+    """Resolve --section/--section-id among the sections of the custom smart list named by --smart-list."""
+    section_name = getattr(a, "section", None)
+    section_id = normalize_section_id(getattr(a, "section_id", None))
+    smart_ref = resolve_custom_smart_list_or_die(db, a)
     sections = [row for row in q_smart_list_sections(db, smart_ref["id"]) if row["ZCKIDENTIFIER"]]
     if section_id:
         matches = [row for row in sections if row["ZCKIDENTIFIER"].lower() == section_id.lower()]
@@ -5841,6 +5958,86 @@ def assign_smart_list_section(reminder_ckid, target, partial_context=None):
     return {**result, "smartList": target["smartList"], "section": target["section"], "verified": True}
 
 
+def _fail_unverified(partial_context, action, message):
+    if partial_context is not None:
+        fail_private_add_partial(partial_context, action, message)
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def remove_from_section(db, reminder_ckid, list_pk, a, partial_context=None):
+    """Take a reminder out of its section in its list, or in --smart-list, and read the change back."""
+    if smart_list_section_targeted(a):
+        smart_ref = resolve_custom_smart_list_or_die(db, a)
+        container_pk, smart_list = smart_ref["id"], True
+        request = {"action": "remove_from_smart_list_section", "smartListId": smart_ref["objectUUID"]}
+        where = f"smart list {smart_ref['title']!r}"
+    else:
+        if list_pk is None:
+            row = q_reminder_by_identifier(db, reminder_ckid)
+            list_pk = row["ZLIST"] if row is not None else None
+        container_pk, smart_list = list_pk, False
+        request = {"action": "remove_from_section"}
+        where = "its list"
+    current = q_reminder_section_ckid(db, container_pk, reminder_ckid, smart_list=smart_list) if container_pk else None
+    if not current:
+        return {"status": "unchanged", "action": request["action"], "reason": "not_in_section"}
+    result = private_action({**request, "id": reminder_ckid, "sectionId": current}, partial_context=partial_context)
+    left = _wait_for_order(
+        lambda: _read_fresh_db_value(
+            lambda fresh: q_reminder_section_ckid(fresh, container_pk, reminder_ckid, smart_list=smart_list)
+        ),
+        None,
+    )
+    if not left:
+        _fail_unverified(partial_context, request["action"],
+                         f"ReminderKit reported success, but the reminder is still in a section of {where}.")
+    return {**result, "previousSectionId": current, "verified": True}
+
+
+def add_smart_list_section_and_assign(db, reminder_ckid, a, partial_context=None):
+    """Create a section in --smart-list, put the reminder in it, and read the change back."""
+    smart_ref = resolve_custom_smart_list_or_die(db, a)
+    existing = [row["ZCKIDENTIFIER"] for row in q_smart_list_sections(db, smart_ref["id"]) if row["ZCKIDENTIFIER"]]
+    result = private_action({
+        "action": "add_smart_list_section_and_assign",
+        "id": reminder_ckid,
+        "name": a.new_section,
+        "smartListId": smart_ref["objectUUID"],
+        "existingSectionIds": existing,
+    }, partial_context=partial_context)
+    section_id = (result.get("sectionId") or "").casefold()
+    verified = bool(section_id) and _wait_for_order(
+        lambda: (_read_fresh_db_value(
+            lambda fresh: q_reminder_section_ckid(fresh, smart_ref["id"], reminder_ckid, smart_list=True)
+        ) or "").casefold(),
+        section_id,
+    )
+    if not verified:
+        _fail_unverified(partial_context, "add_smart_list_section_and_assign",
+                         f"ReminderKit reported success, but the reminder is not in the new section "
+                         f"{a.new_section!r} of smart list {smart_ref['title']!r}.")
+    return {**result, "smartList": smart_ref["title"], "section": a.new_section, "verified": True}
+
+
+def set_messaging_contact(reminder_ckid, a, partial_context=None):
+    """Set or clear the When Messaging a Person trigger, and read it back."""
+    handles = {"phones": [], "emails": []}
+    if not getattr(a, "clear_messaging_contact", False):
+        handles, _ = parse_messaging_contact(a.messaging_contact)
+    result = private_action({"action": "set_messaging_contact", "id": reminder_ckid, **handles}, partial_context=partial_context)
+    expected = handles if handles["phones"] or handles["emails"] else None
+
+    def read(fresh):
+        row = q_reminder_by_identifier(fresh, reminder_ckid)
+        return q_messaging_contact(fresh, row["Z_PK"]) if row is not None else None
+
+    if not _wait_for_order(lambda: _read_fresh_db_value(read), expected):
+        _fail_unverified(partial_context, "set_messaging_contact",
+                         "ReminderKit reported success, but the reminder's messaging contact didn't change.")
+    return {**result, "verified": True}
+
+
 def private_changes_from_args(a):
     return any([
         getattr(a, "url", None),
@@ -5853,6 +6050,7 @@ def private_changes_from_args(a):
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
         smart_list_section_targeted(a),
+        board_private_args(a),
         getattr(a, "subtask", None),
         getattr(a, "image", None),
         getattr(a, "flag", False),
@@ -5878,6 +6076,7 @@ def private_only_changes_from_args(a):
         getattr(a, "section_id", None),
         getattr(a, "new_section", None),
         smart_list_section_targeted(a),
+        board_private_args(a),
         getattr(a, "subtask", None),
         getattr(a, "image", None),
         getattr(a, "flagged", None) is not None,
@@ -5895,7 +6094,7 @@ def private_only_changes_from_args(a):
 def refuse_private_args_without_opt_in(a):
     if private_only_changes_from_args(a) and not private_metadata_enabled(a):
         print(
-            "Error: synced tag replacement/removal, grocery, section, assignment, subtask, image, urgent, early-reminder, flagged, and location writes require --private. "
+            "Error: synced tag replacement/removal, rich-link replacement, grocery, section, assignment, subtask, image, urgent, early-reminder, flagged, messaging-contact, and location writes require --private. "
             "Example: remctl add \"Milk\" -l Groceries --private --grocery",
             file=sys.stderr,
         )
@@ -6051,6 +6250,13 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
             "tags": replacement_tags,
         }, partial_context=partial_context))
 
+    if getattr(a, "set_url", None) is not None or getattr(a, "clear_urls", False):
+        results.append(private_action({
+            "action": "set_url_attachments",
+            "id": reminder_ckid,
+            "urls": [a.set_url] if getattr(a, "set_url", None) else [],
+        }, partial_context=partial_context))
+
     if urls or tags:
         results.append(private_action({
             "action": "add_private_metadata",
@@ -6074,7 +6280,16 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
                 "sectionId": target["sectionId"],
             }, partial_context=partial_context))
 
-    if getattr(a, "new_section", None):
+    if getattr(a, "no_section", False):
+        if db is None:
+            db = open_db()
+        results.append(remove_from_section(db, reminder_ckid, list_pk, a, partial_context=partial_context))
+
+    if getattr(a, "new_section", None) and smart_list_section_targeted(a):
+        if db is None:
+            db = open_db()
+        results.append(add_smart_list_section_and_assign(db, reminder_ckid, a, partial_context=partial_context))
+    elif getattr(a, "new_section", None):
         if db is None:
             db = open_db()
         if list_pk is None:
@@ -6092,6 +6307,9 @@ def apply_private_changes(reminder_ckid, a, db=None, list_pk=None, partial_conte
             "name": a.new_section,
             "existingSectionIds": existing_section_ids,
         }, partial_context=partial_context))
+
+    if getattr(a, "messaging_contact", None) or getattr(a, "clear_messaging_contact", False):
+        results.append(set_messaging_contact(reminder_ckid, a, partial_context=partial_context))
 
     subtasks = parse_subtask_specs(getattr(a, "subtask", None))
     if subtasks:
@@ -9464,11 +9682,59 @@ def cmd_show_group(a, db, group_ref):
     print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
 
 
+def cmd_show_smart_list(a, db):
+    """show --smart-list: the smart list's reminders, grouped by its sections, unassigned ones under Other."""
+    from remctl_workspace import execute
+    smart_ref = resolve_custom_smart_list_or_die(db, a)
+    items, offset = [], 0
+    while offset is not None:
+        page = execute({"view": "smart", "smartId": smart_ref["id"], "includeCompleted": bool(a.completed),
+                        "sort": "manual", "limit": 500, "offset": offset}, globals())
+        items += page["items"]
+        offset = page.get("nextOffset")
+    sections = [row for row in q_smart_list_sections(db, smart_ref["id"]) if row["ZCKIDENTIFIER"]]
+    memberships = {
+        member.casefold(): (group or "").casefold()
+        for member, group in effective_section_memberships(_section_memberships_data(db, smart_ref["id"])).items()
+    }
+    groups = [{"id": row["ZCKIDENTIFIER"], "name": row["ZDISPLAYNAME"], "reminders": []} for row in sections]
+    by_section = {group["id"].casefold(): group for group in groups}
+    other = {"id": None, "name": "Other", "reminders": []}
+    for item in items:
+        section_id = memberships.get(str(item.get("objectUUID") or "").casefold())
+        group = by_section.get(section_id, other)
+        item["section"] = group["name"] if group is not other else None
+        group["reminders"].append(item)
+    groups.append(other)
+    if a.json:
+        print(json.dumps({"smartList": smart_ref["title"], "smartListId": smart_ref["id"], "sections": groups},
+                         indent=2, ensure_ascii=False, default=str))
+        return
+    if not items:
+        print(f"No {'active ' if not a.completed else ''}reminders in smart list '{safe_display(smart_ref['title'])}'")
+        return
+    print(f"{C.bold(safe_display(smart_ref['title']))}:")
+    for group in groups:
+        if not group["reminders"]:
+            continue
+        print(f"\n  {C.bold('[' + safe_display(group['name']) + ']')}")
+        for item in group["reminders"]:
+            due = f" {C.dim(item['dueDate'][:16].replace('T', ' '))}" if item.get("dueDate") else ""
+            print(f"    #{item['id']} {safe_display(item['title'])} {C.dim('(' + safe_display(item.get('list') or '') + ')')}{due}")
+    print(f"\n{len(items)} reminder{'s' if len(items) != 1 else ''}")
+
+
 def cmd_show(a):
     if eventkit_read_requested(a):
         cmd_show_eventkit(a)
         return
     db = open_db()
+    if smart_list_section_targeted(a):
+        if getattr(a, "list", None) or getattr(a, "list_id", None) is not None:
+            print("Error: pass a list or a smart list, not both.", file=sys.stderr)
+            sys.exit(1)
+        cmd_show_smart_list(a, db)
+        return
     list_ref = resolve_required_list_target_or_die(
         db,
         name=getattr(a, "list", None),
@@ -11194,8 +11460,9 @@ def cmd_subtasks(a):
     att = preload_attachments(db, [a.id, *sub_pks])
     ind = preload_indicators(db, sub_pks)
     if a.json:
-        d = to_dict(parent, db, _att=att)
-        d["subtasks"] = [to_dict(s, db, _sc=sc, _ht=ht, _att=att) for s in subs]
+        smart_sections = q_smart_list_section_entries(db)
+        d = add_board_fields(db, to_dict(parent, db, _att=att), parent, smart_sections)
+        d["subtasks"] = [add_board_fields(db, to_dict(s, db, _sc=sc, _ht=ht, _att=att), s, smart_sections) for s in subs]
         print(json.dumps(d, indent=2))
         return
     print(f"Parent: {safe_display(parent['ZTITLE'])}")
@@ -11231,12 +11498,14 @@ def cmd_info(a):
     if r["ZLIST"]:
         memberships = q_section_memberships(db, r["ZLIST"])
         sec = memberships.get(r["ZCKIDENTIFIER"])
+    smart_sections = q_smart_list_section_entries(db)
     if a.json:
-        d = hydrate_reminder_detail(db, to_dict(r, db, section=sec), a.id)
+        d = add_board_fields(db, hydrate_reminder_detail(db, to_dict(r, db, section=sec), a.id), r, smart_sections)
         if subs:
             subtask_payloads = reminders_to_dicts(subs, db)
-            for subtask_payload in subtask_payloads:
+            for sub, subtask_payload in zip(subs, subtask_payloads):
                 hydrate_reminder_detail(db, subtask_payload, subtask_payload["id"])
+                add_board_fields(db, subtask_payload, sub, smart_sections)
             d["subtasks"] = subtask_payloads
         print(json.dumps(d, indent=2))
         return
@@ -11244,6 +11513,11 @@ def cmd_info(a):
     print(f"  Title:     {safe_display(r['ZTITLE'])}")
     print(f"  List:      {color_list_name(r['list_name'], db)}")
     if sec: print(f"  Section:   {C.bold(safe_display(sec))}")
+    for entry in smart_sections.get((r["ZCKIDENTIFIER"] or "").casefold(), []):
+        print(f"  Board:     {safe_display(entry['smartList'])} → {C.bold(safe_display(entry['section']))}")
+    messaging = q_messaging_contact(db, a.id)
+    if messaging:
+        print(f"  Messaging: {safe_display(', '.join(messaging['phones'] + messaging['emails']))}")
     status_str = C.green("Completed") if r["ZCOMPLETED"] else C.yellow("Active")
     print(f"  Status:    {status_str}")
     pri_val = r["ZPRIORITY"] or 0
@@ -11975,12 +12249,47 @@ def _section_private_call_or_die(payload, expected_status):
     sys.exit(1)
 
 
+def create_smart_list_section(db, a):
+    """section-create --smart-list: add a section to a custom smart list, after its others."""
+    smart_ref = resolve_custom_smart_list_or_die(db, a)
+    sections = q_smart_list_sections(db, smart_ref["id"])
+    if any((row["ZDISPLAYNAME"] or "").casefold() == a.name.casefold() for row in sections):
+        print(f"Error: section already exists in smart list {smart_ref['title']!r}: {a.name}", file=sys.stderr)
+        sys.exit(1)
+    require_private_helper(json_mode=a.json, minimum_protocol=BOARD_PRIVATE_PROTOCOL_VERSION)
+    result = _section_private_call_or_die(
+        {
+            "action": "create_smart_list_section",
+            "smartListId": smart_ref["objectUUID"],
+            "name": a.name,
+            "existingSectionIds": [row["ZCKIDENTIFIER"] for row in sections if row["ZCKIDENTIFIER"]],
+        },
+        "created",
+    )
+    if a.json:
+        print(json.dumps({
+            "status": "created",
+            "smartList": smart_ref["title"],
+            "smartListId": smart_ref["id"],
+            "name": a.name,
+            "sectionId": result.get("sectionId"),
+            "private": result,
+        }, ensure_ascii=False))
+    else:
+        print(f"Created section: {safe_display(a.name)} in smart list {safe_display(smart_ref['title'])}")
+
+
 def cmd_section_create(a):
     require_private_metadata(a)
     if not (getattr(a, "name", None) or "").strip():
         print("Error: pass a section name.", file=sys.stderr)
         sys.exit(1)
     db = open_db()
+    if smart_list_section_targeted(a):
+        if getattr(a, "list", None) or getattr(a, "list_id", None) is not None:
+            print("Error: pass a list or a smart list, not both.", file=sys.stderr)
+            sys.exit(1)
+        return create_smart_list_section(db, a)
     list_ref = _section_list_ref_or_die(db, a)
     if section_name_exists(db, list_ref["id"], a.name):
         print(
@@ -12119,6 +12428,9 @@ def cmd_export(a):
         print(output.getvalue(), end="")
     else:
         data = reminders_to_dicts(items, db)
+        smart_sections = q_smart_list_section_entries(db)
+        for item, payload in zip(items, data):
+            add_board_fields(db, payload, item, smart_sections)
         print(json.dumps(data, indent=2))
 
 def cmd_import(a):
@@ -12328,7 +12640,7 @@ _remctl() {
         'subtasks:Show subtasks'
         'info:Full detail view'
         'sections:Show sections'
-        'section-create:Create a section in a list'
+        'section-create:Create a section in a list or custom smart list'
         'section-rename:Rename a section in a list'
         'section-delete:Delete a section in a list'
         'sharees:Show people available for assignment in a shared list'
@@ -12363,6 +12675,8 @@ _remctl() {
         show)
             _arguments \
                 '--list-id[Show list by stable numeric ID]:id:' \
+                '(--smart-list-id)--smart-list[Show a custom smart list by its sections]:smart-list:' \
+                '(--smart-list)--smart-list-id[Show a custom smart list by numeric ID]:id:' \
                 '--completed[Include completed reminders]' \
                 '--via-eventkit[Limited signed-host or direct read-only fallback; no numeric ids or private metadata]' \
                 '(-v --verbose)'{-v,--verbose}'[Verbose output]' \
@@ -12512,6 +12826,7 @@ _remctl() {
                 '--urgent[Set private urgent state]' \
                 '--no-urgent[Clear private urgent state]' \
                 '--early-reminder[Set Early Reminder delta, e.g. 15m, 1h, clear]:delta:' \
+                '--messaging-contact[Show when messaging this phone or email]:handle:' \
                 '--location-title[Location alarm title]:title:' \
                 '--location-address[Location alarm street address]:address:' \
                 '--latitude[Location alarm latitude]:latitude:' \
@@ -12542,8 +12857,13 @@ _remctl() {
                 '--section[Assign to existing section]:section:' \
                 '--section-id[Assign to section by stable ID]:section-id:' \
                 '--new-section[Create and assign to new section]:section:' \
+                '--no-section[Take out of its section]' \
                 '(--smart-list-id)--smart-list[Resolve --section in this custom smart list]:smart-list:' \
                 '(--smart-list)--smart-list-id[Resolve --section in this custom smart list by numeric ID]:id:' \
+                '(--clear-urls)--set-url[Replace every rich link]:url:' \
+                '(--set-url)--clear-urls[Remove every rich link]' \
+                '--messaging-contact[Show when messaging this phone or email]:handle:' \
+                '--clear-messaging-contact[Remove the messaging trigger]' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
                 '--assign[Assign to shared-list user]:sharee:' \
@@ -12784,6 +13104,8 @@ _remctl() {
             _arguments \
                 '(-l --list)'{-l,--list}'[Target list]:list:' \
                 '--list-id[Target list by stable numeric ID]:id:' \
+                '(--smart-list-id)--smart-list[Target custom smart list]:smart-list:' \
+                '(--smart-list)--smart-list-id[Target custom smart list by numeric ID]:id:' \
                 '--private[Use private ReminderKit section creation]' \
                 '--json[JSON output]'
             return
@@ -12826,13 +13148,13 @@ BASH_COMPLETION = '''_remctl() {
 
     local cmd="${COMP_WORDS[1]}"
     if [ "$cmd" = "add" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --smart-list --smart-list-id --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --smart-list --smart-list-id --subtask --image --assign --unassign --urgent --no-urgent --early-reminder --messaging-contact --location-title --location-address --latitude --longitude --radius --proximity --url --tags -t --list -l --list-id --notes -n --due -d --priority -p --flag -f --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "done" ]; then
         COMPREPLY=( $(compgen -W "--date --json" -- "$cur") )
         return
     elif [ "$cmd" = "edit" ]; then
-        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --smart-list --smart-list-id --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--private --grocery --section --section-id --new-section --no-section --smart-list --smart-list-id --set-url --clear-urls --messaging-contact --clear-messaging-contact --subtask --image --assign --unassign --flagged --no-flagged --urgent --no-urgent --early-reminder --location-title --location-address --latitude --longitude --radius --proximity --title --list -l --list-id --url --tags -t --set-tags --clear-tags --remove-tag --notes -n --due -d --priority -p --recurrence --alarm --json" -- "$cur") )
         return
     elif [ "$cmd" = "reminder-move" ]; then
         COMPREPLY=( $(compgen -W "--before --after --first --last --parent --top-level --smart-list --smart-list-id --private --json" -- "$cur") )
@@ -12841,7 +13163,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
         return
     elif [ "$cmd" = "show" ]; then
-        COMPREPLY=( $(compgen -W "--list-id --completed --via-eventkit --verbose -v --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--list-id --smart-list --smart-list-id --completed --via-eventkit --verbose -v --json" -- "$cur") )
         return
     elif [ "$cmd" = "deleted" ]; then
         COMPREPLY=( $(compgen -W "--limit --offset --json" -- "$cur") )
@@ -12931,7 +13253,7 @@ BASH_COMPLETION = '''_remctl() {
         COMPREPLY=( $(compgen -W "--list-id --force --json" -- "$cur") )
         return
     elif [ "$cmd" = "section-create" ]; then
-        COMPREPLY=( $(compgen -W "--list -l --list-id --private --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--list -l --list-id --smart-list --smart-list-id --private --json" -- "$cur") )
         return
     elif [ "$cmd" = "section-rename" ]; then
         COMPREPLY=( $(compgen -W "--new-name --list -l --list-id --section-id --private --json" -- "$cur") )
@@ -12986,7 +13308,7 @@ complete -c remctl -n "__fish_use_subcommand" -a tags -d "List all tags"
 complete -c remctl -n "__fish_use_subcommand" -a subtasks -d "Show subtasks"
 complete -c remctl -n "__fish_use_subcommand" -a info -d "Full detail view"
 complete -c remctl -n "__fish_use_subcommand" -a sections -d "Show sections"
-complete -c remctl -n "__fish_use_subcommand" -a section-create -d "Create a section in a list"
+complete -c remctl -n "__fish_use_subcommand" -a section-create -d "Create a section in a list or custom smart list"
 complete -c remctl -n "__fish_use_subcommand" -a section-rename -d "Rename a section in a list"
 complete -c remctl -n "__fish_use_subcommand" -a section-delete -d "Delete a section in a list"
 complete -c remctl -n "__fish_use_subcommand" -a sharees -d "Show people available for assignment in a shared list"
@@ -13022,6 +13344,8 @@ complete -c remctl -l image-mode -d "Image rendering protocol" -x -a "kitty iter
 complete -c remctl -l image-width -d "Image render width in cells" -x
 complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Explain authoritative access.effective readiness"
 complete -c remctl -n "__fish_seen_subcommand_from show" -l list-id -d "Show list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from show" -l smart-list -d "Show a custom smart list by its sections" -r
+complete -c remctl -n "__fish_seen_subcommand_from show" -l smart-list-id -d "Show a custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l completed -d "Include completed reminders"
 complete -c remctl -n "__fish_seen_subcommand_from show" -l via-eventkit -d "Limited signed-host or direct read-only fallback; no numeric ids or private metadata"
 complete -c remctl -n "__fish_seen_subcommand_from show" -s v -l verbose -d "Verbose output"
@@ -13163,6 +13487,8 @@ complete -c remctl -n "__fish_seen_subcommand_from list-delete" -l list-id -d "D
 complete -c remctl -n "__fish_seen_subcommand_from list-delete" -l force -d "Skip confirmation prompt"
 complete -c remctl -n "__fish_seen_subcommand_from section-create" -s l -l list -d "Target list" -r
 complete -c remctl -n "__fish_seen_subcommand_from section-create" -l list-id -d "Target list by stable numeric ID" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -l smart-list -d "Target custom smart list" -r
+complete -c remctl -n "__fish_seen_subcommand_from section-create" -l smart-list-id -d "Target custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from section-create" -l private -d "Use private ReminderKit section creation"
 complete -c remctl -n "__fish_seen_subcommand_from section-create" -l json -d "JSON output"
 complete -c remctl -n "__fish_seen_subcommand_from section-rename" -l new-name -d "New section name" -r
@@ -13181,6 +13507,7 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsup
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign to section by stable ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l messaging-contact -d "Show when messaging this phone or email" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list -d "Resolve --section in this custom smart list" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
@@ -13198,6 +13525,11 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l private -d "Use unsu
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l section-id -d "Assign to section by stable ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Create and assign to new section" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-section -d "Take out of its section"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l set-url -d "Replace every rich link" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l clear-urls -d "Remove every rich link"
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l messaging-contact -d "Show when messaging this phone or email" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l clear-messaging-contact -d "Remove the messaging trigger"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list -d "Resolve --section in this custom smart list" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l subtask -d "Add private subtask title or JSON object" -r
@@ -14809,6 +15141,13 @@ def build_parser():
         c.add_argument("--address", dest="location_address", help=argparse.SUPPRESS)
         c.add_argument("--radius", type=float, default=100.0, help="Guarded metadata: location alarm radius in meters (up to 100000)")
         c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
+    def messaging_contact_arguments(c, clearable=False):
+        c.add_argument(
+            "--messaging-contact", action="append", metavar="PHONE_OR_EMAIL",
+            help="Private metadata: show this reminder when messaging the person with this phone number or email (repeatable, or comma-separated)",
+        )
+        if clearable:
+            c.add_argument("--clear-messaging-contact", action="store_true", help="Private metadata: remove the When Messaging a Person trigger")
     def img(c):
         # Re-declare the global image flags so they also parse after the command name.
         # argparse.SUPPRESS keeps an unused re-declaration from overwriting the
@@ -14975,6 +15314,8 @@ def build_parser():
     )
     c.add_argument("list", nargs="?", help="List name")
     c.add_argument("--list-id", type=int, help="Show a list by stable numeric ID")
+    c.add_argument("--smart-list", metavar="NAME", help="Show a custom smart list's reminders, grouped by its sections")
+    c.add_argument("--smart-list-id", type=int, metavar="ID", help="Like --smart-list, by numeric ID from smart-lists")
     c.add_argument("--completed", action="store_true", help="Include completed")
     eventkit_read(c); vb(c); js(c); display_format(c); img(c)
 
@@ -15030,10 +15371,10 @@ def build_parser():
     c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in a Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the target list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
-    c.add_argument("--new-section", help="Private metadata: create a section in the target list and assign this reminder")
+    c.add_argument("--new-section", help="Private metadata: create a section in the target list, or in --smart-list, and assign this reminder")
     smart_section = c.add_mutually_exclusive_group()
     smart_section.add_argument("--smart-list", metavar="NAME",
-                               help="Private metadata: resolve --section/--section-id in this custom smart list instead")
+                               help="Private metadata: use this custom smart list's sections for --section, --section-id, and --new-section")
     smart_section.add_argument("--smart-list-id", type=int, metavar="ID",
                                help="Private metadata: like --smart-list, by numeric ID from smart-lists")
     c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
@@ -15042,6 +15383,7 @@ def build_parser():
     c.add_argument("--unassign", action="store_true", help="Private metadata: clear any existing assignment")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
+    messaging_contact_arguments(c)
     location_alarm_arguments(c)
     js(c)
 
@@ -15134,6 +15476,9 @@ def build_parser():
     c.add_argument("-n", "--notes"); c.add_argument("-d", "--due", help="Due date; date-only forms create all-day reminders, explicit times create timed reminders, or clear")
     c.add_argument("-p", "--priority")
     c.add_argument("--url", help="URL; appended to notes normally, synced rich link with --private (web URL or app link such as obsidian://)")
+    rich_links = c.add_mutually_exclusive_group()
+    rich_links.add_argument("--set-url", metavar="URL", help="Private metadata: replace every rich link with this one")
+    rich_links.add_argument("--clear-urls", action="store_true", help="Private metadata: remove every rich link")
     c.add_argument("--recurrence", help="Recurrence: daily, weekly, monthly, yearly, 'weekly mon,wed,fri', 'monthly 1,15', 'monthly 4th-fri', 'monthly last-fri', 'monthly -1-fri', interval xN 1-999 like 'daily x2' / 'monthly x2 4th-fri' (bridge only)")
     c.add_argument("--alarm", help="Alarm: 15m, 1h, 1d, ISO datetime, or clear (bridge only)")
     c.add_argument("--private", action="store_true", help="Use guarded Reminders metadata writes for URL/tags/sections/assignments/subtasks/images/location alarms")
@@ -15145,10 +15490,11 @@ def build_parser():
     c.add_argument("--grocery", action="store_true", help="Private metadata: categorize this reminder in its Groceries list")
     c.add_argument("--section", help="Private metadata: assign to an existing section in the reminder's list")
     c.add_argument("--section-id", help="Private metadata: assign to a section by stable ID when names collide")
-    c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list and assign this reminder")
+    c.add_argument("--new-section", help="Private metadata: create a section in the reminder's list, or in --smart-list, and assign this reminder")
+    c.add_argument("--no-section", action="store_true", help="Private metadata: take the reminder out of its section in its list, or in --smart-list")
     smart_section = c.add_mutually_exclusive_group()
     smart_section.add_argument("--smart-list", metavar="NAME",
-                               help="Private metadata: resolve --section/--section-id in this custom smart list instead")
+                               help="Private metadata: use this custom smart list's sections for --section, --section-id, --new-section, and --no-section")
     smart_section.add_argument("--smart-list-id", type=int, metavar="ID",
                                help="Private metadata: like --smart-list, by numeric ID from smart-lists")
     c.add_argument("--subtask", action="append", help="Private metadata: add a subtask title or JSON object (repeatable)")
@@ -15158,6 +15504,7 @@ def build_parser():
     c.add_argument("--flagged", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set the real flagged state")
     c.add_argument("--urgent", action=argparse.BooleanOptionalAction, default=None, help="Private metadata: set urgent state")
     c.add_argument("--early-reminder", help="Private metadata: Early Reminder before due date, e.g. 15m, 1h, 2d, 1w, 1mo, or clear")
+    messaging_contact_arguments(c, clearable=True)
     location_alarm_arguments(c)
     js(c)
 
@@ -15572,12 +15919,14 @@ def build_parser():
 
     c = sub.add_parser(
         "section-create",
-        help="Create a section in a list",
-        description="Create a Reminders list section through unsupported private ReminderKit APIs.",
+        help="Create a section in a list or custom smart list",
+        description="Create a Reminders list or custom smart-list section through unsupported private ReminderKit APIs.",
     )
     c.add_argument("name", help="New section name")
     c.add_argument("-l", "--list", help="Target list name")
     c.add_argument("--list-id", type=int, help="Target list by stable numeric ID")
+    c.add_argument("--smart-list", metavar="NAME", help="Target custom smart list name, instead of a list")
+    c.add_argument("--smart-list-id", type=int, metavar="ID", help="Target custom smart list by numeric ID from smart-lists")
     c.add_argument("--private", action="store_true", help="Required for private ReminderKit section creation")
     c.add_argument("--private-metadata", action="store_true", help=argparse.SUPPRESS)
     js(c)

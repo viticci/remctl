@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#define REMCTL_PRIVATE_PROTOCOL_VERSION 4
+#define REMCTL_PRIVATE_PROTOCOL_VERSION 5
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <dlfcn.h>
@@ -48,6 +48,7 @@
 - (id)addGroupWithName:(NSString *)name toAccountGroupContextChangeItem:(id)context;
 - (id)addGroupWithName:(NSString *)name toAccountGroupContextChangeItem:(id)context groupObjectID:(id)objectID;
 - (id)addListSectionWithDisplayName:(NSString *)name toListSectionContextChangeItem:(id)context;
+- (id)addSmartListSectionWithDisplayName:(NSString *)name toSmartListSectionContextChangeItem:(id)context;
 - (id)addCustomSmartListWithName:(NSString *)name toAccountChangeItem:(id)accountChangeItem smartListObjectID:(id)objectID;
 - (id)addTemplateWithName:(NSString *)name configuration:(id)configuration toAccountChangeItem:(id)accountChangeItem;
 - (id)addListUsingTemplate:(id)templateObject toAccountChangeItem:(id)accountChangeItem;
@@ -121,6 +122,12 @@
 - (id)urgentAlarmContext;
 - (void)addAlarm:(id)alarm;
 - (void)removeFromParentReminder;
+- (void)setContactHandles:(id)contactHandles;
+@end
+
+// The "When Messaging a Person" trigger: the phone numbers and email addresses Messages matches.
+@interface REMContactRepresentation : NSObject
+- (instancetype)initWithPhones:(NSArray<NSString *> *)phones emails:(NSArray<NSString *> *)emails;
 @end
 
 @interface REMReminderSubtaskContextChangeItem : NSObject
@@ -151,6 +158,8 @@
 @interface REMReminderAttachmentContextChangeItem : NSObject
 - (id)addImageAttachmentWithURL:(NSURL *)url width:(NSUInteger)width height:(NSUInteger)height error:(NSError **)error;
 - (id)addURLAttachmentWithURL:(NSURL *)url;
+- (id)setURLAttachmentWithURL:(NSURL *)url;
+- (void)removeURLAttachments;
 @end
 
 @interface REMReminderHashtagContextChangeItem : NSObject
@@ -527,7 +536,9 @@ static NSURL *sectionURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDListSection/%@", ckIdentifier]];
 }
 
-static NSArray *sectionObjectIDsFromStrings(NSArray *sectionIDs) {
+static NSURL *smartListSectionURL(NSString *ckIdentifier);
+
+static NSArray *sectionObjectIDsFromStrings(NSArray *sectionIDs, NSURL *(*urlFor)(NSString *)) {
     NSMutableArray *result = [NSMutableArray array];
     if (![sectionIDs isKindOfClass:[NSArray class]]) {
         return result;
@@ -536,7 +547,7 @@ static NSArray *sectionObjectIDsFromStrings(NSArray *sectionIDs) {
         if (![raw isKindOfClass:[NSString class]] || [raw length] == 0) {
             continue;
         }
-        id objectID = [REMObjectID objectIDWithURL:sectionURL(raw)];
+        id objectID = [REMObjectID objectIDWithURL:urlFor(raw)];
         if (objectID) {
             [result addObject:objectID];
         }
@@ -558,6 +569,50 @@ static NSURL *smartListURL(NSString *ckIdentifier) {
 
 static NSURL *smartListSectionURL(NSString *ckIdentifier) {
     return [NSURL URLWithString:[NSString stringWithFormat:@"x-apple-reminderkit://REMCDSmartListSection/%@", ckIdentifier]];
+}
+
+// The sections context of a custom smart list, through an update in this save request.
+static id smartListSectionContext(REMStore *store, REMSaveRequest *save, id cmd) {
+    NSString *smartListID = cmd[@"smartListId"];
+    if (![smartListID isKindOfClass:[NSString class]] || [smartListID length] == 0) fail(@"smartListId is required");
+    id smartListObjectID = [REMObjectID objectIDWithURL:smartListURL(smartListID)];
+    if (!smartListObjectID) fail(@"Could not build ReminderKit smart-list object ID");
+    NSError *error = nil;
+    id smartList = [store fetchCustomSmartListWithObjectID:smartListObjectID error:&error];
+    if (!smartList) fail(error.localizedDescription ?: @"Custom smart list not found");
+    REMSmartListChangeItem *smartListChange = [save updateSmartList:smartList];
+    if (!smartListChange || ![smartListChange respondsToSelector:@selector(sectionsContextChangeItem)]) {
+        fail(@"ReminderKit smart-list change item does not support sections");
+    }
+    id sectionContext = [smartListChange sectionsContextChangeItem];
+    if (!sectionContext
+        || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]
+        || ![sectionContext respondsToSelector:@selector(setUnsavedSectionIDsOrdering:)]
+        || ![sectionContext respondsToSelector:@selector(setShouldUpdateSectionsOrdering:)]) {
+        fail(@"ReminderKit smart-list section context unavailable");
+    }
+    return sectionContext;
+}
+
+// Add a section to a list or smart-list section context, after the sections it already has.
+static id addSectionToContext(REMSaveRequest *save, id sectionContext, NSString *name, NSArray *existingSectionIDs, BOOL smartList) {
+    id sectionChange = smartList
+        ? [save addSmartListSectionWithDisplayName:name toSmartListSectionContextChangeItem:sectionContext]
+        : [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
+    id sectionObjectID = [sectionChange remObjectID];
+    if (!sectionObjectID) fail(@"Could not create section object ID");
+    NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(existingSectionIDs, smartList ? smartListSectionURL : sectionURL)];
+    [ordering addObject:sectionObjectID];
+    [sectionContext setUnsavedSectionIDsOrdering:ordering];
+    [sectionContext setShouldUpdateSectionsOrdering:YES];
+    return sectionObjectID;
+}
+
+// One membership change: into a section, or out of every section when sectionObjectID is nil.
+// Reminders.app's own "Move to Section > None" writes a membership with no group, so RemCTL does too.
+static void setSectionMembership(id sectionContext, id reminderObjectID, id sectionObjectID) {
+    id membership = [[REMMembership alloc] initWithMemberIdentifier:[reminderObjectID uuid] groupIdentifier:(sectionObjectID ? [sectionObjectID uuid] : nil) isObsolete:NO modifiedOn:[NSDate date]];
+    [sectionContext setUnsavedMembershipsOfRemindersInSections:[[REMMemberships alloc] initWithMemberships:@[membership]]];
 }
 
 static NSURL *manualSortHintURL(NSString *ckIdentifier) {
@@ -981,13 +1036,18 @@ int main(void) {
         NSSet<NSString *> *allowedActions = [NSSet setWithArray:@[
             @"add_private_metadata",
             @"add_url_attachments",
+            @"set_url_attachments",
             @"add_tags",
             @"set_tags",
             @"add_subtasks",
             @"clone_reminder_tree_to_list",
             @"assign_section",
+            @"remove_from_section",
             @"assign_smart_list_section",
+            @"remove_from_smart_list_section",
             @"add_section_and_assign",
+            @"add_smart_list_section_and_assign",
+            @"set_messaging_contact",
             @"assign_sharee",
             @"clear_assignment",
             @"add_attachments",
@@ -1000,6 +1060,7 @@ int main(void) {
             @"set_list_parent_group",
             @"delete_group",
             @"create_section",
+            @"create_smart_list_section",
             @"rename_section",
             @"delete_section",
             @"set_list_appearance",
@@ -1254,7 +1315,7 @@ int main(void) {
             id sectionChange = [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
             id sectionObjectID = [sectionChange remObjectID];
             if (!sectionObjectID) fail(@"Could not create section object ID");
-            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"])];
+            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"], sectionURL)];
             [ordering addObject:sectionObjectID];
             [sectionContext setUnsavedSectionIDsOrdering:ordering];
             [sectionContext setShouldUpdateSectionsOrdering:YES];
@@ -1266,6 +1327,30 @@ int main(void) {
                 @"action": action,
                 @"listId": listID,
                 @"name": name,
+                @"sectionURL": [[sectionObjectID urlRepresentation] absoluteString] ?: @"",
+            });
+            return 0;
+        }
+        if ([action isEqualToString:@"create_smart_list_section"]) {
+            NSString *name = cmd[@"name"];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
+            if (![REMSaveRequest instancesRespondToSelector:@selector(addSmartListSectionWithDisplayName:toSmartListSectionContextChangeItem:)]) {
+                fail(@"Smart-list section creation is unavailable on this macOS version");
+            }
+            REMStore *store = [REMStore new];
+            REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
+            id sectionContext = smartListSectionContext(store, save, cmd);
+            id sectionObjectID = addSectionToContext(save, sectionContext, name, cmd[@"existingSectionIds"], YES);
+            NSError *error = nil;
+            if (![save saveSynchronouslyWithError:&error]) {
+                fail(error.localizedDescription ?: @"ReminderKit smart-list section create failed");
+            }
+            output(@{
+                @"status": @"created",
+                @"action": action,
+                @"smartListId": cmd[@"smartListId"],
+                @"name": name,
+                @"sectionId": [[sectionObjectID uuid] UUIDString] ?: @"",
                 @"sectionURL": [[sectionObjectID urlRepresentation] absoluteString] ?: @"",
             });
             return 0;
@@ -2363,6 +2448,21 @@ int main(void) {
             }
         } else if ([action isEqualToString:@"add_url_attachments"]) {
             if (urls.count == 0) fail(@"At least one URL is required");
+        } else if ([action isEqualToString:@"set_url_attachments"]) {
+            // Replace every rich link with the given ones; none clears them.
+            id attachmentContext = [change attachmentContext];
+            if (!attachmentContext || ![attachmentContext respondsToSelector:@selector(removeURLAttachments)]) {
+                fail(@"ReminderKit attachment context does not support replacing rich links");
+            }
+            for (NSString *urlString in urls) {
+                if (!looksLikeRichLinkURL(urlString)) fail([NSString stringWithFormat:@"Invalid rich link URL: %@", urlString]);
+            }
+            [attachmentContext removeURLAttachments];
+            for (NSString *urlString in urls) {
+                [attachmentContext addURLAttachmentWithURL:[NSURL URLWithString:urlString]];
+                addedURLs += 1;
+            }
+            details[@"urlsReplaced"] = @YES;
         } else if ([action isEqualToString:@"add_tags"]) {
             if (tags.count == 0) fail(@"At least one tag is required");
         } else if ([action isEqualToString:@"set_tags"]) {
@@ -2430,7 +2530,9 @@ int main(void) {
             }
             details[@"subtaskURLs"] = subtaskURLs;
             details[@"subtasks"] = subtaskDetails;
-        } else if ([action isEqualToString:@"assign_section"]) {
+        } else if ([action isEqualToString:@"assign_section"] || [action isEqualToString:@"remove_from_section"]) {
+            // remove_from_section takes the section the reminder is in now, checks it exists,
+            // and replaces the membership with one that has no section.
             NSString *sectionID = cmd[@"sectionId"];
             if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
             id sectionObjectID = [REMObjectID objectIDWithURL:sectionURL(sectionID)];
@@ -2445,15 +2547,11 @@ int main(void) {
             if (!sectionContext || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]) {
                 fail(@"ReminderKit section context unavailable");
             }
-            id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
-            id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
-            [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
+            setSectionMembership(sectionContext, objectID, [action isEqualToString:@"remove_from_section"] ? nil : sectionObjectID);
             details[@"sectionId"] = sectionID;
-        } else if ([action isEqualToString:@"assign_smart_list_section"]) {
+        } else if ([action isEqualToString:@"assign_smart_list_section"] || [action isEqualToString:@"remove_from_smart_list_section"]) {
             NSString *sectionID = cmd[@"sectionId"];
-            NSString *smartListID = cmd[@"smartListId"];
             if (![sectionID isKindOfClass:[NSString class]] || sectionID.length == 0) fail(@"sectionId is required");
-            if (![smartListID isKindOfClass:[NSString class]] || smartListID.length == 0) fail(@"smartListId is required");
             if (![store respondsToSelector:@selector(fetchSmartListSectionWithObjectID:error:)]) {
                 fail(@"Smart-list section assignment is unavailable on this macOS version");
             }
@@ -2462,50 +2560,50 @@ int main(void) {
             error = nil;
             id section = [store fetchSmartListSectionWithObjectID:sectionObjectID error:&error];
             if (!section) fail(error.localizedDescription ?: @"Smart-list section not found");
-            id smartListObjectID = [REMObjectID objectIDWithURL:smartListURL(smartListID)];
-            if (!smartListObjectID) fail(@"Could not build ReminderKit smart-list object ID");
-            error = nil;
-            id smartList = [store fetchCustomSmartListWithObjectID:smartListObjectID error:&error];
-            if (!smartList) fail(error.localizedDescription ?: @"Custom smart list not found");
-            REMSmartListChangeItem *smartListChange = [save updateSmartList:smartList];
-            if (!smartListChange) fail(@"Could not create ReminderKit smart-list change item");
-            if (![smartListChange respondsToSelector:@selector(sectionsContextChangeItem)]) {
-                fail(@"ReminderKit smart-list change item does not support sections");
-            }
-            id sectionContext = [smartListChange sectionsContextChangeItem];
-            if (!sectionContext || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]) {
-                fail(@"ReminderKit smart-list section context unavailable");
-            }
-            id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
-            id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
-            [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
+            id sectionContext = smartListSectionContext(store, save, cmd);
+            setSectionMembership(sectionContext, objectID, [action isEqualToString:@"remove_from_smart_list_section"] ? nil : sectionObjectID);
             details[@"sectionId"] = sectionID;
-            details[@"smartListId"] = smartListID;
-        } else if ([action isEqualToString:@"add_section_and_assign"]) {
+            details[@"smartListId"] = cmd[@"smartListId"];
+        } else if ([action isEqualToString:@"add_section_and_assign"] || [action isEqualToString:@"add_smart_list_section_and_assign"]) {
             NSString *name = cmd[@"name"];
             if (![name isKindOfClass:[NSString class]] || name.length == 0) fail(@"name is required");
-            id list = [reminder list];
-            if (!list) fail(@"Reminder has no parent list");
-            id listChange = [save updateList:list];
-            if (!listChange) fail(@"Could not create ReminderKit list change item");
-            id sectionContext = [listChange sectionsContextChangeItem];
-            if (!sectionContext
-                || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]
-                || ![sectionContext respondsToSelector:@selector(setUnsavedSectionIDsOrdering:)]
-                || ![sectionContext respondsToSelector:@selector(setShouldUpdateSectionsOrdering:)]) {
-                fail(@"ReminderKit section context unavailable");
+            BOOL smartList = [action isEqualToString:@"add_smart_list_section_and_assign"];
+            id sectionContext = nil;
+            if (smartList) {
+                if (![REMSaveRequest instancesRespondToSelector:@selector(addSmartListSectionWithDisplayName:toSmartListSectionContextChangeItem:)]) {
+                    fail(@"Smart-list section creation is unavailable on this macOS version");
+                }
+                sectionContext = smartListSectionContext(store, save, cmd);
+                details[@"smartListId"] = cmd[@"smartListId"];
+            } else {
+                id list = [reminder list];
+                if (!list) fail(@"Reminder has no parent list");
+                id listChange = [save updateList:list];
+                if (!listChange) fail(@"Could not create ReminderKit list change item");
+                sectionContext = [listChange sectionsContextChangeItem];
+                if (!sectionContext
+                    || ![sectionContext respondsToSelector:@selector(setUnsavedMembershipsOfRemindersInSections:)]
+                    || ![sectionContext respondsToSelector:@selector(setUnsavedSectionIDsOrdering:)]
+                    || ![sectionContext respondsToSelector:@selector(setShouldUpdateSectionsOrdering:)]) {
+                    fail(@"ReminderKit section context unavailable");
+                }
             }
-            id sectionChange = [save addListSectionWithDisplayName:name toListSectionContextChangeItem:sectionContext];
-            id sectionObjectID = [sectionChange remObjectID];
-            if (!sectionObjectID) fail(@"Could not create section object ID");
-            id membership = [[REMMembership alloc] initWithMemberIdentifier:[objectID uuid] groupIdentifier:[sectionObjectID uuid] isObsolete:NO modifiedOn:[NSDate date]];
-            id memberships = [[REMMemberships alloc] initWithMemberships:@[membership]];
-            [sectionContext setUnsavedMembershipsOfRemindersInSections:memberships];
-            NSMutableArray *ordering = [NSMutableArray arrayWithArray:sectionObjectIDsFromStrings(cmd[@"existingSectionIds"])];
-            [ordering addObject:sectionObjectID];
-            [sectionContext setUnsavedSectionIDsOrdering:ordering];
-            [sectionContext setShouldUpdateSectionsOrdering:YES];
+            id sectionObjectID = addSectionToContext(save, sectionContext, name, cmd[@"existingSectionIds"], smartList);
+            setSectionMembership(sectionContext, objectID, sectionObjectID);
+            details[@"sectionId"] = [[sectionObjectID uuid] UUIDString] ?: @"";
             details[@"sectionURL"] = [[sectionObjectID urlRepresentation] absoluteString] ?: @"";
+        } else if ([action isEqualToString:@"set_messaging_contact"]) {
+            // Empty phones and emails clear the trigger.
+            NSArray<NSString *> *phones = stringArray(cmd[@"phones"], @"phones");
+            NSArray<NSString *> *emails = stringArray(cmd[@"emails"], @"emails");
+            if (![change respondsToSelector:@selector(setContactHandles:)] || !NSClassFromString(@"REMContactRepresentation")) {
+                fail(@"The When Messaging a Person trigger is unavailable on this macOS version");
+            }
+            id handles = (phones.count || emails.count)
+                ? [[NSClassFromString(@"REMContactRepresentation") alloc] initWithPhones:phones emails:emails]
+                : nil;
+            [change setContactHandles:handles];
+            details[@"messagingContact"] = handles ? @{@"phones": phones, @"emails": emails} : [NSNull null];
         } else if ([action isEqualToString:@"assign_sharee"]) {
             NSString *assigneeID = cmd[@"assigneeId"];
             NSString *originatorID = cmd[@"originatorId"];

@@ -90,7 +90,13 @@ if [[ -f "$APP_PATH/Contents/Resources/distribution.json" ]]; then
     if [[ "$SKIP_LAUNCHSERVICES" == "1" ]]; then
         packaged_python="$APP_PATH/Contents/Resources/Python/bin/python3.13"
     fi
-    [[ -x "$packaged_python" ]] || fail "The packaged Python runtime is missing. Repair the installation before uninstalling."
+    # The protected runtime under /Library can go missing (a migrated Mac, a
+    # cleaned /Library). The signed app carries the same interpreter.
+    if [[ ! -x "$packaged_python" ]]; then
+        packaged_python="$APP_PATH/Contents/Resources/Python/bin/python3.13"
+        echo -e "${DIM}The protected Python runtime is missing; using the copy inside the app.${RESET}" >&2
+    fi
+    [[ -x "$packaged_python" ]] || fail "The packaged Python runtime is missing, and the app has no copy. Install RemCTL again from the download, then uninstall."
     UNINSTALL_PYTHON="$packaged_python"
 fi
 
@@ -170,8 +176,10 @@ if os.path.lexists(manifest):
   value=json.load(open(manifest,encoding="utf-8")); entries=value["entries"]
   if not isinstance(entries,dict):raise ValueError
   valid=value.get("version")==1 and all(isinstance(item,dict) for item in entries.values())
-  valid=valid and not(set(entries)-managed) and present()==set(entries)
-  valid=valid and all(match(n,item) for n,item in entries.items())
+  # A listed file that is already gone is fine; a changed or unlisted one is not.
+  changed=sorted(n for n in present() if n not in entries or not match(n,entries[n]))
+  valid=valid and not(set(entries)-managed) and not changed
+  if changed:print("Changed since RemCTL installed them: "+", ".join(changed),file=sys.stderr)
  except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError):valid=False
  raise SystemExit(0 if valid else 1)
 p=present()
@@ -283,7 +291,7 @@ for bin_dir in "${BIN_DIRS[@]}"; do
 done
 if [[ "$OWNED_BIN_COUNT" -eq 0 ]]; then
     if [[ -e "$APP_PATH" || -L "$APP_PATH" || -e "$AGENT_PATH" || -L "$AGENT_PATH" || -e "$SOCKET_PATH" || -L "$SOCKET_PATH" ]]; then
-        fail "Capability-host artifacts exist without an exact installer ownership marker; nothing was removed."
+        fail "Capability-host artifacts exist without an exact installer ownership marker; nothing was removed. Move any files listed above out of your bin folder and run the uninstaller again."
     fi
 fi
 if [[ -e "$AGENT_PATH" || -L "$AGENT_PATH" ]]; then

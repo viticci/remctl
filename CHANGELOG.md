@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.7.0 — 2026-11-28
+
+### New
+
+- Replace or remove rich links. `edit --private --set-url URL` replaces every rich link on a reminder with one, for example after the note it pointed to was renamed, and `edit --private --clear-urls` removes them all. `--url` still adds a link beside the others. MCP `update_reminder` takes `set_url` and `clear_urls`. Images are untouched. Thanks to @rayshan ([#79](https://github.com/viticci/remctl/issues/79)).
+- Take a reminder out of its section. `edit --private --no-section` moves it back to the unsectioned part of its list, the same change as Reminders' "Move to Section > None", and leaves the section and its other reminders alone. With `--smart-list` or `--smart-list-id`, it takes the reminder out of that custom smart list's section instead. RemCTL reads the change back and reports `verified: true`; a reminder that isn't in a section reports `unchanged`. MCP `update_reminder` takes `no_section`. Thanks to @nutcracker ([#81](https://github.com/viticci/remctl/issues/81)).
+- Read a custom smart list's sections as a board. `info --json`, `subtasks --json`, and `export --format json` report `smartListSections` for each reminder: the custom smart lists whose sections it is in, with `smartListId`, `smartList`, `sectionId`, and `section`, or an empty array. MCP `get_reminder` includes it. `show --smart-list NAME` (or `--smart-list-id ID`) lists the reminders that match a custom smart list, grouped by its sections, with the rest under Other. Thanks to @pflajszer ([#82](https://github.com/viticci/remctl/issues/82)).
+- Set up a board without opening Reminders. `section-create NAME --smart-list BOARD --private` adds a section to a custom smart list, after its others, and `edit --private --smart-list BOARD --new-section NAME` creates one and puts the reminder in it. The Codex workspace's Section Create tool takes `smart_list` and `smart_list_id` ([#82](https://github.com/viticci/remctl/issues/82)).
+- Set "When Messaging a Person". `add` and `edit` with `--private --messaging-contact PHONE_OR_EMAIL` (repeatable, or comma-separated) make Reminders show the reminder the next time you message that person in Messages, and `edit --private --clear-messaging-contact` removes it. `info --json` and `export --format json` report `messagingContact` as `{"phones": [...], "emails": [...]}`, or `null`. MCP `create_reminder` and `update_reminder` take `messaging_contact`, and `update_reminder` takes `clear_messaging_contact`. RemCTL takes the person's phone numbers or email addresses, which is what Reminders stores; it doesn't look up names, because that would need a Contacts permission RemCTL doesn't ask for. Thanks to @pflajszer ([#83](https://github.com/viticci/remctl/issues/83)).
+
+### Fixes
+
+- A broken install can be repaired. When some of RemCTL's files in `~/bin` had changed, the installer told you to move them out, then refused again because its record of the old install still listed the files you had moved. Files that are gone no longer block it, and in Terminal it now offers to move the changed files to the Trash and carry on. The uninstaller accepts the same state and names the files that changed. Thanks to @adamayers ([#84](https://github.com/viticci/remctl/issues/84)).
+- The uninstaller works when the protected Python under `/Library/RemCTL/Python` is missing, for example after moving to a new Mac. It uses the copy inside the signed app instead of stopping with "Repair the installation before uninstalling" ([#84](https://github.com/viticci/remctl/issues/84)).
+- `./install.sh --from-source` over an install from the download explains that the download is signed with a certificate this Mac doesn't have, and says to install the download again or use `--migrate-signing`, instead of failing in `codesign` ([#84](https://github.com/viticci/remctl/issues/84)).
+- The installation guide has a new section, [Repairing a broken install](docs/installation.md#repairing-a-broken-install). Reinstalling never touches your reminders, which live in Reminders and iCloud.
+
+### Compatibility
+
+- The private helper reports protocol 5. The new rich-link, section, smart-list section, and messaging-contact writes need it and refuse an older helper before writing anything. Reinstall the app to get it.
+
 ## 2.6.0 — 2026-11-25
 
 ### New

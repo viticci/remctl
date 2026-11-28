@@ -731,6 +731,11 @@ def matches(path, item):
     with open(path,"rb") as handle: digest=hashlib.sha256(handle.read()).hexdigest()
     return digest == item.get("sha256")
 if os.path.lexists(manifest):
+    # A listed file that is gone is fine: the new generation recreates it. Files
+    # that changed, or that the manifest doesn't list, go to stdout so the caller
+    # can offer to move them to the Trash (5). An unreadable manifest takes every
+    # managed file with it, so the result is a clean install.
+    current=existing()
     try:
         metadata=os.lstat(manifest)
         if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
@@ -738,15 +743,13 @@ if os.path.lexists(manifest):
         value=json.load(open(manifest,encoding="utf-8")); entries=value["entries"]
         if value.get("version") != 1 or not isinstance(entries,dict) or set(entries) - managed: raise ValueError
         if not all(isinstance(item,dict) for item in entries.values()): raise ValueError
-        current=existing(); expected=set(entries)
-        problems=sorted(current ^ expected)
-        problems += sorted(name for name,item in entries.items() if name in current and not matches(os.path.join(root,name),item))
-        if problems:
-            print("Ownership mismatch: " + ", ".join(dict.fromkeys(problems)), file=sys.stderr)
-            raise SystemExit(1)
+        problems=sorted(name for name in current if name not in entries or not matches(os.path.join(root,name),entries[name]))
     except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError):
-        print("Ownership mismatch: .remctl-install-manifest.json", file=sys.stderr)
-        raise SystemExit(1)
+        problems=sorted(current) + [".remctl-install-manifest.json"]
+    if problems:
+        print("Ownership mismatch: " + ", ".join(problems), file=sys.stderr)
+        print("\n".join(problems))
+        raise SystemExit(5)
     raise SystemExit(0)
 present=existing()
 if not present: raise SystemExit(0)
@@ -811,7 +814,11 @@ resolve_legacy_install() {
         ADOPT_EXISTING=1
         return 0
     fi
-    echo -e "${YELLOW}An older RemCTL is installed in $BIN_DIR, and the installer can't verify its files:${RESET}"
+    if [[ "$status" == "5" ]]; then
+        echo -e "${YELLOW}These RemCTL files in $BIN_DIR changed since RemCTL installed them:${RESET}"
+    else
+        echo -e "${YELLOW}An older RemCTL is installed in $BIN_DIR, and the installer can't verify its files:${RESET}"
+    fi
     echo "  $listed"
     [[ "$DRY_RUN" != "1" ]] || { echo "Dry run: they would be moved to the Trash."; return 0; }
     [[ -t 0 && -t 1 ]] || fail "Nothing was changed. Run the installer in Terminal to move these files to the Trash, or move them out of $BIN_DIR yourself."
@@ -842,8 +849,8 @@ fi
 if LEGACY_PATHS="$(installed_bin_owned "$APP_CONTRACT")"; then bin_status=0; else bin_status=$?; fi
 case "$bin_status" in
     0) ;;
-    3|4) resolve_legacy_install "$bin_status" "$LEGACY_PATHS" ;;
-    *) fail "Nothing was changed: RemCTL's files in $BIN_DIR (listed above) changed since it installed them, or come from an install it can't verify. Move those files out of $BIN_DIR and run the installer again. For a 2.0 prerelease you have reviewed, add --adopt-existing-install once." ;;
+    3|4|5) resolve_legacy_install "$bin_status" "$LEGACY_PATHS" ;;
+    *) fail "Nothing was changed: RemCTL's files in $BIN_DIR (listed above) come from an install it can't verify. Move those files out of $BIN_DIR and run the installer again. For a 2.0 prerelease you have reviewed, add --adopt-existing-install once." ;;
 esac
 if [[ "$CAPABILITY_SIMULATION" != "1" ]]; then
     new_signature="$(/usr/bin/codesign -d --verbose=4 -r- "$STAGED_APP" 2>&1)" || fail "Could not inspect the staged host signature."

@@ -253,6 +253,20 @@ def main():
         if marker.is_file() and json.loads(marker.read_text()).get("identity") == args.preserve_identity:
             signing = local_identity(args.signing_directory)
         else:
+            # A release install records RemCTL's Developer ID certificate, which only
+            # its publisher has. Say so before the build, instead of a codesign error.
+            available = subprocess.run(
+                ["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"],
+                capture_output=True, text=True, check=False,
+            ).stdout
+            if args.preserve_identity.upper() not in available.upper():
+                raise SystemExit(
+                    "The installed RemCTL is signed with a certificate this Mac doesn't have "
+                    f"({args.preserve_identity}), usually because it came from the notarized download. "
+                    "To keep its permissions, install the download again instead of building from source. "
+                    "To build from source anyway, run ./install.sh --from-source --migrate-signing, "
+                    "then grant permissions again with remctl onboard."
+                )
             signing = {"identity": args.preserve_identity}
     else:
         signing = local_identity(args.signing_directory)

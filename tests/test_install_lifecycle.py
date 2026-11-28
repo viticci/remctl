@@ -551,11 +551,11 @@ class InstallerLifecycleTests(unittest.TestCase):
         foreign.write_text("# foreign replacement\n")
 
         reinstall = self.run_script(
-            INSTALL, "--dry-run", "--shell-completions", "none", check=False
+            INSTALL, "--shell-completions", "none", check=False
         )
         self.assertNotEqual(reinstall.returncode, 0)
         self.assertIn("Nothing was changed", reinstall.stdout)
-        self.assertIn("changed since it installed them", reinstall.stdout)
+        self.assertIn("changed since RemCTL installed them", reinstall.stdout)
         self.assertIn("Ownership mismatch: remctl_runtime.py", reinstall.stdout)
         self.assertEqual(foreign.read_text(), "# foreign replacement\n")
 
@@ -564,6 +564,37 @@ class InstallerLifecycleTests(unittest.TestCase):
         self.assertIn("without an exact installer ownership marker", uninstall.stdout)
         self.assertEqual(foreign.read_text(), "# foreign replacement\n")
         self.assertTrue(self.app.exists())
+
+    def test_changed_files_moved_out_of_bin_no_longer_block_reinstall_or_uninstall(self) -> None:
+        # Issue #84: the installer said to move changed files out of bin, then
+        # reported the moved files as mismatches because the manifest still listed them.
+        self.run_script(INSTALL, "--shell-completions", "none")
+        changed = self.bin / "remctl_runtime.py"
+        changed.write_text("# edited by hand\n")
+
+        refused = self.run_script(INSTALL, "--shell-completions", "none", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("remctl_runtime.py", refused.stdout)
+        self.assertIn("Nothing was changed", refused.stdout)
+        self.assertEqual(changed.read_text(), "# edited by hand\n")
+
+        changed.rename(self.prefix / "moved-out.py")
+        (self.bin / "remctl-private").unlink()
+        uninstall_dry = self.run_script(UNINSTALL, "--dry-run", "--keep-config")
+        self.assertIn("would remove", uninstall_dry.stdout)
+        self.run_script(INSTALL, "--shell-completions", "none")
+        self.assert_installed_contract()
+
+    def test_changed_files_move_to_the_trash_after_a_yes_in_terminal(self) -> None:
+        self.run_script(INSTALL, "--shell-completions", "none")
+        changed = self.bin / "remctl_runtime.py"
+        changed.write_text("# edited by hand\n")
+        status, output = self.run_in_terminal(
+            "--shell-completions", "none", answer="y", prompt=b"Move them to the Trash"
+        )
+        self.assertEqual(status, 0, output)
+        self.assert_installed_contract()
+        self.assertNotEqual(changed.read_text(), "# edited by hand\n")
 
     def test_unmanifested_host_requires_explicit_one_time_adoption(self) -> None:
         self.run_script(INSTALL, "--shell-completions", "none")

@@ -1,6 +1,7 @@
 """Offline checks for batch reminder extras and their fallback behavior."""
 
 import os
+import plistlib
 import sqlite3
 import time
 import unittest
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from remctl_serialization import preload_extras, serialize_reminder, serialize_reminders
+from remctl_serialization import decode_contact_handles, preload_extras, serialize_reminder, serialize_reminders
 
 APPLE_EPOCH = 978307200
 
@@ -248,3 +249,26 @@ class DueDateTests(unittest.TestCase):
             "UTC", db=no_queries, ZDUEDATE=utc(17), ZDISPLAYDATEDATE=utc(17), ZTIMEZONE="UTC",
         )
         self.assertEqual(payload["dueDate"], "2026-09-30T17:00:00")
+
+
+class ContactHandlesTests(unittest.TestCase):
+    def test_decodes_the_keyed_archive_reminderkit_writes(self):
+        # The layout REMContactRepresentation.archivedData produced on macOS 27.2.
+        uid = plistlib.UID
+        array = {"$classes": ["NSArray", "NSObject"], "$classname": "NSArray"}
+        archive = plistlib.dumps({
+            "$version": 100000, "$archiver": "NSKeyedArchiver", "$top": {"root": uid(1)},
+            "$objects": [
+                "$null",
+                {"$class": uid(7), "phones": uid(2), "emails": uid(5)},
+                {"$class": uid(4), "NS.objects": [uid(3)]},
+                "+1 (555) 010-0199",
+                array,
+                {"$class": uid(4), "NS.objects": [uid(6)]},
+                "sam@example.com",
+                {"$classes": ["REMContactRepresentation", "NSObject"], "$classname": "REMContactRepresentation"},
+            ],
+        }, fmt=plistlib.FMT_BINARY)
+        self.assertEqual(decode_contact_handles(archive), {"phones": ["+1 (555) 010-0199"], "emails": ["sam@example.com"]})
+        self.assertIsNone(decode_contact_handles(None))
+        self.assertIsNone(decode_contact_handles(b"not an archive"))

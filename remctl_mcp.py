@@ -423,7 +423,8 @@ BATCH_MAX_IDS = 50
 PRIVATE_FIELDS = (
     "section", "section_id", "new_section", "smart_list", "smart_list_id", "subtasks", "assign", "unassign",
     "early_reminder", "urgent", "location_title", "location_address", "latitude", "longitude", "radius", "proximity",
-    "set_tags", "remove_tags", "clear_tags", "grocery",
+    "set_tags", "remove_tags", "clear_tags", "grocery", "set_url", "clear_urls", "no_section",
+    "messaging_contact", "clear_messaging_contact",
 )
 LIST_PRIVATE_FIELDS = ("symbol", "emoji", "groceries", "grocery_locale", "group", "group_id")
 
@@ -466,6 +467,7 @@ def _private_metadata_argv(args: dict[str, Any], *, extra_private: tuple[str, ..
     argv += _option(args, "section", "--section")
     argv += _option(args, "section_id", "--section-id")
     argv += _option(args, "new_section", "--new-section")
+    argv += _flag(args, "no_section", "--no-section")
     argv += _option(args, "smart_list", "--smart-list")
     argv += _option(args, "smart_list_id", "--smart-list-id")
     argv += _repeated(args.get("subtasks"), "--subtask")
@@ -478,6 +480,10 @@ def _private_metadata_argv(args: dict[str, Any], *, extra_private: tuple[str, ..
     argv += _repeated(args.get("remove_tags"), "--remove-tag")
     argv += _flag(args, "clear_tags", "--clear-tags")
     argv += _flag(args, "grocery", "--grocery")
+    argv += _option(args, "set_url", "--set-url")
+    argv += _flag(args, "clear_urls", "--clear-urls")
+    argv += _repeated(args.get("messaging_contact"), "--messaging-contact")
+    argv += _flag(args, "clear_messaging_contact", "--clear-messaging-contact")
     argv += _option(args, "location_title", "--location-title")
     argv += _option(args, "location_address", "--location-address")
     argv += _option(args, "latitude", "--latitude")
@@ -678,11 +684,11 @@ REMINDER_METADATA_PARAMS = (
     Param("grocery", "boolean", "Categorize this reminder automatically in its Groceries list (private)."),
     Param("section", "string", "Existing section name in the target list (private).", max_length=512),
     Param("section_id", "string", "Section id from get_list, for lists with duplicate section names (private).", max_length=512),
-    Param("new_section", "string", "Create this section in the target list and file the reminder there (private).", max_length=512),
+    Param("new_section", "string", "Create this section in the target list, or in smart_list, and file the reminder there (private).", max_length=512),
     Param(
         "smart_list",
         "string",
-        "Custom smart list name: section or section_id then names one of this smart list's own sections, "
+        "Custom smart list name: section, section_id, new_section, and no_section then use this smart list's own sections, "
         "not the reminder list's (private). run with smart-lists --json lists each custom smart list's sections and ids.",
         max_length=512,
     ),
@@ -705,6 +711,14 @@ REMINDER_METADATA_PARAMS = (
     Param("early_reminder", "string", "Early Reminder before the due date: 15m, 1h, 2d, 1w, 1mo, or clear (private).", max_length=16),
     Param("urgent", "boolean", "Set (true) or clear (false) the urgent state (private)."),
     Param(
+        "messaging_contact",
+        "array",
+        "When Messaging a Person: phone numbers or email addresses of one person. The reminder shows when you "
+        "message them in Messages (private). Replaces any earlier messaging contact.",
+        items_type="string",
+        max_items=10,
+    ),
+    Param(
         "location_address",
         "string",
         "Street address with town or postal code for a location alarm (private). RemCTL resolves it first and creates "
@@ -720,7 +734,7 @@ REMINDER_METADATA_PARAMS = (
 METADATA_EXCLUSIVE = (
     ("list", "list_id"),
     ("section", "section_id", "new_section"),
-    ("smart_list", "smart_list_id", "new_section"),
+    ("smart_list", "smart_list_id"),
     ("location_address", "latitude"),
     ("location_address", "longitude"),
 )
@@ -762,7 +776,8 @@ UPDATE_FIELDS = (
     "title", "list", "list_id", "notes", "due", "priority", "recurrence", "alarm", "url", "flagged",
     "tags", "set_tags", "remove_tags", "clear_tags", "section", "section_id", "new_section", "smart_list",
     "smart_list_id", "subtasks", "assign", "unassign", "early_reminder", "urgent", "location_address", "latitude",
-    "longitude", "location_title", "radius", "proximity", "grocery",
+    "longitude", "location_title", "radius", "proximity", "grocery", "set_url", "clear_urls", "no_section",
+    "messaging_contact", "clear_messaging_contact",
 )
 
 TOOLS: tuple[Tool, ...] = (
@@ -862,7 +877,7 @@ TOOLS: tuple[Tool, ...] = (
         "Create Reminder",
         "Create one reminder. Returns status, the new numeric id, and any warnings (a failed flag step keeps the reminder). "
         "Set private to true for synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent state, "
-        "and location alarms. If a private step fails after the reminder exists, the result has status partial and the id: "
+        "location alarms, and the messaging contact. If a private step fails after the reminder exists, the result has status partial and the id: "
         "finish with update_reminder instead of creating it again.",
         (
             Param("title", "string", "Reminder title.", required=True, max_length=1024),
@@ -890,7 +905,7 @@ TOOLS: tuple[Tool, ...] = (
         "Change one or more fields of a reminder. Pass 'clear' as due or alarm to remove them. Moving a reminder with "
         "subtasks, or into a shared list, copies it and deletes the original: the result has a new id plus oldId, so use "
         "the new id afterwards, and that move can't be combined with other changes. Set private to true for synced tags, rich links, sections, subtasks, "
-        "assignment, Early Reminders, urgent state, the flag, and location alarms.",
+        "assignment, Early Reminders, urgent state, the flag, location alarms, and the messaging contact.",
         (
             REMINDER_ID,
             Param("title", "string", "Replacement title.", max_length=1024),
@@ -901,7 +916,11 @@ TOOLS: tuple[Tool, ...] = (
             PRIORITY,
             Param("recurrence", "string", RECURRENCE_HELP + " Also accepts an exported recurrence JSON object as a string.", max_length=4096),
             Param("alarm", "string", ALARM_HELP + " Use clear to remove the alarm.", max_length=64),
-            Param("url", "string", "URL. With private: true, a synced rich link (added, never replaced): a public web URL or an app link such as obsidian://...; otherwise appended to the notes.", max_length=2048),
+            Param("url", "string", "URL. With private: true, a synced rich link added beside any others: a public web URL or an app link such as obsidian://...; otherwise appended to the notes.", max_length=2048),
+            Param("set_url", "string", "Replace every rich link with this one (private): a public web URL or an app link.", max_length=2048),
+            Param("clear_urls", "boolean", "Remove every rich link (private).", default=False),
+            Param("no_section", "boolean", "Take the reminder out of its section in its list, or in smart_list (private).", default=False),
+            Param("clear_messaging_contact", "boolean", "Remove the When Messaging a Person trigger (private).", default=False),
             Param("tags", "string", "Synced tags to add (private), as a list or comma-separated string.", max_length=512, coerce=_coerce_tag_list),
             Param("set_tags", "string", "Replace every synced tag with these (private).", max_length=512, coerce=_coerce_tag_list),
             Param("remove_tags", "array", "Synced tags to remove (private).", items_type="string", max_items=20),
@@ -912,7 +931,10 @@ TOOLS: tuple[Tool, ...] = (
             *REMINDER_METADATA_PARAMS,
         ),
         _argv_update_reminder, "change", read_only=False, idempotent=True, timeout=90,
-        require_one_of=UPDATE_FIELDS, mutually_exclusive=(*METADATA_EXCLUSIVE, ("assign", "unassign")),
+        require_one_of=UPDATE_FIELDS, mutually_exclusive=(
+            *METADATA_EXCLUSIVE, ("assign", "unassign"), ("url", "set_url", "clear_urls"),
+            ("section", "section_id", "new_section", "no_section"), ("messaging_contact", "clear_messaging_contact"),
+        ),
         output_schema=OBJECT_OUTPUT_SCHEMA,
     ),
     Tool(
@@ -1396,13 +1418,14 @@ RemCTL's MCP tools read and change the user's Apple Reminders on their Mac. Each
 
 ## When to set private: true
 
-These features need `private: true`: synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent, Groceries categories, location alarms, the flag in `update_reminder`, restores, and a list's symbol, emoji, Groceries mode, or group. Each argument's description says when it needs it.
+These features need `private: true`: synced tags, rich links, sections, subtasks, assignment, Early Reminders, urgent, Groceries categories, location alarms, the messaging contact, the flag in `update_reminder`, restores, and a list's symbol, emoji, Groceries mode, or group. Each argument's description says when it needs it.
 
 - Without it, most of these are refused before anything is written. When a call is refused because it needs `private: true`, send the same call again with `private: true`.
 - Two are not refused, so decide up front: without it, `url` is added to the notes instead of becoming a rich link, and `create_reminder` adds `tags` to the title as #hashtags instead of synced tags.
 - List colors: `create_list` takes a color name without it, but a `#RRGGBB` color only with it. `update_list` needs it for every change except a rename.
 - Leave it off when nothing needs it.
 - Before you put a reminder in a section or assign it, call `get_list` for the list's section ids and sharees.
+- `url` adds a rich link beside any others. To fix a link that moved, `update_reminder` with `set_url`, not `url`.
 - For a location alarm, check the address with `resolve_location` first. "Home" is a label, not an address: ask the user for the address.
 
 ## Finish a partial write

@@ -321,11 +321,22 @@ remctl add "Paper" -l Projects --private --new-section Reading
 remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8
 remctl edit 23880 --private --smart-list "Flagged Tasks" --section "Next Up"
 remctl edit 23880 --private --smart-list-id 170 --section-id 5C1E0A44-2D7B-4F0E-9B61-0F2B7E0D9A11
+remctl edit 23880 --private --no-section
+remctl edit 23880 --private --smart-list "Board" --no-section
+remctl section-create "Doing" --smart-list "Board" --private
+remctl edit 23880 --private --smart-list "Board" --new-section "Waiting"
+remctl show --smart-list "Board" --json
 ```
 
 Section commands are private writes. Create and rename refuse duplicate names in the same list. `--section` resolves by name; if a list has two sections with the same name, RemCTL uses the one that is not empty when exactly one qualifies, otherwise ask for `--section-id`. Verify with `sections --json` or `show <list> --json`.
 
-Custom smart lists have sections of their own, separate from the sections of the lists their reminders come from. `--smart-list NAME` or `--smart-list-id ID` makes `--section` or `--section-id` name a section of that smart list instead of the reminder's list; without it they always mean the reminder's list. `smart-lists` shows each custom smart list's sections and their ids. A name that two sections of the smart list share fails before writing and prints both ids. RemCTL reads the membership back from the smart list and reports `verified: true`. It does not check that the reminder matches the smart list's filter: if it doesn't, Reminders won't show it there. Needs helper protocol 4; `--new-section` can't be combined with `--smart-list`.
+`--no-section` takes a reminder out of its section, back to the unsectioned part of the list, as dragging it does in Reminders. It changes only that reminder; the section stays. It can't be combined with `--section`, `--section-id`, or `--new-section`. RemCTL reads the change back and reports `verified: true`. A reminder that isn't in a section reports `"status": "unchanged"` with `"reason": "not_in_section"`.
+
+Custom smart lists have sections of their own, separate from the sections of the lists their reminders come from. `--smart-list NAME` or `--smart-list-id ID` makes `--section` or `--section-id` name a section of that smart list instead of the reminder's list; without it they always mean the reminder's list. `smart-lists` shows each custom smart list's sections and their ids. A name that two sections of the smart list share fails before writing and prints both ids. RemCTL reads the membership back from the smart list and reports `verified: true`. It does not check that the reminder matches the smart list's filter: if it doesn't, Reminders won't show it there. Needs helper protocol 4.
+
+With `--smart-list`, `--new-section` creates the section in the smart list, after its others, and puts the reminder there, and `--no-section` takes the reminder out of the smart list's section. `section-create --smart-list NAME` (or `--smart-list-id ID`) creates an empty one. These need helper protocol 5.
+
+To read a board back, `info --json`, `subtasks --json`, and `export --format json` report `smartListSections`: one entry per custom smart list whose section the reminder is in, with `smartListId`, `smartList`, `sectionId`, and `section`, or an empty array. `show --smart-list NAME` (or `--smart-list-id ID`) lists the reminders that match a custom smart list's filter, grouped by its sections in order, with the rest under `Other`; `--json` returns `sections`, each with `id`, `name`, and `reminders`.
 
 ## List groups
 
@@ -441,9 +452,10 @@ remctl location-lookup "Piazza Navona, Rome" --json
 
 | Field | Options | Notes |
 | --- | --- | --- |
-| Rich link | `--url` | A public `http` or `https` host, or an app link such as `obsidian://open?vault=Notes`; loopback, `.local`, private addresses, and `file:`, `javascript:`, `data:`, and file-server schemes are rejected. Additive. |
+| Rich link | `--url` (add), `--set-url` (replace), `--clear-urls` | A public `http` or `https` host, or an app link such as `obsidian://open?vault=Notes`; loopback, `.local`, private addresses, and `file:`, `javascript:`, `data:`, and file-server schemes are rejected. `--url` adds a link beside any others. `edit --set-url` replaces every rich link with one, and `edit --clear-urls` removes them all. The three can't be combined. |
 | Synced tags | `-t/--tags` (add), `--set-tags` (replace), `--clear-tags`, `--remove-tag` (repeatable) | The replace and remove options cannot be combined with each other or with `-t`. |
-| Section | `--section`, `--section-id`, `--new-section`, `--smart-list`, `--smart-list-id` | See [Sections](#sections). |
+| Section | `--section`, `--section-id`, `--new-section`, `--no-section`, `--smart-list`, `--smart-list-id` | See [Sections](#sections). |
+| When Messaging a Person | `--messaging-contact PHONE_OR_EMAIL` (repeatable or comma-separated), `edit --clear-messaging-contact` | Reminders shows the reminder when you message that person in Messages. Give the person's phone numbers or email addresses; RemCTL doesn't look up names in Contacts. Replaces an earlier messaging contact. `info --json` and `export --format json` report `messagingContact` as `{"phones": [...], "emails": [...]}`, or `null`. |
 | Assignment | `--assign`, `--unassign` | Shared lists only. |
 | Subtasks | `--subtask TITLE` or `--subtask '{json}'` | JSON accepts `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields. Additive: new subtasks follow existing ones, in the order given. `subtaskPlacement` in the private result is `afterExisting`, `first` (the parent had none), `unconfirmed` (the existing order couldn't be read, so the batch went first), or `unordered` (this macOS can't order subtasks). To nest an existing reminder instead, use `reminder-move --parent`. |
 | Images | `--image PATH` (repeatable) | Additive. Other file types are rejected because Reminders does not show them. |
@@ -452,7 +464,9 @@ remctl location-lookup "Piazza Navona, Rome" --json
 | Location alarm | `--location-title`, `--latitude` and `--longitude` or `--location-address`, `--radius`, `--proximity` | Saved through EventKit. Replaces an existing location alarm. `--radius` is 1 to 100000 meters, 100 by default. |
 | Groceries | `--grocery` | Only in a Groceries list. |
 
-Rich links and images are additive: RemCTL adds them and does not remove or replace existing ones.
+Images are additive: RemCTL adds them and does not remove or replace existing ones.
+
+`--set-url`, `--clear-urls`, `--no-section`, `--messaging-contact`, `--clear-messaging-contact`, and the smart-list forms of `--new-section` and `section-create` need helper protocol 5. RemCTL refuses an older helper before writing anything.
 
 ### Location alarms from an address
 

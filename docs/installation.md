@@ -187,6 +187,18 @@ Reminders and Automation prompt again during onboarding. Full Disk Access usuall
 
 If you use the Codex workspace, click 'Refresh' there once `doctor` passes.
 
+### Repairing a broken install
+
+Installing again is the repair. Your reminders live in Reminders and iCloud, not in RemCTL, so installing, reinstalling, or uninstalling never touches them. `--keep-config` keeps your settings too.
+
+1. Download the latest release and open 'Install RemCTL', or run `./install.sh` from a checkout. If the protected Python under `/Library/RemCTL/Python` is missing, for example after moving to a new Mac, the installer asks for your password once and puts it back.
+2. If the installer says some of RemCTL's files changed since it installed them, it lists them. In Terminal it offers to move them to the Trash and carry on. Without a terminal, move the listed files out of `~/bin` yourself and run it again. Files that are already gone don't block it.
+3. Run `remctl doctor`.
+
+To remove RemCTL instead, run the uninstaller from inside the app (see [Uninstall](#uninstall)). It works even when the protected Python is missing, because the app carries its own copy.
+
+If you installed the download, don't switch to `./install.sh --from-source` to repair it: the download is signed with RemCTL's certificate, which your Mac doesn't have, so the build stops. To build from source anyway, see [Switching between the download and your own build](#switching-between-the-download-and-your-own-build).
+
 ## Where things go
 
 | What | Default location |
