@@ -12767,7 +12767,7 @@ _remctl() {
         'onboard:Request signed-host Reminders and Automation access'
         'doctor:Diagnose signed-host and effective access'
         'setup:Install shell completions'
-        'permissions:Reopen the Full Disk Access guide, or ask for Contacts access'
+        'permissions:Reopen the signed host Full Disk Access guide for repair, or ask for Contacts access'
         'completion:Generate shell completions'
         'mcp:Run or connect the RemCTL MCP server'
     )
@@ -13435,7 +13435,7 @@ complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
 complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Request signed-host Reminders and Automation access"
 complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose signed-host and effective access"
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
-complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the Full Disk Access guide, or ask for Contacts access"
+complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the signed host Full Disk Access guide for repair, or ask for Contacts access"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
 complete -c remctl -n "__fish_use_subcommand" -a mcp -d "Run or connect the RemCTL MCP server"
 complete -c remctl -n "__fish_seen_subcommand_from mcp" -a "serve install remove status config bundle" -d "MCP action"
@@ -16222,7 +16222,7 @@ def build_parser():
 
     c = sub.add_parser(
         "permissions",
-        help="Reopen the Full Disk Access guide, or ask for Contacts access",
+        help="Reopen the signed host Full Disk Access guide for repair, or ask for Contacts access",
         description=(
             "full-disk-access: in human output, reopen the RemCTL helper with\n"
             "only the exact installed signed host as the Full Disk Access target.\n"
