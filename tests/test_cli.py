@@ -10164,6 +10164,57 @@ class CliTests(unittest.TestCase):
             {"smartListId": 2, "smartList": "Focus", "sectionId": "FOCUS-NEW", "section": "Doing"}
         ]})
 
+    def test_bad_smart_list_targets_fail_before_the_bridge_write(self):
+        # Review finding: --no-section and --new-section checked --smart-list only after the EventKit write.
+        for flags, message in (
+            (["--smart-list", "Nowhere", "--no-section"], "not found"),
+            (["--smart-list", "Today", "--no-section"], "only custom smart lists have sections"),
+            (["--smart-list", "Focus", "--new-section", "next"], "section already exists in smart list 'Focus'"),
+            (["--smart-list", "Focus", "--new-section", "   "], "pass a section name"),
+        ):
+            db = self._smart_list_section_db()
+            args = self.remctl.build_parser()[0].parse_args(["edit", "42", "--title", "Renamed", "--private", *flags])
+            try:
+                with (
+                    self.subTest(flags=flags),
+                    mock.patch.object(self.remctl, "open_db", return_value=db),
+                    mock.patch.object(self.remctl, "q_reminder", return_value={**self._FAKE_REMINDER, "ZLIST": 1}),
+                    mock.patch.object(self.remctl, "private_available", return_value=True),
+                    mock.patch.object(self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 5}),
+                    mock.patch.object(self.remctl, "bridge_available", return_value=True),
+                    mock.patch.object(self.remctl, "bridge_call_result") as bridge_call_result,
+                    mock.patch.object(self.remctl, "private_call") as private_call,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    with self.assertRaises(SystemExit):
+                        self.remctl.cmd_edit(args)
+                    bridge_call_result.assert_not_called()
+                    private_call.assert_not_called()
+                    self.assertIn(message, stderr.getvalue())
+            finally:
+                db.close()
+
+    def test_no_section_is_not_verified_by_an_unreadable_store(self):
+        db = self._smart_list_section_db()
+        db.execute(
+            "UPDATE ZREMCDBASELIST SET ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA = ? WHERE Z_PK = 1",
+            (json.dumps({"memberships": [{"memberID": "REM-1", "groupID": "SECTION-1", "modifiedOn": 100}]}),),
+        )
+        args = self._private_edit_args(no_section=True)
+        try:
+            with (
+                mock.patch.object(self.remctl, "private_action", return_value={"status": "updated"}),
+                mock.patch.object(self.remctl, "_read_fresh_db_value",
+                                  side_effect=lambda reader: reader(mock.Mock(execute=mock.Mock(side_effect=sqlite3.OperationalError("locked"))))),
+                mock.patch.object(self.remctl.time, "sleep"),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.remove_from_section(db, "REM-1", 1, args)
+        finally:
+            db.close()
+        self.assertIn("still in a section", stderr.getvalue())
+
     def test_set_url_and_clear_urls_replace_every_rich_link(self):
         # Issue #79.
         db = self._smart_list_section_db()
@@ -10198,6 +10249,7 @@ class CliTests(unittest.TestCase):
             ({"phones": ["+39 333 123 4567"], "emails": ["sam@example.com"]}, None),
         )
         self.assertEqual(self.remctl.parse_messaging_contact(["Sam Rivera"]), (None, "Sam Rivera"))
+        self.assertEqual(self.remctl.parse_messaging_contact(["#1234"]), (None, "#1234"))
         with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
             self.remctl.validate_private_args(self._private_edit_args(messaging_contact=["Sam Rivera"]))
         self.assertIn("takes a phone number or an email address", stderr.getvalue())
