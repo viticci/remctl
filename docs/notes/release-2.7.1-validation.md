@@ -63,3 +63,7 @@ Both apps and the disk image were accepted by Apple, stapled, and validated. A q
 ## Coverage limits
 
 The Contacts lookup was proven on the source-built host on this Mac, which isn't signed with the hardened runtime. The release build's hardened-runtime Contacts entitlement was checked in its signature, not exercised by a lookup, because installing the disk image's own runtime needs an administrator password. The reviewer confirmed that a hardened-runtime bridge with the entitlement answers `contacts_access_required` correctly without prompting. The workspace fix was exercised through the plugin's `workspace_mutate` path, not by clicking in Codex.
+
+## Publication
+
+Published on November 28, 2026. The `v2.7.1` tag points to commit `7361bbe`, which adds the release notes and this validation on top of the build commit `e6a3a92`; the disk image was built from `e6a3a92`. The [public release](https://github.com/viticci/remctl/releases/tag/v2.7.1) is the latest release, not a draft or prerelease. The disk image was downloaded without authentication through the `latest` URL: its bytes, GitHub's asset digest, and SHA-256 (`09bcefdce39704822b9b70693ad6f229bb7250a3c89ee8c822bc48def67e7b18`) match the verified build, its stapled ticket validates, and a quarantined copy passes Gatekeeper as Notarized Developer ID. `scripts/download_release.sh --dry-run` also verified it.
