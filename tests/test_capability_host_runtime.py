@@ -832,6 +832,7 @@ class CapabilityHostRuntimeTests(unittest.TestCase):
                     "reminders",
                     "automation",
                     "automationTarget",
+                    "contacts",
                 },
             )
             time.sleep(5.5)
