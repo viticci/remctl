@@ -906,7 +906,7 @@ function Workspace() {
             label: "None",
             run: () =>
               batchItems(items, "update_reminder", {
-                section: "none",
+                no_section: true,
                 private: true,
               }),
           },
@@ -1173,13 +1173,13 @@ function Workspace() {
     if (kind === "date") batchItems(items, "update_reminder", (item) => ({due: rescheduledDue(item, target.dataset.dropDate!)}));
     else if (kind === "list") batchItems(items, "update_reminder", {list_id: id});
     else if (kind === "section" && settings.advancedFeatures && query.listId)
-      batchItems(items, "update_reminder", {...(target.dataset.dropSection ? {section_id: target.dataset.dropSection} : {section: "none"}), private: true});
+      batchItems(items, "update_reminder", {...(target.dataset.dropSection ? {section_id: target.dataset.dropSection} : {no_section: true}), private: true});
     else if (kind === "reminder" && settings.advancedFeatures && query.view === "list") {
       const anchor = data.items.find((item: D) => item.id === id);
       if (!anchor || payload.ids.includes(id)) return;
       if (layout === "columns" && items.some((item: D) => item.section !== anchor.section)) {
         const section = data.sections.find((value: D) => value.title === anchor.section && value.listId === query.listId);
-        batchItems(items, "update_reminder", {...(section ? {section_id: section.objectUUID} : {section: "none"}), private: true});
+        batchItems(items, "update_reminder", {...(section ? {section_id: section.objectUUID} : {no_section: true}), private: true});
       } else run(async () => {
         for (const item of items) await mutate("manage_reminder_move", {id: item.id, before: id, private: true}, item.revision);
         await refresh();
@@ -2047,7 +2047,7 @@ function Workspace() {
                         batchItems(items, "update_reminder", {
                           ...(section
                             ? { section_id: section.objectUUID }
-                            : { section: "none" }),
+                            : { no_section: true }),
                           private: true,
                         });
                       }}
@@ -2729,8 +2729,19 @@ function ActionForm({
         const privateFields = [
           "tags",
           "set_tags",
+          "remove_tags",
+          "clear_tags",
           "section",
           "section_id",
+          "new_section",
+          "no_section",
+          "smart_list",
+          "smart_list_id",
+          "set_url",
+          "clear_urls",
+          "messaging_contact",
+          "clear_messaging_contact",
+          "flagged",
           "assign",
           "unassign",
           "early_reminder",
@@ -2920,7 +2931,7 @@ function Inspector({
                     }
                     if (args.section_id === "") {
                       delete args.section_id;
-                      args.section = "none";
+                      args.no_section = true;
                     }
                     const saved=await save(args,draftRevision.current);
                     if(saved && !["partial", "uncertain"].includes(saved.status)){setDraft({});draftRevision.current=item.revision;}

@@ -85,7 +85,7 @@ Right-click a list, folder, or custom smart list and choose **Move Up** or **Mov
   <img alt="The inspector open beside a demo list" src="../assets/readme/inspector-light.jpg">
 </picture>
 
-**The inspector.** Click a reminder to edit its title, notes, list, date and time, repeat rule, priority, flag, URL, tags, section, assignment, Early Reminder, and location. It shows subtasks and attachments; click an image to preview it or save it to Downloads. Drop an image (PNG, JPEG, WebP, or HEIC, up to 8 MB) or a web link onto a reminder to attach it. Unsaved edits stay with each reminder while the workspace is open. Save with ⌘S, or click 'Cancel' to discard them.
+**The inspector.** Click a reminder to edit its title, notes, list, date and time, repeat rule, priority, flag, URL, tags, section, assignment, Early Reminder, and location. It shows subtasks and attachments; click an image to preview it or save it to Downloads. Drop an image (PNG, JPEG, WebP, or HEIC, up to 8 MB) or a web link onto a reminder to attach it. Unsaved edits stay with each reminder while the workspace is open. Save with ⌘S, or click 'Cancel' to discard them. The URL field adds a link; to replace or remove links, or to set When Messaging a Person, use 'Update Reminder' in the command palette.
 
 **Quick add.** Click 'New Reminder' or press N for a floating panel above the Codex composer. Pick a list, date, time, priority, or flag, and press Return to add. ⌘Return adds it and keeps the panel open for the next one. Press Escape and your draft is still there next time.
 

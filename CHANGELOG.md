@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.7.1 — Unreleased
+## 2.7.1 — 2026-11-28
 
 ### New
 
@@ -9,7 +9,9 @@
 
 ### Fixes
 
-- The splash screen, `add` and `edit` help, `smart-lists` help, README, guides, and skills cover the 2.7.0 features: `--set-url`, `--clear-urls`, `--no-section`, smart-list sections and `show --smart-list`, and the messaging contact.
+- In the Codex workspace, 'Move to Section › None', dropping a card in the Others column, and clearing a reminder's section in the inspector failed, because they asked for a section named "none". They now use `no_section`, the same change as Reminders' own Move to Section › None.
+- The Codex workspace's command-palette forms send `private: true` for the new fields (`set_url`, `clear_urls`, `no_section`, `smart_list`, `messaging_contact`, and their clearing options), so they no longer fail with "needs private: true".
+- The splash screen, `add` and `edit` help, `smart-lists` help, README, guides, workspace guides, and skills cover the 2.7.0 features: `--set-url`, `--clear-urls`, `--no-section`, smart-list sections and `show --smart-list`, and the messaging contact.
 
 ## 2.7.0 — 2026-11-28
 
