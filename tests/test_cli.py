@@ -10251,6 +10251,8 @@ class CliTests(unittest.TestCase):
         # Review finding: a comma inside a name must not split it into two lookups.
         self.assertEqual(self.remctl.split_messaging_contact(["Voorhees, John", "Acme, Inc."]),
                          ({"phones": [], "emails": []}, ["Voorhees, John", "Acme, Inc."]))
+        self.assertEqual(self.remctl.split_messaging_contact(["+1 555 0100,", ","]),
+                         ({"phones": ["+1 555 0100"], "emails": []}, []))
         john = {"identifier": "C-1", "name": "John Voorhees", "phones": ["+1 555 0100"], "emails": ["john@example.com"]}
         johnny = {"identifier": "C-2", "name": "John Voorhees Jr.", "phones": ["+1 555 0101"], "emails": []}
         cases = (

@@ -4853,9 +4853,9 @@ def split_messaging_contact(values):
     parts = []
     for raw in values or []:
         pieces = [piece.strip() for piece in raw.split(",") if piece.strip()]
-        if len(pieces) > 1 and all(is_handle(piece) for piece in pieces):
+        if pieces and all(is_handle(piece) for piece in pieces):
             parts += pieces
-        elif raw.strip():
+        elif pieces:
             parts.append(raw.strip())
     phones, emails, names = [], [], []
     for value in parts:
@@ -14511,8 +14511,11 @@ def request_contacts_access(a):
         else:
             print(f"Error: {message}", file=sys.stderr)
         sys.exit(1)
+    host_error = None
     try:
-        status = (capability_host_status_snapshot().get("permissions") or {}).get("contacts")
+        snapshot = capability_host_status_snapshot()
+        status = (snapshot.get("permissions") or {}).get("contacts")
+        host_error = snapshot.get("error") if status is None else None
         # --json only reports, like full-disk-access --json; the prompt needs a person.
         if status not in ("authorized", "limited") and not json_mode:
             remctl_broker.request_permission("contacts", timeout=305)
@@ -14525,7 +14528,10 @@ def request_contacts_access(a):
         sys.exit(1)
     ok = status in ("authorized", "limited")
     if json_mode:
-        print(json.dumps({"ok": ok, "contacts": status}))
+        payload = {"ok": ok, "contacts": status}
+        if host_error:
+            payload["error"] = host_error
+        print(json.dumps(payload))
     elif ok:
         print("Contacts access: allowed. --messaging-contact can now take a person's name.")
     else:
