@@ -4843,8 +4843,22 @@ PHONE_HANDLE_RE = re.compile(r"^\+?[0-9 ()./-]+$")
 
 def split_messaging_contact(values):
     """Split --messaging-contact values into phones, emails, and names to look up in Contacts."""
+    def is_handle(value):
+        return bool(EMAIL_HANDLE_RE.match(value)) or (
+            bool(PHONE_HANDLE_RE.match(value)) and sum(ch.isdigit() for ch in value) >= 3
+        )
+
+    # A value splits on commas only when every part is a phone or email, so a
+    # name such as "Voorhees, John" or "Acme, Inc." stays one Contacts lookup.
+    parts = []
+    for raw in values or []:
+        pieces = [piece.strip() for piece in raw.split(",") if piece.strip()]
+        if len(pieces) > 1 and all(is_handle(piece) for piece in pieces):
+            parts += pieces
+        elif raw.strip():
+            parts.append(raw.strip())
     phones, emails, names = [], [], []
-    for value in [part.strip() for part in ",".join(values or []).split(",") if part.strip()]:
+    for value in parts:
         if EMAIL_HANDLE_RE.match(value):
             if value.casefold() not in {email.casefold() for email in emails}:
                 emails.append(value)
@@ -12926,7 +12940,7 @@ _remctl() {
                 '--urgent[Set private urgent state]' \
                 '--no-urgent[Clear private urgent state]' \
                 '--early-reminder[Set Early Reminder delta, e.g. 15m, 1h, clear]:delta:' \
-                '--messaging-contact[Show when messaging this phone or email]:handle:' \
+                '--messaging-contact[Show when messaging this person (phone, email, or name)]:handle:' \
                 '--location-title[Location alarm title]:title:' \
                 '--location-address[Location alarm street address]:address:' \
                 '--latitude[Location alarm latitude]:latitude:' \
@@ -12962,7 +12976,7 @@ _remctl() {
                 '(--smart-list)--smart-list-id[Resolve --section in this custom smart list by numeric ID]:id:' \
                 '(--clear-urls)--set-url[Replace every rich link]:url:' \
                 '(--set-url)--clear-urls[Remove every rich link]' \
-                '--messaging-contact[Show when messaging this phone or email]:handle:' \
+                '--messaging-contact[Show when messaging this person (phone, email, or name)]:handle:' \
                 '--clear-messaging-contact[Remove the messaging trigger]' \
                 '--subtask[Add private subtask title or JSON object]:subtask:' \
                 '--image[Add private image attachment]:path:_files' \
@@ -13014,6 +13028,13 @@ _remctl() {
         doctor)
             _arguments \
                 '--for-agent[Explain authoritative access.effective readiness]' \
+                '--json[JSON output]'
+            return
+            ;;
+        permissions)
+            _arguments \
+                '1:topic:(full-disk-access contacts)' \
+                '--wait[Wait for the helper to close]' \
                 '--json[JSON output]'
             return
             ;;
@@ -13259,6 +13280,9 @@ BASH_COMPLETION = '''_remctl() {
     elif [ "$cmd" = "reminder-move" ]; then
         COMPREPLY=( $(compgen -W "--before --after --first --last --parent --top-level --smart-list --smart-list-id --private --json" -- "$cur") )
         return
+    elif [ "$cmd" = "permissions" ]; then
+        COMPREPLY=( $(compgen -W "full-disk-access contacts --wait --json" -- "$cur") )
+        return
     elif [ "$cmd" = "doctor" ]; then
         COMPREPLY=( $(compgen -W "--for-agent --json" -- "$cur") )
         return
@@ -13443,6 +13467,7 @@ complete -c remctl -l images -d "Render image attachments inline"
 complete -c remctl -l image-mode -d "Image rendering protocol" -x -a "kitty iterm2 halfblock none"
 complete -c remctl -l image-width -d "Image render width in cells" -x
 complete -c remctl -n "__fish_seen_subcommand_from doctor" -l for-agent -d "Explain authoritative access.effective readiness"
+complete -c remctl -n "__fish_seen_subcommand_from permissions" -f -a "full-disk-access contacts"
 complete -c remctl -n "__fish_seen_subcommand_from show" -l list-id -d "Show list by stable numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l smart-list -d "Show a custom smart list by its sections" -r
 complete -c remctl -n "__fish_seen_subcommand_from show" -l smart-list-id -d "Show a custom smart list by numeric ID" -r
@@ -13607,7 +13632,7 @@ complete -c remctl -n "__fish_seen_subcommand_from add" -l private -d "Use unsup
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section -d "Assign to existing section" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l section-id -d "Assign to section by stable ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l new-section -d "Create and assign to new section" -r
-complete -c remctl -n "__fish_seen_subcommand_from add" -l messaging-contact -d "Show when messaging this phone or email" -r
+complete -c remctl -n "__fish_seen_subcommand_from add" -l messaging-contact -d "Show when messaging this person (phone, email, or name)" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list -d "Resolve --section in this custom smart list" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
 complete -c remctl -n "__fish_seen_subcommand_from add" -l subtask -d "Add private subtask title or JSON object" -r
@@ -13628,7 +13653,7 @@ complete -c remctl -n "__fish_seen_subcommand_from edit" -l new-section -d "Crea
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l no-section -d "Take out of its section"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l set-url -d "Replace every rich link" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l clear-urls -d "Remove every rich link"
-complete -c remctl -n "__fish_seen_subcommand_from edit" -l messaging-contact -d "Show when messaging this phone or email" -r
+complete -c remctl -n "__fish_seen_subcommand_from edit" -l messaging-contact -d "Show when messaging this person (phone, email, or name)" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l clear-messaging-contact -d "Remove the messaging trigger"
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list -d "Resolve --section in this custom smart list" -r
 complete -c remctl -n "__fish_seen_subcommand_from edit" -l smart-list-id -d "Resolve --section in this custom smart list by numeric ID" -r
@@ -14479,9 +14504,17 @@ def remctl_tailscale_detect():
 def request_contacts_access(a):
     """Ask the signed host for Contacts access: its permission window, then the macOS prompt."""
     json_mode = getattr(a, "json", False)
+    if capability_host_requested_mode() == "direct":
+        message = "Direct mode is self-managed; Contacts access is requested only through the signed Capability Host."
+        if json_mode:
+            print(json.dumps({"ok": False, "contacts": None, "error": {"code": "direct_mode_self_managed", "message": message}}))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
     try:
         status = (capability_host_status_snapshot().get("permissions") or {}).get("contacts")
-        if status not in ("authorized", "limited"):
+        # --json only reports, like full-disk-access --json; the prompt needs a person.
+        if status not in ("authorized", "limited") and not json_mode:
             remctl_broker.request_permission("contacts", timeout=305)
             status = (capability_host_status_snapshot().get("permissions") or {}).get("contacts")
     except remctl_broker.CapabilityHostError as exc:
@@ -15282,7 +15315,7 @@ def build_parser():
         c.add_argument("--proximity", choices=["arriving", "leaving"], default="arriving", help="Guarded metadata: location alarm trigger direction")
     def messaging_contact_arguments(c, clearable=False):
         c.add_argument(
-            "--messaging-contact", action="append", metavar="PHONE_OR_EMAIL",
+            "--messaging-contact", action="append", metavar="PHONE_EMAIL_OR_NAME",
             help="Private metadata: show this reminder when messaging this person: a phone number, an email address, or a contact's name or identifier, looked up with `remctl permissions contacts` access (repeatable, or comma-separated)",
         )
         if clearable:
@@ -16228,7 +16261,8 @@ def build_parser():
             "only the exact installed signed host as the Full Disk Access target.\n"
             "JSON reports the validated target without opening UI.\n"
             "contacts: ask macOS, through the signed host, for the optional Contacts access that\n"
-            "--messaging-contact needs to look up a person by name."
+            "--messaging-contact needs to look up a person by name. With --json it only reports\n"
+            "the current Contacts state."
         ),
         epilog=(
             "Examples:\n"

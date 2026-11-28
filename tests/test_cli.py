@@ -10248,6 +10248,9 @@ class CliTests(unittest.TestCase):
             self.remctl.split_messaging_contact(["+39 333 123 4567, sam@example.com", "SAM@example.com", "John Voorhees"]),
             ({"phones": ["+39 333 123 4567"], "emails": ["sam@example.com"]}, ["John Voorhees"]),
         )
+        # Review finding: a comma inside a name must not split it into two lookups.
+        self.assertEqual(self.remctl.split_messaging_contact(["Voorhees, John", "Acme, Inc."]),
+                         ({"phones": [], "emails": []}, ["Voorhees, John", "Acme, Inc."]))
         john = {"identifier": "C-1", "name": "John Voorhees", "phones": ["+1 555 0100"], "emails": ["john@example.com"]}
         johnny = {"identifier": "C-2", "name": "John Voorhees Jr.", "phones": ["+1 555 0101"], "emails": []}
         cases = (
@@ -10275,6 +10278,22 @@ class CliTests(unittest.TestCase):
                     handles, people = self.remctl.resolve_messaging_contact(args)
                     self.assertEqual(handles["phones"], phones)
                     self.assertEqual(people, [{"name": "John Voorhees", "identifier": "C-1"}])
+
+    def test_permissions_contacts_prompts_only_through_the_host_and_never_for_json(self):
+        snapshot = {"available": True, "permissions": {"contacts": "notDetermined"}}
+        for mode, json_mode, prompts in (("auto", False, True), ("auto", True, False), ("direct", False, False)):
+            args = SimpleNamespace(topic="contacts", json=json_mode)
+            with (
+                self.subTest(mode=mode, json_mode=json_mode),
+                mock.patch.object(self.remctl, "capability_host_requested_mode", return_value=mode),
+                mock.patch.object(self.remctl, "capability_host_status_snapshot", return_value=snapshot),
+                mock.patch.object(self.remctl.remctl_broker, "request_permission") as request_permission,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self.remctl.cmd_permissions(args)
+            self.assertEqual(request_permission.called, prompts)
 
     def test_smart_list_flag_needs_an_existing_section_flag(self):
         for overrides, message in (

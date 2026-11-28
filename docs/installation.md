@@ -104,6 +104,8 @@ remctl doctor
 
 Only Full Disk Access needs a restart. Reminders and Automation take effect right away.
 
+The helper accepts the notarized download and a host you built with `./install.sh --from-source`, which is signed with the local certificate the installer keeps. It refuses an ad-hoc or unsigned host. In that case, add the app by hand with the steps above, then restart the host.
+
 ### Contacts (optional)
 
 `--messaging-contact` sets When Messaging a Person from a phone number or email address without any extra permission. To give it a person's name instead, allow Contacts once:
@@ -113,8 +115,6 @@ remctl permissions contacts
 ```
 
 The host shows a RemCTL Permissions window. Click Continue, and macOS asks whether RemCTL Capability Host may access your contacts. RemCTL reads only the matching person's phone numbers and email addresses, and only when you set When Messaging a Person by name. Onboarding doesn't ask for it, and `doctor` reports it without a warning. To turn it off, use System Settings → Privacy & Security → Contacts.
-
-The helper accepts the notarized download and a host you built with `./install.sh --from-source`, which is signed with the local certificate the installer keeps. It refuses an ad-hoc or unsigned host. In that case, add the app by hand with the steps above, then restart the host.
 
 ### Automation right after a restart
 

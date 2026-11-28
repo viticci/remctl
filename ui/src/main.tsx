@@ -2585,7 +2585,8 @@ function ActionForm({
   const fields = Object.entries(props).filter(
     ([key]) => !["private", "force"].includes(key) &&
       !((key === "group" || key.endsWith("list")) && props[`${key}_id`]) &&
-      !(key === "name" && ((tool.name.startsWith("manage_group_") && props.group_id) || props.template_id || props.smart_list_id)),
+      !(key === "name" && ((tool.name.startsWith("manage_group_") && props.group_id) || props.template_id ||
+        (props.smart_list_id && !tool.name.startsWith("manage_section_")))),
   );
   const common = new Set([
     ...(tool.inputSchema.required || []),
@@ -2755,15 +2756,21 @@ function ActionForm({
           "group",
           "group_id",
           "location_address",
+          "location_title",
           "latitude",
           "longitude",
           "proximity",
           "radius",
+          "grocery",
+          "standard",
         ];
+        const listChange =
+          tool.name === "update_list" &&
+          Object.keys(args).some((k) => !["list", "list_id", "new_name", "private"].includes(k));
         if (
           props.private &&
           advanced &&
-          (requiresPrivate ||
+          (requiresPrivate || listChange ||
             Object.keys(args).some((k) => privateFields.includes(k)) ||
             (typeof args.color === "string" && args.color.startsWith("#")))
         )
