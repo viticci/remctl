@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.7.1 — Unreleased
+
+### New
+
+- `--messaging-contact` takes a person's name or contact identifier, as well as phone numbers and email addresses: `edit 123 --private --messaging-contact "John Voorhees"`. RemCTL looks the name up in Contacts, needs exactly one matching contact, and uses all of that contact's phone numbers and emails. It resolves the name before writing anything. The result lists the matched contact. MCP `messaging_contact` takes names too.
+- Contacts is a new, optional permission. `remctl permissions contacts` shows the Capability Host's RemCTL Permissions window, then the macOS prompt. Onboarding doesn't ask for it, and `doctor` reports it without a warning. Without it, a name fails with `contacts_access_required` and nothing changes; two or more matching contacts fail with `contact_ambiguous` and their identifiers.
+
+### Fixes
+
+- The splash screen, `add` and `edit` help, `smart-lists` help, README, guides, and skills cover the 2.7.0 features: `--set-url`, `--clear-urls`, `--no-section`, smart-list sections and `show --smart-list`, and the messaging contact.
+
 ## 2.7.0 — 2026-11-28
 
 ### New

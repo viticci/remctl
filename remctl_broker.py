@@ -1149,7 +1149,7 @@ def permission_status(*, timeout: float = 10) -> dict[str, Any]:
 
 
 def request_permission(kind: str, *, timeout: float = 305) -> dict[str, Any]:
-    if kind not in {"reminders", "automation"}:
+    if kind not in {"reminders", "automation", "contacts"}:
         raise ValueError(f"unsupported Capability Host permission: {kind}")
     response = _request(
         {
@@ -2200,6 +2200,7 @@ def _validate_native_permission_response(payload: dict[str, Any]) -> dict[str, A
         "reminders",
         "automation",
         "automationTarget",
+        "contacts",
     }
     if not isinstance(permissions, dict) or set(permissions) != expected_permission_keys:
         raise _ServerError(
@@ -2213,7 +2214,7 @@ def _validate_native_permission_response(payload: dict[str, Any]) -> dict[str, A
         )
     if any(
         not _bounded_native_string(permissions.get(key), maximum=128)
-        for key in ("fullDiskAccess", "reminders", "automation")
+        for key in ("fullDiskAccess", "reminders", "automation", "contacts")
     ):
         raise _ServerError(
             "native permission values are invalid",
@@ -2259,6 +2260,7 @@ def _native_permission_command(
         "permissionStatus": 10.0,
         "requestReminders": 300.0,
         "requestAutomation": 300.0,
+        "requestContacts": 300.0,
     }
     if operation not in allowed_operations:
         raise _ServerError(
@@ -2556,6 +2558,7 @@ def _unknown_permission_status() -> dict[str, Any]:
         "reminders": "unknown",
         "automation": "unknown",
         "automationTarget": "com.apple.reminders",
+        "contacts": "unknown",
     }
 
 
@@ -2902,6 +2905,7 @@ def _handle_request(
         operations = {
             "reminders": "requestReminders",
             "automation": "requestAutomation",
+            "contacts": "requestContacts",
         }
         if permission not in operations:
             raise _ServerError("unsupported permission request", code="invalid_request")

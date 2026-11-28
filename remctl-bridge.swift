@@ -1,6 +1,7 @@
 import Foundation
 import EventKit
 import CoreLocation
+import Contacts
 
 // MARK: - JSON Models
 
@@ -664,6 +665,66 @@ func placemarkPayload(_ placemark: CLPlacemark) -> [String: Any]? {
     return payload
 }
 
+/// Find contacts by name or contact identifier, for "When Messaging a Person".
+/// It never asks for Contacts access: `remctl permissions contacts` does that,
+/// through the Capability Host's own permission window. Without access it reports
+/// `contacts_access_required` and the current status.
+func runContactsLookup(_ cmd: Command) -> Never {
+    let status = CNContactStore.authorizationStatus(for: .contacts)
+    let statusName: String = {
+        switch status {
+        case .authorized: return "authorized"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .notDetermined: return "notDetermined"
+        default: return status.rawValue == 4 ? "limited" : "unknown"
+        }
+    }()
+    // rawValue 4 is limited access: the contacts the user chose to share.
+    guard status == .authorized || status.rawValue == 4 else {
+        output([
+            "status": "error",
+            "code": "contacts_access_required",
+            "contactsAccess": statusName,
+            "message": "RemCTL needs Contacts access to look up a person by name.",
+        ])
+        exit(1)
+    }
+    guard let query = cmd.query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+        fail("query is required for contacts_lookup")
+    }
+    guard query.count <= 256 else { fail("query is longer than 256 characters") }
+    let keys: [CNKeyDescriptor] = [
+        CNContactIdentifierKey as CNKeyDescriptor,
+        CNContactPhoneNumbersKey as CNKeyDescriptor,
+        CNContactEmailAddressesKey as CNKeyDescriptor,
+        CNContactOrganizationNameKey as CNKeyDescriptor,
+        CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
+    ]
+    let store = CNContactStore()
+    var contacts: [CNContact] = []
+    do {
+        if let contact = try? store.unifiedContact(withIdentifier: query, keysToFetch: keys) {
+            contacts = [contact]
+        } else {
+            contacts = try store.unifiedContacts(matching: CNContact.predicateForContacts(matchingName: query), keysToFetch: keys)
+        }
+    } catch {
+        fail("Contacts lookup failed: \(error.localizedDescription)")
+    }
+    let matches: [[String: Any]] = contacts.prefix(20).map { contact in
+        let name = CNContactFormatter.string(from: contact, style: .fullName) ?? contact.organizationName
+        return [
+            "identifier": contact.identifier,
+            "name": name,
+            "phones": contact.phoneNumbers.map { $0.value.stringValue }.filter { !$0.isEmpty },
+            "emails": contact.emailAddresses.map { String($0.value) }.filter { !$0.isEmpty },
+        ]
+    }
+    output(["status": "ok", "contactsAccess": statusName, "matches": matches])
+    exit(0)
+}
+
 /// Forward-geocode an address with a hard deadline. Needs no Reminders or
 /// Location Services permission: it only asks Apple's geocoder, and it never
 /// writes anything. On the deadline it cancels the request and reports timeout.
@@ -819,6 +880,9 @@ let dueExplicitlyNull: Bool = {
 // Geocoding touches no reminders, so it runs before EventKit is opened or asked for access.
 if cmd.action == "geocode" {
     runGeocode(cmd)
+}
+if cmd.action == "contacts_lookup" {
+    runContactsLookup(cmd)
 }
 
 let store = EKEventStore()

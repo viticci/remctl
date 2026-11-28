@@ -455,7 +455,7 @@ remctl location-lookup "Piazza Navona, Rome" --json
 | Rich link | `--url` (add), `--set-url` (replace), `--clear-urls` | A public `http` or `https` host, or an app link such as `obsidian://open?vault=Notes`; loopback, `.local`, private addresses, and `file:`, `javascript:`, `data:`, and file-server schemes are rejected. `--url` adds a link beside any others. `edit --set-url` replaces every rich link with one, and `edit --clear-urls` removes them all. The three can't be combined. |
 | Synced tags | `-t/--tags` (add), `--set-tags` (replace), `--clear-tags`, `--remove-tag` (repeatable) | The replace and remove options cannot be combined with each other or with `-t`. |
 | Section | `--section`, `--section-id`, `--new-section`, `--no-section`, `--smart-list`, `--smart-list-id` | See [Sections](#sections). |
-| When Messaging a Person | `--messaging-contact PHONE_OR_EMAIL` (repeatable or comma-separated), `edit --clear-messaging-contact` | Reminders shows the reminder when you message that person in Messages. Give the person's phone numbers or email addresses; RemCTL doesn't look up names in Contacts. Replaces an earlier messaging contact. `info --json` and `export --format json` report `messagingContact` as `{"phones": [...], "emails": [...]}`, or `null`. |
+| When Messaging a Person | `--messaging-contact PHONE_EMAIL_OR_NAME` (repeatable or comma-separated), `edit --clear-messaging-contact` | Reminders shows the reminder when you message that person in Messages. Give the person's phone numbers or email addresses, or their name or contact identifier as Contacts has it. A name must match one contact, uses all of that contact's phone numbers and emails, and needs Contacts access: run `remctl permissions contacts` once. Without it, a name fails with `contacts_access_required`; two or more matches fail with `contact_ambiguous` and their identifiers. Nothing is written in either case. Replaces an earlier messaging contact. `info --json` and `export --format json` report `messagingContact` as `{"phones": [...], "emails": [...]}`, or `null`. |
 | Assignment | `--assign`, `--unassign` | Shared lists only. |
 | Subtasks | `--subtask TITLE` or `--subtask '{json}'` | JSON accepts `title`, `notes`, `due`, `priority`, `alarm`, `recurrence`, `earlyReminder`, `url`/`urls`, `tags`, `image`/`images`, `flagged`, `urgent`, and location fields. Additive: new subtasks follow existing ones, in the order given. `subtaskPlacement` in the private result is `afterExisting`, `first` (the parent had none), `unconfirmed` (the existing order couldn't be read, so the batch went first), or `unordered` (this macOS can't order subtasks). To nest an existing reminder instead, use `reminder-move --parent`. |
 | Images | `--image PATH` (repeatable) | Additive. Other file types are rejected because Reminders does not show them. |
@@ -541,6 +541,7 @@ remctl onboard --json                  # checks only, no questions
 remctl doctor                          # health report
 remctl doctor --for-agent --json       # readiness for scripts and agents
 remctl permissions full-disk-access    # reopen the Full Disk Access helper
+remctl permissions contacts            # optional: allow --messaging-contact to take a name
 remctl setup --shell auto              # shell completion
 remctl completion zsh
 remctl mcp install                     # connect AI apps

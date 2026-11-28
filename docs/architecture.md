@@ -19,7 +19,7 @@ Terminal, scripts, agents
        └─ data commands         sent over an owner-only Unix socket (protocol 2)
 
 RemCTL Capability Host.app            signed, persistent, started by a LaunchAgent
-  ├─ holds Full Disk Access, Reminders, and Automation
+  ├─ holds Full Disk Access, Reminders, Automation, and optional Contacts
   └─ runs the same CLI from a sealed archive on a protected Python 3.13+
        ├─ reads the Reminders SQLite database
        ├─ remctl-bridge (Swift)       EventKit writes, address lookup
@@ -153,7 +153,7 @@ Human output strips terminal control characters from titles, notes, URLs, list n
 
 ## Permissions
 
-The host is the only macOS privacy target: Full Disk Access for the database, Reminders for EventKit, Automation for AppleScript. Callers reach those grants through the socket and need none of their own. Direct mode is the exception: it runs in the caller, so a denied direct check is expected while the effective route is ready. `remctl onboard` requests the Reminders and Automation grants only when they are missing and guides the Full Disk Access step; `remctl doctor` reports the state.
+The host is the only macOS privacy target: Full Disk Access for the database, Reminders for EventKit, Automation for AppleScript, and optional Contacts for looking up a messaging contact by name (`remctl permissions contacts`). Callers reach those grants through the socket and need none of their own. Direct mode is the exception: it runs in the caller, so a denied direct check is expected while the effective route is ready. `remctl onboard` requests the Reminders and Automation grants only when they are missing and guides the Full Disk Access step; `remctl doctor` reports the state.
 
 ## Private API compatibility contract
 

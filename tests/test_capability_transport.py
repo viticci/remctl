@@ -1929,7 +1929,7 @@ class NativePermissionPromptContractTests(unittest.TestCase):
         self.assertIn("nativeChannel:", source)
         self.assertIn("permissionStatusPayload()", source)
         self.assertIn(
-            '["permissionStatus", "requestReminders", "requestAutomation"]',
+            '["permissionStatus", "requestReminders", "requestAutomation", "requestContacts"]',
             source,
         )
         self.assertIn("DispatchQueue.main.async", source)
@@ -2074,6 +2074,7 @@ class PermissionRequestLifecycleTests(unittest.TestCase):
             "reminders": "cancelled",
             "automation": "notDetermined",
             "automationTarget": "com.apple.reminders",
+            "contacts": "notDetermined",
         }
 
     def test_disk_access_probe_does_not_block_permission_cache_updates(self):
@@ -2857,6 +2858,7 @@ class PersistentNativePermissionChannelTests(unittest.TestCase):
             "reminders": "authorized",
             "automation": "authorized",
             "automationTarget": "com.apple.reminders",
+            "contacts": "notDetermined",
         }
         value.update(updates)
         return value

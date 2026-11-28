@@ -177,7 +177,7 @@ def build(output: Path, signing: dict, release: bool, cache: Path, architecture:
     shutil.copy2(ROOT / "LICENSE", resources / "LICENSE.txt")
     shutil.copy2(ROOT / "ui/THIRD-PARTY-NOTICES.txt", resources / "UI-THIRD-PARTY-NOTICES.txt")
     target = architecture + "-apple-macosx14.0"
-    run("swiftc", "-target", target, "-O", "-framework", "EventKit", "-framework", "Foundation", ROOT / "remctl-bridge.swift", "-o", helpers / "remctl-bridge")
+    run("swiftc", "-target", target, "-O", "-framework", "EventKit", "-framework", "Contacts", "-framework", "Foundation", ROOT / "remctl-bridge.swift", "-o", helpers / "remctl-bridge")
     run("clang", "-arch", architecture, "-mmacosx-version-min=14.0", "-fobjc-arc", "-O", "-F/System/Library/PrivateFrameworks", "-framework", "Foundation", "-framework", "AppKit", "-framework", "ReminderKit", ROOT / "remctl-private.m", "-o", helpers / "remctl-private")
     run("swiftc", "-target", target, "-O", "-framework", "AppKit", "-framework", "Foundation", ROOT / "remctl-permissions.swift", "-o", client / "remctl-permissions")
     run("swiftc", "-target", target, ROOT / "scripts/render_list_badges.swift", "-o", client / "remctl-list-artwork")
@@ -213,14 +213,22 @@ def build(output: Path, signing: dict, release: bool, cache: Path, architecture:
         shutil.copy2(ROOT / name, resources / "Distribution" / name)
     (resources / "distribution.json").write_text(json.dumps({"format": 1, "version": info["CFBundleShortVersionString"], "architecture": architecture, "pythonVersion": config["version"], "pythonRuntimeID": runtime_id, "signing": "developer-id" if release else "local", "teamID": "4W35M4UN6R" if release else None}, sort_keys=True) + "\n")
     entitlements = output / "host-entitlements.plist"
-    entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events": True}))
+    entitlements.write_bytes(plistlib.dumps({
+        "com.apple.security.automation.apple-events": True,
+        # The hardened runtime needs this for the optional Contacts lookup.
+        "com.apple.security.personal-information.addressbook": True,
+    }))
+    # The bridge does the Contacts lookup, so it carries the same entitlement.
+    bridge_entitlements = output / "bridge-entitlements.plist"
+    bridge_entitlements.write_bytes(plistlib.dumps({"com.apple.security.personal-information.addressbook": True}))
     for directory in (helpers, client):
         for path in directory.iterdir():
             if path.is_file():
                 with path.open("rb") as handle:
                     magic = handle.read(4)
                 if magic in MACH_MAGIC:
-                    sign(path, signing, release, executable=True)
+                    sign(path, signing, release, executable=True,
+                         entitlements=bridge_entitlements if path.name == "remctl-bridge" else None)
     for name in ("remctl-bridge", "remctl-private"):
         shutil.copy2(helpers / name, client / name)
     run("swiftc", "-target", target, "-O", "-framework", "Foundation", "-framework", "AppKit", "-framework", "CoreServices", "-framework", "EventKit", "-framework", "Security", "-framework", "CryptoKit",

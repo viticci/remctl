@@ -262,10 +262,13 @@ def show_splash():
     print(C.dim("    templates   Saved templates              template-info Inspect template"))
     print(C.dim("    sections    Inspect sections             section-*   Manage sections"))
     print(C.dim("    subtasks    Subtasks in order            reminder-move Reorder or nest"))
+    print(C.dim("    edit <id>   Change a reminder            export      JSON or CSV export"))
+    print(C.dim("    show --smart-list NAME   A custom smart list, grouped by its sections"))
     print()
     print(C.dim("  Protected commands use the signed RemCTL Capability Host."))
     print(C.dim("  First setup: remctl onboard   Diagnose or repair: remctl doctor --for-agent"))
     print(C.dim("  Reopen FDA guide: remctl permissions full-disk-access"))
+    print(C.dim("  Messaging contacts by name: remctl permissions contacts (optional)"))
     print()
     print(C.dim(f"  {CLI_NAME} --help for full command reference"))
     print()
@@ -4838,9 +4841,9 @@ EMAIL_HANDLE_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
 PHONE_HANDLE_RE = re.compile(r"^\+?[0-9 ()./-]+$")
 
 
-def parse_messaging_contact(values):
-    """Split --messaging-contact values into {"phones", "emails"}; returns (handles, rejected value)."""
-    phones, emails = [], []
+def split_messaging_contact(values):
+    """Split --messaging-contact values into phones, emails, and names to look up in Contacts."""
+    phones, emails, names = [], [], []
     for value in [part.strip() for part in ",".join(values or []).split(",") if part.strip()]:
         if EMAIL_HANDLE_RE.match(value):
             if value.casefold() not in {email.casefold() for email in emails}:
@@ -4848,9 +4851,58 @@ def parse_messaging_contact(values):
         elif PHONE_HANDLE_RE.match(value) and sum(ch.isdigit() for ch in value) >= 3:
             if value not in phones:
                 phones.append(value)
+        elif value not in names:
+            names.append(value)
+    return {"phones": phones, "emails": emails}, names
+
+
+def lookup_contact_or_die(query, json_mode=False):
+    """The one contact a name or contact identifier names, through the bridge's Contacts lookup."""
+    def refuse(code, message, **extra):
+        if json_mode:
+            print(json.dumps({"status": "error", "code": code, "message": message, **extra}), file=sys.stderr)
         else:
-            return None, value
-    return {"phones": phones, "emails": emails}, None
+            print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    result = bridge_call_result({"action": "contacts_lookup", "query": query})
+    payload = result.get("payload") if isinstance(result, dict) else None
+    if not isinstance(payload, dict):
+        refuse("contacts_lookup_failed", f"could not look up {query!r} in Contacts.")
+    if payload.get("code") == "contacts_access_required":
+        refuse(
+            "contacts_access_required",
+            f"looking up {query!r} needs Contacts access ({payload.get('contactsAccess')}). Run "
+            "`remctl permissions contacts` to allow it, or pass the person's phone number or email address.",
+        )
+    if payload.get("status") != "ok":
+        refuse("contacts_lookup_failed", payload.get("message") or f"could not look up {query!r} in Contacts.")
+    matches = [m for m in payload.get("matches") or [] if m.get("phones") or m.get("emails")]
+    exact = [m for m in matches if (m.get("name") or "").casefold() == query.casefold()]
+    if len(exact) == 1:
+        matches = exact
+    if not matches:
+        refuse("contact_not_found", f"no contact with a phone number or email matches {query!r}.")
+    if len(matches) > 1:
+        options = "; ".join(f"{m.get('name') or '?'} ({m['identifier']})" for m in matches[:10])
+        refuse("contact_ambiguous", f"{len(matches)} contacts match {query!r}. Pass one contact identifier: {options}",
+               candidates=[{"name": m.get("name"), "identifier": m["identifier"]} for m in matches[:10]])
+    return matches[0]
+
+
+def resolve_messaging_contact(a):
+    """Phones and emails for --messaging-contact, with any names looked up once and remembered on a."""
+    if getattr(a, "_messaging_contact", None) is None:
+        handles, names = split_messaging_contact(a.messaging_contact)
+        people = []
+        for name in names:
+            contact = lookup_contact_or_die(name, json_mode=getattr(a, "json", False))
+            people.append({"name": contact.get("name"), "identifier": contact["identifier"]})
+            handles["phones"] += [phone for phone in contact.get("phones", []) if phone not in handles["phones"]]
+            handles["emails"] += [email for email in contact.get("emails", [])
+                                  if email.casefold() not in {e.casefold() for e in handles["emails"]}]
+        a._messaging_contact = (handles, people)
+    return a._messaging_contact
 
 
 def board_private_args(a):
@@ -4897,11 +4949,10 @@ def validate_private_args(a):
     if getattr(a, "messaging_contact", None):
         if getattr(a, "clear_messaging_contact", False):
             refuse("pass either --messaging-contact or --clear-messaging-contact, not both.")
-        handles, rejected = parse_messaging_contact(a.messaging_contact)
-        if handles is None:
-            refuse(f"--messaging-contact takes a phone number or an email address, not {rejected!r}.")
+        # Names are looked up in Contacts here, before anything is written.
+        handles, _ = resolve_messaging_contact(a)
         if not handles["phones"] and not handles["emails"]:
-            refuse("--messaging-contact needs a phone number or an email address.")
+            refuse("--messaging-contact needs a phone number, an email address, or a contact's name.")
 
     if board_private_args(a):
         require_private_helper(json_mode=getattr(a, "json", False), minimum_protocol=BOARD_PRIVATE_PROTOCOL_VERSION)
@@ -6053,10 +6104,12 @@ def add_smart_list_section_and_assign(db, reminder_ckid, a, partial_context=None
 
 def set_messaging_contact(reminder_ckid, a, partial_context=None):
     """Set or clear the When Messaging a Person trigger, and read it back."""
-    handles = {"phones": [], "emails": []}
+    handles, people = {"phones": [], "emails": []}, []
     if not getattr(a, "clear_messaging_contact", False):
-        handles, _ = parse_messaging_contact(a.messaging_contact)
+        handles, people = resolve_messaging_contact(a)
     result = private_action({"action": "set_messaging_contact", "id": reminder_ckid, **handles}, partial_context=partial_context)
+    if people:
+        result = {**result, "contacts": people}
     expected = handles if handles["phones"] or handles["emails"] else None
 
     def read(fresh):
@@ -12714,7 +12767,7 @@ _remctl() {
         'onboard:Request signed-host Reminders and Automation access'
         'doctor:Diagnose signed-host and effective access'
         'setup:Install shell completions'
-        'permissions:Reopen the signed host Full Disk Access guide for repair'
+        'permissions:Reopen the Full Disk Access guide, or ask for Contacts access'
         'completion:Generate shell completions'
         'mcp:Run or connect the RemCTL MCP server'
     )
@@ -13382,7 +13435,7 @@ complete -c remctl -n "__fish_use_subcommand" -a list-delete -d "Delete a list"
 complete -c remctl -n "__fish_use_subcommand" -a onboard -d "Request signed-host Reminders and Automation access"
 complete -c remctl -n "__fish_use_subcommand" -a doctor -d "Diagnose signed-host and effective access"
 complete -c remctl -n "__fish_use_subcommand" -a setup -d "Install shell completions"
-complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the signed host Full Disk Access guide for repair"
+complete -c remctl -n "__fish_use_subcommand" -a permissions -d "Reopen the Full Disk Access guide, or ask for Contacts access"
 complete -c remctl -n "__fish_use_subcommand" -a completion -d "Generate shell completions"
 complete -c remctl -n "__fish_use_subcommand" -a mcp -d "Run or connect the RemCTL MCP server"
 complete -c remctl -n "__fish_seen_subcommand_from mcp" -a "serve install remove status config bundle" -d "MCP action"
@@ -13989,6 +14042,14 @@ def gather_doctor_checks(capability_host=None):
                 "blocked": "Run `remctl onboard` to request Automation access for the signed host.",
             }[automation_state],
         )
+        contacts_access = permissions.get("contacts") if isinstance(permissions, dict) else None
+        add(
+            "contacts",
+            "ok",
+            f"Capability Host Contacts access: {contacts_access or 'unknown'}"
+            + ("" if contacts_access in ("authorized", "limited") else
+               " (optional: only --messaging-contact with a name needs it; `remctl permissions contacts` asks for it)"),
+        )
     elif mode == "direct" and bridge_ok:
         checks.append(bridge_access_check_for_onboarding())
     else:
@@ -14284,7 +14345,7 @@ def cmd_doctor(a):
         if isinstance(permissions, dict):
             permission_summary = ", ".join(
                 f"{key}={permissions.get(key)}"
-                for key in ("fullDiskAccess", "reminders", "automation")
+                for key in ("fullDiskAccess", "reminders", "automation", "contacts")
                 if key in permissions
             )
             if permission_summary:
@@ -14415,7 +14476,38 @@ def remctl_tailscale_detect():
     return remctl_mcp.tailscale_overview()
 
 
+def request_contacts_access(a):
+    """Ask the signed host for Contacts access: its permission window, then the macOS prompt."""
+    json_mode = getattr(a, "json", False)
+    try:
+        status = (capability_host_status_snapshot().get("permissions") or {}).get("contacts")
+        if status not in ("authorized", "limited"):
+            remctl_broker.request_permission("contacts", timeout=305)
+            status = (capability_host_status_snapshot().get("permissions") or {}).get("contacts")
+    except remctl_broker.CapabilityHostError as exc:
+        if json_mode:
+            print(json.dumps({"ok": False, "contacts": None, "error": {"code": exc.code, "message": str(exc)}}))
+        else:
+            print(f"Error: could not request Contacts access: {exc}", file=sys.stderr)
+        sys.exit(1)
+    ok = status in ("authorized", "limited")
+    if json_mode:
+        print(json.dumps({"ok": ok, "contacts": status}))
+    elif ok:
+        print("Contacts access: allowed. --messaging-contact can now take a person's name.")
+    else:
+        print(
+            f"Contacts access: {status or 'unknown'}. To allow it, open System Settings > Privacy & Security > "
+            "Contacts and turn on RemCTL Capability Host. Phone numbers and email addresses work without it."
+        )
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_permissions(a):
+    if a.topic == "contacts":
+        request_contacts_access(a)
+        return
     if a.topic != "full-disk-access":
         print(f"Error: Unsupported permissions topic '{a.topic}'", file=sys.stderr)
         sys.exit(1)
@@ -15191,7 +15283,7 @@ def build_parser():
     def messaging_contact_arguments(c, clearable=False):
         c.add_argument(
             "--messaging-contact", action="append", metavar="PHONE_OR_EMAIL",
-            help="Private metadata: show this reminder when messaging the person with this phone number or email (repeatable, or comma-separated)",
+            help="Private metadata: show this reminder when messaging this person: a phone number, an email address, or a contact's name or identifier, looked up with `remctl permissions contacts` access (repeatable, or comma-separated)",
         )
         if clearable:
             c.add_argument("--clear-messaging-contact", action="store_true", help="Private metadata: remove the When Messaging a Person trigger")
@@ -15326,7 +15418,9 @@ def build_parser():
         epilog=(
             "Examples:\n"
             "  remctl smart-lists --json\n"
+            "  remctl section-create \"Next Up\" --smart-list \"Flagged Tasks\" --private\n"
             "  remctl edit 23880 --private --smart-list \"Flagged Tasks\" --section \"Next Up\"\n"
+            "  remctl show --smart-list \"Flagged Tasks\" --json\n"
             "  remctl edit 23880 --private --smart-list-id 170 --section-id 5C1E0A44-2D7B-4F0E-9B61-0F2B7E0D9A11"
         ),
         formatter_class=HelpFormatter,
@@ -15386,6 +15480,7 @@ def build_parser():
             "  remctl add \"Pick up groceries\" -l Shopping --private --assign alex@example.com\n"
             "  remctl add \"Prepare screenshots\" -l Projects --private --image ~/Desktop/mockup.png --subtask \"Export PNG\"\n"
             "  remctl add \"Leave now\" -l Work --private --urgent\n"
+            "  remctl add \"Ask about the episode\" --private --messaging-contact \"+1 555 0100\"\n"
             "  remctl add \"Leave early\" -l Work -d \"today 14:00\" --private --early-reminder 15m\n"
             "  remctl add \"Buy stamps\" --private --location-address \"Piazza Navona, Rome\" --radius 150\n"
             "  remctl add \"Launch assets\" -l Projects --private --subtask '{\"title\":\"Export PNG\",\"notes\":\"Use final crop\",\"due\":\"tomorrow\",\"url\":\"https://example.com\",\"tags\":[\"media\"]}'\n"
@@ -15497,6 +15592,11 @@ def build_parser():
             "  remctl edit 23880 --private --section-id DCD255E2-7CF5-4B45-9566-3F9A5D84AFA8\n"
             "  remctl smart-lists\n"
             "  remctl edit 23880 --private --smart-list \"Flagged Tasks\" --section \"Next Up\"\n"
+            "  remctl edit 23880 --private --no-section\n"
+            "  remctl edit 23880 --private --set-url \"obsidian://open?vault=Notes&file=Renamed\"\n"
+            "  remctl edit 23880 --private --clear-urls\n"
+            "  remctl edit 23880 --private --messaging-contact \"John Voorhees\"\n"
+            "  remctl edit 23880 --private --clear-messaging-contact\n"
             "  remctl sharees Shopping --json\n"
             "  remctl edit 23880 --private --assign Alex\n"
             "  remctl edit 23880 --private --assign alex@example.com\n"
@@ -16122,15 +16222,19 @@ def build_parser():
 
     c = sub.add_parser(
         "permissions",
-        help="Reopen the signed host's Full Disk Access guide",
+        help="Reopen the Full Disk Access guide, or ask for Contacts access",
         description=(
-            "In human output, reopen the RemCTL helper with only the exact installed signed host\n"
-            "as the Full Disk Access target. JSON reports the validated target without opening UI."
+            "full-disk-access: in human output, reopen the RemCTL helper with\n"
+            "only the exact installed signed host as the Full Disk Access target.\n"
+            "JSON reports the validated target without opening UI.\n"
+            "contacts: ask macOS, through the signed host, for the optional Contacts access that\n"
+            "--messaging-contact needs to look up a person by name."
         ),
         epilog=(
             "Examples:\n"
             "  remctl permissions full-disk-access\n"
             "  remctl permissions full-disk-access --json\n"
+            "  remctl permissions contacts\n"
             "\n"
             "The helper opens System Settings and copies the signed host path. It never targets\n"
             "Hermes, Python, Codex, Terminal, or another caller. If the host is absent, reinstall\n"
@@ -16140,7 +16244,7 @@ def build_parser():
         ),
         formatter_class=HelpFormatter,
     )
-    c.add_argument("topic", choices=["full-disk-access"], help="Permission flow to open")
+    c.add_argument("topic", choices=["full-disk-access", "contacts"], help="Permission flow to open")
     c.add_argument("--wait", action="store_true", help="Wait for the helper to close")
     js(c)
 

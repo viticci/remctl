@@ -713,8 +713,9 @@ REMINDER_METADATA_PARAMS = (
     Param(
         "messaging_contact",
         "array",
-        "When Messaging a Person: phone numbers or email addresses of one person. The reminder shows when you "
-        "message them in Messages (private). Replaces any earlier messaging contact.",
+        "When Messaging a Person: one person's phone numbers or email addresses, or their name as it appears in "
+        "Contacts. The reminder shows when you message them in Messages (private). A name must match one contact and needs "
+        "Contacts access, which the user allows once by running remctl permissions contacts in Terminal. Replaces any earlier messaging contact.",
         items_type="string",
         max_items=10,
     ),
@@ -1426,6 +1427,7 @@ These features need `private: true`: synced tags, rich links, sections, subtasks
 - Leave it off when nothing needs it.
 - Before you put a reminder in a section or assign it, call `get_list` for the list's section ids and sharees.
 - `url` adds a rich link beside any others. To fix a link that moved, `update_reminder` with `set_url`, not `url`.
+- `messaging_contact` takes a phone number, an email, or a name from Contacts. If a name fails with `contacts_access_required`, ask the user to run `remctl permissions contacts` in Terminal, or to give the phone number or email.
 - For a location alarm, check the address with `resolve_location` first. "Home" is a label, not an address: ask the user for the address.
 
 ## Finish a partial write

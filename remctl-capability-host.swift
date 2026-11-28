@@ -1,4 +1,5 @@
 import AppKit
+import Contacts
 import CoreServices
 import CryptoKit
 import Darwin
@@ -342,6 +343,17 @@ private func remindersAuthorizationStatus() -> String {
     return "unknown"
 }
 
+// Contacts is optional: only --messaging-contact with a person's name needs it.
+private func contactsAuthorizationStatus() -> String {
+    let status = CNContactStore.authorizationStatus(for: .contacts)
+    if status == .authorized { return "authorized" }
+    if status.rawValue == 4 { return "limited" }
+    if status == .denied { return "denied" }
+    if status == .restricted { return "restricted" }
+    if status == .notDetermined { return "notDetermined" }
+    return "unknown"
+}
+
 private func eventKitErrorStatus(_ error: Error) -> String {
     let value = error as NSError
     let truncatedDomain = String(value.domain.prefix(80))
@@ -549,7 +561,8 @@ private let automationStatusCache = AutomationStatusCache(
 
 private func permissionStatusPayload(
     reminders: String? = nil,
-    automation: String? = nil
+    automation: String? = nil,
+    contacts: String? = nil
 ) -> [String: Any] {
     [
         "status": "ok",
@@ -557,15 +570,17 @@ private func permissionStatusPayload(
         "reminders": reminders ?? remindersAuthorizationStatus(),
         "automation": automation ?? automationStatusCache.status(),
         "automationTarget": remindersBundleIdentifier,
+        "contacts": contacts ?? contactsAuthorizationStatus(),
     ]
 }
 
 #if REMCTL_TESTING
 private func emitPermissionStatus(
     reminders: String? = nil,
-    automation: String? = nil
+    automation: String? = nil,
+    contacts: String? = nil
 ) -> Never {
-    let payload = permissionStatusPayload(reminders: reminders, automation: automation)
+    let payload = permissionStatusPayload(reminders: reminders, automation: automation, contacts: contacts)
     guard JSONSerialization.isValidJSONObject(payload),
           let data = try? JSONSerialization.data(
               withJSONObject: payload,
@@ -581,6 +596,7 @@ private func emitPermissionStatus(
 private enum PermissionPrompt {
     case reminders
     case automation
+    case contacts
 #if REMCTL_TESTING
     case windowTest
     case hangingTest
@@ -660,6 +676,7 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
     )
     private let requestGate = PermissionRequestGate()
     private var eventStore: EKEventStore?
+    private var contactStore: CNContactStore?
     private var timeoutTimer: Timer?
     private var activationTimer: Timer?
     private var readinessTimer: Timer?
@@ -772,6 +789,8 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
             return "Allow RemCTL to access Reminders"
         case .automation:
             return "Allow RemCTL to automate Reminders"
+        case .contacts:
+            return "Allow RemCTL to look up your contacts"
 #if REMCTL_TESTING
         case .windowTest:
             return "RemCTL Permission Window Test"
@@ -789,6 +808,8 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
             return "Click Continue to ask macOS for full access to your reminders."
         case .automation:
             return "Click Continue to let RemCTL ask macOS to automate Reminders.app. Reminders.app may open."
+        case .contacts:
+            return "RemCTL reads a person's phone numbers and email addresses only when you set When Messaging a Person by name. Click Continue to ask macOS."
 #if REMCTL_TESTING
         case .windowTest:
             return "This test verifies the active, frontmost, key-window permission gate."
@@ -935,6 +956,8 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
             requestReminders()
         case .automation:
             requestAutomation()
+        case .contacts:
+            requestContacts()
 #if REMCTL_TESTING
         case .windowTest:
             finish(with: windowTestResult())
@@ -975,7 +998,7 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
             DispatchQueue.main.async { [weak self] in
                 self?.continueButton?.performClick(nil)
             }
-        case .reminders, .automation, .activationUnavailableTest:
+        case .reminders, .automation, .contacts, .activationUnavailableTest:
             break
         }
     }
@@ -1024,6 +1047,23 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
         eventStore = store
         store.requestFullAccessToReminders { [weak self] granted, error in
             let status = remindersRequestResult(granted: granted, error: error)
+            DispatchQueue.main.async {
+                self?.finish(with: status)
+            }
+        }
+    }
+
+    private func requestContacts() {
+        let existing = contactsAuthorizationStatus()
+        guard existing == "notDetermined" else {
+            finish(with: existing)
+            return
+        }
+        let store = CNContactStore()
+        contactStore = store
+        store.requestAccess(for: .contacts) { [weak self] granted, error in
+            let status = error.map { eventKitErrorStatus($0) }
+                ?? (granted ? "authorized" : contactsAuthorizationStatus())
             DispatchQueue.main.async {
                 self?.finish(with: status)
             }
@@ -1086,7 +1126,7 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
         switch prompt {
         case .automation:
             effectiveStatus = automationStatusCache.recordPermissionResult(status)
-        case .reminders:
+        case .reminders, .contacts:
             effectiveStatus = status
 #if REMCTL_TESTING
         case .windowTest, .hangingTest, .activationUnavailableTest:
@@ -1119,6 +1159,7 @@ private final class PermissionPromptController: NSObject, NSWindowDelegate {
         readinessTimer = nil
         NotificationCenter.default.removeObserver(self)
         eventStore = nil
+        contactStore = nil
         permissionWindow?.orderOut(nil)
         permissionWindow?.close()
         permissionWindow = nil
@@ -1646,6 +1687,8 @@ private final class OneShotPermissionApplicationDelegate: NSObject, NSApplicatio
                 emitPermissionStatus(reminders: status)
             case .automation:
                 emitPermissionStatus(automation: status)
+            case .contacts:
+                emitPermissionStatus(contacts: status)
 #if REMCTL_TESTING
             case .windowTest:
                 guard !status.isEmpty else { exit(70) }
@@ -1690,6 +1733,8 @@ private func runPermissionPrompt(
             emitPermissionStatus(reminders: "promptUnavailable")
         case .automation:
             emitPermissionStatus(automation: "promptUnavailable")
+        case .contacts:
+            emitPermissionStatus(contacts: "promptUnavailable")
 #if REMCTL_TESTING
         case .windowTest:
             exit(70)
@@ -1925,7 +1970,7 @@ private final class NativePermissionServer {
         guard Set(request.keys) == ["protocolVersion", "operation"],
               nativeProtocolVersionIsValid(request["protocolVersion"]),
               let operation = request["operation"] as? String,
-              ["permissionStatus", "requestReminders", "requestAutomation"].contains(operation)
+              ["permissionStatus", "requestReminders", "requestAutomation", "requestContacts"].contains(operation)
         else { return nil }
         return operation
     }
@@ -1944,7 +1989,9 @@ private final class NativePermissionServer {
         }
         let box = ResponseBox()
         let semaphore = DispatchSemaphore(value: 0)
-        let prompt: PermissionPrompt = operation == "requestReminders" ? .reminders : .automation
+        let prompt: PermissionPrompt = operation == "requestReminders"
+            ? .reminders
+            : (operation == "requestContacts" ? .contacts : .automation)
         DispatchQueue.main.async { [requestHandler] in
             requestHandler(prompt) { permissions in
                 box.value = permissions
@@ -2224,6 +2271,8 @@ private final class CapabilityHostApplicationDelegate: NSObject, NSApplicationDe
                 permissions = permissionStatusPayload(reminders: status)
             case .automation:
                 permissions = permissionStatusPayload(automation: status)
+            case .contacts:
+                permissions = permissionStatusPayload(contacts: status)
 #if REMCTL_TESTING
             case .windowTest:
                 permissions = permissionStatusPayload()

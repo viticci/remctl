@@ -10242,17 +10242,39 @@ class CliTests(unittest.TestCase):
             self.remctl.validate_private_args(args)
         self.assertIn("protocol 4 < required 5", stderr.getvalue())
 
-    def test_messaging_contact_takes_phones_and_emails_only(self):
-        # Issue #83.
+    def test_messaging_contact_takes_handles_or_looks_up_one_contact_by_name(self):
+        # Issue #83: phones and emails pass through; a name needs exactly one contact.
         self.assertEqual(
-            self.remctl.parse_messaging_contact(["+39 333 123 4567, sam@example.com", "SAM@example.com"]),
-            ({"phones": ["+39 333 123 4567"], "emails": ["sam@example.com"]}, None),
+            self.remctl.split_messaging_contact(["+39 333 123 4567, sam@example.com", "SAM@example.com", "John Voorhees"]),
+            ({"phones": ["+39 333 123 4567"], "emails": ["sam@example.com"]}, ["John Voorhees"]),
         )
-        self.assertEqual(self.remctl.parse_messaging_contact(["Sam Rivera"]), (None, "Sam Rivera"))
-        self.assertEqual(self.remctl.parse_messaging_contact(["#1234"]), (None, "#1234"))
-        with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
-            self.remctl.validate_private_args(self._private_edit_args(messaging_contact=["Sam Rivera"]))
-        self.assertIn("takes a phone number or an email address", stderr.getvalue())
+        john = {"identifier": "C-1", "name": "John Voorhees", "phones": ["+1 555 0100"], "emails": ["john@example.com"]}
+        johnny = {"identifier": "C-2", "name": "John Voorhees Jr.", "phones": ["+1 555 0101"], "emails": []}
+        cases = (
+            ({"status": "ok", "matches": [john, johnny]}, None, ["+1 555 0100"]),
+            ({"status": "ok", "matches": [{**john, "name": "J. Voorhees"}, johnny]}, "contacts match 'John Voorhees'", None),
+            ({"status": "ok", "matches": []}, "no contact with a phone number or email matches", None),
+            ({"status": "error", "code": "contacts_access_required", "contactsAccess": "notDetermined"},
+             "remctl permissions contacts", None),
+        )
+        for payload, error, phones in cases:
+            args = self._private_edit_args(messaging_contact=["John Voorhees"])
+            with (
+                self.subTest(payload=payload),
+                mock.patch.object(self.remctl, "bridge_call_result", return_value={"returncode": 0, "payload": payload}),
+                mock.patch.object(self.remctl, "private_available", return_value=True),
+                mock.patch.object(self.remctl, "_probe_private_protocol_version", return_value={"ok": True, "version": 5}),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                if error:
+                    with self.assertRaises(SystemExit):
+                        self.remctl.validate_private_args(args)
+                    self.assertIn(error, stderr.getvalue())
+                else:
+                    self.remctl.validate_private_args(args)
+                    handles, people = self.remctl.resolve_messaging_contact(args)
+                    self.assertEqual(handles["phones"], phones)
+                    self.assertEqual(people, [{"name": "John Voorhees", "identifier": "C-1"}])
 
     def test_smart_list_flag_needs_an_existing_section_flag(self):
         for overrides, message in (

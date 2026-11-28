@@ -12,7 +12,7 @@ Hermes bundles a skill named `apple-reminders`. That skill runs [`remindctl`](ht
 | Reminder ids | Stable numeric ids from Reminders' database | Row numbers from the last listing, or EventKit id prefixes |
 | Permissions | Held by one signed app, RemCTL Capability Host. Hermes, Terminal, and Python get none. | Granted to whatever app runs `remindctl`, usually the terminal |
 | Reads | Reminders' local database: sections, subtasks, tags, rich links, attachments, Early Reminders, display dates | Public EventKit only |
-| Writes | EventKit, plus opt-in ReminderKit (`private: true`) for sections, synced tags, rich links, subtasks, assignment, Early Reminders, urgent state, images, groups, smart lists, and templates | Public EventKit only |
+| Writes | EventKit, plus opt-in ReminderKit (`private: true`) for sections, synced tags, rich links, subtasks, assignment, Early Reminders, urgent state, the messaging contact, images, groups, smart lists, and templates | Public EventKit only |
 
 [The remindctl comparison](notes/remindctl-comparison-2026-09-26.md) compares the two feature by feature, with sources.
 

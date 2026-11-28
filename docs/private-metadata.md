@@ -96,7 +96,7 @@ With `--smart-list NAME` or `--smart-list-id ID`, `--section` and `--section-id`
 
 `edit --set-url` and `--clear-urls` call `removeURLAttachments` on the reminder's attachment context, then add the new link, if any, in the same save (helper action `set_url_attachments`). Image attachments are left alone.
 
-`--messaging-contact` sets "When Messaging a Person". Reminders stores it as `contactHandles` on the reminder, a `REMContactRepresentation` with the person's phone numbers and email addresses, archived in `ZCONTACTHANDLES` (helper action `set_messaging_contact`). Messages matches those handles, so RemCTL takes them as given and doesn't read Contacts, which would need a Contacts permission the Capability Host doesn't ask for. Reads decode the archive into `messagingContact`.
+`--messaging-contact` sets "When Messaging a Person". Reminders stores it as `contactHandles` on the reminder, a `REMContactRepresentation` with the person's phone numbers and email addresses, archived in `ZCONTACTHANDLES` (helper action `set_messaging_contact`). Messages matches those handles. A name goes through the bridge's `contacts_lookup` action, which reads Contacts with the host's optional Contacts grant (`remctl permissions contacts`) and never asks for it itself. RemCTL needs exactly one matching contact with a phone number or email, and resolves it before anything is written. Reads decode the archive into `messagingContact`.
 
 `-t/--tags` is additive. `--set-tags`, `--clear-tags`, and repeatable `--remove-tag` rewrite the synced tag set, require `--private`, and cannot be combined with `-t` or each other. Tag reads and rewrites ignore soft-deleted tag links, so a recently-deleted tag is no longer returned and `--remove-tag` cannot resurrect it.
 

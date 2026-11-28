@@ -28,6 +28,8 @@
     <string>14.0</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>RemCTL automates Apple Reminders when you run commands that require Reminders.app.</string>
+    <key>NSContactsUsageDescription</key>
+    <string>RemCTL looks up a person's phone numbers and email addresses when you set When Messaging a Person by name.</string>
     <key>NSRemindersFullAccessUsageDescription</key>
     <string>RemCTL reads and updates your reminders when you ask it to.</string>
 </dict>

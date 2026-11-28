@@ -33,6 +33,8 @@ Setup asks for three permissions, all for 'RemCTL Capability Host': Reminders, A
 remctl doctor
 ```
 
+One more is optional: Contacts, which RemCTL uses only to look up a person by name when you set When Messaging a Person. Setup doesn't ask for it. Run `remctl permissions contacts` when you want it; phone numbers and email addresses work without it.
+
 If you quit setup early, pick it up again with `remctl onboard`. If `remctl` isn't found, the installer tells you which folder to add to your PATH (usually `~/bin`). [Installation](docs/installation.md) covers custom paths, permissions by hand, and troubleshooting.
 
 ## Upgrade
@@ -160,13 +162,18 @@ Open 'Reminders' in the Codex sidebar, or ask Codex to open your Reminders works
 
 ## Private metadata
 
-Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, manual ordering and subtask nesting, list icons, Groceries lists, list groups, custom smart lists and their sections, and templates. RemCTL writes them only when you pass `--private`:
+Some Reminders features have no public API: sections, synced tags, rich links, image attachments, subtasks, shared-list assignment, urgent reminders, Early Reminders, When Messaging a Person, manual ordering and subtask nesting, list icons, Groceries lists, list groups, custom smart lists and their sections, and templates. RemCTL writes them only when you pass `--private`:
 
 ```bash
 remctl add "Research" -l Projects --private --url https://example.com -t remctl --section Research
+remctl edit 23882 --private --set-url "obsidian://open?vault=Notes&file=Renamed"   # replace the rich link
+remctl edit 23882 --private --no-section                  # back to no section
+remctl add "Ask about the episode" --private --messaging-contact "John Voorhees"
 remctl smart-list-create "Priority or Today" --private --match any --priority high,medium --date today
-remctl reminder-move 23882 --parent 23880 --private     # make an existing reminder a subtask
+remctl section-create "Next Up" --smart-list "Priority or Today" --private
 remctl edit 23882 --private --smart-list "Priority or Today" --section "Next Up"
+remctl show --smart-list "Priority or Today"              # the smart list, by section
+remctl reminder-move 23882 --parent 23880 --private       # make an existing reminder a subtask
 ```
 
 These writes use Apple's private ReminderKit framework, never the database directly. Apple can change these APIs in any macOS release. [Private metadata](docs/private-metadata.md) lists what works and how to verify it.

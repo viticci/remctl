@@ -550,7 +550,7 @@ if [[ -n "$PREBUILT_APP" ]]; then
     done
 else
 echo -e "${BLUE}→${RESET} Compiling native helpers..."
-swiftc -target "$MACOS_TARGET" -O -framework EventKit -framework Foundation -o "$BIN_STAGE/remctl-bridge" "$SCRIPT_DIR/remctl-bridge.swift"
+swiftc -target "$MACOS_TARGET" -O -framework EventKit -framework Contacts -framework Foundation -o "$BIN_STAGE/remctl-bridge" "$SCRIPT_DIR/remctl-bridge.swift"
 swiftc -target "$MACOS_TARGET" -O -framework AppKit -framework Foundation -o "$BIN_STAGE/remctl-permissions" "$SCRIPT_DIR/remctl-permissions.swift"
 clang -fobjc-arc -O -F/System/Library/PrivateFrameworks -framework Foundation -framework AppKit -framework ReminderKit \
     -o "$BIN_STAGE/remctl-private" "$SCRIPT_DIR/remctl-private.m"
