@@ -76,3 +76,7 @@ Both Developer ID apps and the disk image were accepted by Apple, stapled, and v
 ## Coverage limits
 
 Testing ran on Apple silicon with macOS 27.2.1. Only Reminders.app on this Mac was checked, not iPhone, so whether the messaging trigger fires in Messages on iOS wasn't tested. The disk image's own runtime wasn't installed here, because that needs an administrator password. The #84 recovery was reproduced in temp-prefix simulations, not on a Mac whose protected Python had been deleted.
+
+## Publication
+
+Published on November 28, 2026. The `v2.7.0` tag points to commit `b9bb7ca`, which adds the release notes and this validation on top of the build commit `045e23f`; the disk image was built from `045e23f`. The [public release](https://github.com/viticci/remctl/releases/tag/v2.7.0) is the latest release, not a draft or prerelease. The disk image was downloaded without authentication through the `latest` URL: its bytes, GitHub's asset digest, and SHA-256 (`61e590164c118ba835894ec5c2107e320e2f0af2b57a02819d98699103ee1a48`) match the verified build, its stapled ticket validates, and a quarantined copy passes Gatekeeper as Notarized Developer ID. `scripts/download_release.sh --dry-run` also verified it.
