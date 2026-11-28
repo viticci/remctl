@@ -15,6 +15,7 @@ These are dated engineering records: audits, reviews, and the evidence behind ea
 | [2.1.0 validation](release-2.1.0-validation.md) | The Claude Code plugin, the completed-search fix (#54), and plugin-aware installs |
 | [2.2.0 validation](release-2.2.0-validation.md) | No Priority, performance and date fixes, notarized download, and installed acceptance |
 | [2.2.1 validation](release-2.2.1-validation.md) | The three contributor fixes, verified 1.7.1 upgrades, notarized download, and installed acceptance |
+| [2.7.0 validation](release-2.7.0-validation.md) | Rich-link replacement (#79), leaving sections (#81), smart-list boards (#82), the messaging trigger (#83), install recovery (#84), review, notarized download, and live acceptance in Reminders.app |
 | [2.6.0 validation](release-2.6.0-validation.md) | The `reminders` skill over MCP, the list-write timeout hint, notarized download, and installed and live acceptance |
 | [2.5.0 validation](release-2.5.0-validation.md) | App links as rich links, shared-list moves from #77, the tall-window workspace fix, notarized download, and live acceptance |
 | [2.4.0 validation](release-2.4.0-validation.md) | Subtask nesting, Smart List sections, eleven merged contributor PRs, issue fixes, notarized download, and live acceptance across every MCP surface |
