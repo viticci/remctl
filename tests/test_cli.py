@@ -9126,6 +9126,8 @@ class CliTests(unittest.TestCase):
             mock.patch.object(self.remctl, "q_section_memberships", return_value={"ABC": "Playground"}),
             mock.patch.object(self.remctl, "q_rich_link", return_value="https://example.com/shortcuts-playground-plugin"),
             mock.patch.object(self.remctl, "q_subtask_count", return_value=0),
+            mock.patch.object(self.remctl, "q_smart_list_section_entries", return_value={}),
+            mock.patch.object(self.remctl, "q_messaging_contact", return_value=None),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             self.remctl.cmd_info(SimpleNamespace(id=42, json=True))
